@@ -120,14 +120,34 @@ async def auth_login(body: LoginRequest, response: Response, request: Request):
     creds = state._ensure_web_credentials()
     username = str(body.username or "").strip()
     password = str(body.password or "")
+    from common.web_auth import verify_password
+
     ok_user = secrets.compare_digest(username, creds["username"])
-    ok_pass = secrets.compare_digest(password, creds["password"])
+    stored_pass = str(creds["password"] or "")
+    if stored_pass.startswith("pbkdf2_sha256$"):
+        ok_pass = verify_password(password, stored_pass)
+    else:
+        ok_pass = secrets.compare_digest(password, stored_pass)
     if not (ok_user and ok_pass):
         with state._LOGIN_ATTEMPTS_LOCK:
             state._LOGIN_ATTEMPTS.setdefault(client_ip, []).append(now)
         raise HTTPException(401, "用户名或密码错误")
     with state._LOGIN_ATTEMPTS_LOCK:
         state._LOGIN_ATTEMPTS.pop(client_ip, None)
+    if not stored_pass.startswith("pbkdf2_sha256$"):
+        try:
+            from common.web_auth import hash_password
+
+            with state._edit_config() as cfg:
+                web_cfg = cfg.setdefault("web", {})
+                if str(web_cfg.get("password") or "") == stored_pass:
+                    web_cfg["password"] = hash_password(password)
+            state._WEB_CREDS_CACHE = None
+            state._WEB_CREDS_CACHE_MTIME = None
+        except Exception:
+            state_log = getattr(state, "logger", None)
+            if state_log:
+                state_log.exception("failed to upgrade panel password to hash")
     session = state._sign_session(creds["username"])
     state._set_session_cookie(response, session, secure=state._request_is_secure(request))
     return {
@@ -474,12 +494,16 @@ async def auth_change_password(
     state = _state()
     with state._edit_config() as cfg:
         web = cfg.setdefault("web", {})
+        from common.web_auth import hash_password, verify_password
+
         current = str(web.get("password") or "")
-        if not secrets.compare_digest(str(body.current_password or ""), current):
+        if current.startswith("pbkdf2_sha256$"):
+            ok_current = verify_password(str(body.current_password or ""), current)
+        else:
+            ok_current = secrets.compare_digest(str(body.current_password or ""), current)
+        if not ok_current:
             raise HTTPException(400, "当前密码不正确")
-        if secrets.compare_digest(current, body.new_password):
-            raise HTTPException(400, "新密码不能与当前密码相同")
-        web["password"] = body.new_password
+        web["password"] = hash_password(body.new_password)
         web["token"] = secrets.token_urlsafe(32)
     state._WEB_CREDS_CACHE = None
     state._WEB_CREDS_CACHE_MTIME = None

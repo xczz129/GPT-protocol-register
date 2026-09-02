@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import secrets
 import hmac
 import time
 
@@ -20,6 +21,38 @@ def _b64url(data: bytes) -> str:
 def _b64url_decode(value: str) -> bytes:
     padding = "=" * (-len(value) % 4)
     return base64.urlsafe_b64decode((value + padding).encode("ascii"))
+
+
+PBKDF2_ITERATIONS = 260_000
+
+
+def hash_password(password: str, *, salt: str | None = None, iterations: int = PBKDF2_ITERATIONS) -> str:
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        str(password or "").encode("utf-8"),
+        salt.encode("utf-8"),
+        iterations,
+    ).hex()
+    return "pbkdf2_sha256$" + str(iterations) + "$" + salt + "$" + digest
+
+
+def verify_password(password: str, stored: str) -> bool:
+    raw = str(stored or "").strip()
+    if not raw.startswith("pbkdf2_sha256$"):
+        return False
+    try:
+        _, iter_text, salt, digest = raw.split("$", 3)
+        iterations = int(iter_text)
+        expected = hashlib.pbkdf2_hmac(
+            "sha256",
+            str(password or "").encode("utf-8"),
+            salt.encode("utf-8"),
+            iterations,
+        ).hex()
+        return hmac.compare_digest(expected, digest)
+    except (ValueError, TypeError):
+        return False
 
 
 def sign_session(username: str, secret: str, *, max_age: int, now: int | None = None) -> str:

@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -27,6 +27,9 @@ from common.task_store import (
 
 DATA_DIR = ROOT / "data"
 TRASH_FILE = DATA_DIR / "account_trash.json"
+TRASH_RETENTION_DAYS = 60
+TRASH_MAX_ROWS = 2000
+BACKUP_KEEP = 10
 OPS_STATE_FILE = DATA_DIR / "panel_operations.json"
 TASK_HISTORY_FILE = DATA_DIR / "task_history.json"
 _TASK_HISTORY_LOCK = threading.Lock()
@@ -217,9 +220,27 @@ def archive_accounts(records: Iterable[dict[str, Any]], *, reason: str) -> int:
             )
             count += 1
         if count:
-            _write_json(TRASH_FILE, rows[-5000:])
+            _write_json(TRASH_FILE, _trim_trash_rows(rows))
             _invalidate_trash_cache()
         return count
+
+
+def _trim_trash_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep newest TRASH_MAX_ROWS entries and drop ones older than retention."""
+    if len(rows) > TRASH_MAX_ROWS:
+        rows = rows[-TRASH_MAX_ROWS:]
+    cutoff = datetime.now(timezone.utc) - timedelta(days=TRASH_RETENTION_DAYS)
+    kept: list[dict[str, Any]] = []
+    for row in rows:
+        stamp = str(row.get("deleted_at") or "")
+        try:
+            moment = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        except ValueError:
+            kept.append(row)
+            continue
+        if moment >= cutoff:
+            kept.append(row)
+    return kept
 
 
 def list_trash(*, limit: int = 200) -> list[dict[str, Any]]:
@@ -251,8 +272,25 @@ def take_trash(ids: Iterable[str]) -> list[dict[str, Any]]:
         return taken
 
 
+def _rotate_backups() -> None:
+    """Keep only the newest BACKUP_KEEP zip archives."""
+    if not BACKUP_DIR.is_dir():
+        return
+    zips = sorted(
+        (item for item in BACKUP_DIR.glob("gpt-register-backup-*.zip")),
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+    for stale in zips[BACKUP_KEEP:]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
+
 def create_backup() -> dict[str, Any]:
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    _rotate_backups()
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     name = f"gpt-register-backup-{stamp}.zip"
     path = BACKUP_DIR / name

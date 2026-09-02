@@ -6043,6 +6043,24 @@ app = FastAPI(title="GPT Register FP", version="1.0.0", lifespan=_app_lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
 app.include_router(auth_router)
 
+from web.routes.account_groups import router as account_groups_router
+from web.routes.accounts_trash import router as accounts_trash_router
+app.include_router(account_groups_router)
+app.include_router(accounts_trash_router)
+
+from web.routes.account_groups import (  # noqa: E402,F401
+    account_group_export_credentials,
+    account_groups,
+    account_groups_create,
+    account_groups_delete,
+    account_groups_rename,
+    accounts_assign_group,
+)
+from web.routes.accounts_trash import (  # noqa: E402,F401
+    accounts_trash,
+    accounts_trash_restore,
+)
+
 if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -7760,23 +7778,7 @@ async def cdks_status(body: CDKStatusRequest):
     }
 
 
-@app.get("/api/account-groups")
-async def account_groups():
-    def _response():
-        cfg = _read_config()
-        key = (
-            f"account-groups:v2:{account_store_revision(ACCOUNTS_FILE)}:"
-            f"{_file_stamp(GROUPS_FILE)}:{_account_data_stamp()}"
-        )
-        return _cached_json_response(
-            cfg,
-            key,
-            "accounts_ttl",
-            300,
-            lambda: {"ok": True, "items": _groups_with_counts()},
-        )
 
-    return await asyncio.to_thread(_response)
 
 
 def _account_log_event_identity(item: dict[str, Any]) -> str:
@@ -8127,84 +8129,7 @@ async def account_operation_logs(
         raise
 
 
-@app.post("/api/account-groups")
-async def account_groups_create(body: GroupCreateRequest):
-    try:
-        group = await asyncio.to_thread(create_group, body.name, GROUPS_FILE)
-    except ValueError as error:
-        raise HTTPException(400, str(error)) from error
-    return {"ok": True, "group": group}
 
-
-@app.put("/api/account-groups/{group_id}")
-async def account_groups_rename(group_id: str, body: GroupUpdateRequest):
-    try:
-        group = await asyncio.to_thread(rename_group, group_id, body.name, GROUPS_FILE)
-    except KeyError as error:
-        raise HTTPException(404, str(error).strip("'")) from error
-    except ValueError as error:
-        raise HTTPException(400, str(error)) from error
-    return {"ok": True, "group": group}
-
-
-@app.delete("/api/account-groups/{group_id}")
-async def account_groups_delete(group_id: str):
-    try:
-        removed, remaining = await asyncio.to_thread(delete_group, group_id, GROUPS_FILE)
-    except KeyError as error:
-        raise HTTPException(404, str(error).strip("'")) from error
-    except ValueError as error:
-        raise HTTPException(400, str(error)) from error
-    fallback_id = remaining[0]["id"]
-    moved = await asyncio.to_thread(
-        reassign_account_group,
-        group_id,
-        fallback_id,
-        path=ACCOUNTS_FILE,
-    )
-    return {
-        "ok": True,
-        "removed": removed,
-        "fallback_group_id": fallback_id,
-        "moved": moved,
-    }
-
-
-@app.post("/api/accounts/group")
-async def accounts_assign_group(body: AccountGroupAssignRequest):
-    if get_group(body.group_id, GROUPS_FILE) is None:
-        raise HTTPException(404, "分组不存在")
-    if not body.delete_all and not body.keys:
-        raise HTTPException(400, "请选择要移动的账号")
-    changed, _ = await asyncio.to_thread(
-        assign_account_group,
-        body.keys,
-        body.group_id,
-        delete_all=body.delete_all,
-        include_records=False,
-        path=ACCOUNTS_FILE,
-    )
-    return {
-        "ok": True,
-        "changed": changed,
-        "count": await asyncio.to_thread(count_accounts, ACCOUNTS_FILE),
-    }
-
-
-@app.get("/api/account-groups/{group_id}/export-credentials")
-async def account_group_export_credentials(group_id: str):
-    group = get_group(group_id, GROUPS_FILE)
-    if group is None:
-        raise HTTPException(404, "分组不存在")
-    lines, missing = await asyncio.to_thread(_credential_lines_for_group, group_id)
-    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", group["name"]).strip("-") or "group"
-    payload = ("\n".join(lines) + ("\n" if lines else "")).encode("utf-8")
-    headers = {
-        "Content-Disposition": f'attachment; filename="{safe_name}.mail-credentials.txt"',
-        "X-Exported-Count": str(len(lines)),
-        "X-Missing-Count": str(missing),
-    }
-    return StreamingResponse(iter([payload]), media_type="text/plain; charset=utf-8", headers=headers)
 
 
 def _security_credential_lines(records: list[dict[str, Any]]) -> tuple[list[str], int]:
@@ -10811,35 +10736,7 @@ async def backups_restore(body: BackupRestoreRequest):
     return {"ok": True, "restored": restored, "message": "备份已恢复，请刷新页面"}
 
 
-@app.get("/api/accounts/trash")
-async def accounts_trash():
-    def _load_public_trash() -> list[dict[str, Any]]:
-        rows = list_trash(limit=500)
-        items: list[dict[str, Any]] = []
-        for row in rows:
-            record = row.get("record") if isinstance(row.get("record"), dict) else {}
-            items.append(
-                {
-                    "trash_id": row.get("trash_id"),
-                    "deleted_at": row.get("deleted_at"),
-                    "reason": row.get("reason"),
-                    "account": account_public_view(record),
-                }
-            )
-        return items
 
-    items = await asyncio.to_thread(_load_public_trash)
-    return {"ok": True, "count": len(items), "items": items}
-
-
-@app.post("/api/accounts/trash/restore")
-async def accounts_trash_restore(body: TrashRestoreRequest):
-    if not any(str(value or "").strip() for value in body.ids):
-        return {"ok": True, "restored": 0}
-    records = await asyncio.to_thread(take_trash, body.ids)
-    if records:
-        await asyncio.to_thread(upsert_account_records, records, ACCOUNTS_FILE)
-    return {"ok": True, "restored": len(records)}
 
 
 def create_app() -> FastAPI:
