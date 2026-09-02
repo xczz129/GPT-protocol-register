@@ -5742,7 +5742,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
             "mfa_enabled": True,
         }
         with (
-            patch.object(web_app, "_load_security_accounts", new=AsyncMock(return_value=[account])),
+            patch("web.routes.accounts_reauth._load_security_accounts", new=AsyncMock(return_value=[account])),
             patch.object(
                 web_app,
                 "_repair_account_security_sync",
