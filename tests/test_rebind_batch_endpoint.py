@@ -5,6 +5,8 @@ import time
 import unittest
 from unittest.mock import patch
 
+import web.routes.accounts_rebind as rebind_routes
+
 
 class RebindBatchEndpointTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -46,8 +48,8 @@ class RebindBatchEndpointTests(unittest.TestCase):
         )
         with (
             patch.object(web_app, "_read_config", return_value={"mail": {}}),
-            patch.object(web_app, "_rebind_load_record", side_effect=lambda value: records.get(value.lower())),
-            patch.object(web_app, "_rebind_reserve_target", side_effect=reserve),
+            patch.object(rebind_routes, "_rebind_load_record", side_effect=lambda value: records.get(value.lower())),
+            patch.object(rebind_routes, "_rebind_reserve_target", side_effect=reserve),
             patch.object(web_app, "account_is_deactivated", return_value=False),
         ):
             result = asyncio.run(web_app.account_rebind_preflight(body))
@@ -101,8 +103,8 @@ class RebindBatchEndpointTests(unittest.TestCase):
             return {"job_id": "job-fixture", "status": "queued", "total": len(records), "items": []}
 
         with (
-            patch.object(web_app, "_rebind_load_record", side_effect=lambda value: {web_app._account_key(first): first, web_app._account_key(second): second}.get(value)),
-            patch.object(web_app, "_rebind_target_conflict", return_value=""),
+            patch.object(rebind_routes, "_rebind_load_record", side_effect=lambda value: {web_app._account_key(first): first, web_app._account_key(second): second}.get(value)),
+            patch.object(rebind_routes, "_rebind_target_conflict", return_value=""),
             patch.object(web_app.ACCOUNT_REBIND_JOBS, "start", side_effect=fake_start),
         ):
             result = asyncio.run(
@@ -135,8 +137,8 @@ class RebindBatchEndpointTests(unittest.TestCase):
         duplicate = {"provider": "domain_api", "address": "same-target@example.net"}
         with (
             patch.object(web_app, "_read_config", return_value={"mail": {}}),
-            patch.object(web_app, "_rebind_load_record", side_effect=lambda value: records.get(value.lower())),
-            patch.object(web_app, "_rebind_reserve_target", return_value=dict(duplicate)),
+            patch.object(rebind_routes, "_rebind_load_record", side_effect=lambda value: records.get(value.lower())),
+            patch.object(rebind_routes, "_rebind_reserve_target", return_value=dict(duplicate)),
             patch.object(web_app, "account_is_deactivated", return_value=False),
             patch.object(web_app, "release_mailbox") as release,
         ):

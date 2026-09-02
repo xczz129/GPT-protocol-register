@@ -5,6 +5,8 @@ import time
 import unittest
 from unittest.mock import patch
 
+import web.routes.accounts_rebind as rebind_routes
+
 from fastapi import HTTPException
 
 
@@ -46,7 +48,7 @@ class RebindEndpointTests(unittest.TestCase):
             "totp_secret": "JBSWY3DPEHPK3PXP",
         }
         with (
-            patch.object(web_app, "_rebind_load_record", return_value=current),
+            patch.object(rebind_routes, "_rebind_load_record", return_value=current),
             patch.object(web_app, "release_mailbox") as release_mailbox,
         ):
             with self.assertRaises(HTTPException) as raised:
@@ -88,8 +90,8 @@ class RebindEndpointTests(unittest.TestCase):
             "account_id": source["account_id"],
         }
         with (
-            patch.object(web_app, "_rebind_load_record", return_value=current),
-            patch.object(web_app, "_rebind_target_conflict", return_value="目标邮箱已在账号库中"),
+            patch.object(rebind_routes, "_rebind_load_record", return_value=current),
+            patch.object(rebind_routes, "_rebind_target_conflict", return_value="目标邮箱已在账号库中"),
             patch.object(web_app, "release_mailbox") as release_mailbox,
         ):
             with self.assertRaises(HTTPException) as raised:
