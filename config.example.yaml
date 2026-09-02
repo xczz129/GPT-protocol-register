@@ -1,0 +1,218 @@
+# GPT 注册（指纹浏览器）配置示例
+# 复制为 config.yaml 后修改：
+#   cp config.example.yaml config.yaml
+
+mail:
+  providers:
+    # ---------- Outlook（Graph / IMAP + refresh_token）----------
+    - type: outlook_token
+      enable: true
+      label: Outlook Pool
+      # graph | imap | auto
+      # 推荐 imap：个人 MSA refresh_token 多数只有 IMAP 权限，没有 Graph Mail.Read
+      # （graph 会报 AADSTS70000 scopes unauthorized）
+      # auto = 先 graph 失败再 imap
+      mode: imap
+      imap_host: outlook.office365.com
+      message_limit: 10
+      # 每行一条：email----password----client_id----refresh_token
+      mailboxes: |
+        user1@example.com----YOUR_PASSWORD----YOUR_CLIENT_ID----YOUR_REFRESH_TOKEN
+        user2@example.com----YOUR_PASSWORD----YOUR_CLIENT_ID----YOUR_REFRESH_TOKEN
+
+    # ---------- iCloud Hide My Email API（替换为你的服务地址）----------
+    - type: icloud_api
+      enable: true
+      label: iCloud Pool
+      api_base: https://mail-api.example.invalid
+      # 每行一条：email----api_key
+      mailboxes: |
+        mailbox@example.com----YOUR_API_KEY
+
+    # ---------- 域名邮箱（Freemail 兼容 API，自动创建）----------
+    - type: domain_api
+      enable: false
+      label: 域名邮箱
+      api_base: https://freemail.example.invalid
+      username: ""
+      password: ""
+      # 留空时使用服务端返回的第一个域名；面板里可以刷新后选择。
+      default_domain: ""
+      domains: []
+      domain_index: 0
+      local_length: 12
+      # 动态创建池的单批可用容量上限；面板任务本身最多 500。
+      capacity: 500
+      mailboxes: ""
+
+    # ---------- Maddy WebUI 自动化 API（替换为你的服务地址）----------
+    - type: maddy_webui
+      enable: false
+      label: Maddy 邮箱
+      api_base: https://mail-admin.example.invalid/api
+      # 直接填写 API Key，或留空并在进程环境中设置 MADDY_WEBUI_API_KEY
+      api_key: ""
+      default_domain: example.invalid
+      domains:
+        - example.invalid
+      blocked_domains:
+        - blocked.example.invalid
+      local_length: 12
+      capacity: 500
+      mailboxes: ""
+
+    # ---------- Fastmail 别名池（mailcode-api 服务端管理，永久保留）----------
+    - type: fastmail_api
+      enable: false
+      label: Fastmail Pool
+      # mailcode-api 服务地址，例如 http://服务器IP:8686
+      api_base: http://127.0.0.1:8686
+      # 管理密钥（X-API-Key）：用于分配别名 / 查询池状态
+      # 或留空并在进程环境中设置 FASTMAIL_ADMIN_KEY
+      admin_key: ""
+      # Fastmail 主账号，每行一个（主账号密码保存在 mailcode-api 服务内，这里不需要）
+      # 例如：
+      #   mailbox-owner@example.com
+      accounts: ""
+      # 服务不可达时的容量回退值；正常情况实时读取 /api/v1/accounts 的 availableCount
+      capacity: 615
+      mailboxes: ""
+
+  request_timeout: 30
+  wait_timeout: 90
+  wait_interval: 3
+  icloud_resync_interval: 15
+
+proxy:
+  enabled: false
+  # single_proxy / pool / country_pool
+  mode: single_proxy
+  url: ""
+  resource_url: ""
+  # 代理池文件，每行一条（支持 host:port:user:pass / user:pass@host:port / http://...）
+  pool_file: ""
+  # country_pool 模式下选择国家；代理明细保存在 data/registration_proxy_pools.json
+  selected_country: ""
+  rotate_per_task: true
+  clearance:
+    enabled: false
+    mode: none
+    flaresolverr_url: ""
+    # FlareSolverr 在 Docker 内时，这里应使用其容器可访问的代理地址
+    proxy_url: ""
+    timeout_sec: 60
+    refresh_interval: 3600
+
+registration:
+  # browser = 浏览器优先并支持同会话接管；hybrid = 会话内混合；protocol = 纯 HTTP 协议
+  engine: protocol
+  threads: 10
+  # browser 模式注册成功并关闭浏览器后，继续用协议设置密码并启用/复核 TOTP 2FA。
+  browser_protocol_security_after_register: true
+  protocol_otp_timeout: 180
+  protocol_otp_poll_chunk: 60
+  protocol_tls_verify: true
+  protocol_ca_bundle: ""
+  protocol_request_timeout: 30
+  protocol_oauth_timeout: 60
+  protocol_sentinel_timeout: 30
+  protocol_sentinel_worker_timeout: 90
+  protocol_sentinel_sdk_cache_ttl: 300
+  protocol_sentinel_behavior_duration_ms: 4200
+  protocol_sentinel_worker_persistent: true
+  protocol_sentinel_worker_pool_size: 4
+  # true = 注册完成立即访问 /backend-api/me 复核；false = 少一次高风险请求，交给后续测活
+  protocol_verify_me: true
+  # true = 注册后立刻开 TOTP；false = 先保存 security_pending，后续批量补全
+  protocol_enable_totp_after_register: true
+  protocol_account_timeout: 600
+  # 独立协议登录使用已有账号邮箱；CLI: python3 cli.py login --email user@example.com
+  # 批量处理异常账号：python3 cli.py login --all-needed -j 3
+  protocol_login_otp_timeout: 180
+  protocol_login_poll_chunk: 60
+  protocol_login_retries: 1
+  # 邮箱换绑接口使用的客户端标识；留空采用代码默认值，接口版本变化时可在此覆盖。
+  rebind_client_version: ""
+  rebind_client_build: ""
+  # 默认延后远程测活，避免注册完成后立即 refresh 并访问 Web Backend。
+  post_register_health_check: false
+  total: 1
+  timeout: 480
+  max_transient_retries: 2
+
+# 面板 GET 响应缓存。Redis 不可用时自动降级到进程内缓存。
+cache:
+  enabled: true
+  redis_url: redis://127.0.0.1:6379/0
+  prefix: gpt-register-fp
+  socket_timeout: 0.35
+  status_ttl: 3
+  accounts_ttl: 300
+  mailboxes_ttl: 120
+  operations_ttl: 5
+  config_ttl: 60
+  tasks_ttl: 60
+  browsers_ttl: 300
+  local_max_entries: 32
+  local_max_bytes: 67108864
+
+fingerprint:
+  # local     = 免费：本机 Chrome/Chromium + stealth（默认）
+  # camoufox  = 免费：Camoufox 反检测 Firefox（需 python3 -m camoufox fetch）
+  # obscura   = 免费：轻量 Rust 无头浏览器 + CDP（bin/obscura，内存约 30MB 级）
+  browser: local
+  camoufox:
+    headless: true
+    os: windows          # windows / macos / linux，逗号分隔可随机
+    locale: auto         # auto 跟随 proxy.selected_country，也可手工指定 en-US
+    geoip: true          # 按代理出口同步地理位置与时区
+    humanize: 0.15       # 鼠标移动最大延迟秒数；0 为关闭
+
+# chatgpt2api（basketikun）— 注册成功后自动 POST /api/accounts
+chatgpt2api:
+  enabled: false
+  # 你的实例地址（末尾可带 /）
+  url: https://chatgpt2api.example.invalid
+  # 管理后台 admin key（Authorization: Bearer）
+  key: ""
+  # 注册成功后立刻上传（单号失败不影响注册成功）
+  auto_upload: true
+
+logging:
+  level: INFO
+
+maintenance:
+  enabled: false
+  interval_hours: 12
+  workers: 10
+  auto_delete_invalid: false
+  webhook_url: ""
+  notify_on_complete: false
+  notify_on_pool_low: false
+  pool_low_threshold: 3
+
+maddy_auto_register:
+  # 单独的 Maddy 自动注册策略：每轮按域名单独启动注册批次。
+  enabled: false
+  interval_hours: 1
+  per_domain: 20
+  concurrency: 3
+  engine: protocol
+  keep_on_fail: false
+  refresh_domains: true
+  group_id: ""
+
+# 本地面板（默认只绑 127.0.0.1）
+# 打开 http://host:port/login 用账号密码登录
+web:
+  host: "127.0.0.1"
+  port: 8787
+  username: "admin"
+  # 首次启动若为空会自动生成随机密码并打印到终端
+  password: ""
+  # 会话签名密钥（留空自动生成，一般不用管）
+  token: ""
+  # 只有这些反向代理地址提供的转发头才会被信任
+  trusted_proxies:
+    - "127.0.0.1"
+    - "::1"

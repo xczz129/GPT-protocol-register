@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#ffffff" />
+  <title>登录 · GPT Register FP</title>
+  <link rel="stylesheet" href="/static/style.css?v=20260808-1" />
+</head>
+<body class="login-body">
+  <div class="login-shell">
+    <div class="login-brand">
+      <span class="brand-mark" aria-hidden="true">G</span>
+      <span><b>GPT Register</b>FP Console</span>
+    </div>
+    <div class="login-card">
+      <h1>欢迎回来</h1>
+      <p class="login-lead">登录以进入账号注册控制台</p>
+      <form id="loginForm" class="login-form" autocomplete="on">
+        <label>用户名
+          <input id="loginUser" name="username" type="text" autocomplete="username" required placeholder="请输入用户名" />
+        </label>
+        <label>密码
+          <input id="loginPass" name="password" type="password" autocomplete="current-password" required placeholder="请输入密码" />
+        </label>
+        <button id="loginBtn" type="submit">登录</button>
+        <div id="loginMsg" class="login-msg" role="status"></div>
+      </form>
+    </div>
+  </div>
+  <script>
+    (async function () {
+      try {
+        const st = await fetch("/api/auth/status", { credentials: "same-origin" }).then((r) => r.json());
+        if (st && st.authenticated) {
+          location.replace("/cdk");
+          return;
+        }
+      } catch {}
+
+      const form = document.getElementById("loginForm");
+      const msg = document.getElementById("loginMsg");
+      const btn = document.getElementById("loginBtn");
+      const userEl = document.getElementById("loginUser");
+      const passEl = document.getElementById("loginPass");
+
+      form.addEventListener("submit", async (ev) => {
+        ev.preventDefault();
+        msg.textContent = "";
+        msg.className = "login-msg";
+        btn.disabled = true;
+        try {
+          const res = await fetch("/api/auth/login", {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              username: (userEl.value || "").trim(),
+              password: passEl.value || "",
+            }),
+          });
+          let data = null;
+          try { data = await res.json(); } catch {}
+          if (!res.ok) {
+            const detail = (data && (data.detail || data.message)) || "登录失败";
+            throw new Error(typeof detail === "string" ? detail : "登录失败");
+          }
+          location.replace("/cdk");
+        } catch (e) {
+          msg.textContent = e.message || "登录失败";
+          msg.className = "login-msg err";
+          btn.disabled = false;
+        }
+      });
+
+      userEl.focus();
+    })();
+  </script>
+</body>
+</html>

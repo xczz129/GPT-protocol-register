@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#181b20" />
+  <title>GPT Register FP Console</title>
+  <script>
+    // Old bookmarks used this legacy client, which only fetched the first
+    // 1,000 account rows. Send them to the paginated Vue console instead.
+    location.replace("/" + location.hash);
+  </script>
+  <link rel="stylesheet" href="/static/style.css?v=20260715-2" />
+</head>
+<body>
+  <div class="shell">
+    <header class="hero">
+      <div class="page-heading">
+        <div class="eyebrow">GPT REGISTER FP</div>
+        <h1 id="pageTitle">注册任务</h1>
+        <p id="pageSubtitle">创建、调度并观察账号注册任务</p>
+      </div>
+      <div class="hero-actions">
+        <span id="runBadge" class="badge idle"><i></i>空闲</span>
+        <span id="loginUserLabel" class="tag" style="display:none"></span>
+        <button id="btnRefresh" class="btn secondary icon-command" type="button" title="刷新当前数据">刷新</button>
+        <button id="btnLogout" class="btn secondary icon-command" type="button" title="退出当前会话">退出</button>
+      </div>
+    </header>
+
+    <div class="layout">
+      <aside class="side">
+        <div class="brandbox">
+          <span class="brand-mark" aria-hidden="true">G</span>
+          <span class="brand-copy"><b>GPT Register</b><small>FP Console</small></span>
+        </div>
+        <nav class="nav">
+          <a class="active" href="#task"><span class="nav-icon" aria-hidden="true">▶</span><span>任务</span><small>01</small></a>
+          <a href="#fingerprint"><span class="nav-icon" aria-hidden="true">◎</span><span>指纹</span><small>02</small></a>
+          <a href="#mail"><span class="nav-icon" aria-hidden="true">@</span><span>邮箱池</span><small>03</small></a>
+          <a href="#proxy"><span class="nav-icon" aria-hidden="true">⇄</span><span>代理</span><small>04</small></a>
+          <a href="#chatgpt2api"><span class="nav-icon" aria-hidden="true">↑</span><span>chatgpt2api</span><small>05</small></a>
+          <a href="#logs"><span class="nav-icon" aria-hidden="true">›_</span><span>日志</span><small>06</small></a>
+          <a href="#accounts"><span class="nav-icon" aria-hidden="true">◇</span><span>账号</span><small id="navAccounts">—</small></a>
+        </nav>
+      </aside>
+
+      <main class="content">
+        <section class="metrics">
+          <div class="metric"><div class="num" id="stAvail">—</div><div class="label">邮箱可用</div></div>
+          <div class="metric blue"><div class="num" id="stSplitAvail">—</div><div class="label">别名邮箱可用</div></div>
+          <div class="metric gray"><div class="num" id="stMailTotal">—</div><div class="label">邮箱总数</div></div>
+          <div class="metric"><div class="num" id="stAccounts">—</div><div class="label">账号记录</div></div>
+          <div class="metric blue"><div class="num" id="stAccountsUsable">—</div><div class="label">账号可用</div></div>
+          <div class="metric gray"><div class="num" id="stAccountsDeactivated">—</div><div class="label">已封号留档</div></div>
+          <div class="metric blue"><div class="num" id="stSuccess">—</div><div class="label">本轮成功</div></div>
+          <div class="metric red"><div class="num" id="stFailed">—</div><div class="label">本轮失败</div></div>
+          <div class="metric gray"><div class="num" id="stProxy">—</div><div class="label">代理</div></div>
+        </section>
+
+
+        <div class="grid view active" id="task">
+          <section class="card">
+            <div class="card-h">
+              <div>
+                <h2>注册任务</h2>
+                <p class="subtle">纯协议与指纹浏览器双引擎；数量按可用邮箱封顶，指定邮箱时强制 1×1。</p>
+              </div>
+            </div>
+            <div class="form">
+              <label class="full">注册引擎
+                <select id="fEngine">
+                  <option value="protocol">纯协议（chatgpt2api）</option>
+                  <option value="browser">指纹浏览器</option>
+                </select>
+              </label>
+              <label>数量 <input id="fTotal" type="number" min="1" max="500" value="1" /></label>
+              <label>并发 <input id="fConc" type="number" min="1" value="1" /></label>
+              <label class="full">邮箱类型
+                <select id="fMailType">
+                  <option value="auto">自动（两池都用）</option>
+                  <option value="outlook">仅 Outlook</option>
+                  <option value="icloud">仅 iCloud</option>
+                </select>
+              </label>
+              <label class="full">指定邮箱（可选）
+                <input id="fEmail" type="text" placeholder="user@outlook.com 或 hide@icloud.com" />
+              </label>
+              <label class="check"><input id="fKeep" type="checkbox" /> 失败保留浏览器</label>
+            </div>
+            <div class="actions">
+              <button id="btnStart" class="primary" type="button">开始运行</button>
+              <button id="btnStop" class="danger" type="button" disabled>停止任务</button>
+              <a class="btn secondary" href="#logs">查看日志</a>
+            </div>
+            <div id="jobMsg" class="msg" role="status" aria-live="polite"></div>
+          </section>
+
+          <aside class="card run-card">
+            <h2>运行态</h2>
+            <div class="stat"><span class="key">任务状态</span><span class="value"><span id="runBadgeMirror" class="tag">同步中</span></span></div>
+            <div class="stat"><span class="key">邮箱合计</span><span class="value"><span id="mailMeta">—</span></span></div>
+            <div class="stat"><span class="key">Outlook</span><span class="value"><span id="mailMetaOutlook">—</span></span></div>
+            <div class="stat"><span class="key">iCloud</span><span class="value"><span id="mailMetaIcloud">—</span></span></div>
+            <div class="stat"><span class="key">代理池</span><span class="value" id="proxyRuntimeText">—</span></div>
+            <div class="toolbar">
+              <button id="btnResetFailed" class="btn secondary" type="button">释放 failed/in_use</button>
+              <button id="btnReloadAcc" class="btn secondary" type="button">刷新账号</button>
+            </div>
+          </aside>
+          <section class="card task-card-panel span-all">
+            <div class="task-title-row">
+              <div>
+                <h2>任务名片</h2>
+                <p class="subtle">每个并发注册任务一张卡，实时显示邮箱、代理、当前步骤和结果。</p>
+              </div>
+              <button id="btnReloadTasks" class="btn secondary" type="button">刷新任务</button>
+            </div>
+            <div id="taskBoard" class="task-board">
+              <div class="empty-card">暂无任务，点击开始运行后会生成任务名片。</div>
+            </div>
+            <div class="bulkbar">
+              <label class="checkline"><input id="taskSelectPage" type="checkbox" /> 全选本页</label>
+              <button id="btnDeleteTasks" class="btn danger" type="button">删除选中</button>
+              <button id="btnClearTasks" class="btn danger" type="button">清空任务名片</button>
+              <button id="taskPrev" class="btn secondary" type="button">上一页</button>
+              <button id="taskNext" class="btn secondary" type="button">下一页</button>
+              <span id="taskPager" class="pager-info"></span>
+            </div>
+          </section>
+        </div>
+
+        <section class="card view" id="fingerprint">
+          <div class="card-h">
+            <div>
+              <h2>指纹浏览器</h2>
+              <p class="subtle">支持 Local Chrome、Camoufox 与 Obscura 三种免费浏览器。</p>
+            </div>
+            <span class="pill queue">Fingerprint</span>
+          </div>
+          <div class="form three">
+            <label>类型
+              <select id="fpBrowser">
+                <option value="local">local（Chrome+stealth）</option>
+                <option value="camoufox">camoufox</option>
+                <option value="obscura">obscura</option>
+              </select>
+            </label>
+            <label class="camoufox-option">Camoufox OS
+              <select id="fpCfxOs">
+                <option value="windows">Windows</option>
+                <option value="macos">macOS</option>
+                <option value="linux">Linux</option>
+                <option value="windows,macos,linux">随机桌面系统</option>
+              </select>
+            </label>
+            <label class="camoufox-option">Locale
+              <input id="fpCfxLocale" type="text" placeholder="自动匹配出口 IP" />
+            </label>
+            <label class="camoufox-option">Humanize (s)
+              <input id="fpCfxHumanize" type="number" min="0" max="1.5" step="0.05" value="0.15" />
+            </label>
+            <label class="check camoufox-option"><input id="fpCfxHeadless" type="checkbox" checked /> 无头运行</label>
+            <label class="check camoufox-option"><input id="fpCfxGeoip" type="checkbox" checked /> 出口 GeoIP 同步</label>
+            <label>单账号超时(s)
+              <input id="regTimeout" type="number" min="60" max="3600" value="480" />
+            </label>
+            <label>瞬时重试
+              <input id="regRetries" type="number" min="0" max="10" value="2" />
+            </label>
+          </div>
+          <div class="actions">
+            <button id="btnSaveFp" class="primary" type="button">保存指纹配置</button>
+          </div>
+        </section>
+
+        <section class="card view" id="mail">
+          <div class="card-h">
+            <div>
+              <h2>邮箱池</h2>
+              <p class="subtle">Outlook 与 iCloud 可同时启用；保存后状态卡片会自动刷新。</p>
+            </div>
+            <span class="pill success">Mail Pool</span>
+          </div>
+
+          <div class="split">
+            <div class="panel-soft">
+              <div class="task-title-row">
+                <div>
+                  <h3>Outlook 邮箱池</h3>
+                  <p class="hint">每行：email----password----client_id----refresh_token</p>
+                </div>
+                <label class="compact">取码模式
+                  <select id="mailMode">
+                    <option value="imap">imap（推荐）</option>
+                    <option value="graph">graph</option>
+                    <option value="auto">auto</option>
+                  </select>
+                </label>
+              </div>
+              <textarea id="mailboxesOutlook" rows="7" spellcheck="false" placeholder="user@outlook.com----password----client_id----refresh_token"></textarea>
+              <div class="actions"><button id="btnSaveMailOutlook" class="primary" type="button">保存 Outlook 池</button></div>
+            </div>
+
+            <div class="panel-soft">
+              <div class="task-title-row">
+                <div>
+                  <h3>iCloud 邮箱池</h3>
+                  <p class="hint">每行：email----api_key · API: icloud.xbovo.online</p>
+                </div>
+                <label class="checkline"><input id="icloudEnable" type="checkbox" checked /> 启用</label>
+              </div>
+              <label class="label-line">API Base
+                <input id="icloudApiBase" type="text" placeholder="https://icloud.xbovo.online" />
+              </label>
+              <textarea id="mailboxesIcloud" rows="5" spellcheck="false" placeholder="manta@icloud.com----alias_xxxxxxxx"></textarea>
+              <div class="actions"><button id="btnSaveMailIcloud" class="primary" type="button">保存 iCloud 池</button></div>
+            </div>
+          </div>
+          <div class="mail-library">
+            <div class="task-title-row">
+              <div>
+                <h3>已导入邮箱</h3>
+                <p class="hint">保存/导入后会在这里展示邮箱列表、状态、是否已注册，并可读取最近邮件。</p>
+              </div>
+              <div class="toolbar tight">
+                <input id="mailSearch" class="search-input" type="text" placeholder="搜索邮箱 / 状态 / provider" />
+                <select id="mailListType">
+                  <option value="auto">全部邮箱</option>
+                  <option value="outlook">Outlook</option>
+                  <option value="icloud">iCloud</option>
+                </select>
+                <button id="btnReloadMailboxes" class="btn secondary" type="button">刷新邮箱列表</button>
+              </div>
+            </div>
+            <div id="mailboxList" class="mailbox-list">
+              <div class="empty-card">正在加载邮箱池…</div>
+            </div>
+            <div class="bulkbar">
+              <label class="checkline"><input id="mailSelectPage" type="checkbox" /> 全选本页</label>
+              <button id="btnDeleteMailboxes" class="btn danger" type="button">删除选中邮箱</button>
+              <button id="mailPrev" class="btn secondary" type="button">上一页</button>
+              <button id="mailNext" class="btn secondary" type="button">下一页</button>
+              <span id="mailPager" class="pager-info"></span>
+            </div>
+          </div>
+        </section>
+
+        <section class="card view" id="proxy">
+          <div class="card-h">
+            <div>
+              <h2>代理</h2>
+              <p class="subtle">支持单条代理与代理池；保存时写入配置并生成预览。</p>
+            </div>
+            <span class="pill queue">Proxy</span>
+          </div>
+          <div class="form two">
+            <label class="check"><input id="pxEnabled" type="checkbox" /> 启用代理</label>
+            <label class="check"><input id="pxRotate" type="checkbox" checked /> 每任务轮换</label>
+            <label>出站方式
+              <select id="pxMode">
+                <option value="single_proxy">单代理</option>
+                <option value="pool">代理池</option>
+              </select>
+            </label>
+            <label>清障方式
+              <select id="pxClearanceMode">
+                <option value="none">关闭</option>
+                <option value="flaresolverr">FlareSolverr</option>
+              </select>
+            </label>
+            <label>代理地址
+              <input id="pxUrl" type="text" placeholder="http://user:pass@host:port" />
+            </label>
+            <label>资源代理地址
+              <input id="pxResourceUrl" type="text" placeholder="留空则复用代理地址" />
+            </label>
+            <label>FlareSolverr 地址
+              <input id="pxFlareUrl" type="text" placeholder="http://127.0.0.1:8191" />
+            </label>
+            <label>FlareSolverr 出站代理
+              <input id="pxFlareProxy" type="text" placeholder="Docker 内可访问的 socks5://warp:1080" />
+            </label>
+            <label>代理池文件
+              <input id="pxFile" type="text" placeholder="data/proxy_pool.txt" value="data/proxy_pool.txt" />
+            </label>
+            <label class="full">代理池文本（每行一条，保存时写入 pool_file）
+              <textarea id="pxText" rows="5" spellcheck="false" placeholder="http://user:pass@host:port"></textarea>
+            </label>
+          </div>
+          <div class="actions">
+            <button id="btnSaveProxy" class="primary" type="button">保存代理</button>
+          </div>
+        </section>
+
+        <section class="card view" id="chatgpt2api">
+          <div class="card-h">
+            <div>
+              <h2>chatgpt2api 自动上传</h2>
+              <p class="subtle">注册成功后把普通网页号 POST 到你的 chatgpt2api 实例（Bearer admin key）。</p>
+            </div>
+            <span class="pill success">C2A</span>
+          </div>
+          <div class="form two">
+            <label class="check"><input id="c2aEnabled" type="checkbox" /> 启用 chatgpt2api</label>
+            <label class="check"><input id="c2aAuto" type="checkbox" checked /> 注册成功后自动上传</label>
+            <label class="full">实例网址
+              <input id="c2aUrl" type="text" placeholder="https://chatgpt2api.xbovo.online/" />
+            </label>
+            <label class="full">Admin Key
+              <input id="c2aKey" type="password" placeholder="管理后台 admin key" autocomplete="off" />
+            </label>
+          </div>
+          <p class="hint" style="margin-top:8px">填写你的地址（例如 <code>https://chatgpt2api.xbovo.online/</code>）和 admin key，保存后新注册账号会自动入库。也可点「上传已有账号」把本地已注册的 token 批量推送。</p>
+          <div class="actions">
+            <button id="btnSaveC2a" class="primary" type="button">保存配置</button>
+            <button id="btnTestC2a" class="btn secondary" type="button">测试连接</button>
+            <button id="btnUploadC2a" class="btn secondary" type="button">上传已有账号</button>
+          </div>
+          <div id="c2aMsg" class="msg" role="status" aria-live="polite"></div>
+        </section>
+
+        <section class="card view" id="logs">
+          <div class="card-h">
+            <div>
+              <h2>实时日志</h2>
+              <p class="subtle">显示运行输出；任务运行时通过 SSE 追加。</p>
+            </div>
+            <div class="actions toolbar-tight">
+              <span id="logStreamBadge" class="pill queue" role="status">连接中</span>
+              <button id="btnClearLog" class="btn danger" type="button">清空日志</button>
+            </div>
+          </div>
+          <div id="logBox" class="log" role="log" aria-live="off"></div>
+        </section>
+
+        <section class="card view" id="accounts">
+          <div class="card-h">
+            <div>
+              <h2>账号记录</h2>
+              <p class="subtle">账号记录实时保存；列表默认隐藏密码/Token，下载 JSON 包含完整字段。</p>
+            </div>
+            <button id="btnReloadAccBottom" class="btn secondary" type="button">刷新列表</button>
+          </div>
+          <div class="bulkbar">
+            <label class="checkline"><input id="accSelectPage" type="checkbox" /> 全选本页</label>
+            <button id="btnDownloadAccounts" class="btn primary" type="button">下载选中 JSON</button>
+            <button id="btnDownloadAllAccounts" class="btn secondary" type="button">下载全部 JSON</button>
+            <button id="btnHealthAccounts" class="btn secondary" type="button">测活选中</button>
+            <button id="btnHealthAllAccounts" class="btn secondary" type="button">测活全部（跳过已封号）</button>
+            <button id="btnDeleteAccounts" class="btn danger" type="button">删除选中</button>
+            <button id="btnDeleteAllAccounts" class="btn danger" type="button">全部删除</button>
+          </div>
+          <div class="table-wrap">
+            <table class="acct">
+              <thead>
+                <tr>
+                  <th>选择</th>
+                  <th>邮箱</th>
+                  <th>密码</th>
+                  <th>注册方式</th>
+                  <th>套餐</th>
+                  <th>状态</th>
+                  <th>额度</th>
+                  <th>Token</th>
+                  <th>代理</th>
+                  <th>时间</th>
+                </tr>
+              </thead>
+              <tbody id="accBody">
+                <tr><td colspan="10" class="muted">加载中…</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div id="mailModal" class="modal-mask" role="dialog" aria-modal="true" aria-labelledby="mailModalTitle">
+      <div class="modal-box mail-modal-box">
+        <div class="modal-title-row">
+          <div>
+            <div class="modal-title" id="mailModalTitle">邮件原文</div>
+            <div class="hint" id="mailModalMeta"></div>
+          </div>
+          <button id="btnCloseMailModal" class="btn secondary" type="button">关闭</button>
+        </div>
+        <iframe id="mailModalFrame" class="mail-frame" sandbox="allow-same-origin"></iframe>
+      </div>
+    </div>
+
+    <footer class="foot">
+      <span>gpt-register-fp</span>
+    </footer>
+  </div>
+  <script src="/static/app.js?v=20260825-1"></script>
+</body>
+</html>

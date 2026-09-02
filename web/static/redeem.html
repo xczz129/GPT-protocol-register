@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#111614" />
+  <title>CDK 兑换 · XBOVO Mail</title>
+  <link rel="stylesheet" href="/static/redeem.css?v=20260803-1" />
+</head>
+<body>
+  <svg class="svg-sprite" aria-hidden="true">
+    <symbol id="icon-key" viewBox="0 0 24 24"><path d="m21 2-9.6 9.6"/><circle cx="7.5" cy="15.5" r="5.5"/><path d="m15.5 7.5 3 3M18 5l3 3"/></symbol>
+    <symbol id="icon-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></symbol>
+    <symbol id="icon-arrow-right" viewBox="0 0 24 24"><path d="M5 12h14m-6-6 6 6-6 6"/></symbol>
+    <symbol id="icon-mail" viewBox="0 0 24 24"><rect width="20" height="16" x="2" y="4" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></symbol>
+    <symbol id="icon-inbox" viewBox="0 0 24 24"><path d="M4.5 5.5 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-2.5-6.5A2 2 0 0 0 17.6 4H6.4a2 2 0 0 0-1.9 1.5Z"/><path d="M2 12h6l2 3h4l2-3h6"/></symbol>
+    <symbol id="icon-copy" viewBox="0 0 24 24"><rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></symbol>
+    <symbol id="icon-download" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M4 20h16"/></symbol>
+    <symbol id="icon-refresh" viewBox="0 0 24 24"><path d="M20 6v6h-6M4 18v-6h6"/><path d="M18.5 9A7 7 0 0 0 6 6.5L4 9m2 6a7 7 0 0 0 12.5 2.5L20 15"/></symbol>
+    <symbol id="icon-log-out" viewBox="0 0 24 24"><path d="M10 17l5-5-5-5m5 5H3"/><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/></symbol>
+    <symbol id="icon-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+    <symbol id="icon-shield" viewBox="0 0 24 24"><path d="M12 3 20 6v5c0 5-3.4 8.3-8 10-4.6-1.7-8-5-8-10V6l8-3Z"/><path d="m8.5 12 2.3 2.3 4.7-5"/></symbol>
+    <symbol id="icon-chevron" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+    <symbol id="icon-check" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m8 12 2.5 2.5L16 9"/></symbol>
+    <symbol id="icon-alert" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8v4m0 4h.01"/></symbol>
+  </svg>
+
+  <header class="redeem-topbar">
+    <a class="redeem-brand" href="/redeem" aria-label="XBOVO Mail 兑换页">
+      <span class="redeem-mark"><svg><use href="#icon-mail" /></svg></span>
+      <span class="brand-copy"><b>XBOVO</b><small>MAIL ACCESS</small></span>
+    </a>
+    <nav class="mode-switch" aria-label="CDK 操作模式">
+      <a id="redeemModeLink" href="/redeem"><svg><use href="#icon-key" /></svg><span>兑换</span></a>
+      <a id="queryModeLink" href="/cdk-query"><svg><use href="#icon-search" /></svg><span>查询</span></a>
+    </nav>
+    <span id="sessionState" class="session-state"><i></i>兑换入口</span>
+  </header>
+
+  <main class="redeem-main">
+    <section id="redeemGate" class="access-view">
+      <div class="access-shell">
+        <header class="access-heading">
+          <span class="access-icon"><svg><use href="#icon-key" /></svg></span>
+          <div>
+            <span class="kicker">MAILBOX ACCESS</span>
+            <h1>兑换收件箱</h1>
+            <p>输入你的 CDK，立即打开绑定邮箱。</p>
+          </div>
+        </header>
+
+        <form id="redeemForm" class="access-form redeem-access-form" autocomplete="off">
+          <div class="field-label-row">
+            <label for="cdkInput">CDK 兑换码</label>
+            <span id="redeemCodeCount" hidden></span>
+          </div>
+          <div class="code-control unified-code-control">
+            <svg class="field-icon" aria-hidden="true"><use href="#icon-key" /></svg>
+            <textarea id="cdkInput" name="codes" maxlength="2400" spellcheck="false" autocomplete="one-time-code" placeholder="GPT-XXXX-XXXX-XXXX-XXXX-XXXX" required></textarea>
+            <button id="redeemButton" class="submit-button" type="submit">
+              <span>兑换并进入</span><svg><use href="#icon-arrow-right" /></svg>
+            </button>
+          </div>
+          <div id="redeemMessage" class="form-message" role="status" aria-live="polite"></div>
+        </form>
+        <section id="batchResult" class="batch-result" aria-live="polite" hidden>
+          <header><div><span class="kicker">BATCH RESULT</span><h2>兑换结果</h2></div><span id="batchSummary"></span></header>
+          <div id="batchResultList" class="batch-result-list"></div>
+        </section>
+
+      </div>
+    </section>
+
+    <section id="queryGate" class="access-view" hidden>
+      <div class="access-shell">
+        <header class="access-heading">
+          <span class="access-icon search"><svg><use href="#icon-search" /></svg></span>
+          <div>
+            <span class="kicker">CDK LOOKUP</span>
+            <h1>查询兑换记录</h1>
+            <p>查看 CDK 状态，已兑换记录可直接进入收件箱。</p>
+          </div>
+        </header>
+
+        <form id="queryForm" class="access-form" autocomplete="off">
+          <label for="queryInput">CDK 兑换码</label>
+          <div class="code-control">
+            <svg class="field-icon" aria-hidden="true"><use href="#icon-search" /></svg>
+            <input id="queryInput" name="code" type="text" maxlength="96" spellcheck="false" autocomplete="one-time-code" inputmode="text" placeholder="GPT-XXXX-XXXX-XXXX-XXXX-XXXX" required />
+            <button id="queryButton" class="submit-button" type="submit">
+              <span>查询记录</span><svg><use href="#icon-arrow-right" /></svg>
+            </button>
+          </div>
+          <div id="queryMessage" class="form-message" role="status" aria-live="polite"></div>
+          <div id="queryResult" class="query-result" hidden></div>
+        </form>
+
+      </div>
+    </section>
+
+    <section id="inbox" class="inbox" hidden>
+      <header class="inbox-head">
+        <div class="mailbox-heading">
+          <span class="mailbox-icon"><svg><use href="#icon-inbox" /></svg></span>
+          <div>
+            <span class="kicker">ACTIVE MAILBOX</span>
+            <h1 id="mailboxAddress">-</h1>
+          </div>
+        </div>
+        <div class="inbox-actions">
+          <button id="copyEmail" class="button secondary" type="button"><svg><use href="#icon-copy" /></svg><span>复制邮箱</span></button>
+          <button id="copyAccessToken" class="button secondary" type="button"><svg><use href="#icon-copy" /></svg><span>复制 AT</span></button>
+          <button id="downloadAccountJson" class="button secondary" type="button"><svg><use href="#icon-download" /></svg><span>下载 JSON</span></button>
+          <button id="refreshMail" class="button primary" type="button"><svg><use href="#icon-refresh" /></svg><span>刷新邮件</span></button>
+          <button id="leaveInbox" class="icon-button" type="button" title="退出收件箱" aria-label="退出收件箱"><svg><use href="#icon-log-out" /></svg></button>
+        </div>
+      </header>
+
+      <div class="inbox-strip">
+        <div class="strip-item">
+          <span class="strip-icon"><svg><use href="#icon-mail" /></svg></span>
+          <span class="strip-copy"><small>邮件总数</small><b id="messageCount">0</b></span>
+        </div>
+        <div class="strip-item code-item">
+          <span class="strip-icon"><svg><use href="#icon-key" /></svg></span>
+          <span class="strip-copy"><small>最新验证码</small><button id="latestCode" type="button" disabled>等待邮件</button></span>
+        </div>
+        <div class="strip-item credential-item">
+          <span class="strip-icon"><svg><use href="#icon-key" /></svg></span>
+          <span class="strip-copy"><small>账号密码</small><button id="accountPassword" type="button" title="点击复制密码" aria-label="点击复制账号密码" disabled>未返回</button></span>
+        </div>
+        <div class="strip-item credential-item">
+          <span class="strip-icon"><svg><use href="#icon-shield" /></svg></span>
+          <span class="strip-copy"><small>2FA TOTP 密钥</small><button id="totpSecret" type="button" title="点击复制 TOTP 密钥" aria-label="点击复制 2FA TOTP 密钥" disabled>未返回</button></span>
+        </div>
+        <div class="strip-item">
+          <span class="strip-icon"><svg><use href="#icon-clock" /></svg></span>
+          <span class="strip-copy"><small>同步状态</small><b id="mailStatus">就绪</b></span>
+        </div>
+      </div>
+
+      <div class="mail-section-head">
+        <div><h2>收件箱</h2><span>最近 30 封邮件</span></div>
+        <div id="mailNotice" class="mail-notice" role="status" aria-live="polite"></div>
+      </div>
+      <div id="messageList" class="message-list"></div>
+      <div id="emptyInbox" class="empty-inbox" hidden>
+        <span class="empty-icon"><svg><use href="#icon-inbox" /></svg></span>
+        <b>收件箱还是空的</b>
+        <span>新邮件到达后会自动出现在这里</span>
+        <button id="emptyRefresh" class="button secondary" type="button"><svg><use href="#icon-refresh" /></svg><span>重新检查</span></button>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/redeem.js?v=20260803-2" defer></script>
+</body>
+</html>

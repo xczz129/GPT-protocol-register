@@ -1,0 +1,318 @@
+# -*- coding: utf-8 -*-
+"""In-memory JP Plus/free-trial eligibility batch jobs."""
+
+from __future__ import annotations
+
+import copy
+import threading
+import time
+import uuid
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from datetime import datetime, timezone
+from typing import Any
+
+from common.account_health import InvalidAccessTokenError
+from common.account_store import (
+    account_delete_key,
+    account_is_deactivated,
+    update_account_record_fields,
+)
+from common.trial_eligibility import (
+    _status_fields,
+    account_access_token,
+    check_trial_eligibility,
+    is_trial_probe_retryable,
+)
+from common.trial_proxy_pool import selected_trial_proxies
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _public_item(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "key": account_delete_key(record),
+        "email": str(record.get("email") or ""),
+        "account_id": str(record.get("account_id") or ""),
+        "status": "queued",
+        "result": None,
+        "error": "",
+        "attempt": 0,
+    }
+
+
+class TrialEligibilityJobs:
+    """Run one bounded eligibility batch without persistent legacy job state."""
+
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.jobs: dict[str, dict[str, Any]] = {}
+        self.threads: dict[str, threading.Thread] = {}
+        self.stop_events: dict[str, threading.Event] = {}
+        self.active_job_id = ""
+
+    def start(
+        self,
+        records: list[dict[str, Any]],
+        *,
+        concurrency: int = 5,
+        attempts: int = 8,
+    ) -> dict[str, Any]:
+        selected = [
+            dict(record)
+            for record in records
+            if isinstance(record, dict)
+            and str(record.get("plan_type") or "free").strip().lower() == "free"
+            and account_access_token(record)
+            and not account_is_deactivated(record)
+        ]
+        if not selected:
+            raise ValueError("所选 Free 账号没有可用的 Access Token")
+        with self.lock:
+            active = self.jobs.get(self.active_job_id)
+            if active and active.get("status") in {"queued", "running", "stopping"}:
+                raise RuntimeError("已有优惠检测批次正在运行")
+            job_id = uuid.uuid4().hex
+            job = {
+                "job_id": job_id,
+                "provider": "trial_eligibility",
+                "status": "queued",
+                "stage": "优惠检测排队中",
+                "total": len(selected),
+                "done": 0,
+                "eligible": 0,
+                "discount": 0,
+                "ineligible": 0,
+                "failed": 0,
+                "stopped": 0,
+                "current": "",
+                "concurrency": max(1, min(5, int(concurrency or 1))),
+                "attempts": max(1, min(20, int(attempts or 1))),
+                "created_at": _now(),
+                "started_at": "",
+                "finished_at": "",
+                "items": [_public_item(record) for record in selected],
+            }
+            self.jobs[job_id] = job
+            self.active_job_id = job_id
+            stop_event = threading.Event()
+            self.stop_events[job_id] = stop_event
+            thread = threading.Thread(
+                target=self._run,
+                args=(job_id, selected, stop_event),
+                daemon=True,
+                name=f"trial-check-{job_id[:8]}",
+            )
+            self.threads[job_id] = thread
+            thread.start()
+            return copy.deepcopy(job)
+
+    def _run(
+        self,
+        job_id: str,
+        records: list[dict[str, Any]],
+        stop_event: threading.Event,
+    ) -> None:
+        with self.lock:
+            job = self.jobs[job_id]
+            job.update(status="running", stage="JP 优惠检测运行中", started_at=_now())
+            concurrency = int(job["concurrency"])
+            max_attempts = int(job["attempts"])
+
+        def run_one(index: int, record: dict[str, Any]) -> tuple[str, dict[str, Any], str, int]:
+            if stop_event.is_set():
+                return "stopped", {}, "任务已停止", 0
+            email = str(record.get("email") or record.get("account_id") or f"账号 {index + 1}")
+            with self.lock:
+                item = self.jobs[job_id]["items"][index]
+                item.update(status="running", started_at=_now())
+                self.jobs[job_id]["current"] = email
+
+            country, proxies = selected_trial_proxies(limit=max_attempts)
+            routes = proxies if proxies else [""]
+            route_mode = f"{country} proxy" if proxies and country else "direct"
+            last_error: BaseException | None = None
+            for attempt, proxy in enumerate(routes, 1):
+                if stop_event.is_set():
+                    return "stopped", {}, "任务已停止", attempt - 1
+                try:
+                    result = check_trial_eligibility(
+                        record,
+                        proxy=proxy,
+                        direct=not bool(proxy),
+                    )
+                    fields = _status_fields(result)
+                    fields["trial_eligibility_proxy_mode"] = route_mode
+                    update_account_record_fields(
+                        {account_delete_key(record): fields}, include_records=False
+                    )
+                    eligibility_status = str(result.get("eligibility_status") or "").lower()
+                    if result.get("is_deactivated"):
+                        state = "failed"
+                    elif eligibility_status in {"eligible", "active"}:
+                        state = "eligible"
+                    elif eligibility_status == "discount":
+                        state = "discount"
+                    else:
+                        state = "ineligible"
+                    return state, result, "", attempt
+                except InvalidAccessTokenError as error:
+                    fields = {
+                        "trial_eligibility_status": "invalid",
+                        "trial_eligibility_label": "AT 已失效",
+                        "trial_eligibility_checked_at": _now(),
+                        "trial_eligibility_reason": "token_invalidated",
+                        "trial_eligibility_method": "accounts_check_v4",
+                        "trial_eligibility_proxy_mode": route_mode,
+                        "trial_eligibility_error": str(error)[:500],
+                        "health_status": "invalid",
+                        "health_error": str(error)[:500],
+                        "last_invalid_at": _now(),
+                    }
+                    update_account_record_fields(
+                        {account_delete_key(record): fields}, include_records=False
+                    )
+                    return "failed", {}, str(error), attempt
+                except Exception as error:
+                    last_error = error
+                    if not is_trial_probe_retryable(error) or attempt >= len(routes):
+                        break
+                    time.sleep(min(2.0, 0.25 * attempt))
+
+            retryable = is_trial_probe_retryable(last_error)
+            fields = {
+                "trial_eligibility_status": "error",
+                "trial_eligibility_label": (
+                    f"待复测（{country or '网络'}线路异常）" if retryable else "检测失败"
+                ),
+                "trial_eligibility_checked_at": "" if retryable else _now(),
+                "trial_eligibility_reason": "route_retry_pending" if retryable else "request_error",
+                "trial_eligibility_method": "accounts_check_v4",
+                "trial_eligibility_proxy_mode": route_mode,
+                "trial_eligibility_error": str(last_error or "account_check_failed")[:500],
+            }
+            update_account_record_fields(
+                {account_delete_key(record): fields}, include_records=False
+            )
+            return "failed", {}, str(last_error or "account_check_failed"), len(routes)
+
+        try:
+            worker_count = max(1, min(int(concurrency or 1), len(records)))
+            # Avoid queueing one Future for every account.  Eligibility jobs
+            # can cover the entire account store, while only ``worker_count``
+            # probes can run concurrently.  A two-wave look-ahead keeps the
+            # workers fed and bounds retained record/Future references.
+            max_in_flight = max(worker_count, worker_count * 2)
+            with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix=f"trial-{job_id[:6]}",
+            ) as executor:
+                in_flight: dict[Any, int] = {}
+                next_index = 0
+
+                def submit_next() -> bool:
+                    nonlocal next_index
+                    if next_index >= len(records) or stop_event.is_set():
+                        return False
+                    index = next_index
+                    next_index += 1
+                    in_flight[executor.submit(run_one, index, records[index])] = index
+                    return True
+
+                for _ in range(min(len(records), max_in_flight)):
+                    if not submit_next():
+                        break
+
+                def mark_unsubmitted_stopped(start_index: int) -> None:
+                    """Account for records never submitted after a stop."""
+                    with self.lock:
+                        job = self.jobs[job_id]
+                        for index in range(start_index, len(records)):
+                            item = job["items"][index]
+                            if item.get("status") not in {"queued", "running"}:
+                                continue
+                            item.update(
+                                status="stopped",
+                                result=None,
+                                error="任务已停止",
+                                attempt=0,
+                                finished_at=_now(),
+                            )
+                            job["stopped"] = int(job.get("stopped") or 0) + 1
+                            job["done"] = int(job.get("done") or 0) + 1
+                        job["stage"] = f"{job['done']} / {job['total']} 已完成"
+
+                while in_flight:
+                    completed, _ = wait(
+                        tuple(in_flight),
+                        return_when=FIRST_COMPLETED,
+                    )
+                    for future in completed:
+                        index = in_flight.pop(future)
+                        try:
+                            state, result, error, attempt = future.result()
+                        except Exception as exc:
+                            state, result, error, attempt = "failed", {}, str(exc), 0
+                        with self.lock:
+                            job = self.jobs[job_id]
+                            item = job["items"][index]
+                            item.update(
+                                status="success" if state in {"eligible", "ineligible"} else state,
+                                result=result or None,
+                                error=error[:500],
+                                attempt=attempt,
+                                finished_at=_now(),
+                            )
+                            job[state] = int(job.get(state) or 0) + 1
+                            job["done"] = int(job.get("done") or 0) + 1
+                            job["stage"] = f"{job['done']} / {job['total']} 已完成"
+                        if not stop_event.is_set():
+                            submit_next()
+                if stop_event.is_set():
+                    mark_unsubmitted_stopped(next_index)
+        finally:
+            with self.lock:
+                job = self.jobs[job_id]
+                stopped = stop_event.is_set()
+                job.update(
+                    status=("partial" if stopped or job["failed"] else "success"),
+                    stage="已停止" if stopped else "优惠检测完成",
+                    current="",
+                    finished_at=_now(),
+                )
+                if self.active_job_id == job_id:
+                    self.active_job_id = ""
+
+    def snapshot(self, job_id: str) -> dict[str, Any] | None:
+        with self.lock:
+            job = self.jobs.get(str(job_id or ""))
+            return copy.deepcopy(job) if job else None
+
+    def active(self) -> dict[str, Any] | None:
+        with self.lock:
+            job = self.jobs.get(self.active_job_id)
+            return copy.deepcopy(job) if job else None
+
+    def stop(self, job_id: str) -> dict[str, Any] | None:
+        with self.lock:
+            job = self.jobs.get(str(job_id or ""))
+            if not job:
+                return None
+            event = self.stop_events.get(str(job_id or ""))
+            if event:
+                event.set()
+            if job.get("status") in {"queued", "running"}:
+                job.update(status="stopping", stage="正在停止")
+            return copy.deepcopy(job)
+
+    def wait(self, job_id: str, timeout: float) -> bool:
+        with self.lock:
+            thread = self.threads.get(str(job_id or ""))
+        if not thread:
+            return True
+        thread.join(max(0.0, float(timeout)))
+        return not thread.is_alive()
+
+
+TRIAL_ELIGIBILITY_JOBS = TrialEligibilityJobs()
