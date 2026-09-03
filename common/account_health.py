@@ -331,7 +331,7 @@ def refresh_oauth_tokens(record: dict[str, Any], *, force: bool = False) -> dict
             data={
                 "grant_type": "refresh_token",
                 "refresh_token": refresh_token,
-                "client_id": OAUTH_CLIENT_ID,
+                "client_id": str(record.get("oauth_client_id") or "").strip() or OAUTH_CLIENT_ID,
             },
             timeout=60,
         )

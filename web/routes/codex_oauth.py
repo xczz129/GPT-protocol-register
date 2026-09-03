@@ -393,6 +393,195 @@ async def sms_config_test():
 # Batch run endpoints
 
 
+
+def _parse_credential_lines(text: str) -> list:
+    creds: list = []
+    for raw in str(text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("----", 2)
+        if len(parts) == 3 and all(part.strip() for part in parts):
+            creds.append((parts[0].strip(), parts[1].strip(), parts[2].strip()))
+    return creds
+
+
+def _login_for_token(email: str, password: str, totp: str, sms, log):
+    # Shared protocol login chain for imports: bootstrap -> email ->
+    # password -> TOTP -> (phone?) -> workspace -> PKCE token exchange.
+    client = ProtocolClient(email, timeout=30)
+    try:
+        log("初始化会话与 PKCE")
+        client.bootstrap()
+        client.submit_email()
+        log("邮箱已提交")
+        client.verify_password(password)
+        log("密码验证通过")
+        mfa_id = client.mfa_id()
+        client.issue_mfa_challenge(mfa_id)
+        mfa_response = client.verify_mfa(mfa_id, totp_from_secret(totp))
+        log("2FA 验证通过")
+        try:
+            mfa_data = mfa_response.json()
+        except Exception:
+            mfa_data = {}
+        if not isinstance(mfa_data, dict):
+            mfa_data = {}
+        phone_required, reason = _phone_requirement(mfa_data)
+        if phone_required is True:
+            log(f"服务端要求手机验证({reason or 'add-phone'})")
+            if sms is None:
+                raise RuntimeError("需要手机验证,但接码未启用或未配置")
+            _auto_phone(client, sms, log)
+        else:
+            log("无需手机验证,直接进入 workspace")
+        try:
+            callback = client.select_workspace()
+        except Exception as exc:
+            if sms is not None and "phone" in str(exc).lower():
+                log("workspace 返回手机号步骤,切换到接码流程")
+                _auto_phone(client, sms, log)
+                callback = client.select_workspace()
+            else:
+                raise
+        query = parse_qs(urlparse(callback).query)
+        code = query.get("code", [""])[0]
+        if not code:
+            raise RuntimeError("回调缺少授权 code")
+        log("交换 OAuth Token")
+        token = exchange_code(code, client.verifier)
+        return client, token
+    except Exception:
+        try:
+            client.session.close()
+        except Exception:
+            pass
+        raise
+
+
+def _import_one(email: str, password: str, totp: str, sms_cfg: dict) -> dict:
+    def log(message: str, level: str = "info") -> None:
+        _log(f"{email} | {message}", level)
+
+    settings = SmsSettings.from_mapping(sms_cfg)
+    sms = _sms_client(settings)
+    client, token = _login_for_token(email, password, totp, sms, log)
+    try:
+        refresh = str(token.get("refresh_token") or "")
+        if not refresh:
+            raise RuntimeError("响应缺少 refresh_token(scope 未含 offline_access?)")
+        claims = decode_jwt_payload(str(token.get("id_token") or token.get("access_token") or "")) or {}
+        auth = claims.get("https://api.openai.com/auth")
+        auth = auth if isinstance(auth, dict) else {}
+        now = _state()._now_iso()
+        record = {
+            "email": email,
+            "password": password,
+            "password_set": True,
+            "totp_secret": totp,
+            "mfa_enabled": True,
+            "mfa_factor_type": "totp",
+            "access_token": str(token.get("access_token") or ""),
+            "refresh_token": refresh,
+            "id_token": str(token.get("id_token") or ""),
+            "oauth_client_id": CODEX_CLIENT_ID,
+            "account_id": str(auth.get("chatgpt_account_id") or claims.get("sub") or ""),
+            "plan_type": str(auth.get("chatgpt_plan_type") or "free"),
+            "registration_method": "codex_oauth",
+            "source_type": "import",
+            "browser_type": "curl_cffi/chrome",
+            "device_id": client.device_id,
+            "health_status": "unknown",
+            "registered_at": now,
+            "updated_at": now,
+            "last_token_refresh_at": now,
+            "last_token_refresh_error": "",
+        }
+        _state().upsert_account_record(record, _state().ACCOUNTS_FILE)
+        log("账号已写入账号库(AT/RT/密码/2FA)", "ok")
+        return {
+            "email": email,
+            "status": "success",
+            "refresh_token": refresh,
+            "expires_in": token.get("expires_in"),
+            "error": "",
+        }
+    finally:
+        try:
+            client.session.close()
+        except Exception:
+            pass
+
+
+def _run_import_batch(creds: list, sms_cfg: dict) -> None:
+    try:
+        for email, password, totp in creds:
+            if _STOP.is_set():
+                _log("任务已停止(剩余账号跳过)", "warning")
+                break
+            try:
+                result = _import_one(email, password, totp, sms_cfg)
+                with _LOCK:
+                    _STATE["success"] += 1
+                    _STATE["results"].append(result)
+            except Exception as exc:
+                with _LOCK:
+                    _STATE["failed"] += 1
+                    _STATE["results"].append(
+                        {"email": email, "status": "failed", "refresh_token": "", "expires_in": None, "error": str(exc)[:260]}
+                    )
+                _log(f"{email} | 失败: {exc}", "error")
+            finally:
+                with _LOCK:
+                    _STATE["done"] += 1
+    finally:
+        with _LOCK:
+            _STATE["running"] = False
+            _STATE["finished_at"] = datetime.now().isoformat(timespec="seconds")
+
+
+class CodexOauthImportRequest(BaseModel):
+    text: str = Field(default="", max_length=200000)
+
+
+@router.post("/api/codex-oauth/import")
+async def codex_oauth_import(body: CodexOauthImportRequest):
+    def _do():
+        with _LOCK:
+            if _STATE["running"]:
+                raise HTTPException(409, "已有接码/导入任务在运行")
+        creds = _parse_credential_lines(body.text)
+        if not creds:
+            raise HTTPException(400, "未识别到有效账号行(格式:邮箱----密码----2FA)")
+        cfg = _state()._read_config()
+        sms_cfg = _sms_config_section(cfg)
+        with _LOCK:
+            _STATE.update(
+                {
+                    "running": True,
+                    "total": len(creds),
+                    "done": 0,
+                    "success": 0,
+                    "failed": 0,
+                    "logs": [],
+                    "results": [],
+                    "started_at": datetime.now().isoformat(timespec="seconds"),
+                    "finished_at": "",
+                }
+            )
+        _STOP.clear()
+        threading.Thread(
+            target=_run_import_batch,
+            args=(creds, sms_cfg),
+            name="codex-oauth-import",
+            daemon=True,
+        ).start()
+        _log(f"导入任务启动:{len(creds)} 个账号 · 接码渠道 {SmsSettings.from_mapping(sms_cfg).provider_label}")
+        return {"ok": True, "total": len(creds)}
+
+    return await asyncio.to_thread(_do)
+
+
 class CodexOauthRunRequest(BaseModel):
     emails: list = Field(default_factory=list, max_length=200)
 
