@@ -967,12 +967,10 @@ _ACCOUNT_HEALTH_PROGRESS: dict[str, Any] = {
 
 
 def _account_health_resource_budget(requested_workers: int) -> tuple[int, str]:
+    # Operator choice: health checks are no longer throttled to a single
+    # worker while a registration job is running. The configured value is
+    # respected unconditionally.
     requested = max(1, int(requested_workers or 1))
-    job = globals().get("JOB")
-    if job is not None:
-        with job.lock:
-            if job.running:
-                return 1, "registration_priority"
     return requested, "normal"
 
 
