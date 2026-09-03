@@ -677,15 +677,12 @@ function moveSelected() {
         <div class="bulkbar account-actions">
           <label class="checkline"><input v-model="allPageSelected" type="checkbox" />全选本页</label>
           <button class="btn secondary" type="button" :disabled="!selected.length || busy" title="取消所有分页中已选择的账号" @click="clearAllSelected"><X :size="14" aria-hidden="true" />取消（{{ selected.length }}）</button>
-          <button class="btn primary" :disabled="!selected.length || busy" @click="emit('download', selected)"><Download :size="14" aria-hidden="true" />下载选中</button>
+          <button class="btn primary" :disabled="!accounts.length || busy" :title="selected.length ? '下载选中的账号' : '下载全部账号'" @click="emit('download', selected.length ? selected : null)"><Download :size="14" aria-hidden="true" />{{ selected.length ? `下载选中(${selected.length})` : "下载全部" }}</button>
           <button class="btn secondary" :disabled="!selectedAccessTokenKeys.length || busy || copyingAt" title="复制选中账号的完整 Access Token" @click="emit('copy-selected-at', selected)"><Copy :size="14" aria-hidden="true" />{{ copyingAt ? "读取AT中" : "复制选中AT" }}</button><button class="btn secondary" type="button" :disabled="!selected.length || busy || codexOauthRunning" title="对选中账号接码" @click="emit('codex-oauth', selected)"><Smartphone :size="14" aria-hidden="true" />接码</button><button class="btn secondary" type="button" :disabled="busy || codexOauthRunning" title="粘贴 邮箱----密码----2FA 导入新账号" @click="emit('import-accounts')"><Upload :size="14" aria-hidden="true" />导入账号</button>
           <button class="btn secondary" :disabled="!selectedAccessTokenKeys.length || busy" title="导出选中账号的完整 Access Token" @click="emit('export-selected-at', selected)">导出选中AT</button>
           <button class="btn secondary" :disabled="!selected.length || busy" title="导出选中账号、密码和完整 TOTP 密钥" @click="emit('export-security', selected)">导出账号+密码+2FA</button>
-          <button class="btn secondary" :disabled="!accounts.length || busy" @click="emit('download', null)">下载全部</button>
-          <button class="btn secondary" :disabled="!selected.length || busy || accountLoadBlocked || healthProgress.running" @click="emit('health', selected)">测活选中</button>
-          <button class="btn secondary" :disabled="!accounts.length || busy || accountLoadBlocked || healthProgress.running" @click="emit('health', null)">测活全部（跳过已封号）</button>
-          <button class="btn secondary" :disabled="!selected.length || busy || accountLoadBlocked" @click="emit('trial-check', { keys: selected, force: false })">检测资格选中</button>
-          <button class="btn secondary" :disabled="!accounts.length || busy || accountLoadBlocked" @click="emit('trial-check', { all_accounts: true, force: false })">检测全部 Free 资格</button>
+          <button class="btn secondary" :disabled="!accounts.length || busy || accountLoadBlocked || healthProgress.running" :title="selected.length ? '测活选中的账号' : '测活全部账号(跳过已封号)'" @click="emit('health', selected.length ? selected : null)">{{ healthProgress.running ? "测活中…" : (selected.length ? `测活选中(${selected.length})` : "测活全部") }}</button>
+          <button class="btn secondary" :disabled="!accounts.length || busy || accountLoadBlocked" :title="selected.length ? '检测选中账号的 Free 资格' : '检测全部账号的 Free 资格'" @click="emit('trial-check', selected.length ? { keys: selected, force: false } : { all_accounts: true, force: false })">{{ selected.length ? `检测资格选中(${selected.length})` : "检测全部 Free 资格" }}</button>
           
           <label class="reauth-mode-field">
             <span>登录方式</span>
