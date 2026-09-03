@@ -7,13 +7,14 @@ const props = defineProps({
   trash: { type: Array, default: () => [] },
   form: { type: Object, required: true },
   maddyAutoForm: { type: Object, required: true },
+  backupScheduleForm: { type: Object, required: true },
   groups: { type: Array, default: () => [] },
   security: { type: Object, required: true },
   busy: Boolean,
   maintenanceRunning: Boolean,
   maddyAutoRunning: Boolean,
 });
-const emit = defineEmits(["refresh", "save", "run", "save-maddy-auto", "run-maddy-auto", "test-webhook", "backup", "restore-backup", "restore-trash", "change-password", "revoke-sessions"]);
+const emit = defineEmits(["refresh", "save", "run", "save-maddy-auto", "run-maddy-auto", "test-webhook", "backup", "save-backup-schedule", "restore-backup", "restore-trash", "change-password", "revoke-sessions"]);
 const selectedTrash = ref([]);
 const canChangePassword = computed(() => props.security.currentPassword && props.security.newPassword.length >= 8 && props.security.newPassword === props.security.confirmPassword);
 const successRate = computed(() => Math.max(0, Math.min(100, Number(props.operations.metrics?.success_rate || 0))));
@@ -91,8 +92,15 @@ function formatTime(value) { if (!value) return "-"; try { const date = new Date
     </section>
 
     <section class="card">
-      <div class="card-h"><div><h2>备份与恢复</h2><p class="subtle">备份配置、账号、分组和邮箱状态。</p></div><button class="btn primary" :disabled="busy" @click="emit('backup')">创建备份</button></div>
-      <div class="ops-list"><div v-if="!operations.backups?.length" class="empty-card">暂无备份</div><div v-for="item in operations.backups" :key="item.name" class="ops-row"><div><b>{{ item.name }}</b><small>{{ formatTime(item.created_at) }} · {{ formatSize(item.size) }}</small></div><div class="row-btns"><a class="btn secondary sm" :href="apiUrl(`/api/backups/${encodeURIComponent(item.name)}`)">下载</a><button class="btn danger sm" :disabled="busy" @click="emit('restore-backup', item.name)">恢复</button></div></div></div>
+      <div class="card-h"><div><h2>备份与恢复</h2><p class="subtle">备份数据库、配置、分组和邮箱状态。</p></div><button class="btn primary" :disabled="busy" @click="emit('backup')">立即备份</button></div>
+      <div class="form two">
+        <label class="check"><input v-model="backupScheduleForm.enabled" type="checkbox" />启用定时备份</label>
+        <label>每天备份时间<input v-model="backupScheduleForm.time" type="time" /></label>
+        <label>保留天数<input v-model.number="backupScheduleForm.retentionDays" type="number" min="1" max="90" /></label>
+      </div>
+      <div class="actions"><button class="primary" :disabled="busy" @click="emit('save-backup-schedule')">保存定时设置</button></div>
+      <p class="hint">定时:{{ backupScheduleForm.enabled ? `每天 ${backupScheduleForm.time}` : "未启用" }} · 保留 {{ backupScheduleForm.retentionDays }} 天 · 最近自动备份:{{ formatTime(operations.state?.backup_last_at) }}<template v-if="operations.state?.backup_last_error"> · <span class="danger-text">{{ operations.state.backup_last_error }}</span></template></p>
+      <div class="ops-list"><div v-if="!operations.backups?.length" class="empty-card">暂无备份</div><div v-for="item in operations.backups" :key="item.name" class="ops-row"><div><b>{{ item.name }}<em v-if="item.auto" class="backup-auto-tag">自动</em></b><small>{{ formatTime(item.created_at) }} · {{ formatSize(item.size) }}</small></div><div class="row-btns"><a class="btn secondary sm" :href="apiUrl(`/api/backups/${encodeURIComponent(item.name)}`)">下载</a><button class="btn danger sm" :disabled="busy" @click="emit('restore-backup', item.name)">恢复</button></div></div></div>
     </section>
 
     <section class="card">

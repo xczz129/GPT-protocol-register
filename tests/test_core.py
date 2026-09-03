@@ -10941,6 +10941,7 @@ class PanelOperationsTests(unittest.TestCase):
             with (
                 patch.object(panel_ops, "BACKUP_DIR", root / "backups"),
                 patch.object(panel_ops, "BACKUP_FILES", {"config.yaml": source}),
+                patch.object(panel_ops, "BACKUP_DB_FILES", {}),
             ):
                 item = panel_ops.create_backup()
                 source.write_text("value: changed\n", encoding="utf-8")

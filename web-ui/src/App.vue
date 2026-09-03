@@ -196,6 +196,7 @@ const tokenEligibilityForm = reactive({ accessToken: "", batchTokens: "", useCon
 const tokenEligibility = reactive({ loading: false, error: "", result: null, batch: { running: false, total: 0, done: 0, current: "", results: [], stopped: false } });
 const integrationForm = reactive({ enabled: false, autoUpload: true, url: "", key: "", groupId: "" });
 const maintenanceForm = reactive({ enabled: false, intervalHours: 12, workers: 10, autoDeleteInvalid: false, webhookUrl: "", notifyOnComplete: false, notifyOnPoolLow: false, poolLowThreshold: 3 });
+const backupScheduleForm = reactive({ enabled: false, time: "04:00", retentionDays: 7 });
 const maddyAutoForm = reactive({ enabled: false, intervalHours: 1, perDomain: 20, concurrency: 3, engine: "protocol", keepOnFail: false, refreshDomains: true, groupId: "" });
 const securityForm = reactive({ currentPassword: "", newPassword: "", confirmPassword: "" });
 const title = computed(() => views[active.value]?.[0] || views.task[0]);
@@ -855,6 +856,8 @@ async function loadOperations() {
   Object.assign(maintenanceForm, { enabled: !!value.enabled, intervalHours: Number(value.interval_hours || 12), workers: Number(value.workers || 10), autoDeleteInvalid: !!value.auto_delete_invalid, webhookUrl: "", notifyOnComplete: !!value.notify_on_complete, notifyOnPoolLow: !!value.notify_on_pool_low, poolLowThreshold: Number(value.pool_low_threshold ?? 3) });
   const maddy = operations.value.maddy_auto_register || {};
   Object.assign(maddyAutoForm, { enabled: !!maddy.enabled, intervalHours: Number(maddy.interval_hours || 1), perDomain: Number(maddy.per_domain || 20), concurrency: Number(maddy.concurrency || 3), engine: maddy.engine || "protocol", keepOnFail: !!maddy.keep_on_fail, refreshDomains: maddy.refresh_domains !== false, groupId: maddy.group_id || "" });
+  const backupSchedule = operations.value.backup_schedule || {};
+  Object.assign(backupScheduleForm, { enabled: !!backupSchedule.enabled, time: backupSchedule.time || "04:00", retentionDays: Number(backupSchedule.retention_days ?? 7) });
 }
 async function loadTrash() { trash.value = (await api("/api/accounts/trash")).items || []; }
 async function loadProgress() {
@@ -2507,6 +2510,7 @@ async function runMaddyAutoRegister() {
 }
 async function testWebhook() { await run(() => api("/api/maintenance/test-webhook", { method: "POST", body: jsonBody({ enabled: maintenanceForm.enabled, interval_hours: maintenanceForm.intervalHours, workers: maintenanceForm.workers, auto_delete_invalid: maintenanceForm.autoDeleteInvalid, webhook_url: maintenanceForm.webhookUrl, notify_on_complete: maintenanceForm.notifyOnComplete, notify_on_pool_low: maintenanceForm.notifyOnPoolLow, pool_low_threshold: maintenanceForm.poolLowThreshold }) }), (r) => r.message || "Webhook 测试完成"); }
 async function createBackupNow() { await run(() => api("/api/backups", { method: "POST", body: "{}" }), "备份已创建", [loadOperations]); }
+async function saveBackupSchedule() { await run(() => api("/api/backup-schedule", { method: "PUT", body: jsonBody({ enabled: backupScheduleForm.enabled, time: backupScheduleForm.time, retention_days: backupScheduleForm.retentionDays }) }), "定时备份设置已保存", [loadOperations]); }
 async function restoreBackupNow(name) { if (!await confirmInside(`恢复备份 ${name}？当前配置和数据会被覆盖。`, { title: "恢复备份", confirmText: "恢复", danger: true })) return; await run(() => api("/api/backups/restore", { method: "POST", body: jsonBody({ name }) }), "备份已恢复", [initialize]); }
 async function restoreTrash(ids) { await run(() => api("/api/accounts/trash/restore", { method: "POST", body: jsonBody({ ids }) }), (r) => `已恢复 ${r.restored || 0} 个账号`, [loadTrash, loadAccounts, loadGroups, loadStatus, loadOperations]); }
 async function changePassword() { const result = await run(() => api("/api/auth/change-password", { method: "POST", body: jsonBody({ current_password: securityForm.currentPassword, new_password: securityForm.newPassword }) }), "密码已修改"); if (result) Object.assign(securityForm, { currentPassword: "", newPassword: "", confirmPassword: "" }); }
@@ -2595,7 +2599,7 @@ onBeforeUnmount(() => {
         <RebindView v-else-if="active === 'rebind'" :progress="rebindProgress" :preflight="rebindPreflight" :busy="busy || rebindRequestBusy" :checking="rebindChecking" @preflight="preflightRebind" @start="startRebind" @stop="stopRebind" @reset="resetRebindForInput" @input-change="resetRebindForInput" />
         <CredentialExportView v-else-if="active === 'credential-export'" :accounts="accounts" :busy="busy" @export="exportSecurityByEmail" />
         <ProtocolLoginView v-else-if="active === 'protocol-login'" :accounts="accounts" :progress="reauthProgress" :health-progress="healthProgress" :preflight="protocolLoginPreflight" :busy="busy" @start="startProtocolLoginByEmail" @stop="stopReauth" @health="healthProtocolLoginEmails" @input-change="resetProtocolLoginResultsForInput" />
-        <OperationsView v-else-if="active === 'operations'" :operations="operations" :trash="trash" :form="maintenanceForm" :maddy-auto-form="maddyAutoForm" :groups="groups" :security="securityForm" :busy="busy" :maintenance-running="maintenanceActive" :maddy-auto-running="maddyAutoActive" @refresh="() => Promise.all([loadOperations(), loadTrash()])" @save="saveMaintenance" @run="runMaintenance" @save-maddy-auto="saveMaddyAutoRegister" @run-maddy-auto="runMaddyAutoRegister" @test-webhook="testWebhook" @backup="createBackupNow" @restore-backup="restoreBackupNow" @restore-trash="restoreTrash" @change-password="changePassword" @revoke-sessions="revokeSessions" />
+        <OperationsView v-else-if="active === 'operations'" :operations="operations" :trash="trash" :form="maintenanceForm" :maddy-auto-form="maddyAutoForm" :backup-schedule-form="backupScheduleForm" :groups="groups" :security="securityForm" :busy="busy" :maintenance-running="maintenanceActive" :maddy-auto-running="maddyAutoActive" @refresh="() => Promise.all([loadOperations(), loadTrash()])" @save="saveMaintenance" @run="runMaintenance" @save-maddy-auto="saveMaddyAutoRegister" @run-maddy-auto="runMaddyAutoRegister" @test-webhook="testWebhook" @backup="createBackupNow" @save-backup-schedule="saveBackupSchedule" @restore-backup="restoreBackupNow" @restore-trash="restoreTrash" @change-password="changePassword" @revoke-sessions="revokeSessions" />
       </template>
     </main>
     <footer class="foot"><span>gpt-register-fp · Vue 3</span></footer>

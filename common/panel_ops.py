@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import sqlite3
 import tempfile
 import threading
 import time
@@ -34,11 +36,14 @@ DATA_DIR = ROOT / "data"
 TRASH_FILE = DATA_DIR / "account_trash.json"
 TRASH_RETENTION_DAYS = 60
 TRASH_MAX_ROWS = 2000
-BACKUP_KEEP = 10
+BACKUP_RETENTION_DAYS = 7
+BACKUP_MAX_FILES = 60
+AUTO_BACKUP_MARK = "gpt-register-backup-auto-"
 OPS_STATE_FILE = DATA_DIR / "panel_operations.json"
 TASK_HISTORY_FILE = DATA_DIR / "task_history.json"
 _TASK_HISTORY_LOCK = threading.Lock()
 _TRASH_LOCK = threading.RLock()
+_BACKUP_SCHEDULE_LOCK = threading.Lock()
 _TRASH_CACHE_LOCK = threading.RLock()
 _TRASH_CACHE_PATH: Path | None = None
 _TRASH_CACHE_STAMP: tuple[int, int, int] = (0, 0, 0)
@@ -47,9 +52,17 @@ _TRASH_CACHE_EMAIL_REASONS: dict[str, str] | None = None
 BACKUP_DIR = ROOT / "backups"
 BACKUP_FILES = {
     "config.yaml": ROOT / "config.yaml",
-    "registered_accounts.json": DATA_DIR / "registered_accounts.json",
     "account_groups.json": DATA_DIR / "account_groups.json",
     "outlook_token_state.json": DATA_DIR / "outlook_token_state.json",
+}
+BACKUP_DB_FILES = {
+    "registered_accounts.sqlite3": DATA_DIR / "registered_accounts.sqlite3",
+    "task_history.sqlite3": DATA_DIR / "task_history.sqlite3",
+    "account_operation_logs.sqlite3": DATA_DIR / "account_operation_logs.sqlite3",
+    "account_trash.json": DATA_DIR / "account_trash.json",
+}
+_LEGACY_RESTORE_FILES = {
+    "registered_accounts.json": DATA_DIR / "registered_accounts.json",
     "task_history.json": TASK_HISTORY_FILE,
 }
 
@@ -277,43 +290,116 @@ def take_trash(ids: Iterable[str]) -> list[dict[str, Any]]:
         return taken
 
 
-def _rotate_backups() -> None:
-    """Keep only the newest BACKUP_KEEP zip archives."""
+def _rotate_backups(retention_days: int = BACKUP_RETENTION_DAYS) -> None:
+    'Delete archives older than the retention window; cap the file count.'
     if not BACKUP_DIR.is_dir():
         return
+    cutoff = time.time() - max(1, int(retention_days)) * 86400
     zips = sorted(
         (item for item in BACKUP_DIR.glob("gpt-register-backup-*.zip")),
         key=lambda item: item.stat().st_mtime,
         reverse=True,
     )
-    for stale in zips[BACKUP_KEEP:]:
+    for stale in zips[BACKUP_MAX_FILES:]:
         try:
             stale.unlink()
         except OSError:
             pass
+    for stale in zips:
+        try:
+            if stale.stat().st_mtime < cutoff:
+                stale.unlink()
+        except OSError:
+            pass
 
 
-def create_backup() -> dict[str, Any]:
+def _backup_sqlite_snapshot(source: Path, dest: Path) -> bool:
+    'Online-safe sqlite snapshot via the backup API (handles WAL).'
+    if not source.is_file():
+        return False
+    src_conn = None
+    dst_conn = None
+    try:
+        src_conn = sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=30.0)
+        dst_conn = sqlite3.connect(str(dest))
+        src_conn.backup(dst_conn)
+        return True
+    except Exception:
+        return False
+    finally:
+        for conn in (src_conn, dst_conn):
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+
+def create_backup(*, auto: bool = False, retention_days: int | None = None) -> dict[str, Any]:
+    'Archive the sqlite databases plus small config/state files.'
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    _rotate_backups()
+    _rotate_backups(retention_days if retention_days else BACKUP_RETENTION_DAYS)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    name = f"gpt-register-backup-{stamp}.zip"
+    kind = "auto-" if auto else ""
+    name = f"gpt-register-backup-{kind}{stamp}.zip"
     path = BACKUP_DIR / name
-    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for arcname, source in BACKUP_FILES.items():
-            if arcname == "registered_accounts.json":
-                archive.writestr(arcname, export_account_records(source))
-                continue
-            if arcname == "task_history.json":
-                archive.writestr(arcname, _export_task_runtime(TASK_HISTORY_FILE))
-                continue
-            if source.is_file():
-                archive.write(source, arcname=arcname)
+    with tempfile.TemporaryDirectory(prefix="db-backup-") as workdir:
+        work = Path(workdir)
+        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for arcname, source in BACKUP_FILES.items():
+                if source.is_file():
+                    archive.write(source, arcname=arcname)
+            for arcname, source in BACKUP_DB_FILES.items():
+                if arcname.endswith(".sqlite3"):
+                    snapshot = work / arcname
+                    if _backup_sqlite_snapshot(source, snapshot):
+                        archive.write(snapshot, arcname=arcname)
+                elif source.is_file():
+                    archive.write(source, arcname=arcname)
     try:
         os.chmod(path, 0o600)
     except Exception:
         pass
-    return {"name": name, "size": path.stat().st_size, "created_at": _now()}
+    return {"name": name, "size": path.stat().st_size, "created_at": _now(), "auto": bool(auto)}
+
+
+def maybe_run_scheduled_backup(schedule: dict[str, Any] | None) -> dict[str, Any]:
+    'Run the daily backup when due; at most one scheduled run per day.'
+    schedule = schedule if isinstance(schedule, dict) else {}
+    time_text = str(schedule.get("time") or "04:00").strip()
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", time_text)
+    if match:
+        hour = min(23, max(0, int(match.group(1))))
+        minute = min(59, max(0, int(match.group(2))))
+    else:
+        hour, minute = 4, 0
+    now = datetime.now()
+    today_key = now.strftime("%Y-%m-%d")
+    if not _BACKUP_SCHEDULE_LOCK.acquire(blocking=False):
+        return {"ran": False, "reason": "locked"}
+    try:
+        state = load_ops_state()
+        if str(state.get("backup_last_date") or "") == today_key:
+            return {"ran": False, "reason": "already_done"}
+        if (now.hour, now.minute) < (hour, minute):
+            return {"ran": False, "reason": "not_due"}
+        retention = max(1, min(int(schedule.get("retention_days") or 7), 90))
+        item = create_backup(auto=True, retention_days=retention)
+        update_ops_state(
+            backup_last_date=today_key,
+            backup_last_at=_now(),
+            backup_last_name=str(item.get("name") or ""),
+            backup_last_error="",
+        )
+        return {"ran": True, "item": item}
+    except Exception as exc:
+        try:
+            update_ops_state(backup_last_date=today_key, backup_last_error=str(exc)[:200])
+        except Exception:
+            pass
+        return {"ran": False, "error": str(exc)[:200]}
+    finally:
+        _BACKUP_SCHEDULE_LOCK.release()
 
 
 def list_backups() -> list[dict[str, Any]]:
@@ -325,6 +411,7 @@ def list_backups() -> list[dict[str, Any]]:
         out.append(
             {
                 "name": path.name,
+                "auto": path.name.startswith(AUTO_BACKUP_MARK),
                 "size": stat.st_size,
                 "created_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
             }
@@ -347,7 +434,37 @@ def restore_backup(name: str) -> list[str]:
     restored: list[str] = []
     with zipfile.ZipFile(path) as archive:
         members = set(archive.namelist())
+        for arcname, target in BACKUP_DB_FILES.items():
+            if arcname not in members:
+                continue
+            data = archive.read(arcname)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp = target.with_name(target.name + ".restore-tmp")
+            tmp.write_bytes(data)
+            os.replace(tmp, target)
+            for suffix in ("-wal", "-shm"):
+                sidecar = Path(str(target) + suffix)
+                try:
+                    sidecar.unlink()
+                except OSError:
+                    pass
+            try:
+                os.chmod(target, 0o600)
+            except Exception:
+                pass
+            restored.append(arcname)
         for arcname, target in BACKUP_FILES.items():
+            if arcname not in members:
+                continue
+            data = archive.read(arcname)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            try:
+                os.chmod(target, 0o600)
+            except Exception:
+                pass
+            restored.append(arcname)
+        for arcname, target in _LEGACY_RESTORE_FILES.items():
             if arcname not in members:
                 continue
             data = archive.read(arcname)
@@ -365,13 +482,6 @@ def restore_backup(name: str) -> list[str]:
                 _import_task_runtime(data, TASK_HISTORY_FILE)
                 restored.append(arcname)
                 continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(data)
-            try:
-                os.chmod(target, 0o600)
-            except Exception:
-                pass
-            restored.append(arcname)
     return restored
 
 

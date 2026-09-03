@@ -112,6 +112,7 @@ from common.web_auth import (
     verify_session as _verify_session_value,
 )
 from common.panel_ops import (
+    maybe_run_scheduled_backup,
     archive_accounts,
     backup_path,
     create_backup,
@@ -214,6 +215,7 @@ _OPERATIONS_METRICS_AT = 0.0
 _OPERATIONS_METRICS_VALUE: dict[str, Any] | None = None
 _PANEL_CACHE_WARM_TASK: asyncio.Task | None = None
 _SERVER_SHUTDOWN_EVENT = threading.Event()
+_BACKUP_AUTO_TASK = None
 
 # Email-rebind reservations are intentionally short-lived.  The mailbox
 # provider marks each candidate ``in_use`` in its shared state file; this
@@ -1267,6 +1269,24 @@ def _job_should_pause() -> bool:
         return bool(JOB.paused)
 
 
+def _backup_schedule_config(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
+    source = cfg if isinstance(cfg, dict) else _read_config()
+    raw = source.get("backup_schedule") if isinstance(source.get("backup_schedule"), dict) else {}
+    time_text = str(raw.get("time") or "04:00").strip()
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", time_text)
+    if match:
+        hour = min(23, max(0, int(match.group(1))))
+        minute = min(59, max(0, int(match.group(2))))
+        time_text = f"{hour:02d}:{minute:02d}"
+    else:
+        time_text = "04:00"
+    return {
+        "enabled": bool(raw.get("enabled")),
+        "time": time_text,
+        "retention_days": max(1, min(int(raw.get("retention_days") or 7), 90)),
+    }
+
+
 def _maintenance_config(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
     source = cfg if isinstance(cfg, dict) else _read_config()
     raw = source.get("maintenance") if isinstance(source.get("maintenance"), dict) else {}
@@ -1673,9 +1693,32 @@ async def _shutdown_active_background_jobs() -> None:
         await asyncio.gather(*(wait_one(*item) for item in waits))
 
 
+async def _backup_auto_loop() -> None:
+    'Daily scheduled database backup driven by the backup_schedule config.'
+    while not _SERVER_SHUTDOWN_EVENT.is_set():
+        try:
+            cfg = await asyncio.to_thread(_read_config)
+            schedule = _backup_schedule_config(cfg)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            schedule = {"enabled": False, "time": "04:00", "retention_days": 7}
+        if schedule["enabled"]:
+            try:
+                await asyncio.to_thread(maybe_run_scheduled_backup, schedule)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                try:
+                    JOB.append_log(f"定时备份异常: {str(exc)[:160]}")
+                except Exception:
+                    pass
+        await asyncio.sleep(60)
+
+
 @asynccontextmanager
 async def _app_lifespan(_app: FastAPI):
-    global _MAINTENANCE_TASK, _MADDY_AUTO_TASK, _PANEL_CACHE_WARM_TASK
+    global _MAINTENANCE_TASK, _MADDY_AUTO_TASK, _PANEL_CACHE_WARM_TASK, _BACKUP_AUTO_TASK
     loop = asyncio.get_running_loop()
     _SERVER_SHUTDOWN_EVENT.clear()
     web_executor = ThreadPoolExecutor(
@@ -1693,6 +1736,8 @@ async def _app_lifespan(_app: FastAPI):
         _MAINTENANCE_TASK = asyncio.create_task(_maintenance_loop(), name="account-maintenance")
     if _MADDY_AUTO_TASK is None or _MADDY_AUTO_TASK.done():
         _MADDY_AUTO_TASK = asyncio.create_task(_maddy_auto_loop(), name="maddy-auto-register")
+    if _BACKUP_AUTO_TASK is None or _BACKUP_AUTO_TASK.done():
+        _BACKUP_AUTO_TASK = asyncio.create_task(_backup_auto_loop(), name="backup-auto-scheduler")
     try:
         yield
     finally:
@@ -1718,6 +1763,13 @@ async def _app_lifespan(_app: FastAPI):
             except asyncio.CancelledError:
                 pass
             _MADDY_AUTO_TASK = None
+        if _BACKUP_AUTO_TASK is not None:
+            _BACKUP_AUTO_TASK.cancel()
+            try:
+                await _BACKUP_AUTO_TASK
+            except asyncio.CancelledError:
+                pass
+            _BACKUP_AUTO_TASK = None
         await _shutdown_active_background_jobs()
         web_executor.shutdown(wait=True, cancel_futures=True)
 

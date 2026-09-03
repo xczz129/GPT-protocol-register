@@ -620,6 +620,7 @@ async def operations():
                 "maddy_auto_register": maddy_auto,
                 "state": state,
                 "backups": _state().list_backups(),
+                "backup_schedule": _state()._backup_schedule_config(cfg),
                 "account_backups": _state().list_account_backups(),
                 "trash_count": len(_state().list_trash(limit=1000)),
             }
@@ -696,6 +697,26 @@ async def maintenance_test_webhook(body: MaintenanceUpdate):
     return {"ok": ok, "message": message}
 
 
+class BackupScheduleUpdate(BaseModel):
+    enabled: bool = False
+    time: str = Field(default="04:00", max_length=8)
+    retention_days: int = Field(default=7, ge=1, le=90)
+
+
+@router.put("/api/backup-schedule")
+async def backup_schedule_update(body: BackupScheduleUpdate):
+    with _state()._edit_config() as cfg:
+        current = cfg.setdefault("backup_schedule", {})
+        current.update(
+            {
+                "enabled": bool(body.enabled),
+                "time": str(body.time or "04:00"),
+                "retention_days": max(1, min(int(body.retention_days or 7), 90)),
+            }
+        )
+    return {"ok": True, "backup_schedule": _state()._backup_schedule_config(cfg)}
+
+
 @router.get("/api/backups")
 async def backups_list():
     return {"ok": True, "items": await asyncio.to_thread(_state().list_backups)}
@@ -703,9 +724,10 @@ async def backups_list():
 
 @router.post("/api/backups")
 async def backups_create():
-    _state().PROGRESS.start("backup_create", "创建数据备份", stage="压缩配置与数据文件")
+    retention = _state()._backup_schedule_config(_state()._read_config())["retention_days"]
+    _state().PROGRESS.start("backup_create", "创建数据备份", stage="压缩数据库与配置文件")
     try:
-        item = await asyncio.to_thread(_state().create_backup)
+        item = await asyncio.to_thread(_state().create_backup, retention_days=retention)
     except Exception as exc:
         _state().PROGRESS.finish("backup_create", ok=False, message=str(exc))
         raise
