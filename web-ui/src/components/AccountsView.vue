@@ -65,19 +65,29 @@ function triggerCopied(key) {
   }, 1500);
 }
 
-function copyTextDirect(text, key, fallbackItem, fallbackField) {
+async function copyTextDirect(text, key, fallbackItem, fallbackField) {
   if (!text) return;
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(text).then(() => {
-      triggerCopied(key);
-      emit("copy-value", { text, successMessage: `已复制到剪贴板: ${text}` });
-    }).catch(() => {
-      if (fallbackItem && fallbackField) {
-        emit("copy-credential", fallbackItem, fallbackField);
-      }
-    });
-  } else if (fallbackItem && fallbackField) {
-    emit("copy-credential", fallbackItem, fallbackField);
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const textarea = document.createElement("textarea");
+      textarea.value = text;
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      document.body.appendChild(textarea);
+      textarea.focus();
+      textarea.select();
+      const copied = document.execCommand("copy");
+      textarea.remove();
+      if (!copied) throw new Error("clipboard copy failed");
+    }
+    triggerCopied(key);
+    emit("copy-value", { text, successMessage: `已复制到剪贴板: ${text}` });
+  } catch {
+    if (fallbackItem && fallbackField) {
+      emit("copy-credential", fallbackItem, fallbackField);
+    }
   }
 }
 
