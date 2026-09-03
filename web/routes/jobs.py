@@ -14,10 +14,15 @@ from concurrent.futures import FIRST_COMPLETED, wait
 from datetime import datetime, timezone
 from typing import Any
 
+import re
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 router = APIRouter()
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_DUP_TS_RE = re.compile(r"^\d{1,2}:\d{2}:\d{2}\s+")
 
 
 def _state() -> Any:
@@ -126,10 +131,14 @@ class JobState:
             self.skipped_count = max(0, int(last.get("skipped_count") or 0))
 
     def append_log(self, line: str) -> None:
-        ts = datetime.now().strftime("%H:%M:%S")
-        text = str(line).rstrip()
+        # protocol.log() prints ANSI-colored lines with their own HH:MM:SS
+        # prefix; the stdout Tee forwards them here, so strip both to keep
+        # the panel log readable with a single timestamp.
+        text = _ANSI_RE.sub("", str(line)).rstrip()
         if not text:
             return
+        text = _DUP_TS_RE.sub("", text, count=1)
+        ts = datetime.now().strftime("%H:%M:%S")
         with self.lock:
             self.logs.append(f"[{ts}] {text}")
 
