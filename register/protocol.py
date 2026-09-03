@@ -113,7 +113,7 @@ REGISTER_BROWSER_PROFILES: tuple[dict[str, str], ...] = (
         "impersonate": "firefox147",
         "major": "147",
         "full_version": "147.0",
-        "weight": "5",
+        "weight": "6",
     },
     {
         "impersonate": "firefox144",
@@ -125,7 +125,7 @@ REGISTER_BROWSER_PROFILES: tuple[dict[str, str], ...] = (
         "impersonate": "firefox135",
         "major": "135",
         "full_version": "135.0",
-        "weight": "3",
+        "weight": "2",
     },
     {
         "impersonate": "firefox133",
@@ -221,6 +221,8 @@ REGISTER_COUNTRY_DEVICE_TRAITS: dict[str, tuple[dict[str, str], ...]] = {
         {"screen": "1366x768", "hardware_concurrency": "4", "device_memory": "8", "device_pixel_ratio": "1", "platform_version": "10.0.0"},
         {"screen": "1600x900", "hardware_concurrency": "8", "device_memory": "16", "device_pixel_ratio": "1.2", "platform_version": "10.0.0"},
         {"screen": "1920x1200", "hardware_concurrency": "12", "device_memory": "16", "device_pixel_ratio": "1", "platform_version": "10.0.0"},
+        {"screen": "1536x864", "hardware_concurrency": "8", "device_memory": "8", "device_pixel_ratio": "1.25", "platform_version": "10.0.0"},
+        {"screen": "2560x1440", "hardware_concurrency": "16", "device_memory": "16", "device_pixel_ratio": "1", "platform_version": "10.0.0"},
     ),
     "TR": (
         {"screen": "1920x1080", "hardware_concurrency": "8", "device_memory": "8", "device_pixel_ratio": "1", "platform_version": "10.0.0"},
@@ -255,7 +257,9 @@ REGISTER_COUNTRY_WEBGL_TRAITS: dict[str, tuple[dict[str, str], ...]] = {
         {"vendor": "Intel Inc.", "renderer": "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)"},
         {"vendor": "NVIDIA Corporation", "renderer": "ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 Ti Direct3D11 vs_5_0 ps_5_0, D3D11)"},
         {"vendor": "NVIDIA Corporation", "renderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)"},
+        {"vendor": "NVIDIA Corporation", "renderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 4060 Direct3D11 vs_5_0 ps_5_0, D3D11)"},
         {"vendor": "AMD", "renderer": "ANGLE (AMD, AMD Radeon RX 6600 Direct3D11 vs_5_0 ps_5_0, D3D11)"},
+        {"vendor": "AMD", "renderer": "ANGLE (AMD, AMD Radeon RX 7600 Direct3D11 vs_5_0 ps_5_0, D3D11)"},
     ),
     "TR": (
         {"vendor": "Intel Inc.", "renderer": "ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)"},
@@ -549,16 +553,30 @@ def _country_fingerprint_traits(proxy: str = "") -> dict[str, str]:
             "webgl_vendor": webgl["vendor"],
             "webgl_renderer": webgl["renderer"],
         }
+    # Countries with an identity but no curated hardware pool fall back to
+    # the shared device traits while keeping their own locale/clock, so the
+    # fingerprint stays country-coherent for every supported country.
     identity = country_identity(country)
+    device = secrets.choice(REGISTER_DEVICE_TRAITS)
+    webgl = secrets.choice(
+        REGISTER_COUNTRY_WEBGL_TRAITS.get(country)
+        or REGISTER_JAPAN_WEBGL_TRAITS
+    )
     return {
+        **device,
         "locale": identity.locale if identity else "en-US",
         "timezone": identity.timezone if identity else "UTC",
-        "timezone_offset_min": str(_timezone_offset_for_proxy(proxy)),
+        "timezone_offset_min": str(
+            _timezone_offset_for_timezone(
+                identity.timezone if identity else "UTC",
+                fallback=(identity.timezone_offsets[0] if identity else 0),
+            )
+        ),
         "platform": "Win32",
         "navigator_vendor": "",
         "max_touch_points": "0",
-        "webgl_vendor": "Intel Inc.",
-        "webgl_renderer": "ANGLE (Intel, Intel(R) UHD Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        "webgl_vendor": webgl["vendor"],
+        "webgl_renderer": webgl["renderer"],
     }
 
 
