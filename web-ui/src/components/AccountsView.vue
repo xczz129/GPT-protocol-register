@@ -875,6 +875,16 @@ function moveSelected() {
                     <button
                       class="btn secondary row-icon-btn"
                       type="button"
+                      :disabled="busy || codexOauthRunning || !item.delete_key || item.is_deactivated"
+                      title="补发 Codex RT(协议登录+接码)"
+                      aria-label="补发 RT"
+                      @click="emit('codex-oauth', [item])"
+                    >
+                      <Smartphone :size="13" aria-hidden="true" />
+                    </button>
+                    <button
+                      class="btn secondary row-icon-btn"
+                      type="button"
                       :disabled="busy || !item.delete_key"
                       title="查看账号操作日志"
                       aria-label="查看账号操作日志"

@@ -2577,7 +2577,7 @@ async def accounts_export_access_tokens(body: BulkDeleteRequest):
 async def account_credentials(body: AccountCredentialsRequest):
     """Return one explicitly requested password, TOTP secret, or current code."""
     field = str(body.field or "").strip().lower()
-    if field not in {"password", "totp_secret", "totp_code"}:
+    if field not in {"password", "totp_secret", "totp_code", "refresh_token"}:
         raise HTTPException(400, "不支持的凭据字段")
     target = str(body.key or "").strip()
     records = await asyncio.to_thread(_records_by_keys_with_fallback, [target])
