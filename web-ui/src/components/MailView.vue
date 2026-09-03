@@ -34,6 +34,21 @@ function providerName(item) {
   return "Outlook";
 }
 function stateClass(item) { return item.state === "available" ? "success" : ["failed", "invalid", "token_invalid"].includes(item.state) ? "failed" : "queue"; }
+function registeredClass(item) {
+  if (item.registered) return "success";
+  return String(item.reason || "").includes("cdk_bound") ? "run" : "queue";
+}
+function registeredLabel(item) {
+  if (item.registered) return "已注册";
+  return String(item.reason || "").includes("cdk_bound") ? "已售出" : "未注册";
+}
+function reasonText(item) {
+  const reason = String(item.reason || "");
+  if (reason.includes("cdk_bound")) return "已绑定 CDK · 账号售出后已移出账号库";
+  if (reason.includes("remote_registered")) return "远端已有 ChatGPT 账号 · 不可再用";
+  if (reason.includes("registered_account")) return "已注册过账号";
+  return reason;
+}
 function syncDomainIndex() {
   const list = Array.isArray(props.forms.domainOptions) ? props.forms.domainOptions : [];
   const idx = list.indexOf(props.forms.domainDefault);
@@ -195,8 +210,8 @@ onBeforeUnmount(stopMessagePolling);
       <div v-if="!pageItems.length" class="empty-card">没有匹配的邮箱</div>
       <article v-for="item in pageItems" :key="mailboxKey(item)" class="mailbox-card">
         <div class="mailbox-select"><input v-model="selected" type="checkbox" :value="mailboxKey(item)" /></div>
-        <div class="mailbox-main"><div class="mailbox-email">{{ item.email }}</div><div class="mailbox-sub">{{ providerName(item) }} · {{ item.mode || "-" }} · 登录 {{ item.login_address || item.email }}</div><div v-if="item.reason" class="mailbox-reason">{{ item.reason }}</div></div>
-        <div class="mailbox-tags"><span :class="['pill', stateClass(item)]">{{ item.state || "unknown" }}</span><span :class="['pill', item.registered ? 'success' : 'queue']">{{ item.registered ? "已注册" : "未注册" }}</span></div>
+        <div class="mailbox-main"><div class="mailbox-email">{{ item.email }}</div><div class="mailbox-sub">{{ providerName(item) }} · {{ item.mode || "-" }} · 登录 {{ item.login_address || item.email }}</div><div v-if="item.reason" class="mailbox-reason">{{ reasonText(item) }}</div></div>
+        <div class="mailbox-tags"><span :class="['pill', stateClass(item)]">{{ item.state || "unknown" }}</span><span :class="['pill', registeredClass(item)]">{{ registeredLabel(item) }}</span></div>
         <div class="mailbox-actions"><button class="btn secondary sm" @click="readMessages(item)">{{ expanded === mailboxKey(item) ? "收起邮件" : "查看邮件" }}</button></div>
         <div v-if="expanded === mailboxKey(item)" class="mailbox-inline-viewer active">
           <div class="mailbox-viewer-toolbar">

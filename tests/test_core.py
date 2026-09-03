@@ -283,6 +283,37 @@ class MailParsingTests(unittest.TestCase):
 
         self.assertNotIn("passwordless-retry@icloud.com", state)
 
+    def test_remote_registered_error_retires_mailbox_as_used(self):
+        import mail
+
+        cases = (
+            (
+                "remote-owned@icloud.com",
+                'user_register_http_400, detail={"error": {"code": "invalid_auth_step"}}',
+            ),
+            (
+                "taken@icloud.com",
+                "create_account_failed: user_already_exists",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as td:
+            old_state = mail.STATE_FILE
+            mail.STATE_FILE = Path(td) / "state.json"
+            try:
+                for address, error in cases:
+                    mail.mark_mailbox_result(
+                        {"provider": "icloud_api", "address": address},
+                        success=False,
+                        error=error,
+                    )
+                state = json.loads(mail.STATE_FILE.read_text(encoding="utf-8"))
+            finally:
+                mail.STATE_FILE = old_state
+
+        self.assertEqual(state["remote-owned@icloud.com"]["state"], "used")
+        self.assertIn("invalid_auth_step", state["remote-owned@icloud.com"]["reason"])
+        self.assertEqual(state["taken@icloud.com"]["state"], "used")
+
     def test_icloud_wait_retries_gateway_504_before_returning_code(self):
         from mail import ICloudApiProvider
 

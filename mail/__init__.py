@@ -1175,7 +1175,7 @@ class ICloudApiProvider:
                         raise RuntimeError(
                             f"[{self.label}] {reason}{scope} "
                             f"({len(self.pool)} total, tried {len(tried)}; {detail or 'none'}). "
-                            f"在面板点「释放 failed/in_use」或清空 data/outlook_token_state.json 后重试。"
+                            f"在面板点「释放 failed/in_use」后重试；主邮箱耗尽后计划会自动使用 +split 别名槽。"
                         )
                     email_lower = credential["email"].strip().lower()
                     slot_address = _requested_mailbox_slot(requested_email, email_lower)
@@ -3972,6 +3972,20 @@ def mark_mailbox_result(
         # registration batches instead of attempting another password flow.
         _set_state(address, "used", reason[:300])
         print(f"  [mail] marked used (password reset required): {address}")
+        return
+    if any(
+        marker in reason_l
+        for marker in (
+            "invalid_auth_step",
+            "user_already_exists",
+            "username_already_exists",
+        )
+    ):
+        # The address already belongs to a remote ChatGPT account, so a retry
+        # on this slot can never succeed. Retire it as used instead of
+        # leaving a re-selectable "failed" entry behind.
+        _set_state(address, "used", reason[:300])
+        print(f"  [mail] marked used (remote account exists): {address}")
         return
     if "rate_limit_exceeded" in reason_l:
         _set_state(address, "cooldown", reason[:300])
