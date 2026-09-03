@@ -105,8 +105,9 @@ function formatTime(value) { if (!value) return "-"; try { const date = new Date
         <template v-else>
           <label class="full">火狐狸用户名(ApiName)<input v-model="smsForm.firefoxApiName" type="text" placeholder="ApiName" autocomplete="off" /></label>
           <label class="full">火狐狸 Token(我的密钥)<input v-model="smsForm.firefoxToken" type="password" :placeholder="smsConfig.has_firefox_token ? `已保存 ${smsConfig.firefox_api_token_masked}` : 'firefox token'" autocomplete="off" /></label>
+          <label class="full">对接码(一次锁定国家+项目)<input v-model="smsForm.firefoxDockingCode" type="text" placeholder="格式: eng-1096-DEMO01(在火狐狸接码页复制)" autocomplete="off" /></label>
         </template>
-        <label class="full">国家顺序(按顺序取号)<div class="sms-country-field"><div v-if="smsCountries.length" class="sms-country-chips"><span v-for="(name, index) in smsCountries" :key="name + index" class="sms-country-chip">{{ index + 1 }}. {{ name }}</span></div><span v-else class="sms-country-none">未选择</span><button class="btn secondary sm" type="button" @click="emit('pick-countries')">选择国家</button></div></label>
+        <label v-if="smsForm.provider !== 'firefox'" class="full">国家顺序(按顺序取号)<div class="sms-country-field"><div v-if="smsCountries.length" class="sms-country-chips"><span v-for="(name, index) in smsCountries" :key="name + index" class="sms-country-chip">{{ index + 1 }}. {{ name }}</span></div><span v-else class="sms-country-none">未选择</span><button class="btn secondary sm" type="button" @click="emit('pick-countries')">选择国家</button></div></label>
         <label>等码超时(秒)<input v-model.number="smsForm.timeoutSeconds" type="number" min="30" max="1800" /></label>
         <label>换号重试次数<input v-model.number="smsForm.maxPhoneAttempts" type="number" min="1" max="20" /></label>
       </div>
