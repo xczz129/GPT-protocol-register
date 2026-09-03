@@ -486,7 +486,12 @@ async def sms_countries(provider: str = "smsbower"):
             for country_id, info in (countries or {}).items():
                 if not isinstance(info, dict):
                     continue
-                cid = int(info.get("id") or country_id)
+                # Some provider rows are malformed (empty key / null id, e.g.
+                # Faroe Islands).  Skip them instead of failing the whole list.
+                raw_id = str(info.get("id") or "").strip() or str(country_id or "").strip()
+                if not raw_id.isdigit():
+                    continue
+                cid = int(raw_id)
                 eng = str(info.get("eng") or info.get("rus") or f"Country {cid}")
                 chn = str(info.get("chn") or "")
                 meta = SMSBOWER_COUNTRY_INFO.get(cid)
