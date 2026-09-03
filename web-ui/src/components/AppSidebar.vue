@@ -11,9 +11,11 @@ import {
   Globe2,
   LogIn,
   Mail,
+  Moon,
   Network,
   ShieldCheck,
   SquareTerminal,
+  Sun,
   Ticket,
   X,
 } from "@lucide/vue";
@@ -21,6 +23,13 @@ import {
 const props = defineProps({ active: String, accountCount: [Number, String], open: Boolean });
 const emit = defineEmits(["navigate", "close"]);
 const nav = ref(null);
+
+const theme = ref(document.documentElement.dataset.theme === "light" ? "light" : "dark");
+function setTheme(value) {
+  theme.value = value;
+  document.documentElement.dataset.theme = value;
+  try { localStorage.setItem("ui-theme", value); } catch { /* private mode */ }
+}
 
 const sections = [
   {
@@ -92,5 +101,15 @@ watch(() => props.active, async (value) => {
         </a>
       </section>
     </nav>
+    <div class="side-theme">
+      <div class="side-theme-options" role="group" aria-label="界面风格">
+        <button type="button" :class="{ active: theme === 'dark' }" @click="setTheme('dark')">
+          <Moon :size="13" aria-hidden="true" /><span>黑色</span>
+        </button>
+        <button type="button" :class="{ active: theme === 'light' }" @click="setTheme('light')">
+          <Sun :size="13" aria-hidden="true" /><span>白色</span>
+        </button>
+      </div>
+    </div>
   </aside>
 </template>

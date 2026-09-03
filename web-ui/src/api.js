@@ -1,6 +1,24 @@
+const configuredApiBase = String(import.meta.env.VITE_API_BASE_URL || "").trim().replace(/\/+$/, "");
+
+// Accept either an API origin (https://api.example.com) or an API path
+// (/api), while keeping existing /api/... call sites unchanged.
+export function apiUrl(path) {
+  const value = String(path || "");
+  if (!value) return configuredApiBase || "/";
+  if (/^(?:[a-z][a-z\d+.-]*:|\/\/)/i.test(value)) return value;
+  if (!configuredApiBase) return value;
+  if ((configuredApiBase === "/api" || configuredApiBase.endsWith("/api")) && value === "/api") {
+    return configuredApiBase;
+  }
+  if ((configuredApiBase === "/api" || configuredApiBase.endsWith("/api")) && value.startsWith("/api/")) {
+    return `${configuredApiBase}${value.slice(4)}`;
+  }
+  return `${configuredApiBase}${value.startsWith("/") ? value : `/${value}`}`;
+}
+
 export async function api(path, options = {}) {
-  const response = await fetch(path, {
-    credentials: "same-origin",
+  const response = await fetch(apiUrl(path), {
+    credentials: "include",
     cache: "no-store",
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
     ...options,
@@ -27,9 +45,9 @@ export function jsonBody(value) {
 }
 
 export async function downloadPost(path, payload, filename) {
-  const response = await fetch(path, {
+  const response = await fetch(apiUrl(path), {
     method: "POST",
-    credentials: "same-origin",
+    credentials: "include",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });

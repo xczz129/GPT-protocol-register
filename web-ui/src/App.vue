@@ -1,7 +1,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, reactive, ref, shallowRef } from "vue";
 import { LogOut, Menu, RefreshCw } from "@lucide/vue";
-import { api, downloadPost, jsonBody } from "./api.js";
+import { api, apiUrl, downloadPost, jsonBody } from "./api.js";
 import AccountsView from "./components/AccountsView.vue";
 import AccountLogDialog from "./components/AccountLogDialog.vue";
 import AppDialog from "./components/AppDialog.vue";
@@ -70,7 +70,7 @@ const mailboxes = ref([]);
 const logs = ref([]);
 const capabilities = ref({ items: [] });
 const proxyDiagnostics = ref({ items: [] });
-const operations = ref({ metrics: {}, maintenance: {}, maddy_auto_register: {}, state: {}, backups: [], account_backups: [] });
+const operations = ref({ metrics: {}, maintenance: {}, maddy_auto_register: {}, state: {}, backups: [] });
 const trash = ref([]);
 const progress = ref({ running: 0, items: [] });
 const maintenanceRunning = ref(false);
@@ -205,8 +205,8 @@ const mailForms = reactive({
 });
 const proxyForm = reactive({ enabled: false, rotate: true, mode: "single_proxy", url: "", resourceUrl: "", clearanceMode: "none", flareUrl: "", flareProxy: "", poolFile: "data/proxy_pool.txt", poolText: "", poolTextTouched: false, poolTextComplete: false, poolCount: 0, poolUniqueCount: 0, selectedCountry: "", countries: [], countryPoolPath: "" });
 const trialProxyForm = reactive({ selected_country: "", countries: [] });
-const tokenEligibilityForm = reactive({ accessToken: "", useConfiguredProxy: true });
-const tokenEligibility = reactive({ loading: false, error: "", result: null });
+const tokenEligibilityForm = reactive({ accessToken: "", batchTokens: "", useConfiguredProxy: true });
+const tokenEligibility = reactive({ loading: false, error: "", result: null, batch: { running: false, total: 0, done: 0, current: "", results: [], stopped: false } });
 const integrationForm = reactive({ enabled: false, autoUpload: true, url: "", key: "", groupId: "" });
 const maintenanceForm = reactive({ enabled: false, intervalHours: 12, workers: 10, autoDeleteInvalid: false, webhookUrl: "", notifyOnComplete: false, notifyOnPoolLow: false, poolLowThreshold: 3 });
 const maddyAutoForm = reactive({ enabled: false, intervalHours: 1, perDomain: 20, concurrency: 3, engine: "protocol", keepOnFail: false, refreshDomains: true, groupId: "" });
@@ -981,7 +981,7 @@ function connectStream() {
     : active.value === "logs"
       ? "status,log"
       : "status";
-  const source = new EventSource(`/api/logs/stream?events=${encodeURIComponent(events)}&t=${Date.now()}`);
+  const source = new EventSource(apiUrl(`/api/logs/stream?events=${encodeURIComponent(events)}&t=${Date.now()}`), { withCredentials: true });
   stream = source;
   source.onopen = () => {
     if (stream !== source) return;
@@ -1296,7 +1296,82 @@ async function checkTokenEligibility() {
 }
 function clearTokenEligibility() {
   tokenEligibilityForm.accessToken = "";
+  tokenEligibilityForm.batchTokens = "";
   Object.assign(tokenEligibility, { loading: false, error: "", result: null });
+  Object.assign(tokenEligibility.batch, { running: false, total: 0, done: 0, results: [], stopped: false });
+}
+function parseBatchTokens() {
+  const seen = new Set();
+  const tokens = [];
+  for (const raw of String(tokenEligibilityForm.batchTokens || "").split(/[\s,;]+/)) {
+    let token = raw.trim();
+    if (!token) continue;
+    if (token.toLowerCase().startsWith("bearer ")) token = token.slice(7).trim();
+    if (token.length < 20 || token.length > 20000 || seen.has(token)) continue;
+    seen.add(token);
+    tokens.push(token);
+  }
+  return tokens;
+}
+async function startBatchTokenEligibility() {
+  const batch = tokenEligibility.batch;
+  if (batch.running) return;
+  const tokens = parseBatchTokens();
+  if (!tokens.length) {
+    notify("请先粘贴至少一个有效的 Access Token", "err");
+    return;
+  }
+  if (tokens.length > 200) {
+    notify(`一次最多批量检测 200 个，当前 ${tokens.length} 个`, "err");
+    return;
+  }
+  Object.assign(batch, { running: true, total: tokens.length, done: 0, results: [], stopped: false });
+  const chunkSize = 8;
+  try {
+    for (let offset = 0; offset < tokens.length; offset += chunkSize) {
+      if (batch.stopped) break;
+      const chunk = tokens.slice(offset, offset + chunkSize);
+      try {
+        const data = await api("/api/trial-eligibility/check-tokens", {
+          method: "POST",
+          body: jsonBody({ access_tokens: chunk, use_configured_proxy: !!tokenEligibilityForm.useConfiguredProxy, workers: 4 }),
+        });
+        for (const row of data?.results || []) {
+          batch.results.push({
+            tail: row.token_tail || "-",
+            ok: !!row.ok,
+            eligible: !!row.eligible,
+            plusActive: !!row.has_active_subscription,
+            banned: !!row.is_deactivated,
+            status: row.status || "",
+            plan: row.plan_type || "free",
+            promotions: row.promotion_count ?? 0,
+            elapsed: row.elapsed_seconds ?? null,
+            reason: row.reason || "",
+            error: row.error || "",
+          });
+        }
+      } catch (error) {
+        for (const token of chunk) {
+          batch.results.push({ tail: token.slice(-10), ok: false, eligible: false, plusActive: false, banned: false, status: "", plan: "", promotions: 0, elapsed: null, reason: "", error: error?.message || "检测失败" });
+        }
+      }
+      batch.done = Math.min(offset + chunkSize, tokens.length);
+    }
+    const eligibleCount = batch.results.filter((item) => item.ok && item.eligible).length;
+    const failedCount = batch.results.filter((item) => !item.ok).length;
+    notify(
+      batch.stopped
+        ? `批量检测已停止：完成 ${batch.done}/${batch.total}`
+        : `批量检测完成：${eligibleCount} 个符合试用资格${failedCount ? `，${failedCount} 个失败` : ""}`,
+      failedCount && !batch.stopped ? "err" : "ok",
+    );
+  } finally {
+    batch.running = false;
+  }
+}
+function stopBatchTokenEligibility() {
+  tokenEligibility.batch.stopped = true;
 }
 async function testProxies() { const result = await run(() => api("/api/proxy/test", { method: "POST", body: jsonBody({ proxies: [] }) }), (r) => `代理检测完成：可用 ${r.alive || 0}/${r.count || 0}`); if (result) proxyDiagnostics.value = result; }
 async function saveIntegration() { await run(() => api("/api/chatgpt2api", { method: "PUT", body: jsonBody({ enabled: integrationForm.enabled, url: integrationForm.url, key: integrationForm.key, auto_upload: integrationForm.autoUpload }) }), "chatgpt2api 配置已保存", [loadConfig]); }
@@ -2252,7 +2327,7 @@ async function deleteInvalidAccounts(keys) {
   refreshAccountCollectionsQuietly();
 }
 async function downloadAccounts(keys) {
-  if (!keys) { location.href = "/api/accounts/download-all"; return; }
+  if (!keys) { location.href = apiUrl("/api/accounts/download-all"); return; }
   await run(() => downloadPost("/api/accounts/download", { keys, delete_all: false }, "registered_accounts.selected.json"), "下载已生成");
 }
 async function exportSecurityCredentials(keys) {
@@ -2484,9 +2559,9 @@ async function moveAccountsToGroup(keys, groupId) {
   groups.value = previousGroups;
 }
 function exportGroupCredentials(groupId) {
-  if (groupId) location.href = `/api/account-groups/${encodeURIComponent(groupId)}/export-credentials`;
+  if (groupId) location.href = apiUrl(`/api/account-groups/${encodeURIComponent(groupId)}/export-credentials`);
 }
-function downloadLogs() { location.href = "/api/logs/download"; }
+function downloadLogs() { location.href = apiUrl("/api/logs/download"); }
 async function saveMaintenance() { await run(() => api("/api/maintenance", { method: "PUT", body: jsonBody({ enabled: maintenanceForm.enabled, interval_hours: maintenanceForm.intervalHours, workers: maintenanceForm.workers, auto_delete_invalid: maintenanceForm.autoDeleteInvalid, webhook_url: maintenanceForm.webhookUrl, notify_on_complete: maintenanceForm.notifyOnComplete, notify_on_pool_low: maintenanceForm.notifyOnPoolLow, pool_low_threshold: maintenanceForm.poolLowThreshold }) }), "维护设置已保存", [loadOperations]); }
 async function runMaintenance() {
   if (maintenanceActive.value) return;
@@ -2536,9 +2611,6 @@ async function runMaddyAutoRegister() {
 async function testWebhook() { await run(() => api("/api/maintenance/test-webhook", { method: "POST", body: jsonBody({ enabled: maintenanceForm.enabled, interval_hours: maintenanceForm.intervalHours, workers: maintenanceForm.workers, auto_delete_invalid: maintenanceForm.autoDeleteInvalid, webhook_url: maintenanceForm.webhookUrl, notify_on_complete: maintenanceForm.notifyOnComplete, notify_on_pool_low: maintenanceForm.notifyOnPoolLow, pool_low_threshold: maintenanceForm.poolLowThreshold }) }), (r) => r.message || "Webhook 测试完成"); }
 async function createBackupNow() { await run(() => api("/api/backups", { method: "POST", body: "{}" }), "备份已创建", [loadOperations]); }
 async function restoreBackupNow(name) { if (!await confirmInside(`恢复备份 ${name}？当前配置和数据会被覆盖。`, { title: "恢复备份", confirmText: "恢复", danger: true })) return; await run(() => api("/api/backups/restore", { method: "POST", body: jsonBody({ name }) }), "备份已恢复", [initialize]); }
-async function createAccountBackupNow(payload) { await run(() => api("/api/account-backups", { method: "POST", body: jsonBody({ group_id: payload?.groupId || "", status: payload?.status || "" }) }), (r) => `账号备份已创建（${r.item?.count ?? 0} 个账号）`, [loadOperations]); }
-async function restoreAccountBackupNow(payload) { const replace = payload?.mode === "replace"; const desc = replace ? "覆盖模式会替换当前全部账号数据" : "合并模式只补充当前缺少的账号，不改动现有账号"; if (!await confirmInside(`从账号备份 ${payload.name} 恢复？${desc}。`, { title: "恢复账号备份", confirmText: "恢复", danger: replace })) return; await run(() => api("/api/account-backups/restore", { method: "POST", body: jsonBody({ name: payload.name, mode: replace ? "replace" : "merge" }) }), (r) => `账号备份已恢复：写入 ${r.restored || 0} 个 · 跳过 ${r.skipped || 0} 个`, [loadAccounts, loadOperations]); }
-async function deleteAccountBackupNow(name) { if (!await confirmInside(`删除账号备份 ${name}？删除后不可恢复。`, { title: "删除账号备份", confirmText: "删除", danger: true })) return; await run(() => api(`/api/account-backups/${encodeURIComponent(name)}`, { method: "DELETE" }), "账号备份已删除", [loadOperations]); }
 async function restoreTrash(ids) { await run(() => api("/api/accounts/trash/restore", { method: "POST", body: jsonBody({ ids }) }), (r) => `已恢复 ${r.restored || 0} 个账号`, [loadTrash, loadAccounts, loadGroups, loadStatus, loadOperations]); }
 async function changePassword() { const result = await run(() => api("/api/auth/change-password", { method: "POST", body: jsonBody({ current_password: securityForm.currentPassword, new_password: securityForm.newPassword }) }), "密码已修改"); if (result) Object.assign(securityForm, { currentPassword: "", newPassword: "", confirmPassword: "" }); }
 async function revokeSessions() { if (!await confirmInside("退出其他所有面板会话？", { title: "会话安全", confirmText: "退出其他会话", danger: true })) return; await run(() => api("/api/auth/revoke-sessions", { method: "POST", body: "{}" }), "其他会话已失效"); }
@@ -2618,7 +2690,7 @@ onBeforeUnmount(() => {
         <MailView v-else-if="active === 'mail'" :forms="mailForms" :mailboxes="mailboxes" :progress="progress" :busy="busy" @save-outlook="saveOutlook" @save-icloud="saveIcloud" @save-domain="saveDomainMail" @save-maddy="saveMaddyMail" @save-fastmail="saveFastmailMail" @load-domain-options="loadDomainOptions" @load-maddy-domains="loadMaddyDomains" @load-fastmail-accounts="loadFastmailAccounts" @refresh="loadMailboxes" @delete="deleteMailboxes" @state="updateMailboxState" />
         <ProxyView v-else-if="active === 'proxy'" :form="proxyForm" :diagnostics="proxyDiagnostics" :progress="progress" :busy="busy" @save="saveProxy" @test="testProxies" />
         <TrialProxyView v-else-if="active === 'trial-proxy'" :form="trialProxyForm" :busy="busy" @save="saveTrialProxyPool" @refresh="loadTrialProxyPool" />
-        <PlusEligibilityView v-else-if="active === 'plus-eligibility'" :form="tokenEligibilityForm" :state="tokenEligibility" @check="checkTokenEligibility" @clear="clearTokenEligibility" />
+        <PlusEligibilityView v-else-if="active === 'plus-eligibility'" :form="tokenEligibilityForm" :state="tokenEligibility" @check="checkTokenEligibility" @clear="clearTokenEligibility" @batch-check="startBatchTokenEligibility" @batch-stop="stopBatchTokenEligibility" />
         <IntegrationView v-else-if="active === 'chatgpt2api'" :form="integrationForm" :groups="groups" :progress="progress" :busy="busy" @save="saveIntegration" @test="testIntegration" @upload="uploadIntegration" />
         <LogsView v-else-if="active === 'logs'" :logs="logs" :connected="connected" @refresh="loadLogs" @download="downloadLogs" @clear="logs = []" />
         <AccountsView v-else-if="active === 'accounts'" :accounts="accounts" :accounts-loading="accountsLoading" :account-load-progress="accountLoadProgress" :account-load-error="accountLoadError" :groups="groups" :proxy-countries="proxyForm.countries" :busy="busy" :copying-at="copyingAccessToken" :health-progress="healthProgress" :reauth-progress="reauthProgress" :trial-progress="trialProgress" @refresh="loadAccounts" @health="healthAccounts" @trial-check="trialEligibilityAccounts" @reauth="reauthAccounts" @security-repair="repairSecurityAccounts" @password-change="changeAccountPasswords" @totp-change="changeAccountTotp" @account-logs="openAccountLogs" @stop-reauth="stopReauth" @delete="deleteAccounts" @delete-invalid="deleteInvalidAccounts" @download="downloadAccounts" @copy-selected-at="copySelectedAccessTokens" @export-selected-at="exportSelectedAccessTokens" @export-security="exportSecurityCredentials" @create-group="createAccountGroup" @rename-group="renameAccountGroup" @delete-group="deleteAccountGroup" @move-group="moveAccountsToGroup" @export-group="exportGroupCredentials" @copy-at="copyAccessToken" @copy-credential="copyAccountCredential" @copy-value="copyValue" @generate-cdk="generateCdkForAccount" />
@@ -2626,7 +2698,7 @@ onBeforeUnmount(() => {
         <CredentialExportView v-else-if="active === 'credential-export'" :accounts="accounts" :busy="busy" @export="exportSecurityByEmail" />
         <ProtocolLoginView v-else-if="active === 'protocol-login'" :accounts="accounts" :progress="reauthProgress" :health-progress="healthProgress" :preflight="protocolLoginPreflight" :busy="busy" @start="startProtocolLoginByEmail" @stop="stopReauth" @health="healthProtocolLoginEmails" @input-change="resetProtocolLoginResultsForInput" />
         <CDKView v-else-if="active === 'cdk'" :groups="groups" :cdks="cdks" :summary="cdkSummary" :eligibility="cdkEligibility" :generated="generatedCdks" :busy="busy" @group-change="loadCdks" @generate="generateCdks" @status="changeCdkStatus" @refresh="loadCdks" @clear-generated="generatedCdks = []" />
-        <OperationsView v-else-if="active === 'operations'" :operations="operations" :trash="trash" :form="maintenanceForm" :maddy-auto-form="maddyAutoForm" :groups="groups" :security="securityForm" :busy="busy" :maintenance-running="maintenanceActive" :maddy-auto-running="maddyAutoActive" @refresh="() => Promise.all([loadOperations(), loadTrash()])" @save="saveMaintenance" @run="runMaintenance" @save-maddy-auto="saveMaddyAutoRegister" @run-maddy-auto="runMaddyAutoRegister" @test-webhook="testWebhook" @backup="createBackupNow" @restore-backup="restoreBackupNow" @create-account-backup="createAccountBackupNow" @restore-account-backup="restoreAccountBackupNow" @delete-account-backup="deleteAccountBackupNow" @restore-trash="restoreTrash" @change-password="changePassword" @revoke-sessions="revokeSessions" />
+        <OperationsView v-else-if="active === 'operations'" :operations="operations" :trash="trash" :form="maintenanceForm" :maddy-auto-form="maddyAutoForm" :groups="groups" :security="securityForm" :busy="busy" :maintenance-running="maintenanceActive" :maddy-auto-running="maddyAutoActive" @refresh="() => Promise.all([loadOperations(), loadTrash()])" @save="saveMaintenance" @run="runMaintenance" @save-maddy-auto="saveMaddyAutoRegister" @run-maddy-auto="runMaddyAutoRegister" @test-webhook="testWebhook" @backup="createBackupNow" @restore-backup="restoreBackupNow" @restore-trash="restoreTrash" @change-password="changePassword" @revoke-sessions="revokeSessions" />
       </template>
     </main>
     <footer class="foot"><span>gpt-register-fp · Vue 3</span></footer>

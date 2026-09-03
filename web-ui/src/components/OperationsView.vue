@@ -1,5 +1,6 @@
 <script setup>
 import { computed, ref } from "vue";
+import { apiUrl } from "../api.js";
 
 const props = defineProps({
   operations: { type: Object, default: () => ({}) },
@@ -12,9 +13,8 @@ const props = defineProps({
   maintenanceRunning: Boolean,
   maddyAutoRunning: Boolean,
 });
-const emit = defineEmits(["refresh", "save", "run", "save-maddy-auto", "run-maddy-auto", "test-webhook", "backup", "restore-backup", "create-account-backup", "restore-account-backup", "delete-account-backup", "restore-trash", "change-password", "revoke-sessions"]);
+const emit = defineEmits(["refresh", "save", "run", "save-maddy-auto", "run-maddy-auto", "test-webhook", "backup", "restore-backup", "restore-trash", "change-password", "revoke-sessions"]);
 const selectedTrash = ref([]);
-const accountBackup = ref({ groupId: "", status: "", restoreMode: "merge" });
 const canChangePassword = computed(() => props.security.currentPassword && props.security.newPassword.length >= 8 && props.security.newPassword === props.security.confirmPassword);
 const successRate = computed(() => Math.max(0, Math.min(100, Number(props.operations.metrics?.success_rate || 0))));
 const mailRate = computed(() => props.operations.mail?.total ? Math.round(Number(props.operations.mail.available || 0) * 100 / Number(props.operations.mail.total)) : 0);
@@ -43,9 +43,16 @@ function formatTime(value) { if (!value) return "-"; try { const date = new Date
           <div class="dashboard-kpis"><div><strong>{{ operations.mail?.available ?? 0 }}</strong><span>可用邮箱</span></div><div><strong>{{ operations.accounts?.invalid_other ?? 0 }}</strong><span>其它失效账号</span></div><div><strong>{{ operations.trash_count ?? 0 }}</strong><span>回收站</span></div></div>
         </div>
         <div class="failure-chart">
-          <div class="failure-chart-title"><b>失败原因排行</b><span>{{ operations.metrics?.failed || 0 }} 次失败</span></div>
+          <div class="failure-chart-title"><b>失败原因排行</b><span class="failure-total">{{ operations.metrics?.failed || 0 }} 次失败</span></div>
           <div v-if="!operations.metrics?.failure_reasons?.length" class="dashboard-empty">暂无累计失败明细</div>
-          <div v-for="item in operations.metrics?.failure_reasons || []" :key="item.reason" class="failure-bar"><div><span>{{ item.reason }}</span><b>{{ item.count }}</b></div><div class="failure-track"><i :style="{ width: `${Math.max(8, item.count * 100 / failureMax)}%` }"></i></div></div>
+          <ol v-else class="failure-list">
+            <li v-for="(item, rank) in operations.metrics?.failure_reasons || []" :key="item.reason" class="failure-item">
+              <span class="failure-rank">{{ rank + 1 }}</span>
+              <span class="failure-reason" :title="item.reason">{{ item.reason }}</span>
+              <b class="failure-count">{{ item.count }}</b>
+              <div class="failure-track"><i :style="{ width: `${Math.max(4, item.count * 100 / failureMax)}%` }"></i></div>
+            </li>
+          </ol>
         </div>
       </div>
     </section>
@@ -85,27 +92,12 @@ function formatTime(value) { if (!value) return "-"; try { const date = new Date
 
     <section class="card">
       <div class="card-h"><div><h2>备份与恢复</h2><p class="subtle">备份配置、账号、分组和邮箱状态。</p></div><button class="btn primary" :disabled="busy" @click="emit('backup')">创建备份</button></div>
-      <div class="ops-list"><div v-if="!operations.backups?.length" class="empty-card">暂无备份</div><div v-for="item in operations.backups" :key="item.name" class="ops-row"><div><b>{{ item.name }}</b><small>{{ formatTime(item.created_at) }} · {{ formatSize(item.size) }}</small></div><div class="row-btns"><a class="btn secondary sm" :href="`/api/backups/${encodeURIComponent(item.name)}`">下载</a><button class="btn danger sm" :disabled="busy" @click="emit('restore-backup', item.name)">恢复</button></div></div></div>
+      <div class="ops-list"><div v-if="!operations.backups?.length" class="empty-card">暂无备份</div><div v-for="item in operations.backups" :key="item.name" class="ops-row"><div><b>{{ item.name }}</b><small>{{ formatTime(item.created_at) }} · {{ formatSize(item.size) }}</small></div><div class="row-btns"><a class="btn secondary sm" :href="apiUrl(`/api/backups/${encodeURIComponent(item.name)}`)">下载</a><button class="btn danger sm" :disabled="busy" @click="emit('restore-backup', item.name)">恢复</button></div></div></div>
     </section>
 
     <section class="card">
-      <div class="card-h"><div><h2>账号备份</h2><p class="subtle">仅备份账号数据（含登录凭据），可按分组或状态筛选，保留最近 20 份。</p></div><button class="btn primary" :disabled="busy" @click="emit('create-account-backup', { groupId: accountBackup.groupId, status: accountBackup.status })">创建账号备份</button></div>
-      <div class="form two">
-        <label>分组范围<select v-model="accountBackup.groupId"><option value="">全部分组</option><option v-for="group in groups" :key="group.id" :value="group.id">{{ group.name }}</option></select></label>
-        <label>状态筛选<select v-model="accountBackup.status"><option value="">全部状态</option><option value="正常">正常</option><option value="已封号">已封号</option><option value="异常">异常</option></select></label>
-      </div>
-      <div class="actions backup-mode-row">
-        <span class="backup-mode-label">恢复模式</span>
-        <button type="button" :class="['btn', 'sm', accountBackup.restoreMode === 'merge' ? 'primary' : 'secondary']" :disabled="busy" @click="accountBackup.restoreMode = 'merge'">合并（只补缺）</button>
-        <button type="button" :class="['btn', 'sm', accountBackup.restoreMode === 'replace' ? 'primary' : 'secondary']" :disabled="busy" @click="accountBackup.restoreMode = 'replace'">覆盖全部</button>
-      </div>
-      <div class="ops-list"><div v-if="!operations.account_backups?.length" class="empty-card">暂无账号备份</div><div v-for="item in operations.account_backups" :key="item.name" class="ops-row"><div><b>{{ item.name }}</b><small>{{ formatTime(item.created_at) }} · {{ formatSize(item.size) }} · {{ item.count || 0 }} 个账号</small></div><div class="row-btns"><a class="btn secondary sm" :href="`/api/account-backups/${encodeURIComponent(item.name)}`">下载</a><button class="btn secondary sm" :disabled="busy" @click="emit('restore-account-backup', { name: item.name, mode: accountBackup.restoreMode })">恢复</button><button class="btn danger sm" :disabled="busy" @click="emit('delete-account-backup', item.name)">删除</button></div></div></div>
-      <p class="hint">合并恢复只补充当前缺少的账号，不改动现有账号；覆盖恢复会替换全部账号数据。备份文件包含访问凭据，请妥善保管。</p>
-    </section>
-
-    <section class="card">
-      <div class="card-h"><div><h2>账号回收站</h2><p class="subtle">网页删除的账号可在这里恢复。</p></div></div>
-      <div class="ops-list"><div v-if="!trash.length" class="empty-card">回收站为空</div><label v-for="item in trash.slice(0, 50)" :key="item.trash_id" class="ops-row selectable"><input v-model="selectedTrash" type="checkbox" :value="item.trash_id" /><div><b>{{ item.account?.email || item.account?.account_id || '未知账号' }}</b><small>{{ item.reason }} · {{ formatTime(item.deleted_at) }}</small></div></label></div>
+      <div class="card-h"><div><h2>账号回收站</h2><p class="subtle">网页删除的账号可在这里恢复，共 {{ trash.length }} 条。</p></div></div>
+      <div class="ops-list trash-list"><div v-if="!trash.length" class="empty-card">回收站为空</div><label v-for="item in trash.slice(0, 50)" :key="item.trash_id" class="ops-row selectable trash-row"><input v-model="selectedTrash" type="checkbox" :value="item.trash_id" /><div class="trash-info"><b>{{ item.account?.email || item.account?.account_id || '未知账号' }}</b><small><span class="trash-reason">{{ item.reason }}</span><span class="trash-time">{{ formatTime(item.deleted_at) }}</span></small></div></label></div>
       <div class="actions"><button class="btn secondary" :disabled="!selectedTrash.length || busy" @click="emit('restore-trash', selectedTrash); selectedTrash = []">恢复选中</button></div>
     </section>
 
