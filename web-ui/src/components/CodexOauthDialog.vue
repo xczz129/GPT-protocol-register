@@ -87,7 +87,7 @@ async function copyRt(rt, email) {
                   <small v-if="item.status === 'success'">RT {{ shortRt(item.refresh_token) }}<template v-if="rtDays(item.expires_in)"> · 约 {{ rtDays(item.expires_in) }} 天</template></small>
                   <small v-else>{{ item.error }}</small>
                 </div>
-                <button v-if="item.status === 'success'" class="btn secondary sm" type="button" title="复制完整 refresh_token" @click="copyRt(item.refresh_token, item.email)"><Copy :size="12" aria-hidden="true" />{{ copiedKey === item.email ? "已复制" : "复制 RT" }}</button>
+                <button v-if="item.status === 'success'" class="btn secondary sm" type="button" title="复制完整 refresh_token" @click="copyRt(item.refresh_token, item.email)"><Copy :size="12" aria-hidden="true" />{{ copiedKey === item.email ? "已复制" : (item.token_kind === "at" ? "复制 AT" : "复制 RT") }}</button>
               </div>
             </div>
             <div ref="logsEl" class="codex-oauth-logs">

@@ -32,7 +32,7 @@ function submit() {
             <div>
               <span class="app-dialog-kicker"><Upload :size="12" aria-hidden="true" />导入账号</span>
               <h2>邮箱----密码----2FA 协议登录</h2>
-              <small>自动识别并协议登录,获取 AT/RT 后写入账号库</small>
+              <small>自动识别并协议登录(密码 + TOTP),获取 AT 会话凭证后写入账号库</small>
             </div>
             <button class="app-dialog-close" type="button" title="关闭" aria-label="关闭" @click="emit('close')"><X :size="16" aria-hidden="true" /></button>
           </div>
