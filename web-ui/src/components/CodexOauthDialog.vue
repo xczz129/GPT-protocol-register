@@ -63,12 +63,12 @@ async function copyRt(rt, email) {
   <Teleport to="body">
     <Transition name="dialog-fade">
       <div v-if="open" class="app-dialog-mask" role="presentation" @click.self="emit('close')">
-        <section class="app-dialog codex-oauth-dialog" role="dialog" aria-modal="true" aria-label="接码补发 RT" @keyup.esc="emit('close')">
+        <section class="app-dialog codex-oauth-dialog" role="dialog" aria-modal="true" aria-label="接码" @keyup.esc="emit('close')">
           <div class="app-dialog-head">
             <div>
-              <span class="app-dialog-kicker"><Smartphone :size="12" aria-hidden="true" />接码补发 RT</span>
-              <h2>Codex OAuth 协议登录</h2>
-              <small>refresh_token 补发 · 手机验证自动接码轮换</small>
+              <span class="app-dialog-kicker"><Smartphone :size="12" aria-hidden="true" />接码</span>
+              <h2>接码进度</h2>
+              <small>自动接码 · 完成后可复制 RT</small>
             </div>
             <button class="app-dialog-close" type="button" title="关闭" aria-label="关闭" @click="emit('close')"><X :size="16" aria-hidden="true" /></button>
           </div>
