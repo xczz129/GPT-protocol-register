@@ -16,7 +16,12 @@ from typing import Any, Iterable
 
 from config import ROOT
 from proxy_util import normalize_proxy_url, proxy_brief
-from common.account_store import export_account_records, replace_account_records
+from common.account_store import (
+    ACCOUNTS_FILE,
+    export_account_records,
+    load_accounts,
+    replace_account_records,
+)
 from common.task_store import (
     delete_runtime as _delete_task_runtime,
     export_runtime as _export_task_runtime,
@@ -368,6 +373,146 @@ def restore_backup(name: str) -> list[str]:
                 pass
             restored.append(arcname)
     return restored
+
+
+ACCOUNT_BACKUP_PREFIX = "gpt-accounts-backup-"
+ACCOUNT_BACKUP_KEEP = 20
+
+
+def _rotate_account_backups() -> None:
+    """Keep only the newest ACCOUNT_BACKUP_KEEP account snapshots."""
+    if not BACKUP_DIR.is_dir():
+        return
+    snaps = sorted(
+        (item for item in BACKUP_DIR.glob(ACCOUNT_BACKUP_PREFIX + "*.json")),
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+    for stale in snaps[ACCOUNT_BACKUP_KEEP:]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
+
+def create_account_backup(group_id: str = "", status: str = "") -> dict[str, Any]:
+    """Snapshot account records (with credentials) into a standalone JSON file."""
+    records = load_accounts(ACCOUNTS_FILE)
+    group_id = str(group_id or "").strip()
+    status = str(status or "").strip()
+    selected = [
+        record
+        for record in records
+        if (not group_id or str(record.get("group_id") or "") == group_id)
+        and (not status or str(record.get("status") or "") == status)
+    ]
+    if not selected:
+        raise ValueError("筛选条件下没有匹配的账号")
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    _rotate_account_backups()
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = f"{ACCOUNT_BACKUP_PREFIX}{stamp}-{len(selected)}.json"
+    path = BACKUP_DIR / name
+    payload = {
+        "meta": {
+            "version": 1,
+            "created_at": _now(),
+            "count": len(selected),
+            "filters": {key: value for key, value in (("group_id", group_id), ("status", status)) if value},
+        },
+        "accounts": selected,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+    return {
+        "name": name,
+        "size": path.stat().st_size,
+        "created_at": _now(),
+        "count": len(selected),
+    }
+
+
+def list_account_backups() -> list[dict[str, Any]]:
+    if not BACKUP_DIR.is_dir():
+        return []
+    out = []
+    for path in sorted(BACKUP_DIR.glob(ACCOUNT_BACKUP_PREFIX + "*.json"), reverse=True):
+        stat = path.stat()
+        count = 0
+        tail = path.stem.rsplit("-", 1)[-1]
+        if tail.isdigit():
+            count = int(tail)
+        out.append(
+            {
+                "name": path.name,
+                "size": stat.st_size,
+                "count": count,
+                "created_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
+            }
+        )
+    return out[:50]
+
+
+def account_backup_path(name: str) -> Path:
+    clean = Path(str(name or "")).name
+    if not clean.startswith(ACCOUNT_BACKUP_PREFIX) or not clean.endswith(".json"):
+        raise ValueError("invalid account backup name")
+    path = BACKUP_DIR / clean
+    if not path.is_file():
+        raise FileNotFoundError(clean)
+    return path
+
+
+def _read_account_backup(name: str) -> list[dict[str, Any]]:
+    path = account_backup_path(name)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError("账号备份文件损坏或格式无效") from exc
+    accounts = payload.get("accounts") if isinstance(payload, dict) else None
+    if not isinstance(accounts, list) or not all(isinstance(item, dict) for item in accounts):
+        raise ValueError("账号备份文件损坏或格式无效")
+    return accounts
+
+
+def restore_account_backup(name: str, mode: str = "merge") -> dict[str, Any]:
+    """Restore accounts from a snapshot: merge adds missing, replace overwrites."""
+    accounts = _read_account_backup(name)
+    if mode == "replace":
+        replace_account_records(accounts, ACCOUNTS_FILE)
+        return {"mode": mode, "restored": len(accounts), "skipped": 0, "total": len(accounts)}
+    current = load_accounts(ACCOUNTS_FILE)
+    existing: set[str] = set()
+    for record in current:
+        for field in ("account_id", "email"):
+            value = str(record.get(field) or "").strip().lower()
+            if value:
+                existing.add(value)
+    incoming: list[dict[str, Any]] = []
+    skipped = 0
+    for record in accounts:
+        keys = {
+            str(record.get(field) or "").strip().lower()
+            for field in ("account_id", "email")
+            if str(record.get(field) or "").strip()
+        }
+        if keys & existing:
+            skipped += 1
+            continue
+        incoming.append(record)
+        existing |= keys
+    if incoming:
+        replace_account_records(current + incoming, ACCOUNTS_FILE)
+    return {"mode": "merge", "restored": len(incoming), "skipped": skipped, "total": len(accounts)}
+
+
+def delete_account_backup(name: str) -> str:
+    path = account_backup_path(name)
+    path.unlink()
+    return path.name
 
 
 def probe_proxy(proxy: str, *, timeout: float = 15.0) -> dict[str, Any]:

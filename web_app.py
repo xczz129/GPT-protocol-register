@@ -127,6 +127,7 @@ from common.panel_ops import (
     backup_path,
     create_backup,
     delete_task_runtime,
+    list_account_backups,
     list_backups,
     list_trash,
     load_ops_state,
@@ -9036,6 +9037,7 @@ async def operations():
                 "maddy_auto_register": maddy_auto,
                 "state": state,
                 "backups": list_backups(),
+                "account_backups": list_account_backups(),
                 "trash_count": len(list_trash(limit=1000)),
             }
 
@@ -9190,6 +9192,11 @@ async def backups_restore(body: BackupRestoreRequest):
 
 
 
+
+
+from web.routes.account_backups import router as account_backups_router  # noqa: E402
+
+app.include_router(account_backups_router)
 
 
 def create_app() -> FastAPI:

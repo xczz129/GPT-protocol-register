@@ -893,6 +893,9 @@ button, input, select, textarea { color: inherit; }
 .reason-list > div, .ops-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--line); }
 .reason-list span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ops-list { max-height: 310px; overflow: auto; }
+.backup-mode-row { margin-top: 12px; }
+.backup-mode-label { color: var(--muted); font-size: 11px; }
+
 .ops-row > div:first-of-type { min-width: 0; }
 .ops-row b { overflow-wrap: anywhere; }
 .ops-row.selectable { justify-content: flex-start; cursor: pointer; }
