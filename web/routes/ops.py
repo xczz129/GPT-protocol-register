@@ -653,6 +653,48 @@ async def operations():
     return await asyncio.to_thread(_response)
 
 
+class UiSettingsUpdate(BaseModel):
+    health_workers: int = Field(default=10, ge=1, le=20)
+    reauth_workers: int = Field(default=3, ge=1, le=20)
+
+
+@router.get("/api/ui-settings")
+async def ui_settings_get():
+    def _do():
+        cfg = _state()._read_config()
+        raw = cfg.get("ui_settings") if isinstance(cfg.get("ui_settings"), dict) else {}
+
+        def _int(value, default):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        return {
+            "ok": True,
+            "health_workers": max(1, min(_int(raw.get("health_workers"), 10), 20)),
+            "reauth_workers": max(1, min(_int(raw.get("reauth_workers"), 3), 20)),
+        }
+
+    return await asyncio.to_thread(_do)
+
+
+@router.put("/api/ui-settings")
+async def ui_settings_update(body: UiSettingsUpdate):
+    def _do():
+        with _state()._edit_config() as cfg:
+            current = cfg.setdefault("ui_settings", {})
+            current.update(
+                {
+                    "health_workers": max(1, min(int(body.health_workers or 10), 20)),
+                    "reauth_workers": max(1, min(int(body.reauth_workers or 3), 20)),
+                }
+            )
+        return {"ok": True}
+
+    return await asyncio.to_thread(_do)
+
+
 @router.get("/api/cache/status")
 async def cache_status():
     def _status():

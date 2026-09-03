@@ -2229,3 +2229,14 @@ table.acct .col-actions { text-align: right; white-space: nowrap; }
 .sms-country-chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .sms-country-chip { padding: 2px 10px; border-radius: 999px; background: var(--bg-3); color: var(--ink-600); font-size: 12px; }
 .sms-country-none { color: var(--ink-400); font-size: 12px; }
+
+/* concurrency dialog */
+.concurrency-dialog { width: min(460px, 100%); }
+.concurrency-field { display: grid; gap: 8px; margin: 14px 0 4px; }
+.concurrency-field span { font-size: 13px; color: var(--ink-600); font-weight: 600; }
+.concurrency-field input { padding: 9px 12px; border: 1px solid var(--bg-3); border-radius: 8px; background: var(--bg-1); color: var(--ink-800); font-size: 14px; }
+.concurrency-field input:focus { outline: none; border-color: var(--acc, #6366f1); }
+.concurrency-actions { align-items: center; }
+.concurrency-save { font-size: 12px; padding: 7px 10px; }
+.concurrency-save.saved { border-color: var(--ok, #16a34a); color: var(--ok, #16a34a); }
+.concurrency-spacer { flex: 1; }

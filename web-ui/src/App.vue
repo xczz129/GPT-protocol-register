@@ -7,6 +7,7 @@ import AccountLogDialog from "./components/AccountLogDialog.vue";
 import CodexOauthDialog from "./components/CodexOauthDialog.vue";
 import ImportAccountsDialog from "./components/ImportAccountsDialog.vue";
 import SmsCountryPicker from "./components/SmsCountryPicker.vue";
+import ConcurrencyDialog from "./components/ConcurrencyDialog.vue";
 import AppDialog from "./components/AppDialog.vue";
 import AppSidebar from "./components/AppSidebar.vue";
 import BrowserView from "./components/BrowserView.vue";
@@ -1924,7 +1925,6 @@ async function healthAccounts(keys, options = {}) {
     }
   }
   if ((!all && !targetKeys.length) || (all && !targetKeys.length && !knownTotal) || healthProgress.running) return;
-  const workers = Math.max(1, Math.min(20, Math.floor(Number(options.workers) || 10)));
   const title = options.title || "账号测活";
   const wantedKeys = all ? null : new Set(targetKeys);
   let knownSkipped = 0;
@@ -1932,8 +1932,15 @@ async function healthAccounts(keys, options = {}) {
     if (item?.is_deactivated && (all || wantedKeys.has(item.delete_key))) knownSkipped += 1;
   }
   const requestCount = all ? Math.max(knownTotal, targetKeys.length) : targetKeys.length;
-  const description = options.description || `请求 ${requestCount} 条账号记录，已封号记录自动跳过；使用 ${workers} 路并发检测。`;
-  if (!await confirmInside(description, { title, confirmText: "开始检测" })) return;
+  const savedHealthWorkers = Math.max(1, Math.min(20, Math.floor(Number(uiSettings.value.health_workers) || 10)));
+  const pickedWorkers = await openConcurrencyDialog({
+    title,
+    message: options.description || `请求 ${requestCount} 条账号记录，已封号记录自动跳过。`,
+    value: savedHealthWorkers,
+    kind: "health",
+  });
+  if (!pickedWorkers) return;
+  const workers = Math.max(1, Math.min(20, Math.floor(Number(pickedWorkers) || savedHealthWorkers)));
   Object.assign(healthProgress, { running: true, requested: requestCount, actualTotal: Math.max(0, requestCount - knownSkipped), total: Math.max(0, requestCount - knownSkipped), done: 0, checked: 0, usable: 0, unavailable: knownSkipped, skippedKnownDeactivated: knownSkipped, deactivated: knownSkipped, invalidOther: 0, current: `${workers} 路协议请求并发`, alive: 0, limited: 0, invalid: 0, reauthRequired: 0, error: 0, requestedWorkers: workers, workers, throttled: false, resourceMode: "normal", updates: [] });
   startHealthProgressPolling();
   healthRequestActive = true;
@@ -2029,13 +2036,19 @@ async function pollTrialProgress() {
 async function reauthAccounts(request) {
   const targetKeys = [...(Array.isArray(request) ? request : request?.keys || [])].filter(Boolean);
   const mode = request?.mode === "browser" ? "browser" : "protocol";
-  const concurrency = Math.max(1, Math.floor(Number(request?.concurrency) || 3));
   const modeLabel = mode === "protocol" ? "协议" : "浏览器";
-  const actionDescription = mode === "protocol"
-    ? `将 ${targetKeys.length} 个账号按 ${concurrency} 路并发提交，使用已保存的密码和 TOTP 2FA 重新登录，不读取邮箱验证码。`
-    : `将 ${targetKeys.length} 个账号按 ${concurrency} 路并发提交，使用浏览器重新登录并读取邮箱验证码。`;
   if (!targetKeys.length || reauthProgress.running) return;
-  if (!await confirmInside(actionDescription, { title: `重新登录账号 · ${modeLabel}`, confirmText: "开始重新登录" })) return;
+  const savedReauthWorkers = Math.max(1, Math.min(20, Math.floor(Number(uiSettings.value.reauth_workers) || 3)));
+  const pickedConcurrency = await openConcurrencyDialog({
+    title: `重新登录账号 · ${modeLabel}`,
+    message: mode === "protocol"
+      ? `将 ${targetKeys.length} 个账号使用已保存的密码和 TOTP 2FA 重新登录，不读取邮箱验证码。`
+      : `将 ${targetKeys.length} 个账号使用浏览器重新登录并读取邮箱验证码。`,
+    value: savedReauthWorkers || Math.max(1, Math.floor(Number(request?.concurrency) || 3)),
+    kind: "reauth",
+  });
+  if (!pickedConcurrency) return;
+  const concurrency = Math.max(1, Math.floor(Number(pickedConcurrency) || 3));
   Object.assign(reauthProgress, { running: true, stopping: false, mode, operation: "reauth", concurrency, total: targetKeys.length, done: 0, current: `${concurrency} 路并发`, success: 0, failed: 0, cancelled: 0, last: "", lastStatus: "", lastMessage: "" });
   try {
     const value = await api("/api/accounts/reauth/start", { method: "POST", body: jsonBody({ keys: targetKeys, mode, concurrency }) });
@@ -2534,6 +2547,29 @@ function smsCountryIds() { const text = smsForm.provider === "firefox" ? smsForm
 const smsCountries = computed(() => smsCountryDialog.selected.map((id) => { const hit = (smsCountryDialog.items || []).find((item) => String(item.id) === String(id)); return hit ? `${hit.name}${hit.calling || ""}` : id; }));
 async function openSmsCountryPicker() { smsCountryDialog.open = true; smsCountryDialog.loading = true; smsCountryDialog.error = ""; smsCountryDialog.selected = smsCountryIds(); try { const value = await api(`/api/sms-countries?provider=${encodeURIComponent(smsForm.provider)}`); smsCountryDialog.items = value.items || []; } catch (error) { smsCountryDialog.error = error?.message || "获取国家列表失败"; } finally { smsCountryDialog.loading = false; } }
 function toggleSmsCountry(id) { const value = String(id); const list = smsCountryDialog.selected; const index = list.indexOf(value); if (index >= 0) { list.splice(index, 1); } else { list.push(value); } const text = list.join(", "); if (smsForm.provider === "firefox") { smsForm.firefoxCountryOrder = text; } else { smsForm.countryOrder = text; } }
+const uiSettings = ref({ health_workers: 10, reauth_workers: 3 });
+let uiSettingsLoaded = false;
+async function loadUiSettings() { try { const value = await api("/api/ui-settings"); uiSettings.value = value || {}; uiSettingsLoaded = true; } catch {} }
+const concurrencyDialog = reactive({ open: false, title: "", message: "", value: 10, kind: "health" });
+let concurrencyDialogResolve = null;
+async function openConcurrencyDialog({ title, message, value, kind }) {
+  if (!uiSettingsLoaded) await loadUiSettings();
+  if (concurrencyDialogResolve) { const stale = concurrencyDialogResolve; concurrencyDialogResolve = null; stale(null); }
+  Object.assign(concurrencyDialog, { open: true, title: title || "并发设置", message: message || "", value: Math.max(1, Math.min(20, Math.floor(Number(value) || 1))), kind: kind || "health" });
+  return new Promise((resolve) => { concurrencyDialogResolve = resolve; });
+}
+function closeConcurrencyDialog(result) {
+  concurrencyDialog.open = false;
+  const resolve = concurrencyDialogResolve;
+  concurrencyDialogResolve = null;
+  resolve?.(result);
+}
+async function saveConcurrencyDefault(value) {
+  const workers = Math.max(1, Math.min(20, Math.floor(Number(value) || 1)));
+  const payload = { health_workers: Number(uiSettings.value.health_workers) || 10, reauth_workers: Number(uiSettings.value.reauth_workers) || 3 };
+  if (concurrencyDialog.kind === "health") { payload.health_workers = workers; } else { payload.reauth_workers = workers; }
+  try { await api("/api/ui-settings", { method: "PUT", body: jsonBody(payload) }); uiSettings.value = payload; notify("并发默认值已保存", "ok"); } catch (error) { notify(error?.message || "保存失败", "err"); }
+}
 const importAccountsDialog = reactive({ open: false });
 async function submitImportAccounts(text) { const value = String(text || "").trim(); if (!value) return; await run(() => api("/api/codex-oauth/import", { method: "POST", body: jsonBody({ text: value }) }), "导入任务已启动"); importAccountsDialog.open = false; codexOauthDialog.open = true; stopCodexOauthPolling(); codexOauthTimer = setInterval(async () => { try { codexOauthStatus.value = await api("/api/codex-oauth/status"); if (!codexOauthStatus.value.running) stopCodexOauthPolling(); } catch { stopCodexOauthPolling(); } }, 2000); }
 
@@ -2634,6 +2670,7 @@ onBeforeUnmount(() => {
     <AppDialog :dialog="dialog" @confirm="closeDialog" @cancel="closeDialog(false)" />
     <PasswordChangeDialog :open="passwordChangeDialog.open" :count="passwordChangeDialog.count" @confirm="closePasswordChangeDialog" @cancel="closePasswordChangeDialog(false)" />
     <ClipboardDialog :open="clipboardDialog.open" :title="clipboardDialog.title" :value="clipboardDialog.value" @close="closeClipboardDialog" @copied="clipboardDialogCopied" />
+    <ConcurrencyDialog :open="concurrencyDialog.open" :title="concurrencyDialog.title" :message="concurrencyDialog.message" :value="concurrencyDialog.value" @confirm="closeConcurrencyDialog" @cancel="closeConcurrencyDialog(null)" @save="saveConcurrencyDefault" />
     <SmsCountryPicker :open="smsCountryDialog.open" :provider="smsForm.provider" :items="smsCountryDialog.items" :selected="smsCountryDialog.selected" :loading="smsCountryDialog.loading" :error="smsCountryDialog.error" @close="smsCountryDialog.open = false" @toggle="toggleSmsCountry" />
     <ImportAccountsDialog :open="importAccountsDialog.open" :busy="busy" @close="importAccountsDialog.open = false" @submit="submitImportAccounts" />
     <CodexOauthDialog :open="codexOauthDialog.open" :status="codexOauthStatus" @close="closeCodexOauth" @stop="stopCodexOauth" @copy="codexCopyRt" />
