@@ -70,7 +70,7 @@ function formatTime(value) { if (!value) return "-"; try { const date = new Date
         <label>邮箱预警阈值<input v-model.number="form.poolLowThreshold" type="number" min="0" /></label>
       </div>
       <div class="actions"><button class="primary" :disabled="busy" @click="emit('save')">保存维护设置</button><button class="btn secondary" :disabled="busy || maintenanceRunning" @click="emit('run')">{{ maintenanceRunning ? "测活进行中…" : "立即测活" }}</button><button class="btn secondary" :disabled="busy" @click="emit('test-webhook')">测试 Webhook</button></div>
-      <p class="hint">最近测活：{{ formatTime(operations.state?.last_health_at) }} · CDK 替换 {{ operations.state?.last_health_result?.cdk_replaced || 0 }} · 待补位 {{ operations.state?.last_health_result?.cdk_unresolved || 0 }}</p>
+      <p class="hint">最近测活：{{ formatTime(operations.state?.last_health_at) }}</p>
     </section>
 
     <section class="card">

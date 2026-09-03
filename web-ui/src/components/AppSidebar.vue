@@ -16,7 +16,6 @@ import {
   ShieldCheck,
   SquareTerminal,
   Sun,
-  Ticket,
   X,
 } from "@lucide/vue";
 
@@ -57,7 +56,6 @@ const sections = [
       ["rebind", ArrowLeftRight, "换绑"],
       ["credential-export", FileDown, "凭据导出"],
       ["protocol-login", LogIn, "协议登录"],
-      ["cdk", Ticket, "CDK"],
       ["operations", CloudCog, "运维"],
     ],
   },

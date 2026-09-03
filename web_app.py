@@ -82,17 +82,8 @@ from common.account_operation_log import (
     record_operation_event,
 )
 from common.redis_cache import PANEL_RESPONSE_CACHE
-from common.cdk_store import (
-    cdk_summary,
-    create_cdks,
-    ensure_plain_codes,
-    get_cdk,
-    list_cdks,
-    lookup_cdk,
-    redeem_cdk,
-    replace_available_bindings,
-    set_cdk_status,
-)
+
+
 from common.account_health import (
     InvalidAccessTokenError,
     select_health_check_records,
@@ -117,9 +108,7 @@ from common.registration_proxy_pool import (
     write_registration_proxy_pools,
 )
 from common.web_auth import (
-    sign_redeem_session as _sign_redeem_session_value,
     sign_session as _sign_session_value,
-    verify_redeem_session as _verify_redeem_session_value,
     verify_session as _verify_session_value,
 )
 from common.panel_ops import (
@@ -146,29 +135,15 @@ from config import ROOT as CONFIG_ROOT
 from config_loader import DEFAULT_CONFIG, apply_fingerprint_env, load_config
 from proxy_util import is_proxy_transport_error, resolve_proxy_pool
 from web.routes.auth import (
-    BatchRedeemRequest,
     LoginRequest,
     MailMessagesRequest,
     PasswordChangeRequest,
-    RedeemMessageRequest,
-    RedeemMessagesRequest,
-    RedeemRequest,
     auth_change_password,
     auth_login,
     auth_logout,
     auth_revoke_sessions,
     auth_status,
-    cdk_query,
     login_page,
-    redeem_account_json,
-    redeem_access_token,
-    redeem_batch_exchange,
-    redeem_exchange,
-    redeem_logout,
-    redeem_message,
-    redeem_messages,
-    redeem_page,
-    redeem_session,
     auth_router,
 )
 from mail import (
@@ -221,7 +196,6 @@ STATIC_DIR = WEB_DIR / "static"
 DATA_DIR = CONFIG_ROOT / "data"
 ACCOUNTS_FILE = DATA_DIR / "registered_accounts.json"
 GROUPS_FILE = DATA_DIR / "account_groups.json"
-CDKS_FILE = DATA_DIR / "cdks.json"
 STATE_FILE = DATA_DIR / "outlook_token_state.json"
 CONFIG_FILE = ROOT / "config.yaml"
 MAX_LOG_LINES = 3000
@@ -999,8 +973,6 @@ _ACCOUNT_HEALTH_PROGRESS: dict[str, Any] = {
     "invalid": 0,
     "reauth_required": 0,
     "error": 0,
-    "cdk_replaced": 0,
-    "cdk_unresolved": 0,
     "requested_workers": 0,
     "workers": 0,
     "throttled": False,
@@ -1091,8 +1063,6 @@ def _start_account_health_progress(
             invalid=0,
             reauth_required=0,
             error=0,
-            cdk_replaced=0,
-            cdk_unresolved=0,
             requested_workers=requested_workers,
             workers=actual_workers,
             throttled=actual_workers < requested_workers,
@@ -1163,8 +1133,6 @@ def _update_account_health_progress(
 def _finish_account_health_progress(
     *,
     message: str = "",
-    cdk_replaced: int | None = None,
-    cdk_unresolved: int | None = None,
     result: dict[str, Any] | None = None,
 ) -> None:
     with _ACCOUNT_HEALTH_PROGRESS_LOCK:
@@ -1195,10 +1163,6 @@ def _finish_account_health_progress(
             _ACCOUNT_HEALTH_PROGRESS["done"] = max(
                 0, int(result.get("checked") or 0)
             )
-        if cdk_replaced is not None:
-            _ACCOUNT_HEALTH_PROGRESS["cdk_replaced"] = max(0, int(cdk_replaced))
-        if cdk_unresolved is not None:
-            _ACCOUNT_HEALTH_PROGRESS["cdk_unresolved"] = max(0, int(cdk_unresolved))
 
 
 def _account_health_progress_snapshot(*, include_updates: bool = True) -> dict[str, Any]:
@@ -1479,7 +1443,6 @@ def _run_account_maintenance_sync_impl(*, force: bool = False) -> dict[str, Any]
             message="自动维护跳过已封号账号",
             error=account.get("health_error"),
         )
-    replacement = _replace_cdks_after_health(all_records, result["items"])
     deleted = 0
     if settings["auto_delete_invalid"]:
         records = _load_accounts()
@@ -1517,9 +1480,6 @@ def _run_account_maintenance_sync_impl(*, force: bool = False) -> dict[str, Any]
                 "reauth_required",
                 "error",
             )
-        } | {
-            "cdk_replaced": replacement["replaced"],
-            "cdk_unresolved": replacement["unresolved"],
         },
         last_auto_deleted=deleted,
     )
@@ -1529,7 +1489,6 @@ def _run_account_maintenance_sync_impl(*, force: bool = False) -> dict[str, Any]
             f"正常 {result.get('alive', 0)}，待续期 {result.get('reauth_required', 0)}，"
             f"其它失效 {result.get('invalid_other', result.get('invalid', 0))}，"
             f"已封号跳过 {result.get('skipped_known_deactivated', 0)}，"
-            f"CDK 替换 {replacement['replaced']}，待补位 {replacement['unresolved']}"
         ),
     )
     mail = _public_mail_stats(cfg)
@@ -1553,8 +1512,6 @@ def _run_account_maintenance_sync_impl(*, force: bool = False) -> dict[str, Any]
         "ok": True,
         "skipped": False,
         "deleted": deleted,
-        "cdk_replaced": replacement["replaced"],
-        "cdk_unresolved": replacement["unresolved"],
         **result,
     }
 
@@ -1852,20 +1809,14 @@ if STATIC_DIR.is_dir():
 
 SESSION_COOKIE = "gpt_reg_session"
 SESSION_MAX_AGE = 7 * 24 * 3600  # 7 days
-REDEEM_COOKIE = "gpt_redeem_session"
-REDEEM_SESSION_MAX_AGE = 30 * 24 * 3600
-
 PUBLIC_PATHS = {
     "/login",
-    "/redeem",
-    "/cdk-query",
     "/api/health",
     "/api/auth/login",
     "/api/auth/status",
-    "/api/cdk-query",
     "/favicon.ico",
 }
-PUBLIC_PREFIXES = ("/static/", "/api/redeem")
+PUBLIC_PREFIXES = ("/static/",)
 
 
 def _web_cfg() -> dict[str, Any]:
@@ -1878,9 +1829,6 @@ _WEB_CREDS_CACHE: dict[str, str] | None = None
 _WEB_CREDS_CACHE_MTIME: float | None = None
 _LOGIN_ATTEMPTS: dict[str, list[float]] = {}
 _LOGIN_ATTEMPTS_LOCK = threading.Lock()
-_REDEEM_ATTEMPTS: dict[str, list[float]] = {}
-_REDEEM_ATTEMPTS_LOCK = threading.Lock()
-
 
 def _ensure_web_credentials() -> dict[str, str]:
     """Ensure username/password/session-secret exist; persist if generated.
@@ -1966,140 +1914,6 @@ def _sign_session(username: str, *, max_age: int = SESSION_MAX_AGE) -> str:
 def _verify_session(token: str) -> str | None:
     creds = _ensure_web_credentials()
     return _verify_session_value(token, creds["secret"], creds["username"])
-
-
-def _sign_redeem_session(cdk_id: str, *, max_age: int = REDEEM_SESSION_MAX_AGE) -> str:
-    return _sign_redeem_session_value(
-        cdk_id,
-        _ensure_web_credentials()["secret"],
-        max_age=max_age,
-        now=int(time.time()),
-    )
-
-
-def _verify_redeem_session(token: str) -> str | None:
-    return _verify_redeem_session_value(
-        token,
-        _ensure_web_credentials()["secret"],
-    )
-
-
-def _redeem_record_from_request(request: Request, *, touch: bool = False) -> dict[str, Any] | None:
-    cdk_id = _verify_redeem_session(str(request.cookies.get(REDEEM_COOKIE) or ""))
-    return get_cdk(cdk_id, CDKS_FILE, touch=touch) if cdk_id else None
-
-
-def _redeem_bound_account(record: dict[str, Any]) -> dict[str, Any] | None:
-    """Resolve the one account bound to a redeemed CDK."""
-    key = str(record.get("account_key") or "").strip()
-    account_id = str(record.get("account_id") or "").strip().lower()
-    email = str(record.get("email") or "").strip().lower()
-
-    # The normal production store is indexed SQLite. Resolve by canonical
-    # identity first so a redeemed-session request does not decode every large
-    # session/cookie payload in the account database. A full scan remains a
-    # compatibility fallback for legacy CDKs whose stored account key no
-    # longer matches the account's current canonical identity.
-    lookup_keys: list[str] = []
-    for candidate in (
-        key,
-        key.lower(),
-        f"account_id:{account_id}" if account_id else "",
-        f"email:{email}" if email else "",
-    ):
-        if candidate and candidate not in lookup_keys:
-            lookup_keys.append(candidate)
-
-    def matches(account: dict[str, Any]) -> bool:
-        return bool(
-            (key and _account_key(account) == key)
-            or (
-                account_id
-                and str(account.get("account_id") or "").strip().lower()
-                == account_id
-            )
-            or (
-                email
-                and str(account.get("email") or "").strip().lower() == email
-            )
-        )
-
-    if lookup_keys:
-        found = load_account_records_by_keys(lookup_keys, path=ACCOUNTS_FILE)
-        # Prefer the same identity order as the legacy scan: explicit CDK
-        # account_key, then account_id, then email.
-        for lookup_key in lookup_keys:
-            account = found.get(lookup_key)
-            if isinstance(account, dict) and matches(account):
-                return account
-        # A keyed lookup can return a canonical account under a different key
-        # when an alias happens to bridge two identities; retain the match as
-        # a last fast-path check before falling back to the legacy full scan.
-        for account in found.values():
-            if isinstance(account, dict) and matches(account):
-                return account
-
-    # Preserve legacy alias matching when a CDK predates account_id/email
-    # canonicalization or a custom JSON store is in use.
-    for account in _load_accounts():
-        if matches(account):
-            return account
-    return None
-
-
-def _redeem_security_payload(account: dict[str, Any]) -> dict[str, Any]:
-    password = str(account.get("password") or "")
-    totp_secret = str(account.get("totp_secret") or "")
-    return {
-        "password": password,
-        "password_set": bool(password.strip()),
-        "mfa_enabled": bool(account.get("mfa_enabled")) or bool(totp_secret.strip()),
-        "mfa_factor_type": str(account.get("mfa_factor_type") or ("totp" if totp_secret.strip() else "")),
-        "totp_secret": totp_secret,
-    }
-
-
-def _redeem_account_export(account: dict[str, Any]) -> dict[str, Any]:
-    """Build the account JSON delivered to the holder of its redeemed CDK."""
-    return {
-        "email": str(account.get("email") or ""),
-        "account_id": str(account.get("account_id") or ""),
-        **_redeem_security_payload(account),
-        "access_token": _stored_access_token(account),
-        "session_token": str(account.get("session_token") or ""),
-        "refresh_token": str(account.get("refresh_token") or ""),
-        "plan_type": str(account.get("plan_type") or ""),
-        "expires_at": str(account.get("expires_at") or ""),
-        "registered_at": str(account.get("registered_at") or ""),
-    }
-
-
-def _require_redeemed_account(request: Request) -> dict[str, Any]:
-    record = _redeem_record_from_request(request, touch=True)
-    if record is None:
-        raise HTTPException(401, "兑换会话已失效")
-    if str(record.get("status") or "").lower() != "redeemed":
-        raise HTTPException(403, "CDK 尚未兑换")
-    account = _redeem_bound_account(record)
-    if account is None:
-        raise HTTPException(404, "绑定账号不存在")
-    return account
-
-
-def _set_redeem_cookie(response: Response, cdk_id: str) -> None:
-    response.set_cookie(
-        key=REDEEM_COOKIE,
-        value=_sign_redeem_session(cdk_id),
-        max_age=REDEEM_SESSION_MAX_AGE,
-        httponly=True,
-        secure=True,
-        samesite="lax",
-        path="/",
-    )
-
-
-def _clear_redeem_cookie(response: Response) -> None:
-    response.delete_cookie(key=REDEEM_COOKIE, path="/", secure=True, samesite="lax")
 
 
 def _trusted_proxy_hosts() -> set[str]:
@@ -2194,7 +2008,7 @@ async def _auth_middleware(request: Request, call_next):
         response.headers.setdefault("Pragma", "no-cache")
         return response
     # HTML pages: redirect unauthenticated users to login
-    if path in {"/", "/index.html", "/cdk"} and not _auth_ok(request):
+    if path in {"/", "/index.html"} and not _auth_ok(request):
         return RedirectResponse(
             url="/login",
             status_code=302,
@@ -2211,24 +2025,6 @@ async def public_home(request: Request = None):  # type: ignore[assignment]
     index_path = vue_index if vue_index.is_file() else STATIC_DIR / "index.html"
     if not index_path.is_file():
         return HTMLResponse("<h1>web panel index missing</h1>", status_code=500)
-    return FileResponse(
-        index_path,
-        headers={
-            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-            "Pragma": "no-cache",
-            "Expires": "0",
-        },
-    )
-
-
-@app.get("/cdk", response_class=HTMLResponse)
-async def index():
-    vue_index = STATIC_DIR / "vue" / "index.html"
-    index_path = vue_index if vue_index.is_file() else STATIC_DIR / "index.html"
-    if not index_path.is_file():
-        return HTMLResponse(
-            "<h1>web panel index missing</h1>", status_code=500
-        )
     return FileResponse(
         index_path,
         headers={
@@ -2562,8 +2358,7 @@ async def accounts(limit: int = 200, offset: int = 0):
         for _attempt in range(5):
             revision = account_store_revision(ACCOUNTS_FILE)
             groups_stamp = _stamp(GROUPS_FILE)
-            cdks_stamp = _stamp(CDKS_FILE)
-            cache_key = (cap, start, revision, groups_stamp, cdks_stamp)
+            cache_key = (cap, start, revision, groups_stamp)
             redis_key = ":".join(
                 (
                     "accounts:v3",
@@ -2572,7 +2367,6 @@ async def accounts(limit: int = 200, offset: int = 0):
                     str(revision),
                     _account_data_stamp(),
                     str(groups_stamp),
-                    str(cdks_stamp),
                 )
             )
 
@@ -2589,7 +2383,6 @@ async def accounts(limit: int = 200, offset: int = 0):
                 groups = _groups_with_counts()
                 names = {item["id"]: item["name"] for item in groups}
                 default_id = groups[0]["id"]
-                cdk_marks = _cdk_account_marks()
                 items = load_account_public_views(cap, ACCOUNTS_FILE, offset=start)
                 if account_store_revision(ACCOUNTS_FILE) != expected_revision:
                     raise _RevisionChanged
@@ -2604,18 +2397,6 @@ async def accounts(limit: int = 200, offset: int = 0):
                         group_id = default_id
                     item["group_id"] = group_id
                     item["group_name"] = names[group_id]
-                    item.update(
-                        cdk_marks.get(
-                            str(item.get("delete_key") or ""),
-                            {
-                                "cdk_bound": False,
-                                "cdk_status": "",
-                                "cdk_redeemed": False,
-                                "cdk_redeemed_at": "",
-                                "cdk_last_access_at": "",
-                            },
-                        )
-                    )
                     slim.append(item)
                 if account_store_revision(ACCOUNTS_FILE) != expected_revision:
                     raise _RevisionChanged
@@ -2802,27 +2583,6 @@ async def account_credentials(body: AccountCredentialsRequest):
         payload,
         headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
     )
-
-
-from web.routes.cdks_admin import router as cdks_admin_router  # noqa: E402
-
-app.include_router(cdks_admin_router)
-
-from web.routes.cdks_admin import (  # noqa: E402,F401
-    CDKGenerateRequest,
-    CDKStatusRequest,
-    _account_cdk_security_ready,
-    _cdk_account_marks,
-    _cdk_admin_payload,
-    _cdk_admin_row,
-    _eligible_cdk_bindings,
-    _merge_health_snapshot,
-    _replace_cdks_after_health,
-    _replace_invalid_unredeemed_cdks,
-    cdks,
-    cdks_generate,
-    cdks_status,
-)
 
 
 from web.routes.accounts_io import router as accounts_io_router  # noqa: E402

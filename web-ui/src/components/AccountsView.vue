@@ -39,7 +39,7 @@ const emit = defineEmits([
   "refresh", "health", "reauth", "security-repair", "password-change", "totp-change", 
   "account-logs", "stop-reauth", "delete", "delete-invalid", "download", "copy-selected-at", 
   "export-selected-at", "export-security", "create-group", "rename-group", "delete-group", 
-  "move-group", "export-group", "copy-at", "copy-credential", "copy-value", "trial-check", "generate-cdk"
+  "move-group", "export-group", "copy-at", "copy-credential", "copy-value", "trial-check"
 ]);
 
 const query = ref("");
@@ -210,7 +210,6 @@ const searchTextByItem = computed(() => {
       registrationText(item),
       item.trial_eligibility_label,
       item.trial_eligibility_status,
-      item.cdk_redeemed ? "CDK 已兑换" : "",
     ].map((value) => String(value || "").toLowerCase()));
   }
   return index;
@@ -378,9 +377,9 @@ async function handleTotpClick(item) {
   }
   totpLoading.value[item.delete_key] = true;
   try {
-    const res = await api("/api/accounts/totp", { method: "POST", body: jsonBody({ delete_key: item.delete_key }) });
+    const res = await api("/api/accounts/credentials", { method: "POST", body: jsonBody({ key: item.delete_key, field: "totp_code" }) });
     if (res.code) {
-      totpCodes.value[item.delete_key] = { code: res.code, expires_in: res.expires_in };
+      totpCodes.value[item.delete_key] = { code: res.code, expires_in: res.remaining ?? 30 };
       copyTextDirect(res.code, `totp_code_${item.delete_key}`);
     } else {
       totpCodes.value[item.delete_key] = { error: res.message || "解码失败" };
@@ -392,13 +391,6 @@ async function handleTotpClick(item) {
   }
 }
 
-function cdkEligible(item) {
-  return !!(item.has_password && item.has_totp && item.mfa_enabled);
-}
-function cdkTitle(item) {
-  if (!item.has_password || !item.has_totp || !item.mfa_enabled) return "需要先设置密码并启用 TOTP 2FA";
-  return "为该账号生成 CDK";
-}
 function fmtTime(value) {
   if (!value) return "-";
   try { return new Date(value).toLocaleString("zh-CN", { hour12: false }); } catch { return value; }
@@ -593,8 +585,6 @@ function moveSelected() {
             <span>待续期 {{ healthProgress.reauthRequired || 0 }}</span>
             <span>其它失效 {{ healthProgress.invalidOther || 0 }}</span>
             <span>错误 {{ healthProgress.error || 0 }}</span>
-            <span>CDK 替换 {{ healthProgress.cdkReplaced || 0 }}</span>
-            <span v-if="healthProgress.cdkUnresolved">待补位 {{ healthProgress.cdkUnresolved }}</span>
           </div>
         </div>
 
@@ -734,7 +724,7 @@ function moveSelected() {
                   <input v-model="selected" type="checkbox" :value="item.delete_key" />
                 </td>
 
-                <!-- 账号：邮箱 + ID + CDK -->
+                <!-- 账号：邮箱 + ID -->
                 <td class="col-account" data-label="账号">
                   <div class="acct-cell-main">
                     <button
@@ -757,7 +747,6 @@ function moveSelected() {
                         <span class="acct-id-text">{{ item.account_id }}</span>
                         <component :is="copiedFeedback[`acc_id_${item.delete_key}`] ? Check : Copy" :size="11" aria-hidden="true" />
                       </button>
-                      <span v-if="item.cdk_redeemed" class="capsule-badge plus acct-cdk" :title="`兑换时间：${fmtTime(item.cdk_redeemed_at)}`">CDK已兑换</span>
                     </div>
                   </div>
                 </td>
@@ -879,15 +868,6 @@ function moveSelected() {
                       @click="emit('account-logs', item)"
                     >
                       <ClipboardList :size="13" aria-hidden="true" />
-                    </button>
-                    <button
-                      class="btn secondary row-cdk-btn"
-                      type="button"
-                      :disabled="busy || !cdkEligible(item)"
-                      :title="cdkTitle(item)"
-                      @click="emit('generate-cdk', item)"
-                    >
-                      CDK
                     </button>
                     <button
                       class="btn secondary row-icon-btn"

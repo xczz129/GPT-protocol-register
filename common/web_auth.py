@@ -92,39 +92,3 @@ def verify_session(
     if not hmac.compare_digest(signature, expected):
         return None
     return username if hmac.compare_digest(username, str(expected_username)) else None
-
-
-def sign_redeem_session(cdk_id: str, secret: str, *, max_age: int, now: int | None = None) -> str:
-    expires_at = int(now if now is not None else time.time()) + max(60, int(max_age))
-    payload = f"redeem|{str(cdk_id or '').strip()}|{expires_at}"
-    signature = hmac.new(
-        str(secret).encode("utf-8"),
-        payload.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-    return f"{_b64url(payload.encode('utf-8'))}.{signature}"
-
-
-def verify_redeem_session(
-    token: str,
-    secret: str,
-    *,
-    now: int | None = None,
-) -> str | None:
-    raw = str(token or "").strip()
-    if not raw or "." not in raw:
-        return None
-    body, signature = raw.rsplit(".", 1)
-    try:
-        payload = _b64url_decode(body).decode("utf-8")
-        scope, cdk_id, expires_at = payload.split("|", 2)
-        if scope != "redeem" or int(expires_at) < int(now if now is not None else time.time()):
-            return None
-    except (TypeError, ValueError, UnicodeError):
-        return None
-    expected = hmac.new(
-        str(secret).encode("utf-8"),
-        payload.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-    return cdk_id if hmac.compare_digest(signature, expected) else None

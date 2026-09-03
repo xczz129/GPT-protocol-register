@@ -308,20 +308,7 @@ async def accounts_health(body: AccountHealthRequest):
     except Exception as error:
         _state()._finish_account_health_progress(message=str(error))
         raise
-    try:
-        replacement = await asyncio.to_thread(
-            _state()._replace_cdks_after_health,
-            records,
-            result["items"],
-        )
-    except Exception as error:
-        _state()._finish_account_health_progress(message=str(error))
-        raise
-    _state()._finish_account_health_progress(
-        cdk_replaced=replacement["replaced"],
-        cdk_unresolved=replacement["unresolved"],
-        result=result,
-    )
+    _state()._finish_account_health_progress(result=result)
     # The UI refreshes its paginated account view after completion. Returning
     # every checked row here duplicates that response and can be several MB for
     # an all-account run, so keep row payloads for small targeted checks only.
@@ -341,8 +328,6 @@ async def accounts_health(body: AccountHealthRequest):
         "invalid": result["invalid"],
         "reauth_required": result["reauth_required"],
         "error": result["error"],
-        "cdk_replaced": replacement["replaced"],
-        "cdk_unresolved": replacement["unresolved"],
         "items": (
             [_state().account_public_view(item) for item in result["items"]]
             if include_rows

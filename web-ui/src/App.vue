@@ -7,7 +7,7 @@ import AccountLogDialog from "./components/AccountLogDialog.vue";
 import AppDialog from "./components/AppDialog.vue";
 import AppSidebar from "./components/AppSidebar.vue";
 import BrowserView from "./components/BrowserView.vue";
-import CDKView from "./components/CDKView.vue";
+import LoginView from "./components/LoginView.vue";
 import ClipboardDialog from "./components/ClipboardDialog.vue";
 import CredentialExportView from "./components/CredentialExportView.vue";
 import ProtocolLoginView from "./components/ProtocolLoginView.vue";
@@ -37,10 +37,10 @@ const views = {
   rebind: ["邮箱换绑", "将现有账号换绑到邮箱池中的未占用地址并刷新凭据"],
   "credential-export": ["凭据导出", "按邮箱筛选并导出账号、密码和 2FA"],
   "protocol-login": ["协议登录", "按邮箱批量重新登录并查看账号状态"],
-  cdk: ["CDK 管理", "生成并管理邮箱兑换码"],
   operations: ["运维中心", "统计、自动维护、备份恢复与面板安全"],
 };
 
+const onLoginPage = location.pathname === "/login";
 const active = ref("task");
 const sidebarOpen = ref(false);
 const loading = ref(true);
@@ -53,10 +53,6 @@ const config = ref({ fingerprint: {}, registration: {} });
 // creating thousands of nested Vue proxies; callers replace the array when a
 // batch changes (see applyHealthProgress and the group actions below).
 const accounts = shallowRef([]);
-const cdks = ref([]);
-const cdkSummary = ref({});
-const cdkEligibility = ref({});
-const generatedCdks = ref([]);
 const groups = ref([]);
 // Task cards can contain a large history and nested step arrays. They are
 // treated as immutable snapshots, so deep proxying adds cost without helping
@@ -92,7 +88,7 @@ const passwordChangeDialog = reactive({ open: false, count: 0 });
 const clipboardDialog = reactive({ open: false, title: "", value: "", successMessage: "" });
 const accountLogDialog = reactive({ open: false, account: null, logs: [], total: 0, loading: false, error: "" });
 const copyingAccessToken = ref(false);
-const healthProgress = reactive({ running: false, requested: 0, actualTotal: 0, total: 0, done: 0, checked: 0, usable: 0, unavailable: 0, skippedKnownDeactivated: 0, deactivated: 0, invalidOther: 0, current: "", alive: 0, limited: 0, invalid: 0, reauthRequired: 0, error: 0, cdkReplaced: 0, cdkUnresolved: 0, requestedWorkers: 0, workers: 0, throttled: false, resourceMode: "normal", updates: [] });
+const healthProgress = reactive({ running: false, requested: 0, actualTotal: 0, total: 0, done: 0, checked: 0, usable: 0, unavailable: 0, skippedKnownDeactivated: 0, deactivated: 0, invalidOther: 0, current: "", alive: 0, limited: 0, invalid: 0, reauthRequired: 0, error: 0, requestedWorkers: 0, workers: 0, throttled: false, resourceMode: "normal", updates: [] });
 const reauthProgress = reactive({ running: false, stopping: false, mode: "protocol", operation: "reauth", concurrency: 3, total: 0, done: 0, current: "", success: 0, failed: 0, cancelled: 0, last: "", lastStatus: "", lastMessage: "", items: [] });
 const protocolLoginPreflight = reactive({ requested: 0, matched: 0, submitted: 0, invalidFormat: [], notFound: [], missingCredentials: [] });
 const rebindPreflight = reactive({ eligible: false, requested: 0, matched: 0, eligibleCount: 0, source: null, sources: [], target: null, items: [], reservationId: "", invalidFormat: [], invalidTargets: [], notFound: [], missingCredentials: [], conflicts: [], message: "" });
@@ -274,7 +270,7 @@ function navigate(name, updateHash = true) {
   active.value = views[name] ? name : "task";
   sidebarOpen.value = false;
   document.title = `${title.value} · GPT Register FP`;
-  if (updateHash) history.replaceState(null, "", active.value === "cdk" ? "/cdk" : `/#${active.value}`);
+  if (updateHash) history.replaceState(null, "", `/#${active.value}`);
   window.scrollTo({ top: 0, behavior: "smooth" });
   if (!loading.value) {
     loadActiveView().catch(() => {});
@@ -647,14 +643,6 @@ async function loadAccounts() {
   }
 }
 async function loadTrialProxyPool() { const data = await api("/api/trial-proxy-pool"); trialProxyForm.selected_country = data.selected_country || ""; trialProxyForm.countries = (data.countries || []).map((item) => ({ ...item })); }
-async function loadCdks(groupId = "") {
-  const selected = groupId || groups.value.find((item) => item.name === "出售")?.id || groups.value[0]?.id || "";
-  const query = selected ? `?group_id=${encodeURIComponent(selected)}` : "";
-  const data = await api(`/api/cdks${query}`);
-  cdks.value = data.items || [];
-  cdkSummary.value = data.summary || {};
-  cdkEligibility.value = data.eligibility || {};
-}
 async function loadGroups() {
   if (groupsLoadPromise) return groupsLoadPromise;
   groupsLoadPromise = (async () => {
@@ -912,7 +900,6 @@ async function loadActiveView() {
   if (active.value === "accounts") return Promise.all([loadAccounts(), resumeHealthProgress()]);
   if (active.value === "credential-export" || active.value === "protocol-login") return loadAccounts();
   if (active.value === "rebind") return resumeRebindProgress();
-  if (active.value === "cdk") return loadCdks();
   if (active.value === "chatgpt2api") return Promise.all([loadGroups(), loadAccounts()]);
   if (active.value === "logs") return loadLogs();
   if (active.value === "operations") return Promise.all([loadOperations(), loadTrash()]);
@@ -923,7 +910,12 @@ async function initialize() {
     restoreReauthUiState();
     restoreRebindUiState();
     const auth = await api("/api/auth/status");
-    if (!auth.authenticated) return location.replace("/login");
+    if (!auth.authenticated) {
+      // The login page renders LoginView directly; no polling runs there.
+      if (onLoginPage) return;
+      return location.replace("/login");
+    }
+    if (onLoginPage) return location.replace("/");
     username.value = auth.username || "";
     // Account pages can start their first page alongside the heavier status
     // summary. This lets the table become useful before mailbox statistics
@@ -1383,27 +1375,6 @@ async function uploadIntegration() {
   await run(() => api("/api/chatgpt2api/upload-all", { method: "POST", body: jsonBody({ url: integrationForm.url, key: integrationForm.key, group_id: integrationForm.groupId || null }) }), (r) => r.message || `已处理 ${r.count || 0} 个账号`);
 }
 
-async function generateCdks(payload) {
-  const result = await run(() => api("/api/cdks/generate", { method: "POST", body: jsonBody(payload) }), (r) => r.message || `已生成 ${r.created || 0} 个 CDK`);
-  if (!result) return;
-  generatedCdks.value = result.codes || [];
-  await Promise.all([loadCdks(result.group_id || payload.group_id), loadAccounts()]);
-}
-async function generateCdkForAccount(account) {
-  await generateCdks({
-    group_id: account?.group_id || "",
-    account_key: account?.delete_key || "",
-    count: 1,
-    expires_days: 0,
-  });
-}
-async function changeCdkStatus(payload) {
-  const groupId = payload.group_id || "";
-  const body = { ids: payload.ids, status: payload.status };
-  const result = await run(() => api("/api/cdks/status", { method: "POST", body: jsonBody(body) }), (r) => `已更新 ${r.changed || 0} 个 CDK`);
-  if (result) await loadCdks(groupId);
-}
-
 function applyHealthProgress(value) {
   const requested = Number(value?.requested ?? value?.total ?? 0);
   const actualTotal = Number(value?.actual_total ?? value?.total ?? 0);
@@ -1441,8 +1412,6 @@ function applyHealthProgress(value) {
     invalid: Number(value.invalid || 0),
     reauthRequired: Number(value.reauth_required || 0),
     error: Number(value.error || 0),
-    cdkReplaced: Number(value.cdk_replaced || 0),
-    cdkUnresolved: Number(value.cdk_unresolved || 0),
     requestedWorkers: Number(value.requested_workers || value.workers || 0),
     workers: Number(value.workers || value.requested_workers || 0),
     throttled: !!value.throttled,
@@ -1611,7 +1580,7 @@ async function pollReauthProgress(announce = true) {
     }
     clearTimeout(reauthProgressTimer);
     reauthProgressTimer = null;
-    await Promise.all([loadAccounts(), loadStatus(), loadOperations(), loadCdks()]);
+    await Promise.all([loadAccounts(), loadStatus(), loadOperations()]);
     if (announce && reauthCompletionAnnounced !== value.job_id) {
       reauthCompletionAnnounced = value.job_id;
       const topLevelFailed = value.status === "failed";
@@ -2029,7 +1998,7 @@ async function healthAccounts(keys, options = {}) {
   const requestCount = all ? Math.max(knownTotal, targetKeys.length) : targetKeys.length;
   const description = options.description || `请求 ${requestCount} 条账号记录，已封号记录自动跳过；使用 ${workers} 路并发检测。`;
   if (!await confirmInside(description, { title, confirmText: "开始检测" })) return;
-  Object.assign(healthProgress, { running: true, requested: requestCount, actualTotal: Math.max(0, requestCount - knownSkipped), total: Math.max(0, requestCount - knownSkipped), done: 0, checked: 0, usable: 0, unavailable: knownSkipped, skippedKnownDeactivated: knownSkipped, deactivated: knownSkipped, invalidOther: 0, current: `${workers} 路协议请求并发`, alive: 0, limited: 0, invalid: 0, reauthRequired: 0, error: 0, cdkReplaced: 0, cdkUnresolved: 0, requestedWorkers: workers, workers, throttled: false, resourceMode: "normal", updates: [] });
+  Object.assign(healthProgress, { running: true, requested: requestCount, actualTotal: Math.max(0, requestCount - knownSkipped), total: Math.max(0, requestCount - knownSkipped), done: 0, checked: 0, usable: 0, unavailable: knownSkipped, skippedKnownDeactivated: knownSkipped, deactivated: knownSkipped, invalidOther: 0, current: `${workers} 路协议请求并发`, alive: 0, limited: 0, invalid: 0, reauthRequired: 0, error: 0, requestedWorkers: workers, workers, throttled: false, resourceMode: "normal", updates: [] });
   startHealthProgressPolling();
   healthRequestActive = true;
   healthServerRunObserved = false;
@@ -2043,7 +2012,6 @@ async function healthAccounts(keys, options = {}) {
     // second full multi-page account load for the same completed run.
     scheduleAccountsRefresh(100);
     notify(`测活完成：请求 ${healthProgress.requested} 条，实际检测 ${healthProgress.checked} 条，跳过已封号 ${healthProgress.skippedKnownDeactivated} 条；可用 ${healthProgress.usable}，待续期 ${healthProgress.reauthRequired}，其它失效 ${healthProgress.invalidOther}，错误 ${healthProgress.error}`);
-    if (healthProgress.cdkReplaced || healthProgress.cdkUnresolved) await loadCdks();
   } catch (error) {
     const value = await pollHealthProgress(true);
     if (value?.running) {
@@ -2568,8 +2536,8 @@ async function runMaintenance() {
   maintenanceRunning.value = true;
   try {
     const result = await api("/api/maintenance/run", { method: "POST", body: "{}" });
-    await Promise.all([loadOperations(), loadAccounts(), loadCdks(), loadStatus(), loadTrash()]);
-    notify(`测活完成：请求 ${result.requested || 0} 条，实际检测 ${result.checked || 0} 条，跳过已封号 ${result.skipped_known_deactivated || 0} 条；可用 ${result.usable || 0}，待续期 ${result.reauth_required || 0}，其它失效 ${result.invalid_other || 0}，CDK 替换 ${result.cdk_replaced || 0}，删除 ${result.deleted || 0}`);
+    await Promise.all([loadOperations(), loadAccounts(), loadStatus(), loadTrash()]);
+    notify(`测活完成：请求 ${result.requested || 0} 条，实际检测 ${result.checked || 0} 条，跳过已封号 ${result.skipped_known_deactivated || 0} 条；可用 ${result.usable || 0}，待续期 ${result.reauth_required || 0}，其它失效 ${result.invalid_other || 0}，删除 ${result.deleted || 0}`);
   } catch (error) {
     notify(error.message || "账号维护失败", "err");
   } finally {
@@ -2618,13 +2586,13 @@ async function logout() { await api("/api/auth/logout", { method: "POST", body: 
 
 onMounted(() => {
   const hash = location.hash.replace(/^#/, "");
-  const pathView = location.pathname === "/cdk" ? "cdk" : "";
-  navigate(pathView || (views[hash] ? hash : "task"), false);
+  navigate(views[hash] ? hash : "task", false);
   window.addEventListener("hashchange", () => {
     const next = location.hash.replace(/^#/, "");
-    navigate(views[next] ? next : (location.pathname === "/cdk" ? "cdk" : "task"), false);
+    navigate(views[next] ? next : "task", false);
   });
   initialize();
+  if (onLoginPage) return;  // 认证前的登录页不启动任何轮询
   pollTimer = setInterval(() => {
     if (document.hidden) return;
     // The SSE stream carries job status continuously. Keep the aggregate
@@ -2667,7 +2635,8 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="shell vue-shell">
+  <LoginView v-if="onLoginPage" />
+  <div v-else class="shell vue-shell">
     <button v-if="sidebarOpen" class="sidebar-scrim" type="button" aria-label="关闭导航" @click="closeSidebar"></button>
     <AppSidebar :active="active" :account-count="status.accounts_count" :open="sidebarOpen" @navigate="navigate" @close="closeSidebar" />
     <header class="hero">
@@ -2693,11 +2662,10 @@ onBeforeUnmount(() => {
         <PlusEligibilityView v-else-if="active === 'plus-eligibility'" :form="tokenEligibilityForm" :state="tokenEligibility" @check="checkTokenEligibility" @clear="clearTokenEligibility" @batch-check="startBatchTokenEligibility" @batch-stop="stopBatchTokenEligibility" />
         <IntegrationView v-else-if="active === 'chatgpt2api'" :form="integrationForm" :groups="groups" :progress="progress" :busy="busy" @save="saveIntegration" @test="testIntegration" @upload="uploadIntegration" />
         <LogsView v-else-if="active === 'logs'" :logs="logs" :connected="connected" @refresh="loadLogs" @download="downloadLogs" @clear="logs = []" />
-        <AccountsView v-else-if="active === 'accounts'" :accounts="accounts" :accounts-loading="accountsLoading" :account-load-progress="accountLoadProgress" :account-load-error="accountLoadError" :groups="groups" :proxy-countries="proxyForm.countries" :busy="busy" :copying-at="copyingAccessToken" :health-progress="healthProgress" :reauth-progress="reauthProgress" :trial-progress="trialProgress" @refresh="loadAccounts" @health="healthAccounts" @trial-check="trialEligibilityAccounts" @reauth="reauthAccounts" @security-repair="repairSecurityAccounts" @password-change="changeAccountPasswords" @totp-change="changeAccountTotp" @account-logs="openAccountLogs" @stop-reauth="stopReauth" @delete="deleteAccounts" @delete-invalid="deleteInvalidAccounts" @download="downloadAccounts" @copy-selected-at="copySelectedAccessTokens" @export-selected-at="exportSelectedAccessTokens" @export-security="exportSecurityCredentials" @create-group="createAccountGroup" @rename-group="renameAccountGroup" @delete-group="deleteAccountGroup" @move-group="moveAccountsToGroup" @export-group="exportGroupCredentials" @copy-at="copyAccessToken" @copy-credential="copyAccountCredential" @copy-value="copyValue" @generate-cdk="generateCdkForAccount" />
+        <AccountsView v-else-if="active === 'accounts'" :accounts="accounts" :accounts-loading="accountsLoading" :account-load-progress="accountLoadProgress" :account-load-error="accountLoadError" :groups="groups" :proxy-countries="proxyForm.countries" :busy="busy" :copying-at="copyingAccessToken" :health-progress="healthProgress" :reauth-progress="reauthProgress" :trial-progress="trialProgress" @refresh="loadAccounts" @health="healthAccounts" @trial-check="trialEligibilityAccounts" @reauth="reauthAccounts" @security-repair="repairSecurityAccounts" @password-change="changeAccountPasswords" @totp-change="changeAccountTotp" @account-logs="openAccountLogs" @stop-reauth="stopReauth" @delete="deleteAccounts" @delete-invalid="deleteInvalidAccounts" @download="downloadAccounts" @copy-selected-at="copySelectedAccessTokens" @export-selected-at="exportSelectedAccessTokens" @export-security="exportSecurityCredentials" @create-group="createAccountGroup" @rename-group="renameAccountGroup" @delete-group="deleteAccountGroup" @move-group="moveAccountsToGroup" @export-group="exportGroupCredentials" @copy-at="copyAccessToken" @copy-credential="copyAccountCredential" @copy-value="copyValue" />
         <RebindView v-else-if="active === 'rebind'" :progress="rebindProgress" :preflight="rebindPreflight" :busy="busy || rebindRequestBusy" :checking="rebindChecking" @preflight="preflightRebind" @start="startRebind" @stop="stopRebind" @reset="resetRebindForInput" @input-change="resetRebindForInput" />
         <CredentialExportView v-else-if="active === 'credential-export'" :accounts="accounts" :busy="busy" @export="exportSecurityByEmail" />
         <ProtocolLoginView v-else-if="active === 'protocol-login'" :accounts="accounts" :progress="reauthProgress" :health-progress="healthProgress" :preflight="protocolLoginPreflight" :busy="busy" @start="startProtocolLoginByEmail" @stop="stopReauth" @health="healthProtocolLoginEmails" @input-change="resetProtocolLoginResultsForInput" />
-        <CDKView v-else-if="active === 'cdk'" :groups="groups" :cdks="cdks" :summary="cdkSummary" :eligibility="cdkEligibility" :generated="generatedCdks" :busy="busy" @group-change="loadCdks" @generate="generateCdks" @status="changeCdkStatus" @refresh="loadCdks" @clear-generated="generatedCdks = []" />
         <OperationsView v-else-if="active === 'operations'" :operations="operations" :trash="trash" :form="maintenanceForm" :maddy-auto-form="maddyAutoForm" :groups="groups" :security="securityForm" :busy="busy" :maintenance-running="maintenanceActive" :maddy-auto-running="maddyAutoActive" @refresh="() => Promise.all([loadOperations(), loadTrash()])" @save="saveMaintenance" @run="runMaintenance" @save-maddy-auto="saveMaddyAutoRegister" @run-maddy-auto="runMaddyAutoRegister" @test-webhook="testWebhook" @backup="createBackupNow" @restore-backup="restoreBackupNow" @restore-trash="restoreTrash" @change-password="changePassword" @revoke-sessions="revokeSessions" />
       </template>
     </main>
