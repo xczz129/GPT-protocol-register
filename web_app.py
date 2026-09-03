@@ -536,47 +536,6 @@ class ConfigUpdate(BaseModel):
     config: dict[str, Any]
 
 
-class ProxyUpdate(BaseModel):
-    enabled: bool = False
-    mode: str = "single_proxy"
-    url: str = ""
-    resource_url: str = ""
-    pool_file: str = ""
-    pool_text: str | None = None
-    selected_country: str = ""
-    country_pools: list[dict[str, Any]] | None = None
-    rotate_per_task: bool = True
-    clearance: dict[str, Any] | None = None
-
-
-class ChatGPT2APIUpdate(BaseModel):
-    enabled: bool = False
-    url: str = ""
-    key: str = ""
-    auto_upload: bool = True
-
-
-class ChatGPT2APITestRequest(BaseModel):
-    url: str | None = None
-    key: str | None = None
-
-
-class ChatGPT2APIUploadRequest(ChatGPT2APITestRequest):
-    group_id: str | None = None
-
-
-class CDKGenerateRequest(BaseModel):
-    group_id: str = ""
-    count: int = Field(1, ge=1, le=500)
-    expires_days: int = Field(0, ge=0, le=3650)
-    account_key: str = Field(default="", max_length=256)
-
-
-class CDKStatusRequest(BaseModel):
-    ids: list[str] = Field(default_factory=list)
-    status: str
-
-
 from web.routes.shared_models import AccountTokenRequest  # noqa: E402
 
 
@@ -604,10 +563,6 @@ class AccountGroupAssignRequest(BaseModel):
 class TaskDeleteRequest(BaseModel):
     indexes: list[str | int] = Field(default_factory=list)
     delete_all: bool = False
-
-
-class ProxyTestRequest(BaseModel):
-    proxies: list[str] = Field(default_factory=list)
 
 
 class MaintenanceUpdate(BaseModel):
@@ -1049,210 +1004,6 @@ def _records_by_keys_with_fallback(
     return found
 
 
-def _account_cdk_security_ready(record: dict[str, Any]) -> bool:
-    """Only expose accounts with a usable password-backed TOTP setup to CDK."""
-    if account_is_deactivated(record):
-        return False
-    password = str(record.get("password") or "").strip()
-    totp_secret = str(record.get("totp_secret") or "").strip()
-    mfa_enabled = bool(record.get("mfa_enabled")) or bool(totp_secret)
-    return bool(password and totp_secret and mfa_enabled)
-
-
-def _cdk_account_marks() -> dict[str, dict[str, Any]]:
-    """Index CDK binding/redeem state by every stable account identity."""
-    marks: dict[str, dict[str, Any]] = {}
-    priority = {"redeemed": 3, "available": 2, "disabled": 1}
-    for record in list_cdks(CDKS_FILE):
-        status = str(record.get("status") or "available").strip().lower()
-        mark = {
-            "cdk_bound": True,
-            "cdk_status": status,
-            "cdk_redeemed": status == "redeemed",
-            "cdk_redeemed_at": str(record.get("redeemed_at") or ""),
-            "cdk_last_access_at": str(record.get("last_access_at") or ""),
-        }
-        aliases = {
-            str(record.get("account_key") or "").strip(),
-            f"email:{str(record.get('email') or '').strip().lower()}" if str(record.get("email") or "").strip() else "",
-            f"account_id:{str(record.get('account_id') or '').strip().lower()}" if str(record.get("account_id") or "").strip() else "",
-        }
-        for alias in aliases:
-            if not alias:
-                continue
-            current = marks.get(alias)
-            if current is None or priority.get(status, 0) >= priority.get(str(current.get("cdk_status") or ""), 0):
-                marks[alias] = dict(mark)
-    return marks
-
-
-def _eligible_cdk_bindings(group_id: str) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    group = get_group(group_id, GROUPS_FILE)
-    if group is None:
-        raise KeyError("分组不存在")
-    provider_map = _mailbox_provider_map(_read_config())
-    existing = list_cdks(CDKS_FILE)
-    bound_keys = {str(item.get("account_key") or "") for item in existing}
-    bindings: list[dict[str, Any]] = []
-    stats = {
-        "group_accounts": 0,
-        "without_mailbox": 0,
-        "invalid": 0,
-        "already_bound": 0,
-        "security_incomplete": 0,
-    }
-    for account in _load_accounts():
-        if str(account.get("group_id") or "").strip() != group_id:
-            continue
-        stats["group_accounts"] += 1
-        email = str(account.get("email") or "").strip()
-        email_l = email.lower()
-        provider_type = provider_map.get(email_l, str(account.get("provider_type") or "").strip())
-        if not email or not provider_type:
-            stats["without_mailbox"] += 1
-            continue
-        if normalized_health_status(account) == "invalid":
-            stats["invalid"] += 1
-            continue
-        account_key = _account_key(account) or f"email:{email_l}"
-        if account_key in bound_keys:
-            stats["already_bound"] += 1
-            continue
-        if not _account_cdk_security_ready(account):
-            stats["security_incomplete"] += 1
-            continue
-        bindings.append(
-            {
-                "account_key": account_key,
-                "account_id": str(account.get("account_id") or ""),
-                "email": email,
-                "provider_type": provider_type,
-                "group_id": group_id,
-                "group_name": str(group.get("name") or ""),
-                "registered_at": str(account.get("registered_at") or ""),
-            }
-        )
-    bindings.sort(key=lambda item: (item.get("registered_at") or "", item["email"]))
-    stats["eligible"] = len(bindings)
-    return bindings, stats
-
-
-def _replace_invalid_unredeemed_cdks(
-    checked_records: list[dict[str, Any]],
-    *,
-    accounts: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    # Health callers already hold a complete account snapshot. Reusing it
-    # avoids decoding the full payload store a second time at the end of a
-    # large run.
-    accounts = accounts if accounts is not None else _load_accounts()
-    account_keys = {_account_key(item) for item in accounts if _account_key(item)}
-    account_emails = {
-        str(item.get("email") or "").strip().lower()
-        for item in accounts
-        if str(item.get("email") or "").strip()
-    }
-    account_ids = {
-        str(item.get("account_id") or "").strip().lower()
-        for item in accounts
-        if str(item.get("account_id") or "").strip()
-    }
-    invalid_accounts: list[dict[str, Any]] = []
-    invalid_identities: set[tuple[str, str, str]] = set()
-
-    def add_invalid(account: dict[str, Any]) -> None:
-        item = {
-            "account_key": str(account.get("account_key") or _account_key(account) or ""),
-            "account_id": str(account.get("account_id") or ""),
-            "email": str(account.get("email") or ""),
-        }
-        identity = (
-            item["account_key"].strip(),
-            item["account_id"].strip().lower(),
-            item["email"].strip().lower(),
-        )
-        if identity not in invalid_identities:
-            invalid_identities.add(identity)
-            invalid_accounts.append(item)
-
-    for account in [*accounts, *checked_records]:
-        if normalized_health_status(account) == "invalid":
-            add_invalid(account)
-
-    # Keep unresolved CDKs repairable after their invalid account was archived.
-    for record in list_cdks(CDKS_FILE):
-        key = str(record.get("account_key") or "").strip()
-        email = str(record.get("email") or "").strip().lower()
-        account_id = str(record.get("account_id") or "").strip().lower()
-        exists = (
-            (key and key in account_keys)
-            or (email and email in account_emails)
-            or (account_id and account_id in account_ids)
-        )
-        if not exists:
-            add_invalid(record)
-
-    if not invalid_accounts:
-        return {"replaced": 0, "unresolved": 0, "items": []}
-
-    provider_map = _mailbox_provider_map(_read_config())
-    group_names = {item["id"]: item["name"] for item in _groups_with_counts()}
-    candidates: list[dict[str, Any]] = []
-    for account in accounts:
-        health = normalized_health_status(account)
-        if health not in {"alive", "limited"}:
-            continue
-        if not _account_cdk_security_ready(account):
-            continue
-        email = str(account.get("email") or "").strip()
-        provider_type = provider_map.get(email.lower(), str(account.get("provider_type") or "").strip())
-        group_id = str(account.get("group_id") or "").strip()
-        if not email or not provider_type or not group_id:
-            continue
-        candidates.append(
-            {
-                "account_key": _account_key(account) or f"email:{email.lower()}",
-                "account_id": str(account.get("account_id") or ""),
-                "email": email,
-                "provider_type": provider_type,
-                "group_id": group_id,
-                "group_name": group_names.get(group_id, ""),
-                "health_status": health,
-                "registered_at": str(account.get("registered_at") or ""),
-            }
-        )
-    candidates.sort(
-        key=lambda item: (
-            0 if item["health_status"] == "alive" else 1,
-            item["registered_at"],
-            item["email"].lower(),
-        )
-    )
-    return replace_available_bindings(invalid_accounts, candidates, CDKS_FILE)
-
-
-def _merge_health_snapshot(
-    accounts: list[dict[str, Any]],
-    checked_records: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Overlay this run's health results without decoding the store again."""
-    if not checked_records:
-        return accounts
-    return normalize_accounts([*accounts, *checked_records])
-
-
-def _replace_cdks_after_health(
-    accounts: list[dict[str, Any]],
-    checked_records: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """Merge health results and repair bindings in one worker-thread call."""
-    refreshed_records = _merge_health_snapshot(accounts, checked_records)
-    return _replace_invalid_unredeemed_cdks(
-        checked_records,
-        accounts=refreshed_records,
-    )
-
-
 _ACCOUNT_REAUTH_MODES = frozenset({"browser", "protocol"})
 _ACCOUNT_HEALTH_PROGRESS_LOCK = threading.Lock()
 _MAINTENANCE_RUN_LOCK = threading.Lock()
@@ -1511,120 +1262,6 @@ from web.routes.security_ops import (  # noqa: E402,F401
     _security_proxy_candidates,
 )
 ACCOUNT_REAUTH_JOBS = AccountReauthBatchJobs()
-
-
-def _cdk_admin_row(record: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key: record.get(key)
-        for key in (
-            "id",
-            "code",
-            "code_hint",
-            "email",
-            "account_id",
-            "provider_type",
-            "group_id",
-            "group_name",
-            "status",
-            "created_at",
-            "updated_at",
-            "redeemed_at",
-            "last_access_at",
-            "expires_at",
-            "replacement_count",
-            "last_replaced_at",
-        )
-    }
-
-
-def _cdk_admin_payload(group_id: str = "") -> dict[str, Any]:
-    rows = ensure_plain_codes(CDKS_FILE)
-    groups = _groups_with_counts()
-    selected = str(group_id or "").strip()
-    eligible: dict[str, Any] = {}
-    if selected:
-        try:
-            _bindings, eligible = _eligible_cdk_bindings(selected)
-        except KeyError:
-            eligible = {}
-    items = [_cdk_admin_row(item) for item in rows]
-    items.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
-    return {
-        "ok": True,
-        "items": items,
-        "summary": cdk_summary(rows),
-        "groups": groups,
-        "eligibility": eligible,
-    }
-
-
-def _proxy_pool_preview(cfg: dict[str, Any]) -> dict[str, Any]:
-    proxy = cfg.get("proxy") if isinstance(cfg.get("proxy"), dict) else {}
-    pool_file = str(proxy.get("pool_file") or "").strip()
-    lines: list[str] = []
-    if pool_file:
-        path = Path(pool_file).expanduser()
-        if not path.is_absolute():
-            path = (ROOT / path).resolve()
-        if path.is_file():
-            try:
-                lines = [
-                    ln.strip()
-                    for ln in path.read_text(
-                        encoding="utf-8", errors="replace"
-                    ).splitlines()
-                    if ln.strip() and not ln.strip().startswith("#")
-                ]
-            except Exception:
-                lines = []
-    country_pools = read_registration_proxy_pools()
-    selected_country = str(proxy.get("selected_country") or "").upper().strip()
-    selected_pool = next(
-        (item for item in country_pools["items"] if item["country"] == selected_country),
-        None,
-    )
-    selected_count = int((selected_pool or {}).get("count") or 0)
-    mode = str(proxy.get("mode") or "single_proxy")
-    return {
-        "enabled": bool(proxy.get("enabled")),
-        "mode": mode,
-        "url": str(proxy.get("url") or ""),
-        "resource_url": str(proxy.get("resource_url") or ""),
-        "clearance": dict(proxy.get("clearance") or {}) if isinstance(proxy.get("clearance"), dict) else {},
-        "pool_file": pool_file,
-        "pool_count": selected_count if mode == "country_pool" else len(lines),
-        "pool_unique_count": selected_count if mode == "country_pool" else len(set(lines)),
-        "rotate_per_task": bool(proxy.get("rotate_per_task", True)),
-        "pool_preview": lines[:20],
-        "pool_text": "\n".join(lines),
-        "selected_country": selected_country,
-        "country_pools": country_pools,
-    }
-
-
-def _c2a_public(cfg: dict[str, Any]) -> dict[str, Any]:
-    from common.chatgpt2api import c2a_config_from
-
-    c = c2a_config_from(cfg)
-    key = str(c.get("key") or "")
-    return {
-        "enabled": bool(c.get("enabled")),
-        "url": str(c.get("url") or ""),
-        "key": "",
-        "key_masked": _mask_secret(key) if key else "",
-        "has_key": bool(key),
-        "auto_upload": bool(c.get("auto_upload", True)),
-    }
-
-
-def _warm_panel_caches() -> None:
-    """Prime the expensive mailbox/status snapshot after a service restart."""
-    try:
-        _public_mail_stats(_read_config())
-    except Exception as error:
-        # Cache warming is opportunistic; the first request can still build a
-        # fresh snapshot if a provider or a partially-written data file fails.
-        logger.debug("panel cache warm-up skipped: %s", error)
 
 
 class _LogStream(io.TextIOBase):
@@ -2919,249 +2556,36 @@ from web.routes.mailbox import (  # noqa: E402,F401
 )
 
 
-@app.put("/api/proxy")
-async def put_proxy(body: ProxyUpdate):
-    # Proxy settings are persisted independently from an active batch. A
-    # request already in flight keeps its selected proxy; protocol workers
-    # refresh this saved pool before the next task or retry.
-    country_pools = read_registration_proxy_pools()
-    if body.country_pools is not None:
-        try:
-            country_pools = write_registration_proxy_pools(body.country_pools)
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from exc
-    selected_country = str(body.selected_country or "").upper().strip()
-    known_countries = {item["country"]: item for item in country_pools["items"]}
-    if selected_country and selected_country not in known_countries:
-        raise HTTPException(400, "当前国家未在主注册代理池中")
-    mode = body.mode if body.mode in {"single_proxy", "pool", "country_pool"} else "single_proxy"
-    if mode == "country_pool":
-        if not selected_country:
-            raise HTTPException(400, "请选择主注册代理国家")
-        if not int(known_countries[selected_country].get("count") or 0):
-            raise HTTPException(400, "所选国家没有可用代理")
+from web.routes.proxy_admin import router as proxy_admin_router  # noqa: E402
 
-    with _edit_config() as cfg:
-        proxy = cfg.setdefault("proxy", {})
-        proxy["enabled"] = body.enabled
-        proxy["mode"] = mode
-        proxy["url"] = body.url or ""
-        proxy["resource_url"] = body.resource_url or ""
-        proxy["selected_country"] = selected_country
-        proxy["rotate_per_task"] = body.rotate_per_task
-        if body.clearance is not None:
-            raw = body.clearance
-            mode = str(raw.get("mode") or "none").strip().lower()
-            proxy["clearance"] = {
-                "enabled": bool(raw.get("enabled")),
-                "mode": mode if mode in {"none", "flaresolverr"} else "none",
-                "flaresolverr_url": str(raw.get("flaresolverr_url") or "").strip(),
-                "proxy_url": str(raw.get("proxy_url") or "").strip(),
-                "timeout_sec": max(1, min(300, int(raw.get("timeout_sec") or 60))),
-                "refresh_interval": max(0, int(raw.get("refresh_interval") or 3600)),
-            }
-        pool_file = (body.pool_file or "").strip()
-        if body.pool_text is not None:
-            if not pool_file:
-                pool_file = str(DATA_DIR / "proxy_pool.txt")
-            path = Path(pool_file).expanduser()
-            if not path.is_absolute():
-                path = (ROOT / path).resolve()
-            else:
-                path = path.resolve()
-            try:
-                path.relative_to(DATA_DIR.resolve())
-            except ValueError:
-                raise HTTPException(400, "代理池文件必须位于项目 data 目录")
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(body.pool_text.rstrip() + "\n", encoding="utf-8")
-            try:
-                rel = path.relative_to(ROOT)
-                pool_file = str(rel)
-            except ValueError:
-                pool_file = str(path)
-        proxy["pool_file"] = pool_file
-    return {"ok": True, "proxy": _proxy_pool_preview(cfg)}
+app.include_router(proxy_admin_router)
+
+from web.routes.proxy_admin import (  # noqa: E402,F401
+    ProxyTestRequest,
+    ProxyUpdate,
+    _proxy_pool_preview,
+    _warm_panel_caches,
+    proxy_test,
+    put_proxy,
+)
 
 
-@app.post("/api/proxy/test")
-async def proxy_test(body: ProxyTestRequest):
-    from register.batch import resolve_proxy_pool
 
-    cfg = _read_config()
-    proxy_cfg = cfg.get("proxy") if isinstance(cfg.get("proxy"), dict) else {}
-    proxies = [str(value or "").strip() for value in body.proxies if str(value or "").strip()]
-    if not proxies:
-        proxies = resolve_proxy_pool(proxy_cfg)
-        single = str(proxy_cfg.get("url") or "").strip()
-        if not proxies and single:
-            proxies = [single]
-    if not proxies:
-        raise HTTPException(400, "没有可测试的代理")
-    targets = proxies[:100]
-    PROGRESS.start("proxy_test", "代理批量检测", total=len(targets), stage="检测出口连通性")
-    items: list[dict[str, Any]] = []
-    try:
-        tasks = [asyncio.create_task(asyncio.to_thread(probe_proxy, proxy)) for proxy in targets]
-        for future in asyncio.as_completed(tasks):
-            items.append(await future)
-            PROGRESS.update(
-                "proxy_test",
-                done=len(items),
-                total=len(targets),
-                stage=f"已检测 {len(items)} / {len(targets)}",
-            )
-    except Exception as exc:
-        PROGRESS.finish("proxy_test", ok=False, message=str(exc))
-        raise
-    alive = sum(1 for item in items if item.get("ok"))
-    PROGRESS.finish("proxy_test", message=f"可用 {alive} / {len(items)}")
-    return {
-        "ok": True,
-        "count": len(items),
-        "alive": alive,
-        "items": items,
-    }
+from web.routes.chatgpt2api import router as chatgpt2api_router  # noqa: E402
 
+app.include_router(chatgpt2api_router)
 
-@app.get("/api/chatgpt2api")
-async def get_chatgpt2api():
-    return {"chatgpt2api": _c2a_public(_read_config())}
+from web.routes.chatgpt2api import (  # noqa: E402,F401
+    ChatGPT2APITestRequest,
+    ChatGPT2APIUpdate,
+    ChatGPT2APIUploadRequest,
+    _c2a_public,
+    get_chatgpt2api,
+    put_chatgpt2api,
+    test_chatgpt2api,
+    upload_all_chatgpt2api,
+)
 
-
-@app.put("/api/chatgpt2api")
-async def put_chatgpt2api(body: ChatGPT2APIUpdate):
-    if JOB.running:
-        raise HTTPException(409, "job is running; stop it before saving config")
-    from common.chatgpt2api import normalize_c2a_url
-
-    with _edit_config() as cfg:
-        c2a = cfg.setdefault("chatgpt2api", {})
-        c2a["enabled"] = bool(body.enabled)
-        c2a["url"] = normalize_c2a_url(body.url) or "https://chatgpt2api.xbovo.online"
-        new_key = str(body.key or "").strip()
-        if new_key and "…" not in new_key and "***" not in new_key:
-            c2a["key"] = new_key
-        c2a["auto_upload"] = bool(body.auto_upload)
-    return {"ok": True, "chatgpt2api": _c2a_public(cfg)}
-
-
-@app.post("/api/chatgpt2api/test")
-async def test_chatgpt2api(body: ChatGPT2APITestRequest):
-    from common.chatgpt2api import c2a_config_from, test_connection
-
-    cfg = _read_config()
-    c = c2a_config_from(cfg)
-    url = (body.url or "").strip() or c.get("url") or ""
-    key = (body.key or "").strip() or c.get("key") or ""
-    ok, msg = await asyncio.to_thread(test_connection, url, key)
-    return {"ok": ok, "message": msg, "url": url}
-
-
-@app.post("/api/chatgpt2api/upload-all")
-async def upload_all_chatgpt2api(body: ChatGPT2APIUploadRequest | None = None):
-    from common.chatgpt2api import (
-        c2a_config_from,
-        collect_local_accounts,
-        import_accounts,
-        normalize_c2a_url,
-    )
-
-    cfg = _read_config()
-    c = c2a_config_from(cfg)
-    body = body or ChatGPT2APIUploadRequest()
-    url = normalize_c2a_url((body.url or "").strip() or c.get("url") or "")
-    key = (body.key or "").strip() or c.get("key") or ""
-    if not url or not key:
-        raise HTTPException(400, "请先配置 chatgpt2api 网址和 admin key")
-    group_id = str(body.group_id or "").strip()
-    groups = _groups_with_counts()
-    default_group_id = str(groups[0]["id"])
-    group = next((item for item in groups if item["id"] == group_id), None) if group_id else None
-    if group_id and group is None:
-        raise HTTPException(404, "分组不存在")
-    group_count = (group or {}).get("account_count")
-    if group is not None and group_count is not None:
-        try:
-            expected = max(0, int(group_count))
-        except (TypeError, ValueError):
-            expected = await asyncio.to_thread(count_accounts, ACCOUNTS_FILE)
-    else:
-        expected = await asyncio.to_thread(count_accounts, ACCOUNTS_FILE)
-    PROGRESS.start(
-        "c2a_upload",
-        "chatgpt2api 账号上传",
-        total=expected,
-        stage="筛选分组与有效账号",
-    )
-    accounts = await asyncio.to_thread(
-        collect_local_accounts,
-        group_id=group_id,
-        default_group_id=default_group_id,
-        accounts_path=ACCOUNTS_FILE,
-    )
-    if not accounts:
-        scope = f"分组“{group['name']}”" if group else "本地"
-        PROGRESS.finish("c2a_upload", ok=False, message=f"{scope}没有有效账号")
-        return {
-            "ok": False,
-            "message": f"{scope}没有可上传的有效账号",
-            "count": 0,
-            "group_id": group_id,
-            "group_name": str((group or {}).get("name") or ""),
-        }
-    PROGRESS.update(
-        "c2a_upload",
-        done=0,
-        total=len(accounts),
-        percent=30,
-        stage=f"正在提交 {len(accounts)} 个账号到远端",
-    )
-    try:
-        upload_result = await asyncio.to_thread(import_accounts, url, key, accounts)
-    except Exception as exc:
-        PROGRESS.finish("c2a_upload", ok=False, message=str(exc))
-        raise
-    ok, msg, data = upload_result
-    PROGRESS.update(
-        "c2a_upload",
-        done=len(accounts),
-        total=len(accounts),
-        percent=95,
-        stage="记录上传结果",
-    )
-    uploaded_emails = {
-        str(item.get("email") or "").strip().lower()
-        for item in accounts
-        if isinstance(item, dict) and str(item.get("email") or "").strip()
-    }
-    upload_keys = [
-        _account_key(item)
-        for item in accounts
-        if str(item.get("email") or "").strip().lower() in uploaded_emails
-        and _account_key(item)
-    ]
-    if upload_keys:
-        await asyncio.to_thread(
-            update_account_records,
-            upload_keys,
-            {
-                "c2a_upload_status": "success" if ok else "failed",
-                "c2a_uploaded_at": _now_iso(),
-                "c2a_upload_error": "" if ok else msg[:300],
-            },
-            path=ACCOUNTS_FILE,
-        )
-    PROGRESS.finish("c2a_upload", ok=ok, message=msg)
-    return {
-        "ok": ok,
-        "message": msg,
-        "count": len(accounts),
-        "result": data,
-        "url": url,
-        "group_id": group_id,
-        "group_name": str((group or {}).get("name") or ""),
-    }
 
 
 @app.get("/api/accounts")
@@ -3431,112 +2855,26 @@ async def account_credentials(body: AccountCredentialsRequest):
     )
 
 
-@app.get("/api/cdks")
-async def cdks(group_id: str = ""):
-    return await asyncio.to_thread(_cdk_admin_payload, group_id)
+from web.routes.cdks_admin import router as cdks_admin_router  # noqa: E402
 
+app.include_router(cdks_admin_router)
 
-@app.post("/api/cdks/generate")
-async def cdks_generate(body: CDKGenerateRequest):
-    account_key = str(body.account_key or "").strip()
-    group_id = str(body.group_id or "").strip()
-    if account_key:
-        account = await asyncio.to_thread(
-            lambda: _records_by_keys_with_fallback([account_key]).get(account_key)
-        )
-        if account is None:
-            raise HTTPException(404, "指定账号不存在")
-        group_id = str(account.get("group_id") or "").strip()
-        if not group_id:
-            raise HTTPException(400, "指定账号没有有效分组")
-    if not group_id:
-        raise HTTPException(400, "请选择账号分组")
-    try:
-        bindings, eligibility = await asyncio.to_thread(
-            _eligible_cdk_bindings, group_id
-        )
-    except KeyError as error:
-        raise HTTPException(404, str(error).strip("'")) from error
-    selected = (
-        [item for item in bindings if str(item.get("account_key") or "") == account_key]
-        if account_key
-        else bindings[: body.count]
-    )
-    if not selected:
-        message = "指定账号无法生成 CDK：可能未在邮箱池、已失效或已绑定 CDK" if account_key else "该分组没有可生成 CDK 的账号"
-        raise HTTPException(400, message)
-    created = await asyncio.to_thread(
-        create_cdks,
-        selected,
-        expires_days=body.expires_days,
-        path=CDKS_FILE,
-    )
-    if not created:
-        raise HTTPException(409, "所选账号已绑定 CDK，请刷新后重试")
-    codes = [
-        {
-            "id": str(item.get("id") or ""),
-            "code": str(item.get("code") or ""),
-            "email": str(item.get("email") or ""),
-            "expires_at": str(item.get("expires_at") or ""),
-        }
-        for item in created
-    ]
-    for item in created:
-        record_operation_event(
-            {
-                "email": item.get("email"),
-                "account_id": item.get("account_id"),
-            },
-            "cdk_generate",
-            "success",
-            message="CDK 生成成功",
-            metadata={
-                "cdk_id": str(item.get("id") or ""),
-                "group_id": str(item.get("group_id") or group_id),
-                "expires_at": str(item.get("expires_at") or ""),
-            },
-        )
-    return {
-        "ok": True,
-        "created": len(codes),
-        "codes": codes,
-        "eligibility": eligibility,
-        "group_id": group_id,
-        "message": f"已为指定账号生成 CDK" if account_key else f"已生成 {len(codes)} 个 CDK",
-    }
+from web.routes.cdks_admin import (  # noqa: E402,F401
+    CDKGenerateRequest,
+    CDKStatusRequest,
+    _account_cdk_security_ready,
+    _cdk_account_marks,
+    _cdk_admin_payload,
+    _cdk_admin_row,
+    _eligible_cdk_bindings,
+    _merge_health_snapshot,
+    _replace_cdks_after_health,
+    _replace_invalid_unredeemed_cdks,
+    cdks,
+    cdks_generate,
+    cdks_status,
+)
 
-
-@app.post("/api/cdks/status")
-async def cdks_status(body: CDKStatusRequest):
-    try:
-        changed, rows = await asyncio.to_thread(
-            set_cdk_status, body.ids, body.status, CDKS_FILE
-        )
-    except ValueError as error:
-        raise HTTPException(400, str(error)) from error
-    wanted_ids = {str(value or "").strip() for value in body.ids if str(value or "").strip()}
-    for item in rows:
-        if str(item.get("id") or "") not in wanted_ids:
-            continue
-        record_operation_event(
-            {
-                "email": item.get("email"),
-                "account_id": item.get("account_id"),
-            },
-            "cdk_status",
-            "success",
-            message="CDK 状态已更新",
-            metadata={
-                "cdk_id": str(item.get("id") or ""),
-                "status": str(item.get("status") or body.status),
-            },
-        )
-    return {
-        "ok": True,
-        "changed": changed,
-        "summary": cdk_summary(rows),
-    }
 
 
 
