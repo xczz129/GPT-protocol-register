@@ -131,8 +131,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--provider",
         dest="mail_type",
         default=None,
-        choices=["auto", "outlook", "icloud", "domain", "maddy", "fastmail", "outlook_token", "icloud_api", "domain_api", "maddy_webui", "fastmail_api"],
-        help="Mailbox pool: auto / outlook / icloud / domain / maddy / fastmail",
+        choices=["auto", "outlook", "icloud", "maddy", "fastmail", "outlook_token", "icloud_api", "maddy_webui", "fastmail_api"],
+        help="Mailbox pool: auto / outlook / icloud / maddy / fastmail",
     )
 
     sub = parser.add_subparsers(dest="command")
@@ -153,8 +153,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--provider",
         dest="mail_type",
         default=None,
-        choices=["auto", "outlook", "icloud", "domain", "maddy", "fastmail", "outlook_token", "icloud_api", "domain_api", "maddy_webui", "fastmail_api"],
-        help="Mailbox pool: auto / outlook / icloud / domain / maddy / fastmail",
+        choices=["auto", "outlook", "icloud", "maddy", "fastmail", "outlook_token", "icloud_api", "maddy_webui", "fastmail_api"],
+        help="Mailbox pool: auto / outlook / icloud / maddy / fastmail",
     )
     p_reg.set_defaults(func=cmd_register)
 
@@ -173,8 +173,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--provider",
         dest="mail_type",
         default=None,
-        choices=["auto", "outlook", "icloud", "domain", "maddy", "fastmail", "outlook_token", "icloud_api", "domain_api", "maddy_webui", "fastmail_api"],
-        help="Mailbox pool: auto / outlook / icloud / domain / maddy / fastmail",
+        choices=["auto", "outlook", "icloud", "maddy", "fastmail", "outlook_token", "icloud_api", "maddy_webui", "fastmail_api"],
+        help="Mailbox pool: auto / outlook / icloud / maddy / fastmail",
     )
     p_login.set_defaults(func=cmd_login)
 

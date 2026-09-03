@@ -4,7 +4,6 @@
 Supported:
   - outlook_token: email----password----client_id----refresh_token  (Graph / IMAP)
   - icloud_api:    email----api_key  (https://icloud.xbovo.online Hide My Email API)
-  - domain_api:    auto-created custom-domain mailboxes via Freemail-compatible API
   - maddy_webui:   auto-created maddy mailboxes via maddy-webui automation API
   - fastmail_api:  server-managed Fastmail alias pool via mailcode-api
 """
@@ -130,9 +129,6 @@ def _normalize_domain_values(raw: Any) -> list[str]:
 OUTLOOK_DEFAULT_IMAP_HOST = "outlook.office365.com"
 
 ICLOUD_API_DEFAULT_BASE = "https://icloud.xbovo.online"
-DOMAIN_API_DEFAULT_BASE = "https://mail.xbovo.online"
-DOMAIN_API_DEFAULT_CAPACITY = 500
-DOMAIN_API_DEFAULT_LOCAL_LENGTH = 12
 MADDY_WEBUI_DEFAULT_BASE = "https://120.53.232.195/api"
 MADDY_WEBUI_DEFAULT_HOST = "admin.xb1219.com"
 MADDY_WEBUI_DEFAULT_CAPACITY = 500
@@ -175,8 +171,6 @@ OTP_CODE_GRACE_SECONDS = 5.0
 
 # External APIs: prefer direct (no system proxy)
 _NO_PROXY = {"http": None, "https": None}
-_DOMAIN_API_SESSION_CACHE_LOCK = Lock()
-_DOMAIN_API_SESSION_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
 
 # The panel asks for mailbox capacity from several endpoints.  The source
 # files are large enough that reparsing them for every request is noticeable,
@@ -192,29 +186,6 @@ def _http_session() -> requests.Session:
     s.trust_env = False
     s.proxies = _NO_PROXY
     return s
-
-
-def _domain_api_cache_key(api_base: str, username: str, password: str) -> tuple[str, str, str]:
-    return (
-        str(api_base or "").strip().rstrip("/").lower(),
-        str(username or "").strip().lower(),
-        hashlib.sha256(str(password or "").encode("utf-8")).hexdigest(),
-    )
-
-
-def _domain_api_cache_entry(api_base: str, username: str, password: str) -> dict[str, Any]:
-    key = _domain_api_cache_key(api_base, username, password)
-    with _DOMAIN_API_SESSION_CACHE_LOCK:
-        entry = _DOMAIN_API_SESSION_CACHE.get(key)
-        if entry is None:
-            entry = {
-                "cookies": None,
-                "logged_in": False,
-                "domains_cache": None,
-                "lock": RLock(),
-            }
-            _DOMAIN_API_SESSION_CACHE[key] = entry
-        return entry
 
 
 def _mailbox_source_stamp(path: Path) -> tuple[int, int, int]:
@@ -501,10 +472,6 @@ class OutlookTokenError(RuntimeError):
 
 
 class ICloudApiError(RuntimeError):
-    pass
-
-
-class DomainApiError(RuntimeError):
     pass
 
 
@@ -1533,442 +1500,6 @@ class ICloudApiProvider:
             # already used — keep waiting with exclude
             # empty / timeout chunk — loop until total wait exhausted
 
-        return None
-
-
-class DomainApiProvider:
-    """Freemail-compatible custom domain mailboxes.
-
-    The provider logs in to a Freemail panel, creates a mailbox on demand, and
-    polls that mailbox through the panel's JSON APIs.
-    """
-
-    name = "domain_api"
-
-    def __init__(self, entry: dict, conf: dict):
-        self.conf = conf
-        self.provider_ref = str(entry.get("provider_ref") or "")
-        self.label = str(entry.get("label") or self.provider_ref or "Domain Mail")
-        self.api_base = (
-            str(entry.get("api_base") or entry.get("base_url") or DOMAIN_API_DEFAULT_BASE)
-            .strip()
-            .rstrip("/")
-            or DOMAIN_API_DEFAULT_BASE
-        )
-        self.username = str(entry.get("username") or "").strip()
-        self.password = str(entry.get("password") or "").strip()
-        self.default_domain = str(
-            entry.get("default_domain") or entry.get("domain") or ""
-        ).strip()
-        try:
-            self.domain_index = int(entry.get("domain_index"))
-        except (TypeError, ValueError):
-            self.domain_index = None
-        self.local_length = max(
-            8,
-            min(
-                30,
-                int(entry.get("local_length") or DOMAIN_API_DEFAULT_LOCAL_LENGTH),
-            ),
-        )
-        self.message_limit = max(1, int(entry.get("message_limit") or 10))
-        self.session = _http_session()
-        self._cache_entry = _domain_api_cache_entry(
-            self.api_base,
-            self.username,
-            self.password,
-        )
-        self._cache_lock = self._cache_entry["lock"]
-        self._load_cached_cookies()
-
-    def close(self) -> None:
-        self.session.close()
-
-    def _load_cached_cookies(self) -> None:
-        cookies = self._cache_entry.get("cookies")
-        if cookies is not None:
-            self.session.cookies.update(cookies)
-
-    def _store_cached_cookies(self, *, logged_in: bool | None = None) -> None:
-        self._cache_entry["cookies"] = self.session.cookies.copy()
-        if logged_in is not None:
-            self._cache_entry["logged_in"] = logged_in
-
-    def _json_or_error(self, resp, *, action: str) -> Any:
-        try:
-            data = resp.json()
-        except Exception:
-            data = None
-        if resp.status_code != 200:
-            if isinstance(data, dict):
-                detail = data.get("error") or data.get("message") or data
-            else:
-                detail = resp.text[:300]
-            raise DomainApiError(f"Domain mail {action} HTTP {resp.status_code}: {detail}")
-        return data
-
-    def _login(self, *, force: bool = False) -> None:
-        with self._cache_lock:
-            if not force and self._cache_entry.get("logged_in"):
-                self._load_cached_cookies()
-                return
-            if not self.username or not self.password:
-                raise DomainApiError("Domain mail missing username or password")
-            resp = self.session.post(
-                f"{self.api_base}/api/login",
-                json={"username": self.username, "password": self.password},
-                headers={"Accept": "application/json", "User-Agent": self.conf["user_agent"]},
-                timeout=self.conf["request_timeout"],
-            )
-            data = self._json_or_error(resp, action="login")
-            if not isinstance(data, dict) or not data.get("success"):
-                self._store_cached_cookies(logged_in=False)
-                raise DomainApiError(
-                    "Domain mail login failed: "
-                    + str((data or {}).get("error") or (data or {}).get("message") or data)
-                )
-            self._store_cached_cookies(logged_in=True)
-
-    def _request_json(self, method: str, path: str, *, action: str, **kwargs: Any) -> Any:
-        self._login()
-        headers = dict(kwargs.pop("headers", {}) or {})
-        headers.setdefault("Accept", "application/json")
-        headers.setdefault("User-Agent", self.conf["user_agent"])
-        timeout = kwargs.pop("timeout", self.conf["request_timeout"])
-        resp = self.session.request(
-            method,
-            f"{self.api_base}{path}",
-            headers=headers,
-            timeout=timeout,
-            **kwargs,
-        )
-        if resp.status_code in {401, 403}:
-            self._store_cached_cookies(logged_in=False)
-            self._login(force=True)
-            resp = self.session.request(
-                method,
-                f"{self.api_base}{path}",
-                headers=headers,
-                timeout=timeout,
-                **kwargs,
-            )
-        if resp.status_code == 200:
-            self._store_cached_cookies()
-        return self._json_or_error(resp, action=action)
-
-    def fetch_domains(self, *, force: bool = False) -> list[str]:
-        cached = self._cache_entry.get("domains_cache")
-        if cached is not None and not force:
-            return list(cached)
-        data = self._request_json("GET", "/api/domains", action="domains")
-        if not isinstance(data, list):
-            raise DomainApiError("Domain mail domains response is not a list")
-        domains = [str(item or "").strip() for item in data if str(item or "").strip()]
-        if not domains:
-            raise DomainApiError("Domain mail returned an empty domain list")
-        self._cache_entry["domains_cache"] = list(domains)
-        return list(domains)
-
-    def _select_domain(self, requested_domain: str = "") -> tuple[int, str]:
-        domains = self.fetch_domains()
-        wanted = str(requested_domain or self.default_domain or "").strip().lower()
-        if wanted:
-            for index, domain in enumerate(domains):
-                if domain.lower() == wanted:
-                    return index, domain
-            raise DomainApiError(f"Domain mail domain not available: {wanted}")
-        if self.domain_index is not None and 0 <= self.domain_index < len(domains):
-            return self.domain_index, domains[self.domain_index]
-        return 0, domains[0]
-
-    def _reserve_address(self, address: str, *, allow_used: bool = False) -> None:
-        target = str(address or "").strip().lower()
-        if not target:
-            raise RuntimeError("Domain mail returned an empty address")
-        with _mailbox_state_lock:
-            with _with_state_file_lock():
-                store = _load_state_unlocked()
-                entry = store.get(target)
-                if not (
-                    _entry_available(entry)
-                    or (
-                        allow_used
-                        and str((entry or {}).get("state") or "").lower() == "used"
-                    )
-                ):
-                    state = str((entry or {}).get("state") or "unavailable")
-                    raise RuntimeError(f"[{self.label}] Domain mailbox unavailable: {target} ({state})")
-                store[target] = {
-                    "state": "in_use",
-                    "reason": "",
-                    "updated_at": datetime.now(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S%z"),
-                }
-                _save_state_unlocked(store)
-
-    def _mailbox_info(self, address: str) -> dict[str, Any] | None:
-        try:
-            data = self._request_json(
-                "GET",
-                "/api/mailbox/info",
-                action="mailbox info",
-                params={"address": address},
-                timeout=min(float(self.conf["request_timeout"]), 10.0),
-            )
-        except Exception:
-            return None
-        return data if isinstance(data, dict) and data.get("address") else None
-
-    def _create_custom(self, local: str, domain_index: int, address: str) -> dict[str, Any]:
-        try:
-            data = self._request_json(
-                "POST",
-                "/api/create",
-                action="create mailbox",
-                json={"local": local, "domainIndex": domain_index},
-            )
-        except DomainApiError:
-            info = self._mailbox_info(address)
-            if info:
-                return info
-            raise
-        if not isinstance(data, dict) or not str(data.get("email") or "").strip():
-            raise DomainApiError(f"Domain mail create response missing email: {data}")
-        return data
-
-    def _generate_mailbox(self, domain_index: int) -> dict[str, Any]:
-        data = self._request_json(
-            "GET",
-            "/api/generate",
-            action="generate mailbox",
-            params={"length": self.local_length, "domainIndex": domain_index},
-        )
-        if not isinstance(data, dict) or not str(data.get("email") or "").strip():
-            raise DomainApiError(f"Domain mail generate response missing email: {data}")
-        return data
-
-    def create_mailbox(
-        self,
-        username: str | None = None,
-        *,
-        allow_used: bool = False,
-    ) -> dict[str, Any]:
-        requested = str(username or "").strip().lower()
-        remote: dict[str, Any]
-        if requested:
-            if "@" in requested:
-                local, requested_domain = requested.rsplit("@", 1)
-            else:
-                local, requested_domain = requested, ""
-            if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", local or ""):
-                raise RuntimeError(f"Domain mailbox local part is invalid: {local}")
-            domain_index, domain = self._select_domain(requested_domain)
-            address = f"{local}@{domain}".lower()
-            self._reserve_address(address, allow_used=allow_used)
-            try:
-                remote = self._create_custom(local, domain_index, address)
-            except Exception:
-                _release_state(address, any_state=True)
-                raise
-        else:
-            domain_index, _domain = self._select_domain()
-            last_error = ""
-            for _attempt in range(5):
-                remote = self._generate_mailbox(domain_index)
-                address = str(remote.get("email") or "").strip().lower()
-                try:
-                    self._reserve_address(address, allow_used=allow_used)
-                    break
-                except RuntimeError as error:
-                    last_error = str(error)
-                    continue
-            else:
-                raise RuntimeError(last_error or "Domain mail generated no usable address")
-
-        email = str(remote.get("email") or remote.get("address") or address).strip().lower()
-        return {
-            "provider": self.name,
-            "provider_ref": self.provider_ref,
-            "address": email,
-            "login_address": email,
-            "base_address": email,
-            "label": self.label,
-            "api_base": self.api_base,
-            "remote_id": str(remote.get("id") or ""),
-            "domain": email.rsplit("@", 1)[1] if "@" in email else "",
-        }
-
-    @staticmethod
-    def _recipients(item: dict[str, Any], fallback: str) -> list[str]:
-        raw = item.get("recipients")
-        if raw in (None, ""):
-            raw = item.get("to_addrs") or item.get("to") or item.get("recipient")
-        if isinstance(raw, list):
-            values = [str(value or "").strip().lower() for value in raw]
-        else:
-            text = str(raw or "")
-            values = [
-                value.strip().lower()
-                for value in re.split(r"[,;\s]+", text)
-                if value.strip()
-            ]
-            if not values:
-                values = [
-                    value.lower()
-                    for value in re.findall(
-                        r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}",
-                        text,
-                    )
-                ]
-        return [value for value in values if "@" in value] or [fallback.lower()]
-
-    def _email_detail(self, message_id: Any) -> dict[str, Any]:
-        if not str(message_id or "").strip():
-            return {}
-        try:
-            data = self._request_json(
-                "GET",
-                f"/api/email/{message_id}",
-                action="email detail",
-                timeout=min(float(self.conf["request_timeout"]), 10.0),
-            )
-        except Exception:
-            return {}
-        return data if isinstance(data, dict) else {}
-
-    def _normalize_message(self, mailbox: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
-        address = str(mailbox.get("address") or "").strip().lower()
-        message_id = str(item.get("id") or item.get("message_id") or "")
-        code = str(item.get("verification_code") or item.get("code") or "").strip()
-        text = str(
-            item.get("content")
-            or item.get("text_content")
-            or item.get("body_text")
-            or item.get("preview")
-            or ""
-        )
-        if code and code not in text:
-            text = f"Verification code: {code}\n{text}".strip()
-        return {
-            "provider": self.name,
-            "mailbox": address,
-            "message_id": message_id,
-            "subject": str(item.get("subject") or ""),
-            "sender": str(item.get("sender") or item.get("from") or ""),
-            "recipients": self._recipients(item, address),
-            "text_content": text,
-            "html_content": str(item.get("html_content") or item.get("body_html") or ""),
-            "received_at": _parse_received_at(
-                item.get("received_at") or item.get("created_at") or item.get("date")
-            ),
-        }
-
-    def fetch_recent_messages(self, mailbox: dict[str, Any]) -> list[dict[str, Any]]:
-        address = str(mailbox.get("address") or "").strip()
-        if not address:
-            raise RuntimeError("Domain mailbox missing address")
-        data = self._request_json(
-            "GET",
-            "/api/emails",
-            action="emails",
-            params={"mailbox": address},
-            timeout=min(float(self.conf["request_timeout"]), 10.0),
-        )
-        if isinstance(data, dict):
-            rows = data.get("list") or data.get("items") or data.get("emails") or []
-        else:
-            rows = data
-        if not isinstance(rows, list):
-            rows = []
-        messages: list[dict[str, Any]] = []
-        for raw in rows[: self.message_limit]:
-            if not isinstance(raw, dict):
-                continue
-            item = dict(raw)
-            if item.get("id") and not any(
-                item.get(key)
-                for key in ("content", "text_content", "html_content", "body_text", "body_html")
-            ):
-                detail = self._email_detail(item.get("id"))
-                if detail:
-                    item.update({k: v for k, v in detail.items() if v not in (None, "")})
-            messages.append(self._normalize_message(mailbox, item))
-        return messages
-
-    def list_mailboxes(self, *, limit: int = 200) -> list[dict[str, Any]]:
-        size = max(1, min(int(limit or 200), 2000))
-        data = self._request_json(
-            "GET",
-            "/api/mailboxes",
-            action="mailboxes",
-            params={"page": 1, "size": size},
-            timeout=min(float(self.conf["request_timeout"]), 10.0),
-        )
-        rows = data.get("list") if isinstance(data, dict) else data
-        return [item for item in rows if isinstance(item, dict)] if isinstance(rows, list) else []
-
-    def delete_mailbox(self, address: str) -> bool:
-        self._request_json(
-            "DELETE",
-            "/api/mailboxes",
-            action="delete mailbox",
-            params={"address": address},
-            timeout=min(float(self.conf["request_timeout"]), 10.0),
-        )
-        return True
-
-    def wait_for_code(
-        self,
-        mailbox: dict[str, Any],
-        stop_check=None,
-    ) -> str | None:
-        seen_value = mailbox.setdefault("_seen_code_message_refs", [])
-        if not isinstance(seen_value, list):
-            seen_value = []
-            mailbox["_seen_code_message_refs"] = seen_value
-        seen_refs = {str(item) for item in seen_value}
-
-        deadline = time.monotonic() + self.conf["wait_timeout"]
-        attempt = 0
-        while time.monotonic() < deadline:
-            if callable(stop_check) and stop_check():
-                logger.info("[%s] 已停止，中止等待验证码 %s", self.name, mailbox.get("address", "?"))
-                return None
-            attempt += 1
-            try:
-                messages = self.fetch_recent_messages(mailbox)
-            except Exception as error:
-                mailbox["_last_code_wait_error"] = str(error)[:300]
-                logger.warning(
-                    "[%s] 轮询验证码 #%d 失败 %s: %s",
-                    self.name,
-                    attempt,
-                    mailbox.get("address", "?"),
-                    error,
-                )
-                messages = []
-            target_address = str(mailbox.get("address") or "").strip().lower()
-            for message in messages:
-                if _message_before_code_boundary(mailbox, message):
-                    continue
-                recipients = [
-                    str(r or "").strip().lower() for r in (message.get("recipients") or [])
-                ]
-                if target_address and recipients and target_address not in recipients:
-                    continue
-                ref = _message_tracking_ref(message)
-                if ref in seen_refs:
-                    continue
-                code = _extract_code(message)
-                if code:
-                    seen_value.append(ref)
-                    mailbox.pop("_last_code_wait_error", None)
-                    print(f"  [域名邮箱] {mailbox.get('address', '?')} 已收到验证码")
-                    return code
-                seen_refs.add(ref)
-            for _ in range(max(1, int(max(0.2, self.conf["wait_interval"]) * 5))):
-                if callable(stop_check) and stop_check():
-                    return None
-                time.sleep(0.2)
         return None
 
 
@@ -3236,8 +2767,6 @@ def _build_provider(entry: dict, conf: dict):
         return ICloudApiProvider(entry, conf)
     if ptype == "outlook_token":
         return OutlookTokenProvider(entry, conf)
-    if ptype == "domain_api":
-        return DomainApiProvider(entry, conf)
     if ptype == "maddy_webui":
         return MaddyWebuiProvider(entry, conf)
     if ptype == "fastmail_api":
@@ -3347,7 +2876,7 @@ def reconcile_registered_mailbox_states(
         lines = str(entry.get("mailboxes") or entry.get("pool") or "")
         if ptype == "icloud_api":
             pool = parse_icloud_credentials(lines)
-        elif ptype in {"domain_api", "maddy_webui"}:
+        elif ptype == "maddy_webui":
             pool = parse_domain_mailboxes(lines)
         else:
             pool = parse_outlook_credentials(lines)
@@ -3469,8 +2998,8 @@ def count_pool_capacity(
         lines = str(entry.get("mailboxes") or entry.get("pool") or "")
         if ptype == "icloud_api":
             pool = parse_icloud_credentials(lines)
-        elif ptype in {"domain_api", "maddy_webui"}:
-            blocked_domains = _maddy_blocked_domains(entry) if ptype == "maddy_webui" else set()
+        elif ptype == "maddy_webui":
+            blocked_domains = _maddy_blocked_domains(entry)
             if requested:
                 requested_domain = requested.rsplit("@", 1)[1] if "@" in requested else ""
                 configured_domains = {
@@ -3521,18 +3050,10 @@ def count_pool_capacity(
                 dynamic_capacity = int(
                     entry.get("capacity")
                     or entry.get("auto_create_limit")
-                    or (
-                        MADDY_WEBUI_DEFAULT_CAPACITY
-                        if ptype == "maddy_webui"
-                        else DOMAIN_API_DEFAULT_CAPACITY
-                    )
+                    or MADDY_WEBUI_DEFAULT_CAPACITY
                 )
             except (TypeError, ValueError):
-                dynamic_capacity = (
-                    MADDY_WEBUI_DEFAULT_CAPACITY
-                    if ptype == "maddy_webui"
-                    else DOMAIN_API_DEFAULT_CAPACITY
-                )
+                dynamic_capacity = MADDY_WEBUI_DEFAULT_CAPACITY
             dynamic_capacity = max(0, min(500, dynamic_capacity))
             stats["total"] = int(stats["total"]) + dynamic_capacity
             stats["total_slots"] = int(stats["total_slots"]) + dynamic_capacity
@@ -3751,7 +3272,6 @@ def create_mailbox(
       - None / "auto" → all enabled providers
       - "outlook" / "outlook_token"
       - "icloud" / "icloud_api"
-      - "domain" / "domain_api"
       - "maddy" / "maddy_webui"
       - "fastmail" / "fastmail_api"
     """
@@ -3760,7 +3280,7 @@ def create_mailbox(
         want = str(provider_type or "auto").strip() or "auto"
         raise RuntimeError(
             f"No mail provider found for type={want!r}. "
-            f"Enable outlook_token, icloud_api, domain_api, maddy_webui, "
+            f"Enable outlook_token, icloud_api, maddy_webui, "
             f"or fastmail_api under mail.providers"
         )
 
@@ -4038,7 +3558,7 @@ def mark_mailbox_result(
         _release_state(address, any_state=True)
         print(f"  [mail] released (transient): {address}")
     elif (
-        isinstance(error, (OutlookTokenError, ICloudApiError, DomainApiError, MaddyWebuiError, FastmailApiError))
+        isinstance(error, (OutlookTokenError, ICloudApiError, MaddyWebuiError, FastmailApiError))
         or "OutlookToken refresh" in reason
         or "iCloud API error" in reason
         or "Maddy WebUI" in reason

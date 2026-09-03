@@ -700,7 +700,7 @@ class MailParsingTests(unittest.TestCase):
         self.assertEqual(normalize_provider_type("outlook_token"), "outlook_token")
         self.assertEqual(base_mailbox_address("abc+tag@icloud.com"), "abc@icloud.com")
 
-    def test_domain_parser_and_provider_aliases(self):
+    def test_domain_mailbox_parser(self):
         rows = parse_domain_mailboxes(
             "box@xb1219.com----6338\n"
             "box@xb1219.com----dup\n"
@@ -714,88 +714,7 @@ class MailParsingTests(unittest.TestCase):
                 {"email": "other@xb1219.com"},
             ],
         )
-        self.assertEqual(normalize_provider_type("domain"), "domain_api")
-        self.assertEqual(normalize_provider_type("freemail"), "domain_api")
-
-    def test_domain_provider_capacity_uses_dynamic_limit(self):
-        import mail
-
-        config = {
-            "providers": [
-                {
-                    "type": "domain_api",
-                    "enable": True,
-                    "default_domain": "xb1219.com",
-                    "domains": ["xb1219.com"],
-                    "capacity": 37,
-                }
-            ]
-        }
-        with (
-            patch.object(mail, "_known_mailbox_bindings", return_value={}),
-            patch.object(mail, "reconcile_registered_mailbox_states", return_value=0),
-            patch.object(mail, "_load_state", return_value={}),
-        ):
-            stats = mail.count_pool_capacity(config, provider_type="domain")
-        self.assertEqual(stats["total"], 37)
-        self.assertEqual(stats["available"], 37)
-
-    def test_domain_provider_reuses_login_cookie_across_instances(self):
-        import mail
-
-        class Response:
-            status_code = 200
-            text = ""
-
-            def __init__(self, payload):
-                self.payload = payload
-
-            def json(self):
-                return self.payload
-
-        class FakeSession:
-            def __init__(self):
-                self.cookies = {}
-                self.post_count = 0
-                self.request_count = 0
-
-            def post(self, *_args, **_kwargs):
-                self.post_count += 1
-                self.cookies["iding-session"] = "cached-cookie"
-                return Response({"success": True})
-
-            def request(self, *_args, **_kwargs):
-                self.request_count += 1
-                return Response(["xb1219.com"])
-
-            def close(self):
-                pass
-
-        sessions: list[FakeSession] = []
-
-        def session_factory():
-            session = FakeSession()
-            sessions.append(session)
-            return session
-
-        entry = {
-            "type": "domain_api",
-            "api_base": "https://mail.example",
-            "username": "user",
-            "password": "secret",
-        }
-        conf = {"request_timeout": 1, "user_agent": "test-agent"}
-        with patch.object(mail, "_http_session", side_effect=session_factory):
-            mail._DOMAIN_API_SESSION_CACHE.clear()
-            first = mail.DomainApiProvider(entry, conf)
-            self.assertEqual(first.fetch_domains(force=True), ["xb1219.com"])
-            first.close()
-            second = mail.DomainApiProvider(entry, conf)
-            self.assertEqual(second.fetch_domains(force=True), ["xb1219.com"])
-            second.close()
-
-        self.assertEqual(sum(session.post_count for session in sessions), 1)
-        self.assertEqual(sessions[1].cookies["iding-session"], "cached-cookie")
+        self.assertEqual(normalize_provider_type("maddy"), "maddy_webui")
 
     def test_extract_code_prefers_expected_otp_patterns(self):
         self.assertEqual(_extract_code({"subject": "Verification code: 123456"}), "123456")
@@ -4392,14 +4311,14 @@ class WebMailboxDeleteLogicTests(unittest.TestCase):
         self.assertIn("keep@icloud.com----k2", cfg["mail"]["providers"][0]["mailboxes"])
         update_state.assert_called_once_with({"remove@icloud.com"}, action="release")
 
-    def test_delete_selected_domain_mailbox_removes_plain_cached_row(self):
+    def test_delete_selected_maddy_mailbox_removes_plain_cached_row(self):
         import web_app
 
         cfg = {
             "mail": {
                 "providers": [
                     {
-                        "type": "domain_api",
+                        "type": "maddy_webui",
                         "enable": True,
                         "mailboxes": "remove@xb1219.com\nkeep@xb1219.com----42\n",
                     }
@@ -4407,7 +4326,7 @@ class WebMailboxDeleteLogicTests(unittest.TestCase):
             }
         }
         body = web_app.MailboxDeleteRequest(
-            items=[{"email": "REMOVE@xb1219.com", "provider_type": "domain_api"}],
+            items=[{"email": "REMOVE@xb1219.com", "provider_type": "maddy_webui"}],
             provider_type="auto",
         )
         with patch.object(web_app, "update_mailbox_states", return_value=1) as update_state:
@@ -11158,90 +11077,6 @@ class MailboxSnapshotCacheTests(unittest.TestCase):
             finally:
                 mail._KNOWN_MAILBOX_BINDINGS_CACHE_KEY = old_key
                 mail._KNOWN_MAILBOX_BINDINGS_CACHE_VALUE = old_value
-
-    def test_domain_mailbox_snapshot_reuses_remote_rows_and_serves_stale_on_error(self):
-        import web_app
-
-        cfg = {
-            "mail": {
-                "providers": [
-                    {
-                        "type": "domain_api",
-                        "enable": True,
-                        "api_base": "https://mail.example/api",
-                        "username": "panel-user",
-                        "password": "panel-pass",
-                        "mailboxes": "fallback@example.com----pw",
-                    }
-                ]
-            }
-        }
-        state = {}
-        provider = MagicMock()
-        provider.list_mailboxes.return_value = [
-            {"address": "remote@example.com", "id": "remote-1"}
-        ]
-        old_rows = dict(mailbox_routes._DOMAIN_MAILBOX_REMOTE_CACHE)
-        old_locks = dict(mailbox_routes._DOMAIN_MAILBOX_REMOTE_FETCH_LOCKS)
-        try:
-            mailbox_routes._DOMAIN_MAILBOX_REMOTE_CACHE.clear()
-            mailbox_routes._DOMAIN_MAILBOX_REMOTE_FETCH_LOCKS.clear()
-            with (
-                patch.object(web_app, "_load_state_file", return_value=state),
-                patch.object(web_app, "account_email_set", return_value=set()),
-                patch.object(web_app, "DomainApiProvider", return_value=provider),
-            ):
-                first = web_app._mailbox_items(cfg, provider_type="domain")
-                second = web_app._mailbox_items(cfg, provider_type="domain")
-                self.assertEqual([item["email"] for item in first], ["remote@example.com"])
-                self.assertEqual([item["email"] for item in second], ["remote@example.com"])
-                self.assertEqual(provider.list_mailboxes.call_count, 1)
-
-                provider.list_mailboxes.side_effect = RuntimeError("upstream down")
-                for key, (_at, rows) in list(mailbox_routes._DOMAIN_MAILBOX_REMOTE_CACHE.items()):
-                    mailbox_routes._DOMAIN_MAILBOX_REMOTE_CACHE[key] = (time.monotonic() - 31, rows)
-                stale = web_app._mailbox_items(cfg, provider_type="domain")
-                self.assertEqual([item["email"] for item in stale], ["remote@example.com"])
-                self.assertEqual(provider.list_mailboxes.call_count, 2)
-                provider.close.assert_called()
-        finally:
-            mailbox_routes._DOMAIN_MAILBOX_REMOTE_CACHE.clear()
-            mailbox_routes._DOMAIN_MAILBOX_REMOTE_CACHE.update(old_rows)
-            mailbox_routes._DOMAIN_MAILBOX_REMOTE_FETCH_LOCKS.clear()
-            mailbox_routes._DOMAIN_MAILBOX_REMOTE_FETCH_LOCKS.update(old_locks)
-
-    def test_disabled_domain_provider_does_not_make_remote_listing_request(self):
-        import web_app
-
-        cfg = {
-            "mail": {
-                "providers": [
-                    {
-                        "type": "domain_api",
-                        "enable": False,
-                        "api_base": "https://mail.example/api",
-                        "username": "panel-user",
-                        "password": "panel-pass",
-                        "mailboxes": "fallback@example.com----pw",
-                    }
-                ]
-            }
-        }
-        provider = MagicMock()
-        old_rows = dict(mailbox_routes._DOMAIN_MAILBOX_REMOTE_CACHE)
-        try:
-            mailbox_routes._DOMAIN_MAILBOX_REMOTE_CACHE.clear()
-            with (
-                patch.object(web_app, "_load_state_file", return_value={}),
-                patch.object(web_app, "account_email_set", return_value=set()),
-                patch.object(web_app, "DomainApiProvider", return_value=provider),
-            ):
-                rows = web_app._mailbox_items(cfg, provider_type="domain")
-            self.assertEqual([item["email"] for item in rows], ["fallback@example.com"])
-            provider.assert_not_called()
-        finally:
-            mailbox_routes._DOMAIN_MAILBOX_REMOTE_CACHE.clear()
-            mailbox_routes._DOMAIN_MAILBOX_REMOTE_CACHE.update(old_rows)
 
 
 class MaddyWebuiMailTests(unittest.TestCase):

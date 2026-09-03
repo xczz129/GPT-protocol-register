@@ -47,7 +47,7 @@ class RebindBatchHelperTests(unittest.TestCase):
 
     def test_batch_reservation_release_releases_each_child_once(self):
         web_app = self.web_app
-        first = {"provider": "domain_api", "address": "one-target@example.net"}
+        first = {"provider": "maddy_webui", "address": "one-target@example.net"}
         second = {"provider": "fastmail_api", "address": "two-target@example.net"}
         reservation = {"items": [{"mailbox": first}, {"mailbox": second}]}
         with patch.object(web_app, "release_mailbox") as release:
@@ -57,9 +57,9 @@ class RebindBatchHelperTests(unittest.TestCase):
 
     def test_register_supersedes_only_overlapping_batch_source(self):
         web_app = self.web_app
-        old_one = {"provider": "domain_api", "address": "old-one@example.net"}
-        old_two = {"provider": "domain_api", "address": "old-two@example.net"}
-        replacement = {"provider": "domain_api", "address": "replacement@example.net"}
+        old_one = {"provider": "maddy_webui", "address": "old-one@example.net"}
+        old_two = {"provider": "maddy_webui", "address": "old-two@example.net"}
+        replacement = {"provider": "maddy_webui", "address": "replacement@example.net"}
         with web_app._REBIND_RESERVATION_LOCK:
             web_app._REBIND_RESERVATIONS["old"] = {
                 "items": [

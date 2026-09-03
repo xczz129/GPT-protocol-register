@@ -34,15 +34,6 @@ _MAIL_STATS_BUILD_LOCK = threading.Lock()
 _MAIL_STATS_CACHE_KEY: tuple[Any, ...] | None = None
 _MAIL_STATS_CACHE_AT = 0.0
 _MAIL_STATS_CACHE_VALUE: dict[str, Any] | None = None
-# Domain mailbox listing is an external read used by the mailbox panel. Keep
-# the last successful snapshot briefly so opening the panel does not block on
-# the provider for every request; per-key locks coalesce concurrent refreshes.
-_DOMAIN_MAILBOX_REMOTE_CACHE_LOCK = threading.RLock()
-_DOMAIN_MAILBOX_REMOTE_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
-_DOMAIN_MAILBOX_REMOTE_FETCH_LOCKS: dict[str, threading.Lock] = {}
-_DOMAIN_MAILBOX_REMOTE_CACHE_TTL = 30.0
-
-
 class MailboxesUpdate(BaseModel):
     mailboxes: str = ""
     append: bool = True
@@ -53,22 +44,13 @@ class MailboxesUpdate(BaseModel):
     api_token: str | None = None
     admin_key: str | None = None
     accounts: str | None = None
-    username: str | None = None
-    password: str | None = None
     default_domain: str | None = None
     domains: list[str] | None = None
-    domain_index: int | None = None
     local_length: int | None = None
     capacity: int | None = None
     enable: bool | None = None
     label: str | None = None
     mailbox_password: str | None = None
-
-
-class DomainMailDomainsRequest(BaseModel):
-    api_base: str | None = None
-    username: str | None = None
-    password: str | None = None
 
 
 class MaddyWebuiDomainsRequest(BaseModel):
@@ -127,26 +109,6 @@ def _mail_stats(cfg: dict[str, Any]) -> dict[str, Any]:
         if ptype == "icloud_api":
             pool = _state().parse_icloud_credentials(lines)
             stats = _state()._pool_stats_for(pool, state)
-        elif ptype == "domain_api":
-            try:
-                dynamic_capacity = int(
-                    item.get("capacity")
-                    or item.get("auto_create_limit")
-                    or _state().DOMAIN_API_DEFAULT_CAPACITY
-                )
-            except (TypeError, ValueError):
-                dynamic_capacity = _state().DOMAIN_API_DEFAULT_CAPACITY
-            dynamic_capacity = max(0, min(500, dynamic_capacity))
-            pool = _state().parse_domain_mailboxes(lines)
-            stats = _state()._pool_stats_for(pool, state) if pool else {
-                "total": dynamic_capacity,
-                "available": dynamic_capacity,
-                "used": 0,
-                "failed": 0,
-                "in_use": 0,
-                "token_invalid": 0,
-                "cooldown": 0,
-            }
         elif ptype == "maddy_webui":
             try:
                 dynamic_capacity = int(
@@ -226,7 +188,7 @@ def _mail_stats(cfg: dict[str, Any]) -> dict[str, Any]:
                     item.get("mode")
                     or (
                         "api"
-                        if ptype in {"icloud_api", "domain_api", "maddy_webui", "fastmail_api"}
+                        if ptype in {"icloud_api", "maddy_webui", "fastmail_api"}
                         else "imap"
                     )
                 ),
@@ -260,124 +222,6 @@ def _mail_stats(cfg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _domain_mailbox_remote_key(provider: dict[str, Any], provider_index: int) -> str:
-    """Build a stable cache key for one configured domain provider."""
-    try:
-        payload = json.dumps(
-            {
-                "provider_index": int(provider_index),
-                "provider": provider,
-                # Tests and hot-reload deployments can replace the provider
-                # class; avoid reusing a snapshot produced by the old class.
-                "provider_impl": id(_state().DomainApiProvider),
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-            default=str,
-            separators=(",", ":"),
-        )
-    except Exception:
-        payload = f"{provider_index}:{repr(provider)}"
-    return _state()._cache_digest(payload)
-
-
-def _copy_mailbox_pool(rows: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
-    """Return a detached pool so callers cannot mutate the shared snapshot."""
-    return [dict(item) for item in rows or [] if isinstance(item, dict)]
-
-
-def _domain_mailbox_pool(
-    cfg: dict[str, Any],
-    provider: dict[str, Any],
-    provider_index: int,
-    lines: str,
-) -> list[dict[str, Any]]:
-    """Read a domain provider mailbox pool with a short stale-on-error cache.
-
-    The cache is deliberately local to the panel listing path. Registration
-    allocation still constructs its provider and reads live state directly.
-    """
-    key = _domain_mailbox_remote_key(provider, provider_index)
-    now = time.monotonic()
-    with _DOMAIN_MAILBOX_REMOTE_CACHE_LOCK:
-        cached = _DOMAIN_MAILBOX_REMOTE_CACHE.get(key)
-        if cached is not None and now - cached[0] < _DOMAIN_MAILBOX_REMOTE_CACHE_TTL:
-            return _copy_mailbox_pool(cached[1])
-        refresh_lock = _DOMAIN_MAILBOX_REMOTE_FETCH_LOCKS.get(key)
-        if refresh_lock is None:
-            refresh_lock = threading.Lock()
-            _DOMAIN_MAILBOX_REMOTE_FETCH_LOCKS[key] = refresh_lock
-            if len(_DOMAIN_MAILBOX_REMOTE_FETCH_LOCKS) > 128:
-                # Keep the lock map bounded; active locks remain referenced by
-                # their callers even if they are evicted from this registry.
-                oldest = next(iter(_DOMAIN_MAILBOX_REMOTE_FETCH_LOCKS))
-                if oldest != key:
-                    _DOMAIN_MAILBOX_REMOTE_FETCH_LOCKS.pop(oldest, None)
-        stale = _copy_mailbox_pool(cached[1]) if cached is not None else None
-
-    with refresh_lock:
-        now = time.monotonic()
-        with _DOMAIN_MAILBOX_REMOTE_CACHE_LOCK:
-            cached = _DOMAIN_MAILBOX_REMOTE_CACHE.get(key)
-            if cached is not None and now - cached[0] < _DOMAIN_MAILBOX_REMOTE_CACHE_TTL:
-                return _copy_mailbox_pool(cached[1])
-            stale = _copy_mailbox_pool(cached[1]) if cached is not None else stale
-
-        username = str(provider.get("username") or "").strip()
-        password = str(provider.get("password") or "").strip()
-        if not bool(provider.get("enable", True)) or not username or not password:
-            return _state().parse_domain_mailboxes(lines)
-
-        domain_provider = None
-        try:
-            mail_cfg = cfg.get("mail") if isinstance(cfg.get("mail"), dict) else {}
-            conf = _state()._make_config(mail_cfg)
-            conf["request_timeout"] = min(
-                float(conf.get("request_timeout") or 30), 8.0
-            )
-            domain_provider = _state().DomainApiProvider(provider, conf)
-            pool: list[dict[str, Any]] = []
-            for remote in domain_provider.list_mailboxes(limit=2000):
-                if not isinstance(remote, dict):
-                    continue
-                address = str(
-                    remote.get("address") or remote.get("email") or ""
-                ).strip()
-                if address:
-                    pool.append(
-                        {"email": address, "id": str(remote.get("id") or "")}
-                    )
-            # Do not retain arbitrary provider payloads or more rows than the
-            # endpoint can expose.  This also bounds memory if a provider
-            # ignores its requested page size.
-            pool = pool[:2000]
-            with _DOMAIN_MAILBOX_REMOTE_CACHE_LOCK:
-                _DOMAIN_MAILBOX_REMOTE_CACHE[key] = (time.monotonic(), _copy_mailbox_pool(pool))
-                while len(_DOMAIN_MAILBOX_REMOTE_CACHE) > 64:
-                    _DOMAIN_MAILBOX_REMOTE_CACHE.pop(
-                        next(iter(_DOMAIN_MAILBOX_REMOTE_CACHE))
-                    )
-            return _copy_mailbox_pool(pool)
-        except Exception:
-            if stale is not None:
-                # A failed refresh must not make an otherwise usable panel
-                # blank.  Advance the timestamp to avoid retrying the same
-                # unavailable upstream for every concurrent request.
-                with _DOMAIN_MAILBOX_REMOTE_CACHE_LOCK:
-                    _DOMAIN_MAILBOX_REMOTE_CACHE[key] = (
-                        time.monotonic(),
-                        _copy_mailbox_pool(stale),
-                    )
-                return _copy_mailbox_pool(stale)
-            return _state().parse_domain_mailboxes(lines)
-        finally:
-            if domain_provider is not None:
-                try:
-                    domain_provider.close()
-                except Exception:
-                    pass
-
-
 def _mailbox_items(
     cfg: dict[str, Any], *, provider_type: str = "auto", q: str = ""
 ) -> list[dict[str, Any]]:
@@ -401,9 +245,7 @@ def _mailbox_items(
         if want and ptype != want:
             continue
         lines = str(provider.get("mailboxes") or "")
-        if ptype == "domain_api":
-            pool = _domain_mailbox_pool(cfg, provider, pi, lines)
-        elif ptype == "maddy_webui":
+        if ptype == "maddy_webui":
             pool = _state().parse_domain_mailboxes(lines)
             # Maddy creates dynamic mailboxes through the automation API and
             # does not expose a mailbox-pool listing endpoint. The shared
@@ -513,7 +355,7 @@ def _mailbox_items(
                     provider.get("mode")
                     or (
                         "api"
-                        if ptype in {"icloud_api", "domain_api", "maddy_webui", "fastmail_api"}
+                        if ptype in {"icloud_api", "maddy_webui", "fastmail_api"}
                         else "imap"
                     )
                 ),
@@ -570,7 +412,7 @@ def _find_mailbox_credential(
             ).strip():
                 return dict(provider, type=ptype), {"email": target}
             continue
-        if ptype in {"domain_api", "maddy_webui"}:
+        if ptype == "maddy_webui":
             target_domain = target.rsplit("@", 1)[1] if "@" in target else ""
             configured_domains = {
                 str(value or "").strip().lower()
@@ -612,8 +454,6 @@ def _find_mailbox_credential(
                         and entry_api_base == provider_api_base
                     ):
                         return dict(provider, type=ptype), {"email": target}
-                if ptype == "domain_api":
-                    return dict(provider, type=ptype), {"email": target}
             continue
         pool = (
             _state().parse_icloud_credentials(str(provider.get("mailboxes") or ""))
@@ -688,32 +528,6 @@ def _fetch_mailbox_messages_sync(
                 "provider_type": ptype,
                 "email": cred["email"],
                 "mode": provider.mode,
-                "items": [_state()._message_preview(m) for m in messages],
-            }
-        finally:
-            provider.close()
-
-    if ptype == "domain_api":
-        provider_entry = dict(
-            provider_entry, message_limit=max(1, min(int(body.limit or 10), 30))
-        )
-        provider = _state().DomainApiProvider(provider_entry, conf)
-        mailbox = {
-            "provider": "domain_api",
-            "provider_ref": "preview",
-            "address": cred["email"],
-            "login_address": cred["email"],
-            "base_address": _state().base_mailbox_address(cred["email"]),
-            "label": str(provider_entry.get("label") or "域名邮箱"),
-            "api_base": str(provider_entry.get("api_base") or ""),
-        }
-        try:
-            messages = provider.fetch_recent_messages(mailbox)[: body.limit]
-            return {
-                "ok": True,
-                "provider_type": ptype,
-                "email": cred["email"],
-                "mode": "api",
                 "items": [_state()._message_preview(m) for m in messages],
             }
         finally:
@@ -935,7 +749,7 @@ def _mailbox_provider_map(cfg: dict[str, Any]) -> dict[str, str]:
         ptype = _state().normalize_provider_type(str(provider.get("type") or ""))
         if ptype not in _state().CANONICAL_PROVIDER_TYPES:
             continue
-        if ptype in {"domain_api", "maddy_webui", "fastmail_api"}:
+        if ptype in {"maddy_webui", "fastmail_api"}:
             parser = _state().parse_domain_mailboxes
         else:
             parser = _state().parse_icloud_credentials if ptype == "icloud_api" else _state().parse_outlook_credentials
@@ -959,7 +773,7 @@ def _filter_mailbox_text(
 ) -> tuple[str, int]:
     kept: list[str] = []
     removed = 0
-    if ptype in {"domain_api", "maddy_webui", "fastmail_api"}:
+    if ptype in {"maddy_webui", "fastmail_api"}:
         parser = _state().parse_domain_mailboxes
     else:
         parser = (
@@ -967,7 +781,7 @@ def _filter_mailbox_text(
         )
     valid = {item["email"].strip().lower() for item in parser(raw)}
     for line in str(raw or "").splitlines():
-        if ptype in {"domain_api", "maddy_webui", "fastmail_api"}:
+        if ptype in {"maddy_webui", "fastmail_api"}:
             email = line.split("----", 1)[0].strip().lower()
         else:
             email = line.split("----", 1)[0].strip().lower() if "----" in line else ""
@@ -985,7 +799,7 @@ def _filter_mailbox_text(
 def _serialize_mailbox_credential(item: dict[str, str], ptype: str) -> str:
     if ptype == "icloud_api":
         return f"{item['email']}----{item['api_key']}"
-    if ptype in {"domain_api", "maddy_webui", "fastmail_api"}:
+    if ptype in {"maddy_webui", "fastmail_api"}:
         remote_id = str(item.get("id") or "").strip()
         return f"{item['email']}----{remote_id}" if remote_id else item["email"]
     return "----".join(
@@ -1001,7 +815,7 @@ def _serialize_mailbox_credential(item: dict[str, str], ptype: str) -> str:
 def _merge_mailbox_credentials(
     existing: str, incoming: str, ptype: str, *, append: bool = True
 ) -> tuple[str, dict[str, int]]:
-    if ptype in {"domain_api", "maddy_webui", "fastmail_api"}:
+    if ptype in {"maddy_webui", "fastmail_api"}:
         parser = _state().parse_domain_mailboxes
     else:
         parser = (
@@ -1051,7 +865,6 @@ def _delete_mailboxes_from_config(
     selected: dict[str, set[str]] = {
         "outlook_token": set(),
         "icloud_api": set(),
-        "domain_api": set(),
         "maddy_webui": set(),
         "fastmail_api": set(),
     }
@@ -1062,8 +875,6 @@ def _delete_mailboxes_from_config(
             ptype = "outlook_token"
         elif ptype in {"icloud", "apple", "hme", "hide_my_email"}:
             ptype = "icloud_api"
-        elif ptype in {"domain", "domain_mail", "custom_domain", "freemail", "xbovo_mail", "iding_mail"}:
-            ptype = "domain_api"
         elif ptype in {"maddy", "maddy_webui_api", "maddy_api", "maddy_mail"}:
             ptype = "maddy_webui"
         elif ptype in {"fastmail", "fastmail_mail", "mailcode", "mailcode_api"}:
@@ -1080,7 +891,7 @@ def _delete_mailboxes_from_config(
         if want and ptype != want:
             continue
         raw = str(provider.get("mailboxes") or "")
-        if ptype in {"domain_api", "maddy_webui", "fastmail_api"}:
+        if ptype in {"maddy_webui", "fastmail_api"}:
             pool = _state().parse_domain_mailboxes(raw)
             targets = selected.get(ptype, set())
             if body.delete_all:
@@ -1090,21 +901,6 @@ def _delete_mailboxes_from_config(
                     if str(item.get("email") or "").strip()
                 }
             remote_removed: set[str] = set()
-            if ptype == "domain_api" and targets and str(provider.get("username") or "").strip() and str(provider.get("password") or "").strip():
-                conf = _state()._make_config(cfg.get("mail") if isinstance(cfg.get("mail"), dict) else {})
-                conf["request_timeout"] = min(float(conf.get("request_timeout") or 30), 8.0)
-                domain_provider = _state().DomainApiProvider(provider, conf)
-                try:
-                    for email in sorted(targets):
-                        try:
-                            if domain_provider.delete_mailbox(email):
-                                removed += 1
-                                remote_removed.add(email)
-                                removed_emails.add(email)
-                        except Exception:
-                            continue
-                finally:
-                    domain_provider.close()
             if body.delete_all:
                 provider["mailboxes"] = ""
             elif pool:
@@ -1544,8 +1340,6 @@ async def put_mailboxes(body: MailboxesUpdate):
                     if ptype == "icloud_api"
                     else "Maddy WebUI 配置"
                     if ptype == "maddy_webui"
-                    else "域名邮箱配置"
-                    if ptype == "domain_api"
                     else "Fastmail 配置"
                     if ptype == "fastmail_api"
                     else "Outlook 邮箱导入"
@@ -1566,40 +1360,6 @@ async def put_mailboxes(body: MailboxesUpdate):
             if ptype == "outlook_token":
                 if body.mode:
                     prov["mode"] = body.mode
-            elif ptype == "domain_api":
-                prov["mode"] = "api"
-                if body.api_base is not None:
-                    prov["api_base"] = (
-                        (body.api_base or "").strip() or _state().DOMAIN_API_DEFAULT_BASE
-                    )
-                else:
-                    prov.setdefault("api_base", _state().DOMAIN_API_DEFAULT_BASE)
-                if body.username is not None:
-                    prov["username"] = str(body.username or "").strip()
-                if body.password is not None and str(body.password or "").strip():
-                    prov["password"] = str(body.password or "").strip()
-                if body.default_domain is not None:
-                    prov["default_domain"] = str(body.default_domain or "").strip()
-                    prov["domain"] = prov["default_domain"]
-                if body.domains is not None:
-                    seen_domains: set[str] = set()
-                    cleaned_domains: list[str] = []
-                    for value in body.domains:
-                        domain = str(value or "").strip()
-                        key = domain.lower()
-                        if not domain or key in seen_domains:
-                            continue
-                        seen_domains.add(key)
-                        cleaned_domains.append(domain)
-                    prov["domains"] = cleaned_domains
-                if body.domain_index is not None:
-                    prov["domain_index"] = max(0, int(body.domain_index or 0))
-                if body.local_length is not None:
-                    prov["local_length"] = max(8, min(30, int(body.local_length or 12)))
-                if body.capacity is not None:
-                    prov["capacity"] = max(1, min(500, int(body.capacity or 1)))
-                prov.setdefault("local_length", _state().DOMAIN_API_DEFAULT_LOCAL_LENGTH)
-                prov.setdefault("capacity", _state().DOMAIN_API_DEFAULT_CAPACITY)
             elif ptype == "maddy_webui":
                 prov["mode"] = "api"
                 if body.api_base is not None:
@@ -1676,31 +1436,6 @@ async def put_mailboxes(body: MailboxesUpdate):
             **import_stats,
             "mail": _state()._public_mail_stats(cfg),
         }
-
-    return await asyncio.to_thread(_do)
-
-
-@router.post("/api/domain-mail/domains")
-async def domain_mail_domains(body: DomainMailDomainsRequest):
-    def _do():
-        cfg = _state()._read_config()
-        saved = _state()._find_provider(cfg, "domain_api") or {}
-        entry = dict(saved, type="domain_api")
-        if body.api_base is not None:
-            entry["api_base"] = (body.api_base or "").strip() or _state().DOMAIN_API_DEFAULT_BASE
-        if body.username is not None:
-            entry["username"] = str(body.username or "").strip()
-        if body.password is not None and str(body.password or "").strip():
-            entry["password"] = str(body.password or "").strip()
-        conf = _state()._make_config(cfg.get("mail") if isinstance(cfg.get("mail"), dict) else {})
-        conf["request_timeout"] = min(float(conf.get("request_timeout") or 30), 10.0)
-        provider = _state().DomainApiProvider(entry, conf)
-        try:
-            items = provider.fetch_domains(force=True)
-        finally:
-            provider.close()
-        default_domain = str(entry.get("default_domain") or entry.get("domain") or "")
-        return {"ok": True, "items": items, "default_domain": default_domain}
 
     return await asyncio.to_thread(_do)
 

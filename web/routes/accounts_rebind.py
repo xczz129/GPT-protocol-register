@@ -37,7 +37,7 @@ class AccountRebindPreflightRequest(BaseModel):
     # also sends a newline/comma separated list here for batch rebinds.
     new_email: str = Field(default="", max_length=200_000)
     new_emails: list[str] = Field(default_factory=list, max_length=500)
-    provider_type: str = Field(default="domain_api", max_length=32)
+    provider_type: str = Field(default="maddy_webui", max_length=32)
     reservation_id: str = Field(default="", max_length=128)
 
 class AccountRebindStartRequest(AccountRebindPreflightRequest):
@@ -352,11 +352,9 @@ def _rebind_reserve_target(
 ) -> dict[str, Any]:
     """Reserve one rebind mailbox after checking local account occupancy."""
     target = str(target_email or "").strip().lower()
-    ptype = _state().normalize_provider_type(provider_type or "domain_api")
-    if ptype not in {"domain_api", "maddy_webui", "fastmail_api"}:
-        raise ValueError(
-            "换绑目标只支持 domain_api、maddy_webui 或 fastmail_api"
-        )
+    ptype = _state().normalize_provider_type(provider_type or "maddy_webui")
+    if ptype not in {"maddy_webui", "fastmail_api"}:
+        raise ValueError("换绑目标只支持 maddy_webui 或 fastmail_api")
     if target and target in _state().account_email_set(_state().ACCOUNTS_FILE):
         raise ValueError("目标邮箱已在账号库中")
     known_bindings = _state()._known_mailbox_bindings()
@@ -732,7 +730,7 @@ async def account_rebind_preflight(body: AccountRebindPreflightRequest):
         raise HTTPException(400, "新邮箱格式无效")
 
     requested = len(values) + len(invalid)
-    provider_type = _state().normalize_provider_type(body.provider_type or "domain_api")
+    provider_type = _state().normalize_provider_type(body.provider_type or "maddy_webui")
     cfg = await asyncio.to_thread(_state()._read_config)
     created_at = _state()._now_iso()
     created_monotonic = time.monotonic()

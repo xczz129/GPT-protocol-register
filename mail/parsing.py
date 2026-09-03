@@ -8,15 +8,6 @@ from typing import Any
 
 ICLOUD_PROVIDER_TYPES = {"icloud_api", "icloud", "hide_my_email"}
 OUTLOOK_PROVIDER_TYPES = {"outlook_token"}
-DOMAIN_PROVIDER_TYPES = {
-    "domain_api",
-    "domain",
-    "domain_mail",
-    "custom_domain",
-    "freemail",
-    "xbovo_mail",
-    "iding_mail",
-}
 MADDY_PROVIDER_TYPES = {
     "maddy",
     "maddy_webui",
@@ -34,14 +25,12 @@ FASTMAIL_PROVIDER_TYPES = {
 CANONICAL_PROVIDER_TYPES = {
     "outlook_token",
     "icloud_api",
-    "domain_api",
     "maddy_webui",
     "fastmail_api",
 }
 SUPPORTED_PROVIDER_TYPES = (
     OUTLOOK_PROVIDER_TYPES
     | ICLOUD_PROVIDER_TYPES
-    | DOMAIN_PROVIDER_TYPES
     | MADDY_PROVIDER_TYPES
     | FASTMAIL_PROVIDER_TYPES
 )
@@ -152,8 +141,6 @@ def normalize_provider_type(raw: str) -> str:
         return "icloud_api"
     if ptype in OUTLOOK_PROVIDER_TYPES:
         return "outlook_token"
-    if ptype in DOMAIN_PROVIDER_TYPES:
-        return "domain_api"
     if ptype in MADDY_PROVIDER_TYPES:
         return "maddy_webui"
     if ptype in FASTMAIL_PROVIDER_TYPES:

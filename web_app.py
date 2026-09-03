@@ -148,10 +148,6 @@ from web.routes.auth import (
 )
 from mail import (
     CANONICAL_PROVIDER_TYPES,
-    DOMAIN_API_DEFAULT_BASE,
-    DOMAIN_API_DEFAULT_CAPACITY,
-    DOMAIN_API_DEFAULT_LOCAL_LENGTH,
-    DomainApiProvider,
     FASTMAIL_API_DEFAULT_BASE,
     FASTMAIL_API_DEFAULT_CAPACITY,
     FastmailApiProvider,
@@ -700,20 +696,6 @@ def _ensure_provider(cfg: dict[str, Any], ptype: str) -> dict[str, Any]:
             "enable": True,
             "label": "iCloud Pool",
             "api_base": "https://icloud.xbovo.online",
-            "mailboxes": "",
-        }
-    elif want == "domain_api":
-        entry = {
-            "type": "domain_api",
-            "enable": True,
-            "label": "域名邮箱",
-            "api_base": DOMAIN_API_DEFAULT_BASE,
-            "username": "",
-            "password": "",
-            "default_domain": "",
-            "domain_index": 0,
-            "local_length": DOMAIN_API_DEFAULT_LOCAL_LENGTH,
-            "capacity": DOMAIN_API_DEFAULT_CAPACITY,
             "mailboxes": "",
         }
     elif want == "maddy_webui":
@@ -2264,7 +2246,6 @@ from web.routes.mailbox import router as mailbox_router  # noqa: E402
 app.include_router(mailbox_router)
 
 from web.routes.mailbox import (  # noqa: E402,F401
-    DomainMailDomainsRequest,
     FastmailAccountsRequest,
     MaddyAutoRegisterUpdate,
     MailboxesUpdate,
@@ -2288,7 +2269,6 @@ from web.routes.mailbox import (  # noqa: E402,F401
     _maddy_webui_domains_payload,
     _public_mail_stats,
     _sanitize_maddy_provider_entry,
-    domain_mail_domains,
     fastmail_accounts,
     mailbox_messages,
     mailboxes_delete,

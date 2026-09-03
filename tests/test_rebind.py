@@ -34,7 +34,7 @@ class RebindEndpointTests(unittest.TestCase):
                 "record_key": "email:same@example.com",
                 "source": source,
                 "mailbox": {
-                    "provider": "domain_api",
+                    "provider": "maddy_webui",
                     "address": "target@example.com",
                 },
                 "email": "target@example.com",
@@ -74,7 +74,7 @@ class RebindEndpointTests(unittest.TestCase):
             "account_id": "source-account",
         }
         mailbox = {
-            "provider": "domain_api",
+            "provider": "maddy_webui",
             "address": "target@example.com",
         }
         with web_app._REBIND_RESERVATION_LOCK:
@@ -118,8 +118,8 @@ class RebindEndpointTests(unittest.TestCase):
             "totp_secret": "JBSWY3DPEHPK3PXP",
         }
         mailbox = {
-            "provider": "domain_api",
-            "provider_ref": "domain_api#1",
+            "provider": "maddy_webui",
+            "provider_ref": "maddy_webui#1",
             "address": "setup-target@example.com",
         }
         reservation = {

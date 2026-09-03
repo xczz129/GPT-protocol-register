@@ -6699,7 +6699,7 @@ def _protocol_mailbox_provider_map(mail_config: dict[str, Any]) -> dict[str, str
         if provider_type not in CANONICAL_PROVIDER_TYPES:
             continue
         lines = str(provider.get("mailboxes") or provider.get("pool") or "")
-        if provider_type in {"domain_api", "maddy_webui"}:
+        if provider_type == "maddy_webui":
             parser = parse_domain_mailboxes
         else:
             parser = parse_icloud_credentials if provider_type == "icloud_api" else parse_outlook_credentials

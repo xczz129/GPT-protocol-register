@@ -44,7 +44,7 @@ class RebindBatchEndpointTests(unittest.TestCase):
 
         body = web_app.AccountRebindPreflightRequest(
             text="one@example.com----one-target@example.net\ntwo@example.com----two-target@example.net",
-            provider_type="domain_api",
+            provider_type="maddy_webui",
         )
         with (
             patch.object(web_app, "_read_config", return_value={"mail": {}}),
@@ -83,13 +83,13 @@ class RebindBatchEndpointTests(unittest.TestCase):
                 {
                     "record_key": web_app._account_key(first),
                     "source": web_app._rebind_public_source(first),
-                    "mailbox": {"provider": "domain_api", "address": "one-target@example.net"},
+                    "mailbox": {"provider": "maddy_webui", "address": "one-target@example.net"},
                     "email": "one-target@example.net",
                 },
                 {
                     "record_key": web_app._account_key(second),
                     "source": web_app._rebind_public_source(second),
-                    "mailbox": {"provider": "domain_api", "address": "two-target@example.net"},
+                    "mailbox": {"provider": "maddy_webui", "address": "two-target@example.net"},
                     "email": "two-target@example.net",
                 },
             ],
@@ -134,7 +134,7 @@ class RebindBatchEndpointTests(unittest.TestCase):
             "one@example.com": self._record("one@example.com", "one"),
             "two@example.com": self._record("two@example.com", "two"),
         }
-        duplicate = {"provider": "domain_api", "address": "same-target@example.net"}
+        duplicate = {"provider": "maddy_webui", "address": "same-target@example.net"}
         with (
             patch.object(web_app, "_read_config", return_value={"mail": {}}),
             patch.object(rebind_routes, "_rebind_load_record", side_effect=lambda value: records.get(value.lower())),
