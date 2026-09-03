@@ -136,6 +136,25 @@ REGISTER_BROWSER_PROFILES: tuple[dict[str, str], ...] = (
 )
 
 
+def is_dead_slot_error(detail: str) -> bool:
+    """Slot-quality failures that retire the mailbox as used.
+
+    These never heal by retrying, so they must not consume the transient
+    retry budget: the task should keep switching to other slots instead.
+    """
+    text = str(detail or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "invalid_auth_step",
+            "user_already_exists",
+            "username_already_exists",
+            "account_deactivated",
+        )
+    )
+
+
+
 def _validate_browser_profiles(
     profiles: tuple[dict[str, str], ...] = REGISTER_BROWSER_PROFILES,
 ) -> None:
@@ -6241,7 +6260,13 @@ async def run_protocol_register(
                         )
                         return
                     raise RuntimeError("dual_alias_start_barrier_timeout")
-            for attempt in range(proxy_retry_limit + 1):
+            # Dead slots (remote-registered mailboxes) are retired as used and
+            # never heal on retry, so they must not consume the transient
+            # retry budget: the task keeps switching slots instead, bounded by
+            # this hard cap.
+            dead_slot_switch_limit = 10
+            dead_slot_switches = 0
+            for attempt in range(proxy_retry_limit + 1 + dead_slot_switch_limit):
                 if not await wait_until_resumed(index, task_group_id):
                     break
                 attempt_error = ""
@@ -6355,11 +6380,17 @@ async def run_protocol_register(
                         )
                     await asyncio.sleep(0.5)
                     continue
-                if attempt >= max_retries:
+                dead_slot_failure = is_dead_slot_error(attempt_error)
+                if attempt >= max_retries and not (
+                    dead_slot_failure
+                    and dead_slot_switches < dead_slot_switch_limit
+                ):
                     break
                 if fixed_email is None and not proxy_failed and not paired_alias:
                     replacement = claim_retry_email(task_email)
                     if replacement and replacement != task_email:
+                        if dead_slot_failure:
+                            dead_slot_switches += 1
                         previous = task_email
                         task_email = replacement
                         print(

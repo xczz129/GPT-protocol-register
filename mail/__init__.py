@@ -3636,20 +3636,27 @@ def count_pool_capacity(
             else:
                 already_bound = bound_aliases.get(base, set())
                 if fixed_base_alias_mode:
-                    # A custom fixed-mailbox batch requests fresh aliases, not
-                    # a lifetime cap. Scan deterministic slots past historical
-                    # registrations and unavailable reservations until the
-                    # requested number of currently usable aliases is found.
+                    # Hard one-split-per-mailbox policy: a primary mailbox may
+                    # spend at most SPLIT_SLOTS_PER_MAILBOX alias slots in
+                    # total. A mailbox whose slot is already bound never yields
+                    # fresh aliases; fixed batches must not mint second slots
+                    # past historical registrations.
+                    wanted_aliases = max(
+                        0,
+                        min(
+                            requested_alias_count,
+                            SPLIT_SLOTS_PER_MAILBOX
+                            - min(SPLIT_SLOTS_PER_MAILBOX, len(already_bound)),
+                        ),
+                    )
                     alias_candidates = []
                     projected_available = 0
                     slot = 1
-                    scan_limit = (
-                        requested_alias_count
-                        + len(already_bound)
-                        + len(store)
-                        + 16
-                    )
-                    while projected_available < requested_alias_count and slot <= scan_limit:
+                    scan_limit = SPLIT_SLOTS_PER_MAILBOX
+                    while (
+                        projected_available < wanted_aliases
+                        and slot <= scan_limit
+                    ):
                         alias = split_mailbox_address(base, slot)
                         slot += 1
                         if alias in already_bound:

@@ -446,7 +446,7 @@ class MailParsingTests(unittest.TestCase):
         self.assertEqual(capacity["available"], 0)
         self.assertEqual(len(capacity["emails"]), 0)
 
-    def test_registered_primary_fixed_email_expands_to_custom_alias_slots(self):
+    def test_registered_primary_fixed_batch_returns_single_alias_slot(self):
         import mail
 
         base = "double@icloud.com"
@@ -473,13 +473,12 @@ class MailParsingTests(unittest.TestCase):
                 )
 
         self.assertEqual(capacity["fixed_email_mode"], "alias_batch")
-        self.assertEqual(capacity["available"], 8)
-        self.assertEqual(
-            capacity["emails"],
-            mail.split_mailbox_addresses(base, 8),
-        )
+        # Hard 1:1: a mailbox yields at most one split slot regardless of the
+        # requested alias count.
+        self.assertEqual(capacity["available"], 1)
+        self.assertEqual(capacity["emails"], [mail.split_mailbox_address(base)])
 
-    def test_custom_alias_batch_skips_historical_slots_and_returns_full_count(self):
+    def test_custom_alias_batch_never_mints_slots_past_lifetime_cap(self):
         import mail
 
         base = "repeat@icloud.com"
@@ -506,12 +505,27 @@ class MailParsingTests(unittest.TestCase):
                     fixed_alias_count=10,
                 )
 
-        self.assertEqual(capacity["available"], 10)
+        # Hard 1:1: both lifetime slots are spent, so the batch returns
+        # nothing instead of minting fresh slots past history.
+        self.assertEqual(capacity["available"], 0)
         self.assertEqual(capacity["split_used"], 2)
-        self.assertEqual(
-            capacity["emails"],
-            [mail.split_mailbox_address(base, slot) for slot in range(3, 13)],
+        self.assertEqual(capacity["emails"], [])
+
+    def test_is_dead_slot_error_classifies_remote_owned_mailboxes(self):
+        from register.protocol import is_dead_slot_error
+
+        self.assertTrue(
+            is_dead_slot_error(
+                'user_register_http_400, detail={"error": {"code": "invalid_auth_step"}}'
+            )
         )
+        self.assertTrue(
+            is_dead_slot_error("create_account_failed: user_already_exists")
+        )
+        self.assertTrue(is_dead_slot_error("login_http_403 account_deactivated"))
+        self.assertFalse(is_dead_slot_error("network timeout"))
+        self.assertFalse(is_dead_slot_error(""))
+        self.assertFalse(is_dead_slot_error("rate_limit_exceeded"))
 
     def test_capacity_schedules_single_alias_slots_by_pool_order(self):
         import mail
@@ -9164,6 +9178,115 @@ class ProtocolAndHealthTests(unittest.TestCase):
         self.assertEqual(result, [])
         register.assert_called_once()
         self.assertIn((1, "skipped", "password_reset_required"), events)
+
+    def test_protocol_batch_dead_slots_do_not_consume_retry_budget(self):
+        from register.protocol import run_protocol_register
+
+        emails = [
+            "dead1@icloud.com",
+            "dead2@icloud.com",
+            "dead3@icloud.com",
+            "healthy+splitabc@icloud.com",
+        ]
+        calls = []
+
+        def registered(index, **kwargs):
+            fixed = kwargs["fixed_email"]
+            calls.append(fixed)
+            if fixed.startswith("dead"):
+                kwargs["task_event"](
+                    index,
+                    "failed",
+                    error=(
+                        'user_register_http_400, detail={"error": '
+                        '{"code": "invalid_auth_step"}}'
+                    ),
+                )
+                return None
+            return {"email": fixed, "access_token": "token"}
+
+        with (
+            patch("mail.release_stale_in_use", return_value=0),
+            patch(
+                "mail.count_pool_capacity",
+                return_value={
+                    "available": len(emails),
+                    "total": 4,
+                    "total_slots": 8,
+                    "emails": emails,
+                },
+            ),
+            patch("register.protocol.resolve_proxy_pool", return_value=[]),
+            patch("register.protocol.register_one", side_effect=registered) as register,
+        ):
+            result = asyncio.run(
+                run_protocol_register(
+                    {
+                        "registration": {
+                            "engine": "protocol",
+                            "max_transient_retries": 0,
+                        },
+                        "mail": {},
+                        "proxy": {},
+                    },
+                    total=1,
+                    concurrency=1,
+                )
+            )
+
+        # max_transient_retries=0 would normally stop after the first failure,
+        # but remote-owned slots retire as used and the task keeps switching
+        # until it lands on a healthy slot.
+        self.assertEqual(
+            calls,
+            [
+                "dead1@icloud.com",
+                "dead2@icloud.com",
+                "dead3@icloud.com",
+                "healthy+splitabc@icloud.com",
+            ],
+        )
+        register.assert_called()
+        self.assertEqual(result[0]["email"], "healthy+splitabc@icloud.com")
+
+    def test_protocol_batch_transient_errors_still_consume_retry_budget(self):
+        from register.protocol import run_protocol_register
+
+        def registered(index, **kwargs):
+            kwargs["task_event"](index, "failed", error="otp_wait_timeout")
+            return None
+
+        with (
+            patch("mail.release_stale_in_use", return_value=0),
+            patch(
+                "mail.count_pool_capacity",
+                return_value={
+                    "available": 1,
+                    "total": 1,
+                    "total_slots": 2,
+                    "emails": ["only@icloud.com"],
+                },
+            ),
+            patch("register.protocol.resolve_proxy_pool", return_value=[]),
+            patch("register.protocol.register_one", side_effect=registered) as register,
+        ):
+            result = asyncio.run(
+                run_protocol_register(
+                    {
+                        "registration": {
+                            "engine": "protocol",
+                            "max_transient_retries": 0,
+                        },
+                        "mail": {},
+                        "proxy": {},
+                    },
+                    total=1,
+                    concurrency=1,
+                )
+            )
+
+        register.assert_called_once()
+        self.assertEqual(result, [])
 
     def test_protocol_batch_pins_distinct_primary_and_split_slots(self):
         from register.protocol import run_protocol_register
