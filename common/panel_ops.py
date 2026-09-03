@@ -654,12 +654,6 @@ def restore_account_backup(name: str, mode: str = "merge") -> dict[str, Any]:
     return {"mode": "merge", "restored": len(incoming), "skipped": skipped, "total": len(accounts)}
 
 
-def delete_backup(name: str) -> str:
-    path = backup_path(name)
-    path.unlink()
-    return path.name
-
-
 def delete_account_backup(name: str) -> str:
     path = account_backup_path(name)
     path.unlink()

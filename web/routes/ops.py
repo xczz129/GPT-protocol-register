@@ -744,15 +744,6 @@ async def backups_download(name: str):
     return FileResponse(path, filename=path.name, media_type="application/zip")
 
 
-@router.delete("/api/backups/{name}")
-async def backups_delete(name: str):
-    try:
-        removed = await asyncio.to_thread(_state().delete_backup, name)
-    except (ValueError, FileNotFoundError) as exc:
-        raise HTTPException(404, "备份不存在") from exc
-    return {"ok": True, "name": removed}
-
-
 @router.post("/api/backups/restore")
 async def backups_restore(body: BackupRestoreRequest):
     if _state().JOB.running:
