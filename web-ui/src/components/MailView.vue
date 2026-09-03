@@ -36,17 +36,30 @@ function providerName(item) {
 function stateClass(item) { return item.state === "available" ? "success" : ["failed", "invalid", "token_invalid"].includes(item.state) ? "failed" : "queue"; }
 function registeredClass(item) {
   if (item.registered) return "success";
-  return String(item.reason || "").includes("cdk_bound") ? "run" : "queue";
+  const reason = String(item.reason || "");
+  if (reason.includes("cdk_bound")) return "run";
+  if (reason.includes("account_deactivated") || reason.includes("known_deactivated")) return "failed";
+  if (reason.includes("remote_registered") || reason.includes("invalid_auth_step") || reason.includes("password_reset_required")) return "failed";
+  return "queue";
 }
 function registeredLabel(item) {
   if (item.registered) return "已注册";
-  return String(item.reason || "").includes("cdk_bound") ? "已售出" : "未注册";
+  const reason = String(item.reason || "");
+  if (reason.includes("cdk_bound")) return "已售出";
+  if (reason.includes("account_deactivated") || reason.includes("known_deactivated")) return "已停用";
+  if (reason.includes("remote_registered") || reason.includes("invalid_auth_step") || reason.includes("password_reset_required")) return "已被占用";
+  if (reason.includes("registered_account")) return "已注册过";
+  return "未注册";
 }
 function reasonText(item) {
   const reason = String(item.reason || "");
   if (reason.includes("cdk_bound")) return "已绑定 CDK · 账号售出后已移出账号库";
   if (reason.includes("remote_registered")) return "远端已有 ChatGPT 账号 · 不可再用";
-  if (reason.includes("registered_account")) return "已注册过账号";
+  if (reason.includes("invalid_auth_step")) return "远端已有 ChatGPT 账号（注册被重定向到登录）";
+  if (reason.includes("password_reset_required")) return "远端已有账号 · 要求重置密码";
+  if (reason.includes("account_deactivated")) return "ChatGPT 账号已被停用";
+  if (reason.includes("known_deactivated")) return "已知账号被停用";
+  if (reason.includes("registered_account")) return "曾通过本系统注册 · 账号记录已不在库中";
   return reason;
 }
 function syncDomainIndex() {
