@@ -2276,3 +2276,42 @@ table.acct .col-actions { text-align: right; white-space: nowrap; }
 .sms-tier-row.cur { border-color: var(--acc, #6366f1); background: color-mix(in srgb, var(--acc, #6366f1) 10%, var(--bg-1)); }
 .sms-tier-row b { font-family: var(--mono, ui-monospace, monospace); font-size: 13px; color: var(--ink-900); }
 .sms-tier-row small { color: var(--ink-400); font-size: 11px; }
+﻿
+/* ===== sms country picker v3 (multi-tier + polish) ===== */
+.sms-country-dialog { width: min(920px, 100%); }
+.sms-country-toolbar { display: flex; align-items: center; gap: 10px; padding: 12px 0; flex-wrap: wrap; border-bottom: 1px solid var(--bg-3); margin-bottom: 10px; }
+.sms-country-searchwrap { position: relative; flex: 1 1 240px; min-width: 200px; display: flex; align-items: center; }
+.sms-country-searchwrap svg { position: absolute; left: 11px; color: var(--ink-400); pointer-events: none; }
+.sms-country-search { width: 100%; padding: 9px 12px 9px 32px; border: 1px solid var(--bg-3); border-radius: 10px; background: var(--bg-1); color: var(--ink-800); font-size: 13px; transition: border-color 0.15s, box-shadow 0.15s; }
+.sms-country-search:focus { outline: none; border-color: var(--acc, #6366f1); box-shadow: 0 0 0 3px color-mix(in srgb, var(--acc, #6366f1) 15%, transparent); }
+.sms-price-filter { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 600; color: var(--ink-500); white-space: nowrap; padding: 5px 10px; border: 1px solid var(--bg-3); border-radius: 10px; background: var(--bg-1); }
+.sms-price-input { width: 62px; padding: 5px 7px; border: none; background: transparent; color: var(--ink-800); font-size: 12px; font-family: var(--mono, ui-monospace, monospace); }
+.sms-price-input:focus { outline: none; }
+.sms-country-count { flex: 1; font-size: 12px; color: var(--ink-500); }
+
+.sms-country-row { position: relative; display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--bg-3); border-radius: 10px; background: var(--bg-1); color: var(--ink-700); font-size: 13px; cursor: pointer; transition: border-color 0.12s, background 0.12s; }
+.sms-country-row:hover { border-color: color-mix(in srgb, var(--acc, #6366f1) 55%, var(--bg-3)); }
+.sms-country-row.on { border-color: var(--acc, #6366f1); background: color-mix(in srgb, var(--acc, #6366f1) 8%, var(--bg-1)); }
+.sms-country-order { width: 20px; height: 20px; border-radius: 999px; background: var(--bg-3); color: var(--ink-600); font-size: 11px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; flex: none; }
+.sms-country-row.on .sms-country-order { background: var(--acc, #6366f1); color: #fff; }
+.sms-country-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.sms-country-calling { font-family: var(--mono, ui-monospace, monospace); font-size: 12px; color: var(--ink-500); }
+.sms-country-price { font-family: var(--mono, ui-monospace, monospace); font-size: 12px; color: var(--ink-600); }
+.sms-country-stock { font-size: 12px; color: var(--ok, #16a34a); }
+.sms-country-price-pick { display: inline-flex; align-items: center; gap: 4px; padding: 3px 10px; border-radius: 999px; border: 1px dashed var(--ink-400, #94a3b8); color: var(--ink-500); font-size: 11px; cursor: pointer; white-space: nowrap; background: transparent; transition: all 0.12s; }
+.sms-country-price-pick:hover { border-color: var(--acc, #6366f1); color: var(--acc, #6366f1); border-style: solid; }
+.sms-country-price-pick.picked { border-style: solid; border-color: var(--acc, #6366f1); color: var(--acc, #6366f1); background: color-mix(in srgb, var(--acc, #6366f1) 8%, transparent); font-weight: 700; }
+
+.sms-tier-panel { display: grid; gap: 4px; padding: 8px 12px 10px 42px; border-bottom: 1px solid var(--bg-3); background: color-mix(in srgb, var(--bg-2) 70%, var(--bg-1)); }
+.sms-tier-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 2px 0 4px; }
+.sms-tier-seq { font-size: 12px; font-weight: 700; color: var(--acc, #6366f1); font-family: var(--mono, ui-monospace, monospace); }
+.sms-tier-hint { font-size: 12px; color: var(--ink-400); }
+.sms-tier-row { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border: 1px solid var(--bg-3); border-radius: 10px; background: var(--bg-1); cursor: pointer; text-align: left; transition: border-color 0.12s, background 0.12s; }
+.sms-tier-row:hover { border-color: color-mix(in srgb, var(--acc, #6366f1) 55%, var(--bg-3)); }
+.sms-tier-row.cur { border-color: var(--acc, #6366f1); background: color-mix(in srgb, var(--acc, #6366f1) 8%, var(--bg-1)); }
+.sms-tier-rank { width: 18px; height: 18px; border-radius: 999px; background: var(--acc, #6366f1); color: #fff; font-size: 10px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; flex: none; visibility: hidden; }
+.sms-tier-row.cur .sms-tier-rank { visibility: visible; }
+.sms-tier-row b { font-family: var(--mono, ui-monospace, monospace); font-size: 14px; color: var(--ink-900); min-width: 52px; }
+.sms-tier-row small { color: var(--ink-400); font-size: 11px; flex: 1; }
+.btn.ghost { border: none; background: none; color: var(--ink-500); cursor: pointer; font-size: 12px; padding: 4px 8px; border-radius: 6px; }
+.btn.ghost:hover { color: var(--err, #e11d48); background: color-mix(in srgb, var(--err, #e11d48) 8%, transparent); }

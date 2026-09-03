@@ -146,6 +146,8 @@ def _provider_specs(sms_cfg: dict) -> dict:
         country = country.strip()
         pid = pid.strip()
         if country and pid:
+            # Multiple provider ids per country are allowed; the comma list
+            # keeps the operator's priority order for providerIds.
             out[country] = pid
     return out
 
