@@ -310,6 +310,205 @@ def _sms_config_section(cfg: dict) -> dict:
         "firefox_country_order": str(ff_countries),
     }
 
+# SMSBower country id -> (english name, chinese name, calling code).
+# The id space follows the sms-activate family shared by SMSBower; calling
+# codes let the picker show the +44-style prefix before a number is bought.
+SMSBOWER_COUNTRY_INFO: dict[int, tuple[str, str, str]] = {
+    0: ("Russia", "俄罗斯", "+7"), 1: ("Ukraine", "乌克兰", "+380"),
+    2: ("Kazakhstan", "哈萨克斯坦", "+77"), 3: ("China", "中国", "+86"),
+    4: ("Philippines", "菲律宾", "+63"), 5: ("Myanmar", "缅甸", "+95"),
+    6: ("Indonesia", "印度尼西亚", "+62"), 7: ("Malaysia", "马来西亚", "+60"),
+    8: ("Kenya", "肯尼亚", "+254"), 9: ("Tanzania", "坦桑尼亚", "+255"),
+    10: ("Vietnam", "越南", "+84"), 11: ("Kyrgyzstan", "吉尔吉斯斯坦", "+996"),
+    12: ("USA", "美国", "+1"), 13: ("Israel", "以色列", "+972"),
+    14: ("Hong Kong", "香港", "+852"), 15: ("Poland", "波兰", "+48"),
+    16: ("England", "英国", "+44"), 17: ("Madagascar", "马达加斯加", "+261"),
+    18: ("Congo DR", "刚果(金)", "+243"), 19: ("Egypt", "埃及", "+20"),
+    20: ("India", "印度", "+91"), 21: ("Ireland", "爱尔兰", "+353"),
+    22: ("Cambodia", "柬埔寨", "+855"), 23: ("Laos", "老挝", "+856"),
+    24: ("Haiti", "海地", "+509"), 25: ("Ivory Coast", "科特迪瓦", "+225"),
+    26: ("Gambia", "冈比亚", "+220"), 27: ("Serbia", "塞尔维亚", "+381"),
+    28: ("Yemen", "也门", "+967"), 29: ("South Africa", "南非", "+27"),
+    30: ("Romania", "罗马尼亚", "+40"), 31: ("Colombia", "哥伦比亚", "+57"),
+    32: ("Estonia", "爱沙尼亚", "+372"), 33: ("Azerbaijan", "阿塞拜疆", "+994"),
+    34: ("Canada", "加拿大", "+1"), 35: ("Morocco", "摩洛哥", "+212"),
+    36: ("Ghana", "加纳", "+233"), 37: ("Argentina", "阿根廷", "+54"),
+    38: ("Uzbekistan", "乌兹别克斯坦", "+998"), 39: ("Cameroon", "喀麦隆", "+237"),
+    40: ("Chad", "乍得", "+235"), 41: ("Germany", "德国", "+49"),
+    42: ("Lithuania", "立陶宛", "+370"), 43: ("Croatia", "克罗地亚", "+385"),
+    44: ("Sweden", "瑞典", "+46"), 45: ("Iraq", "伊拉克", "+964"),
+    46: ("Netherlands", "荷兰", "+31"), 47: ("Latvia", "拉脱维亚", "+371"),
+    48: ("Austria", "奥地利", "+43"), 49: ("Belarus", "白俄罗斯", "+375"),
+    50: ("Thailand", "泰国", "+66"), 51: ("Saudi Arabia", "沙特阿拉伯", "+966"),
+    52: ("Mexico", "墨西哥", "+52"), 54: ("Eswatini", "斯威士兰", "+268"),
+    55: ("Liberia", "利比里亚", "+231"), 56: ("Slovakia", "斯洛伐克", "+421"),
+    57: ("Slovenia", "斯洛文尼亚", "+386"), 58: ("Bangladesh", "孟加拉国", "+880"),
+    59: ("Senegal", "塞内加尔", "+221"), 60: ("Trinidad & Tobago", "特立尼达和多巴哥", "+1868"),
+    61: ("Czech Republic", "捷克", "+420"), 62: ("Uganda", "乌干达", "+256"),
+    63: ("Spain", "西班牙", "+34"), 64: ("Italy", "意大利", "+39"),
+    66: ("France", "法国", "+33"), 68: ("Belgium", "比利时", "+32"),
+    69: ("Bulgaria", "保加利亚", "+359"), 70: ("Hungary", "匈牙利", "+36"),
+    71: ("Moldova", "摩尔多瓦", "+373"), 72: ("Switzerland", "瑞士", "+41"),
+    73: ("Georgia", "格鲁吉亚", "+995"), 74: ("Armenia", "亚美尼亚", "+374"),
+    76: ("Greece", "希腊", "+30"), 78: ("Mongolia", "蒙古", "+976"),
+    79: ("Brazil", "巴西", "+55"), 80: ("Peru", "秘鲁", "+51"),
+    81: ("Turkey", "土耳其", "+90"), 82: ("Nigeria", "尼日利亚", "+234"),
+    83: ("Chile", "智利", "+56"), 84: ("Venezuela", "委内瑞拉", "+58"),
+    85: ("Pakistan", "巴基斯坦", "+92"), 86: ("Ethiopia", "埃塞俄比亚", "+251"),
+    87: ("Mozambique", "莫桑比克", "+258"), 88: ("Burkina Faso", "布基纳法索", "+226"),
+    89: ("Togo", "多哥", "+228"), 90: ("Guinea", "几内亚", "+224"),
+    91: ("Ivory", "科特迪瓦", "+225"), 92: ("Sudan", "苏丹", "+249"),
+    93: ("Zambia", "赞比亚", "+260"), 94: ("Zimbabwe", "津巴布韦", "+263"),
+    95: ("Mali", "马里", "+223"), 96: ("Mauritius", "毛里求斯", "+230"),
+    97: ("Liberia", "利比里亚", "+231"), 98: ("Sierra Leone", "塞拉利昂", "+232"),
+    99: ("Chad", "乍得", "+235"), 101: ("Guinea-Bissau", "几内亚比绍", "+245"),
+    102: ("Congo", "刚果", "+242"), 103: ("Angola", "安哥拉", "+244"),
+    104: ("Sri Lanka", "斯里兰卡", "+94"), 105: ("Nepal", "尼泊尔", "+977"),
+    106: ("Ireland", "爱尔兰", "+353"), 107: ("Portugal", "葡萄牙", "+351"),
+    108: ("Cyprus", "塞浦路斯", "+357"), 109: ("Bulgaria", "保加利亚", "+359"),
+    110: ("Lithuania", "立陶宛", "+370"), 111: ("Serbia", "塞尔维亚", "+381"),
+    112: ("Kosovo", "科索沃", "+383"), 113: ("Bosnia", "波黑", "+387"),
+    114: ("North Macedonia", "北马其顿", "+389"), 115: ("Czech", "捷克", "+420"),
+    116: ("Guatemala", "危地马拉", "+502"), 117: ("Honduras", "洪都拉斯", "+504"),
+    118: ("Nicaragua", "尼加拉瓜", "+505"), 119: ("Panama", "巴拿马", "+507"),
+    120: ("Bolivia", "玻利维亚", "+591"), 121: ("Martinique", "马提尼克", "+596"),
+    122: ("Uruguay", "乌拉圭", "+598"), 123: ("Timor-Leste", "东帝汶", "+670"),
+    124: ("Brunei", "文莱", "+673"), 125: ("Papua", "巴布亚新几内亚", "+675"),
+    126: ("Fiji", "斐济", "+679"), 127: ("Niue", "纽埃", "+683"),
+    128: ("Samoa", "萨摩亚", "+685"), 129: ("Maldives", "马尔代夫", "+960"),
+    130: ("Lebanon", "黎巴嫩", "+961"), 131: ("Jordan", "约旦", "+962"),
+    132: ("Syria", "叙利亚", "+963"), 133: ("Iraq", "伊拉克", "+964"),
+    134: ("Kuwait", "科威特", "+965"), 135: ("Saudi", "沙特", "+966"),
+    136: ("Yemen", "也门", "+967"), 137: ("UAE", "阿联酋", "+971"),
+    138: ("Israel", "以色列", "+972"), 139: ("Bhutan", "不丹", "+975"),
+    140: ("Tajikistan", "塔吉克斯坦", "+992"), 141: ("Azerbaijan", "阿塞拜疆", "+994"),
+    142: ("Georgia", "格鲁吉亚", "+995"), 143: ("Kyrgyzstan", "吉尔吉斯斯坦", "+996"),
+    144: ("Uzbekistan", "乌兹别克斯坦", "+998"), 145: ("Taiwan", "台湾", "+886"),
+    146: ("Maldives", "马尔代夫", "+960"), 147: ("Jordan", "约旦", "+962"),
+    148: ("Bosnia", "波黑", "+387"), 149: ("Albania", "阿尔巴尼亚", "+355"),
+    150: ("Iceland", "冰岛", "+354"), 151: ("Indonesia", "印度尼西亚", "+62"),
+    152: ("Bosnia", "波黑", "+387"), 153: ("Lithuania", "立陶宛", "+370"),
+    154: ("Denmark", "丹麦", "+45"), 155: ("Norway", "挪威", "+47"),
+    156: ("Finland", "芬兰", "+358"), 157: ("Greenland", "格陵兰", "+299"),
+    158: ("Luxembourg", "卢森堡", "+352"), 159: ("Malta", "马耳他", "+356"),
+    160: ("Monaco", "摩纳哥", "+377"), 161: ("Andorra", "安道尔", "+376"),
+    162: ("Liechtenstein", "列支敦士登", "+423"), 163: ("San Marino", "圣马力诺", "+378"),
+    164: ("Algeria", "阿尔及利亚", "+213"), 165: ("Tunisia", "突尼斯", "+216"),
+    166: ("Libya", "利比亚", "+218"), 167: ("Gambia", "冈比亚", "+220"),
+    168: ("Benin", "贝宁", "+229"), 169: ("Niger", "尼日尔", "+227"),
+    170: ("Burundi", "布隆迪", "+257"), 171: ("Rwanda", "卢旺达", "+250"),
+    172: ("Djibouti", "吉布提", "+253"), 173: ("Eritrea", "厄立特里亚", "+291"),
+    174: ("Somalia", "索马里", "+252"), 175: ("Kenya", "肯尼亚", "+254"),
+    176: ("Tanzania", "坦桑尼亚", "+255"), 177: ("Uganda", "乌干达", "+256"),
+    178: ("Lesotho", "莱索托", "+266"), 179: ("Botswana", "博茨瓦纳", "+267"),
+    180: ("Malawi", "马拉维", "+265"), 181: ("Comoros", "科摩罗", "+269"),
+    182: ("Mauritania", "毛里塔尼亚", "+222"), 183: ("Mali", "马里", "+223"),
+    184: ("Cape Verde", "佛得角", "+238"), 185: ("Gabon", "加蓬", "+241"),
+    186: ("Congo", "刚果", "+242"), 187: ("Zaire", "扎伊尔", "+243"),
+    188: ("Central African", "中非", "+236"), 189: ("Equatorial Guinea", "赤道几内亚", "+240"),
+    190: ("South Sudan", "南苏丹", "+211"), 191: ("Afghanistan", "阿富汗", "+93"),
+    192: ("Sri Lanka", "斯里兰卡", "+94"), 193: ("Iran", "伊朗", "+98"),
+    194: ("Palestine", "巴勒斯坦", "+970"), 195: ("Oman", "阿曼", "+968"),
+    196: ("Qatar", "卡塔尔", "+974"), 197: ("Bahrain", "巴林", "+973"),
+    198: ("Kazakhstan", "哈萨克斯坦", "+77"), 199: ("Mongolia", "蒙古", "+976"),
+}
+
+
+def _smsbower_request(api_key: str, action: str, **params) -> str:
+    from urllib.parse import urlencode
+    from urllib.request import Request, urlopen
+
+    query = {"api_key": api_key, "action": action}
+    query.update({k: str(v) for k, v in params.items() if v})
+    request = Request(
+        "https://smsbower.page/stubs/handler_api.php?" + urlencode(query),
+        headers={"User-Agent": "codex-oauth-local/1.0", "Accept": "text/plain, */*"},
+    )
+    with urlopen(request, timeout=30) as response:
+        return response.read().decode("utf-8", "replace").strip()
+
+
+@router.get("/api/sms-countries")
+async def sms_countries(provider: str = "smsbower"):
+    def _do():
+        cfg = _state()._read_config()
+        section = _sms_config_section(cfg)
+        want = str(provider or "smsbower").strip().lower()
+        try:
+            if want == "firefox":
+                settings = SmsSettings.from_mapping(section)
+                from urllib.parse import urlencode
+                from urllib.request import Request, urlopen
+
+                query = {"act": "PagCountry"}
+                token = settings.firefox_api_token
+                if token:
+                    query["token"] = token
+                request = Request(
+                    settings.firefox_api_url + "?" + urlencode(query),
+                    headers={"User-Agent": "codex-oauth-local/1.0"},
+                )
+                with urlopen(request, timeout=30) as response:
+                    body = response.read().decode("utf-8", "replace").strip()
+                import json as _json
+
+                data = _json.loads(body)
+                rows = data.get("data") if isinstance(data, dict) else data
+                out = []
+                for item in rows or []:
+                    if not isinstance(item, dict):
+                        continue
+                    country_id = str(item.get("Country_ID") or item.get("id") or "").strip()
+                    if not country_id:
+                        continue
+                    out.append(
+                        {
+                            "id": country_id,
+                            "name": str(item.get("Country_Title") or country_id),
+                            "calling": "+" + str(item.get("Country_Area") or "").lstrip("+"),
+                            "count": 0,
+                            "price": "",
+                        }
+                    )
+                out.sort(key=lambda row: row["name"])
+                return {"ok": True, "provider": "firefox", "items": out}
+            # smsbower default branch
+            api_key = str(section.get("api_key") or "")
+            if not api_key:
+                raise HTTPException(400, "请先保存 SMSBower API Key")
+            countries_raw = _smsbower_request(api_key, "getCountries")
+            prices_raw = _smsbower_request(api_key, "getPrices", service="dr")
+            import json as _json
+
+            countries = _json.loads(countries_raw) if countries_raw.startswith("{") else {}
+            prices = _json.loads(prices_raw) if prices_raw.startswith("{") else {}
+            out = []
+            for country_id, info in (countries or {}).items():
+                if not isinstance(info, dict):
+                    continue
+                cid = int(info.get("id") or country_id)
+                eng = str(info.get("eng") or info.get("rus") or f"Country {cid}")
+                chn = str(info.get("chn") or "")
+                meta = SMSBOWER_COUNTRY_INFO.get(cid)
+                calling = meta[2] if meta else ""
+                display = chn if chn else eng
+                if meta and chn:
+                    display = chn
+                price_info = (prices.get(str(cid)) or {}).get("dr") or {}
+                count = int(price_info.get("count") or 0) if isinstance(price_info, dict) else 0
+                price = str(price_info.get("cost") or "") if isinstance(price_info, dict) else ""
+                out.append(
+                    {"id": str(cid), "name": display, "calling": calling, "count": count, "price": price}
+                )
+            out.sort(key=lambda row: (-row["count"], row["name"]))
+            return {"ok": True, "provider": "smsbower", "items": out}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(502, f"获取国家列表失败: {str(exc)[:180]}") from exc
+
+    return await asyncio.to_thread(_do)
+
 
 @router.get("/api/sms-config")
 async def sms_config_get():

@@ -10,13 +10,14 @@ const props = defineProps({
   backupScheduleForm: { type: Object, required: true },
   smsForm: { type: Object, required: true },
   smsConfig: { type: Object, default: () => ({}) },
+  smsCountries: { type: Array, default: () => [] },
   groups: { type: Array, default: () => [] },
   security: { type: Object, required: true },
   busy: Boolean,
   maintenanceRunning: Boolean,
   maddyAutoRunning: Boolean,
 });
-const emit = defineEmits(["refresh", "save", "run", "save-maddy-auto", "run-maddy-auto", "test-webhook", "backup", "save-backup-schedule", "save-sms-config", "test-sms", "restore-backup", "restore-trash", "change-password", "revoke-sessions"]);
+const emit = defineEmits(["refresh", "save", "run", "save-maddy-auto", "run-maddy-auto", "test-webhook", "backup", "save-backup-schedule", "save-sms-config", "test-sms", "pick-countries", "restore-backup", "restore-trash", "change-password", "revoke-sessions"]);
 const selectedTrash = ref([]);
 const canChangePassword = computed(() => props.security.currentPassword && props.security.newPassword.length >= 8 && props.security.newPassword === props.security.confirmPassword);
 const successRate = computed(() => Math.max(0, Math.min(100, Number(props.operations.metrics?.success_rate || 0))));
@@ -93,25 +94,23 @@ function formatTime(value) { if (!value) return "-"; try { const date = new Date
       <p v-if="maddyAuto.last_error" class="hint danger-text">最近错误：{{ maddyAuto.last_error }}</p>
     </section>
 
-    <section class="card">
+<section class="card">
       <div class="card-h"><div><h2>接码设置</h2><p class="subtle">Codex OAuth 补发 RT 用的手机验证接码渠道。</p></div></div>
       <div class="form two">
         <label class="check"><input v-model="smsForm.enabled" type="checkbox" />启用自动接码</label>
         <label>接码渠道<select v-model="smsForm.provider"><option value="smsbower">SMSBower</option><option value="firefox">火狐狸 Firefox</option></select></label>
         <template v-if="smsForm.provider !== 'firefox'">
           <label class="full">SMSBower API Key<input v-model="smsForm.apiKey" type="password" :placeholder="smsConfig.has_api_key ? `已保存 ${smsConfig.api_key_masked}` : 'smsbower API key'" autocomplete="off" /></label>
-          <label>服务代码<input v-model="smsForm.service" placeholder="dr" /></label>
-          <label>国家顺序<input v-model="smsForm.countryOrder" placeholder="6, 4, 151" /></label>
         </template>
         <template v-else>
+          <label class="full">火狐狸用户名(ApiName)<input v-model="smsForm.firefoxApiName" type="text" placeholder="ApiName" autocomplete="off" /></label>
           <label class="full">火狐狸 Token(我的密钥)<input v-model="smsForm.firefoxToken" type="password" :placeholder="smsConfig.has_firefox_token ? `已保存 ${smsConfig.firefox_api_token_masked}` : 'firefox token'" autocomplete="off" /></label>
-          <label>对接码<input v-model="smsForm.firefoxDockingCode" placeholder="eng-1096-DEMO01(可选)" /></label>
-          <label>国家顺序<input v-model="smsForm.firefoxCountryOrder" placeholder="usa, chl, eng" /></label>
         </template>
+        <label class="full">国家顺序(按顺序取号)<div class="sms-country-field"><div v-if="smsCountries.length" class="sms-country-chips"><span v-for="(name, index) in smsCountries" :key="name + index" class="sms-country-chip">{{ index + 1 }}. {{ name }}</span></div><span v-else class="sms-country-none">未选择</span><button class="btn secondary sm" type="button" @click="emit('pick-countries')">选择国家</button></div></label>
         <label>等码超时(秒)<input v-model.number="smsForm.timeoutSeconds" type="number" min="30" max="1800" /></label>
         <label>换号重试次数<input v-model.number="smsForm.maxPhoneAttempts" type="number" min="1" max="20" /></label>
       </div>
-      <div class="actions"><button class="primary" :disabled="busy" @click="emit('save-sms-config')">保存接码设置</button><button class="btn secondary" :disabled="busy" @click="emit('test-sms')">测试余额</button></div>
+      <div class="actions"><button class="primary" :disabled="busy" @click="emit('save-sms-config')">保存接码设置</button><button class="btn secondary" :disabled="busy" @click="emit('test-sms')">查看余额</button></div>
       <p class="hint">{{ smsConfig.configured ? (smsConfig.enabled ? `已启用 ${smsConfig.provider_label || ''}` : `已配置 ${smsConfig.provider_label || ''} 但未启用`) : "未配置接码凭证" }}</p>
     </section>
 
