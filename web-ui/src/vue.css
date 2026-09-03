@@ -2268,3 +2268,11 @@ table.acct .col-actions { text-align: right; white-space: nowrap; }
 .sms-price-menu button { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .sms-price-menu button b { font-family: var(--mono, ui-monospace, monospace); }
 .sms-price-menu button small { color: var(--ink-400); font-size: 11px; }
+﻿
+/* tier inline panel */
+.sms-tier-panel { display: grid; gap: 4px; padding: 6px 10px 8px 36px; border-bottom: 1px solid var(--bg-3); background: var(--bg-2); }
+.sms-tier-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 10px; border: 1px solid transparent; border-radius: 8px; background: var(--bg-1); cursor: pointer; text-align: left; }
+.sms-tier-row:hover { border-color: var(--acc, #6366f1); }
+.sms-tier-row.cur { border-color: var(--acc, #6366f1); background: color-mix(in srgb, var(--acc, #6366f1) 10%, var(--bg-1)); }
+.sms-tier-row b { font-family: var(--mono, ui-monospace, monospace); font-size: 13px; color: var(--ink-900); }
+.sms-tier-row small { color: var(--ink-400); font-size: 11px; }

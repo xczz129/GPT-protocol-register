@@ -12,12 +12,12 @@ const props = defineProps({
   loading: Boolean,
   error: { type: String, default: "" },
 });
-const emit = defineEmits(["close", "toggle", "set-price", "set-provider"]);
+const emit = defineEmits(["close", "toggle", "set-provider"]);
 
 const search = ref("");
 const minPrice = ref("");
 const maxPrice = ref("");
-const tierMenu = ref(null);
+const expanded = ref(null);
 
 const filtered = computed(() => {
   const needle = String(search.value || "").trim().toLowerCase();
@@ -49,19 +49,17 @@ function roundPrice(value) {
   return String(Math.round(value * 1000) / 1000);
 }
 
-function toggleTierMenu(item) {
-  if (tierMenu.value === item.id) { tierMenu.value = null; return; }
-  tierMenu.value = item.id;
+function fmtCount(value) {
+  const count = Number(value) || 0;
+  return count >= 10000 ? `${Math.round(count / 1000)}k` : String(count);
+}
+
+function toggleExpand(item) {
+  expanded.value = expanded.value === item.id ? null : item.id;
 }
 
 function pickTier(id, providerId) {
   emit("set-provider", { id, providerId });
-  tierMenu.value = null;
-}
-
-function fmtCount(value) {
-  const count = Number(value) || 0;
-  return count >= 10000 ? `${Math.round(count / 1000)}k` : String(count);
 }
 </script>
 
@@ -74,7 +72,7 @@ function fmtCount(value) {
             <div>
               <span class="app-dialog-kicker"><Globe :size="12" aria-hidden="true" />选择国家</span>
               <h2>接码国家顺序</h2>
-              <small>{{ provider === "firefox" ? "火狐狸" : "SMSBower" }} · 点击行选中 · 点「价位」选择运营商档位</small>
+              <small>{{ provider === "firefox" ? "火狐狸" : "SMSBower" }} · 点击行选中 · 点「价位」展开该国档位,点价格即选定</small>
             </div>
             <button class="app-dialog-close" type="button" title="关闭" aria-label="关闭" @click="emit('close')"><X :size="16" aria-hidden="true" /></button>
           </div>
@@ -90,38 +88,42 @@ function fmtCount(value) {
             <div v-if="loading" class="sms-country-empty">正在获取国家列表…</div>
             <div v-else-if="error" class="sms-country-empty sms-country-error">{{ error }}</div>
             <div v-else-if="!filtered.length" class="sms-country-empty">没有匹配的国家{{ minPrice || maxPrice ? "(试试放宽价格区间)" : "" }}</div>
-            <div
-              v-for="item in filtered"
-              :key="item.id"
-              :class="['sms-country-row', selected.includes(item.id) ? 'on' : '']"
-              role="button"
-              tabindex="0"
-              @click="emit('toggle', item.id)"
-            >
-              <span class="sms-country-order">{{ selected.includes(item.id) ? selected.indexOf(item.id) + 1 : "" }}</span>
-              <span class="sms-country-name">{{ item.name }}</span>
-              <span v-if="item.calling" class="sms-country-calling">{{ item.calling }}</span>
-              <span v-if="item.price" class="sms-country-price">≈${{ item.price }}</span>
-              <span v-if="item.count" class="sms-country-stock">库存 {{ fmtCount(item.count) }}</span>
-              <template v-if="provider !== 'firefox' && (item.tiers || []).length">
-                <span class="sms-country-price-pick" title="选择运营商档位" @click.stop="toggleTierMenu(item)">
+            <template v-for="item in filtered" :key="item.id">
+              <div
+                :class="['sms-country-row', selected.includes(item.id) ? 'on' : '']"
+                role="button"
+                tabindex="0"
+                @click="emit('toggle', item.id)"
+              >
+                <span class="sms-country-order">{{ selected.includes(item.id) ? selected.indexOf(item.id) + 1 : "" }}</span>
+                <span class="sms-country-name">{{ item.name }}</span>
+                <span v-if="item.calling" class="sms-country-calling">{{ item.calling }}</span>
+                <span v-if="item.price" class="sms-country-price">≈${{ item.price }}</span>
+                <span v-if="item.count" class="sms-country-stock">库存 {{ fmtCount(item.count) }}</span>
+                <span v-if="provider !== 'firefox' && (item.tiers || []).length" class="sms-country-price-pick" title="展开该国价位档位" @click.stop="toggleExpand(item)">
                   {{ providers[item.id] ? `#${providers[item.id]}` : "价位" }}<ChevronDown :size="11" aria-hidden="true" />
                 </span>
-                <div v-if="tierMenu === item.id" class="sms-price-menu" @click.stop>
-                  <button type="button" @click="pickTier(item.id, '')">不限(默认最优)</button>
-                  <button
-                    v-for="tier in item.tiers"
-                    :key="tier.id"
-                    type="button"
-                    :class="String(providers[item.id]) === String(tier.id) ? 'cur' : ''"
-                    @click="pickTier(item.id, tier.id)"
-                  >
-                    <b>${{ roundPrice(tier.price) }}</b>
-                    <small>#{{ tier.id }} · {{ fmtCount(tier.count) }} 件</small>
-                  </button>
-                </div>
-              </template>
-            </div>
+              </div>
+              <div v-if="expanded === item.id" class="sms-tier-panel">
+                <button
+                  type="button"
+                  :class="['sms-tier-row', !providers[item.id] ? 'cur' : '']"
+                  @click="pickTier(item.id, '')"
+                >
+                  <b>不限</b><small>平台自动分配最优档位</small>
+                </button>
+                <button
+                  v-for="tier in item.tiers"
+                  :key="tier.id"
+                  type="button"
+                  :class="['sms-tier-row', String(providers[item.id]) === String(tier.id) ? 'cur' : '']"
+                  @click="pickTier(item.id, tier.id)"
+                >
+                  <b>${{ roundPrice(tier.price) }}</b>
+                  <small>#{{ tier.id }} · 库存 {{ fmtCount(tier.count) }}</small>
+                </button>
+              </div>
+            </template>
           </div>
           <div class="app-dialog-actions">
             <span class="sms-country-count">已选 {{ selectedCount }} 个 · 共 {{ filtered.length }} 个国家</span>

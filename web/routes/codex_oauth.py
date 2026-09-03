@@ -598,6 +598,9 @@ SMSBOWER_EXTRA_CALLING: dict[int, str] = {
 }
 
 
+_SMS_COUNTRIES_CACHE: dict = {"at": 0.0, "payload": None}
+
+
 def _smsbower_request(api_key: str, action: str, **params) -> str:
     from urllib.parse import urlencode
     from urllib.request import Request, urlopen
@@ -618,6 +621,12 @@ async def sms_countries(provider: str = "smsbower"):
         cfg = _state()._read_config()
         section = _sms_config_section(cfg)
         want = str(provider or "smsbower").strip().lower()
+        import time as _time
+
+        if want != "firefox" and _SMS_COUNTRIES_CACHE["payload"] is not None and _time.time() - _SMS_COUNTRIES_CACHE["at"] < 60:
+            cached = dict(_SMS_COUNTRIES_CACHE["payload"])
+            cached["cached"] = True
+            return cached
         try:
             if want == "firefox":
                 settings = SmsSettings.from_mapping(section)
@@ -730,7 +739,10 @@ async def sms_countries(provider: str = "smsbower"):
                     }
                 )
             out.sort(key=lambda row: (-row["count"], row["name"]))
-            return {"ok": True, "provider": "smsbower", "items": out}
+            payload = {"ok": True, "provider": "smsbower", "items": out}
+            _SMS_COUNTRIES_CACHE["payload"] = payload
+            _SMS_COUNTRIES_CACHE["at"] = _time.time()
+            return payload
         except HTTPException:
             raise
         except Exception as exc:
