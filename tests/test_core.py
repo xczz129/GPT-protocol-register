@@ -17,6 +17,8 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 from fastapi import HTTPException, Response
 
+import web.routes.mailbox as mailbox_routes
+
 from common.account_store import (
     account_email_set,
     account_public_view,
@@ -1254,7 +1256,7 @@ class CDKStoreTests(unittest.TestCase):
         with (
             patch.object(web_app, "_find_mailbox_credential", return_value=(entry, credential)),
             patch.object(web_app, "ICloudApiProvider", return_value=provider),
-            patch.object(web_app, "_ICLOUD_INBOX_SYNC_INTERVAL", 0.0),
+            patch.object(mailbox_routes, "_ICLOUD_INBOX_SYNC_INTERVAL", 0.0),
         ):
             result = web_app._fetch_mailbox_messages_sync(
                 {}, web_app.MailMessagesRequest(email="box@icloud.com", provider_type="icloud_api", limit=30)
@@ -1281,7 +1283,7 @@ class CDKStoreTests(unittest.TestCase):
         with (
             patch.object(web_app, "_find_mailbox_credential", return_value=(entry, credential)),
             patch.object(web_app, "ICloudApiProvider", return_value=provider),
-            patch.object(web_app, "_ICLOUD_INBOX_SYNC_INTERVAL", 0.0),
+            patch.object(mailbox_routes, "_ICLOUD_INBOX_SYNC_INTERVAL", 0.0),
         ):
             result = web_app._fetch_mailbox_messages_sync(
                 {}, web_app.MailMessagesRequest(email="box@icloud.com", provider_type="icloud_api")
@@ -11455,11 +11457,11 @@ class MailboxSnapshotCacheTests(unittest.TestCase):
         provider.list_mailboxes.return_value = [
             {"address": "remote@example.com", "id": "remote-1"}
         ]
-        old_rows = dict(web_app._DOMAIN_MAILBOX_REMOTE_CACHE)
-        old_locks = dict(web_app._DOMAIN_MAILBOX_REMOTE_FETCH_LOCKS)
+        old_rows = dict(mailbox_routes._DOMAIN_MAILBOX_REMOTE_CACHE)
+        old_locks = dict(mailbox_routes._DOMAIN_MAILBOX_REMOTE_FETCH_LOCKS)
         try:
-            web_app._DOMAIN_MAILBOX_REMOTE_CACHE.clear()
-            web_app._DOMAIN_MAILBOX_REMOTE_FETCH_LOCKS.clear()
+            mailbox_routes._DOMAIN_MAILBOX_REMOTE_CACHE.clear()
+            mailbox_routes._DOMAIN_MAILBOX_REMOTE_FETCH_LOCKS.clear()
             with (
                 patch.object(web_app, "_load_state_file", return_value=state),
                 patch.object(web_app, "account_email_set", return_value=set()),
@@ -11472,17 +11474,17 @@ class MailboxSnapshotCacheTests(unittest.TestCase):
                 self.assertEqual(provider.list_mailboxes.call_count, 1)
 
                 provider.list_mailboxes.side_effect = RuntimeError("upstream down")
-                for key, (_at, rows) in list(web_app._DOMAIN_MAILBOX_REMOTE_CACHE.items()):
-                    web_app._DOMAIN_MAILBOX_REMOTE_CACHE[key] = (time.monotonic() - 31, rows)
+                for key, (_at, rows) in list(mailbox_routes._DOMAIN_MAILBOX_REMOTE_CACHE.items()):
+                    mailbox_routes._DOMAIN_MAILBOX_REMOTE_CACHE[key] = (time.monotonic() - 31, rows)
                 stale = web_app._mailbox_items(cfg, provider_type="domain")
                 self.assertEqual([item["email"] for item in stale], ["remote@example.com"])
                 self.assertEqual(provider.list_mailboxes.call_count, 2)
                 provider.close.assert_called()
         finally:
-            web_app._DOMAIN_MAILBOX_REMOTE_CACHE.clear()
-            web_app._DOMAIN_MAILBOX_REMOTE_CACHE.update(old_rows)
-            web_app._DOMAIN_MAILBOX_REMOTE_FETCH_LOCKS.clear()
-            web_app._DOMAIN_MAILBOX_REMOTE_FETCH_LOCKS.update(old_locks)
+            mailbox_routes._DOMAIN_MAILBOX_REMOTE_CACHE.clear()
+            mailbox_routes._DOMAIN_MAILBOX_REMOTE_CACHE.update(old_rows)
+            mailbox_routes._DOMAIN_MAILBOX_REMOTE_FETCH_LOCKS.clear()
+            mailbox_routes._DOMAIN_MAILBOX_REMOTE_FETCH_LOCKS.update(old_locks)
 
     def test_disabled_domain_provider_does_not_make_remote_listing_request(self):
         import web_app
@@ -11502,9 +11504,9 @@ class MailboxSnapshotCacheTests(unittest.TestCase):
             }
         }
         provider = MagicMock()
-        old_rows = dict(web_app._DOMAIN_MAILBOX_REMOTE_CACHE)
+        old_rows = dict(mailbox_routes._DOMAIN_MAILBOX_REMOTE_CACHE)
         try:
-            web_app._DOMAIN_MAILBOX_REMOTE_CACHE.clear()
+            mailbox_routes._DOMAIN_MAILBOX_REMOTE_CACHE.clear()
             with (
                 patch.object(web_app, "_load_state_file", return_value={}),
                 patch.object(web_app, "account_email_set", return_value=set()),
@@ -11514,8 +11516,8 @@ class MailboxSnapshotCacheTests(unittest.TestCase):
             self.assertEqual([item["email"] for item in rows], ["fallback@example.com"])
             provider.assert_not_called()
         finally:
-            web_app._DOMAIN_MAILBOX_REMOTE_CACHE.clear()
-            web_app._DOMAIN_MAILBOX_REMOTE_CACHE.update(old_rows)
+            mailbox_routes._DOMAIN_MAILBOX_REMOTE_CACHE.clear()
+            mailbox_routes._DOMAIN_MAILBOX_REMOTE_CACHE.update(old_rows)
 
 
 class MaddyWebuiMailTests(unittest.TestCase):
