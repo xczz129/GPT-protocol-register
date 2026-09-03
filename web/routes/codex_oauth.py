@@ -33,9 +33,13 @@ from codex_oauth.oauth import (  # noqa: E402
 )
 from codex_oauth.sms import (  # noqa: E402
     FirefoxSmsClient,
+    SmsActivation,
     SmsBowerClient,
+    SmsError,
     SmsSettings,
     check_sms_balance,
+    normalize_firefox_country,
+    parse_firefox_docking_code,
 )
 
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -96,12 +100,127 @@ def _phone_requirement(data: Any) -> tuple:
     return None, step
 
 
-def _sms_client(settings: SmsSettings):
+def _country_specs(sms_cfg: dict) -> list:
+    """Parse country order entries of the form "country" or "country:maxPrice"."""
+    provider = str(sms_cfg.get("provider") or "").strip().lower()
+    key = "firefox_country_order" if provider == "firefox" else "country_order"
+    specs: list = []
+    for raw in str(sms_cfg.get(key) or "").replace("，", ",").split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        country, _, price = item.partition(":")
+        country = country.strip()
+        price = price.strip()
+        if not country:
+            continue
+        if price:
+            try:
+                float(price)
+            except ValueError:
+                price = ""
+        specs.append((country, price or None))
+    if provider != "firefox":
+        specs = [(c, p) for c, p in specs if str(c).isdigit()]
+    return specs
+
+
+class _PanelSmsBowerClient(SmsBowerClient):
+    """SMSBower client with per-country maxPrice support."""
+
+    def __init__(self, settings: SmsSettings, country_specs: list, *, timeout: float = 30.0):
+        super().__init__(settings, timeout=timeout)
+        self.country_specs = country_specs or [(str(c), None) for c in settings.country_order]
+
+    def acquire(self) -> SmsActivation:
+        last_error = "没有可用号码"
+        for country, max_price in self.country_specs:
+            params = {
+                "service": self.settings.service,
+                "country": country,
+            }
+            price = max_price or self.settings.max_price
+            if price:
+                params["maxPrice"] = price
+            try:
+                body = self._request("getNumber", **params)
+            except SmsError as exc:
+                last_error = str(exc)
+                continue
+            if not body.startswith("ACCESS_NUMBER:"):
+                last_error = f"SMSBower 未分配号码: {body[:120]}"
+                continue
+            parts = body.split(":", 2)
+            if len(parts) != 3 or not parts[1] or not parts[2]:
+                last_error = f"SMSBower 响应格式异常: {body[:120]}"
+                continue
+            return SmsActivation(parts[1], parts[2], int(country), self.settings.api_key)
+        raise SmsError(last_error)
+
+
+class _PanelFirefoxSmsClient(FirefoxSmsClient):
+    """Firefox client honouring per-country maxPrice specs."""
+
+    def __init__(self, settings: SmsSettings, country_specs: list, *, timeout: float = 30.0):
+        super().__init__(settings, timeout=timeout)
+        self.country_specs = country_specs or [(str(c), None) for c in settings.firefox_country_order]
+
+    def acquire(self) -> SmsActivation:
+        last_error = "没有可用号码"
+        dock_country, dock_item_id, dock_did = parse_firefox_docking_code(self.settings.firefox_docking_code)
+        if dock_country and dock_item_id and dock_did:
+            specs = [(dock_country, None)]
+            item_id = dock_item_id
+            did = dock_did
+        else:
+            specs = self.country_specs
+            item_id = self.settings.firefox_item_id
+            did = self.settings.firefox_did
+        self._login()
+        for country, max_price in specs:
+            country = normalize_firefox_country(country)
+            params = {
+                "iid": item_id,
+                "country": country,
+                "dock": "0",
+                "otpmode": "sms",
+            }
+            if did:
+                params["did"] = did
+            price = max_price or self.settings.max_price
+            if price:
+                params["maxPrice"] = price
+            try:
+                body = self._authorized_request("getPhone", **params)
+            except SmsError as exc:
+                last_error = str(exc)
+                continue
+            if not body.startswith("1|"):
+                last_error = f"火狐狸未分配号码：{self._failure(body)[:120]}"
+                continue
+            parts = body.split("|")
+            if len(parts) < 8 or not parts[1].strip() or not parts[7].strip():
+                last_error = f"火狐狸响应格式异常：{body[:160]}"
+                continue
+            returned_country = normalize_firefox_country(parts[3] if len(parts) > 3 else "") or country
+            returned_prefix = parts[4] if len(parts) > 4 else ""
+            phone = self._normalize_phone(parts[7], returned_prefix, returned_country)
+            return SmsActivation(
+                activation_id=parts[1].strip(),
+                phone=phone,
+                country=returned_country,
+                api_key=self._token,
+            )
+        raise SmsError(last_error)
+
+
+def _sms_client(settings: SmsSettings, country_specs: list | None = None):
     if not settings.enabled or not settings.credentials_configured:
         return None
+    specs = list(country_specs or [])
     if settings.provider == "firefox":
-        return FirefoxSmsClient(settings, timeout=30.0)
-    return SmsBowerClient(settings, timeout=30.0)
+        return _PanelFirefoxSmsClient(settings, specs, timeout=30.0)
+    return _PanelSmsBowerClient(settings, specs, timeout=30.0)
 
 
 def _auto_phone(client, sms, log) -> None:
@@ -144,7 +263,7 @@ def _process_one(rec: dict, sms_cfg: dict) -> dict:
         raise RuntimeError("账号缺少密码或 2FA 密钥,无法补发")
 
     settings = SmsSettings.from_mapping(sms_cfg)
-    sms = _sms_client(settings)
+    sms = _sms_client(settings, _country_specs(sms_cfg))
 
     client = ProtocolClient(email, timeout=30)
     try:

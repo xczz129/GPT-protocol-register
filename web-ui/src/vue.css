@@ -2249,4 +2249,16 @@ table.acct .col-actions { text-align: right; white-space: nowrap; }
 .sms-price-input { width: 74px; padding: 7px 9px; border: 1px solid var(--bg-3); border-radius: 8px; background: var(--bg-1); color: var(--ink-800); font-size: 12px; }
 .sms-price-input:focus { outline: none; border-color: var(--acc, #6366f1); }
 .sms-country-count { flex: 1; font-size: 12px; color: var(--ink-500); }
-.sms-country-price { font-family: var(--mono, ui-monospace, monospace); font-size: 12px; color: var(--acc, #6366f1); }
+.sms-country-price { font-family: var(--mono, ui-monospace, monospace); font-size: 12px; color: var(--acc, #6366f1); }﻿
+/* sms country price dropdown */
+.sms-country-row { position: relative; }
+.sms-country-price-pick { display: inline-flex; align-items: center; gap: 3px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--acc, #6366f1); color: var(--acc, #6366f1); font-size: 11px; cursor: pointer; white-space: nowrap; background: transparent; }
+.sms-country-price-pick:hover { background: color-mix(in srgb, var(--acc, #6366f1) 12%, transparent); }
+.sms-price-menu { position: absolute; right: 10px; top: calc(100% + 2px); z-index: 30; min-width: 200px; background: var(--bg-1); border: 1px solid var(--bg-3); border-radius: 10px; box-shadow: 0 10px 28px rgba(0, 0, 0, 0.22); padding: 6px; display: grid; gap: 2px; }
+.sms-price-menu button { padding: 7px 10px; border: none; background: none; color: var(--ink-700); font-size: 12px; text-align: left; border-radius: 7px; cursor: pointer; }
+.sms-price-menu button:hover { background: var(--bg-3); }
+.sms-price-menu button.cur { color: var(--acc, #6366f1); font-weight: 700; }
+.sms-price-custom { display: flex; gap: 6px; padding-top: 5px; border-top: 1px solid var(--bg-3); margin-top: 3px; }
+.sms-price-custom input { flex: 1; min-width: 0; padding: 6px 8px; border: 1px solid var(--bg-3); border-radius: 7px; background: var(--bg-2); color: var(--ink-800); font-size: 12px; }
+.sms-price-custom input:focus { outline: none; border-color: var(--acc, #6366f1); }
+.sms-price-custom button { flex: none; border: 1px solid var(--acc, #6366f1); color: var(--acc, #6366f1); background: none; border-radius: 7px; padding: 6px 10px; font-size: 12px; cursor: pointer; }

@@ -1,20 +1,23 @@
-<script setup>
-import { computed, ref, watch } from "vue";
-import { Globe, X } from "@lucide/vue";
+﻿<script setup>
+import { computed, ref } from "vue";
+import { ChevronDown, Globe, X } from "@lucide/vue";
 
 const props = defineProps({
   open: Boolean,
   provider: { type: String, default: "smsbower" },
   items: { type: Array, default: () => [] },
   selected: { type: Array, default: () => [] },
+  prices: { type: Object, default: () => ({}) },
   loading: Boolean,
   error: { type: String, default: "" },
 });
-const emit = defineEmits(["close", "toggle"]);
+const emit = defineEmits(["close", "toggle", "set-price"]);
 
 const search = ref("");
 const minPrice = ref("");
 const maxPrice = ref("");
+const priceMenu = ref(null);
+const customPrice = ref("");
 
 const filtered = computed(() => {
   const needle = String(search.value || "").trim().toLowerCase();
@@ -41,6 +44,39 @@ function resetFilters() {
   minPrice.value = "";
   maxPrice.value = "";
 }
+
+function roundPrice(value) {
+  return String(Math.round(value * 1000) / 1000);
+}
+
+function priceTiers(item) {
+  const market = Number(item.price);
+  if (!market) return [];
+  return [
+    { label: `市场价 $${roundPrice(market)}`, value: roundPrice(market) },
+    { label: `$${roundPrice(market * 1.5)} · 号码更多`, value: roundPrice(market * 1.5) },
+    { label: `$${roundPrice(market * 2)} · 号码更多`, value: roundPrice(market * 2) },
+    { label: `$${roundPrice(market * 3)} · 号码最多`, value: roundPrice(market * 3) },
+  ];
+}
+
+function togglePriceMenu(item) {
+  if (priceMenu.value === item.id) { priceMenu.value = null; return; }
+  customPrice.value = "";
+  priceMenu.value = item.id;
+}
+
+function pickPrice(id, price) {
+  emit("set-price", { id, price });
+  priceMenu.value = null;
+}
+
+function applyCustomPrice(id) {
+  const value = String(customPrice.value || "").trim();
+  if (!value || Number.isNaN(Number(value))) return;
+  emit("set-price", { id, value });
+  priceMenu.value = null;
+}
 </script>
 
 <template>
@@ -52,7 +88,7 @@ function resetFilters() {
             <div>
               <span class="app-dialog-kicker"><Globe :size="12" aria-hidden="true" />选择国家</span>
               <h2>接码国家顺序</h2>
-              <small>{{ provider === "firefox" ? "火狐狸" : "SMSBower" }} · 点击切换选中,按选择顺序取号 · 显示价格与库存</small>
+              <small>{{ provider === "firefox" ? "火狐狸" : "SMSBower" }} · 点击行切换选中 · 点「价位」选择出价上限</small>
             </div>
             <button class="app-dialog-close" type="button" title="关闭" aria-label="关闭" @click="emit('close')"><X :size="16" aria-hidden="true" /></button>
           </div>
@@ -68,11 +104,12 @@ function resetFilters() {
             <div v-if="loading" class="sms-country-empty">正在获取国家列表…</div>
             <div v-else-if="error" class="sms-country-empty sms-country-error">{{ error }}</div>
             <div v-else-if="!filtered.length" class="sms-country-empty">没有匹配的国家{{ minPrice || maxPrice ? "(试试放宽价格区间)" : "" }}</div>
-            <button
+            <div
               v-for="item in filtered"
               :key="item.id"
               :class="['sms-country-row', selected.includes(item.id) ? 'on' : '']"
-              type="button"
+              role="button"
+              tabindex="0"
               @click="emit('toggle', item.id)"
             >
               <span class="sms-country-order">{{ selected.includes(item.id) ? selected.indexOf(item.id) + 1 : "" }}</span>
@@ -80,8 +117,20 @@ function resetFilters() {
               <span v-if="item.calling" class="sms-country-calling">{{ item.calling }}</span>
               <span v-if="item.price" class="sms-country-price">≈${{ item.price }}</span>
               <span v-if="item.count" class="sms-country-stock">库存 {{ item.count }}</span>
-              <span v-else-if="!item.calling && !item.price" class="sms-country-id">#{{ item.id }}</span>
-            </button>
+              <template v-if="provider !== 'firefox' && item.price">
+                <span class="sms-country-price-pick" title="选择该国家的出价上限(maxPrice)" @click.stop="togglePriceMenu(item)">
+                  {{ prices[item.id] ? `≤$${prices[item.id]}` : "价位" }}<ChevronDown :size="11" aria-hidden="true" />
+                </span>
+                <div v-if="priceMenu === item.id" class="sms-price-menu" @click.stop>
+                  <button type="button" @click="pickPrice(item.id, '')">不限(默认最低价)</button>
+                  <button v-for="tier in priceTiers(item)" :key="tier.value" type="button" :class="String(prices[item.id]) === tier.value ? 'cur' : ''" @click="pickPrice(item.id, tier.value)">{{ tier.label }}</button>
+                  <div class="sms-price-custom">
+                    <input v-model="customPrice" type="number" min="0" step="0.001" placeholder="自定义 $" @keyup.enter="applyCustomPrice(item.id)" />
+                    <button type="button" @click="applyCustomPrice(item.id)">确定</button>
+                  </div>
+                </div>
+              </template>
+            </div>
           </div>
           <div class="app-dialog-actions">
             <span class="sms-country-count">已选 {{ selectedCount }} 个 · 共 {{ filtered.length }} 个国家</span>
