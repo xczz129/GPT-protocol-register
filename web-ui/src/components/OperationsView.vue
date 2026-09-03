@@ -91,7 +91,7 @@ function formatTime(value) { if (!value) return "-"; try { const date = new Date
       <p v-if="maddyAuto.last_error" class="hint danger-text">最近错误：{{ maddyAuto.last_error }}</p>
     </section>
 
-    <section class="card">
+    <section class="card span-all">
       <div class="card-h"><div><h2>备份与恢复</h2><p class="subtle">备份数据库、配置、分组和邮箱状态。</p></div><button class="btn primary" :disabled="busy" @click="emit('backup')">立即备份</button></div>
       <div class="form two">
         <label class="check"><input v-model="backupScheduleForm.enabled" type="checkbox" />启用定时备份</label>
