@@ -10547,7 +10547,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
         self.assertEqual(result["checked"], 4)
         self.assertEqual(maximum_active, 1)
 
-    def test_health_resource_budget_prioritizes_registration(self):
+    def test_health_resource_budget_ignores_registration(self):
         import web_app
 
         state = web_app.JobState()
@@ -10556,20 +10556,12 @@ class ProtocolAndHealthTests(unittest.TestCase):
             state.params = {"concurrency": 3}
         with patch.object(web_app, "JOB", state):
             web_app._start_account_health_progress(4, 10)
-            throttled = web_app._account_health_progress_snapshot()
-            self.assertEqual(throttled["requested_workers"], 10)
-            self.assertEqual(throttled["workers"], 1)
-            self.assertTrue(throttled["throttled"])
-            self.assertEqual(throttled["resource_mode"], "registration_priority")
-
-            with state.lock:
-                state.running = False
-            restored = web_app._account_health_progress_snapshot()
-
-        self.assertEqual(restored["workers"], 10)
-        self.assertFalse(restored["throttled"])
-        self.assertEqual(restored["resource_mode"], "normal")
-        web_app._finish_account_health_progress()
+            snapshot = web_app._account_health_progress_snapshot()
+            self.assertEqual(snapshot["requested_workers"], 10)
+            self.assertEqual(snapshot["workers"], 10)
+            self.assertFalse(snapshot["throttled"])
+            self.assertEqual(snapshot["resource_mode"], "normal")
+            web_app._finish_account_health_progress()
 
     def test_trial_backfill_waits_for_registration_to_finish(self):
         import web_app
