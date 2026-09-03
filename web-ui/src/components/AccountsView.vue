@@ -15,8 +15,9 @@ import {
   RefreshCw, 
   ShieldCheck, 
   Trash2, 
-  Users, 
-  X 
+  Users,
+  Smartphone,
+  X
 } from "@lucide/vue";
 import AppPager from "./AppPager.vue";
 import { api, jsonBody } from "../api.js";
@@ -29,7 +30,8 @@ const props = defineProps({
   groups: { type: Array, default: () => [] }, 
   proxyCountries: { type: Array, default: () => [] }, 
   busy: Boolean, 
-  copyingAt: Boolean, 
+  copyingAt: Boolean,
+  codexOauthRunning: Boolean, 
   healthProgress: { type: Object, default: () => ({}) }, 
   reauthProgress: { type: Object, default: () => ({}) }, 
   trialProgress: { type: Object, default: () => ({}) } 
@@ -37,7 +39,7 @@ const props = defineProps({
 
 const emit = defineEmits([
   "refresh", "health", "reauth", "security-repair", "password-change", "totp-change", 
-  "account-logs", "stop-reauth", "delete", "delete-invalid", "download", "copy-selected-at", 
+  "account-logs", "stop-reauth", "delete", "delete-invalid", "download", "copy-selected-at", "codex-oauth", 
   "export-selected-at", "export-security", "create-group", "rename-group", "delete-group", 
   "move-group", "export-group", "copy-at", "copy-credential", "copy-value", "trial-check"
 ]);
@@ -675,7 +677,7 @@ function moveSelected() {
           <label class="checkline"><input v-model="allPageSelected" type="checkbox" />全选本页</label>
           <button class="btn secondary" type="button" :disabled="!selected.length || busy" title="取消所有分页中已选择的账号" @click="clearAllSelected"><X :size="14" aria-hidden="true" />取消（{{ selected.length }}）</button>
           <button class="btn primary" :disabled="!selected.length || busy" @click="emit('download', selected)"><Download :size="14" aria-hidden="true" />下载选中</button>
-          <button class="btn secondary" :disabled="!selectedAccessTokenKeys.length || busy || copyingAt" title="复制选中账号的完整 Access Token" @click="emit('copy-selected-at', selected)"><Copy :size="14" aria-hidden="true" />{{ copyingAt ? "读取AT中" : "复制选中AT" }}</button>
+          <button class="btn secondary" :disabled="!selectedAccessTokenKeys.length || busy || copyingAt" title="复制选中账号的完整 Access Token" @click="emit('copy-selected-at', selected)"><Copy :size="14" aria-hidden="true" />{{ copyingAt ? "读取AT中" : "复制选中AT" }}</button><button class="btn secondary" type="button" :disabled="!selected.length || busy || codexOauthRunning" title="对选中账号补发 Codex RT(协议登录+接码)" @click="emit('codex-oauth', selected)"><Smartphone :size="14" aria-hidden="true" />接码</button>
           <button class="btn secondary" :disabled="!selectedAccessTokenKeys.length || busy" title="导出选中账号的完整 Access Token" @click="emit('export-selected-at', selected)">导出选中AT</button>
           <button class="btn secondary" :disabled="!selected.length || busy" title="导出选中账号、密码和完整 TOTP 密钥" @click="emit('export-security', selected)">导出账号+密码+2FA</button>
           <button class="btn secondary" :disabled="!accounts.length || busy" @click="emit('download', null)">下载全部</button>

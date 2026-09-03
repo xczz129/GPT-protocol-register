@@ -2182,3 +2182,22 @@ table.acct .col-actions { text-align: right; white-space: nowrap; }
 
 /* scheduled-backup tag */
 .backup-auto-tag { display: inline-block; margin-left: 8px; padding: 0 8px; border-radius: 999px; font-style: normal; font-size: 11px; font-weight: 600; line-height: 18px; vertical-align: 2px; background: var(--bg-2, rgba(127, 127, 127, 0.16)); color: var(--fg-2, #9ca3af); }
+
+/* codex oauth sms dialog */
+.codex-oauth-dialog { width: min(880px, 100%); }
+.codex-oauth-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0 12px; font-size: 13px; color: var(--ink-600); border-bottom: 1px solid var(--bg-3); }
+.codex-oauth-body { display: grid; gap: 12px; }
+.codex-oauth-results { display: grid; gap: 6px; max-height: 220px; overflow: auto; }
+.codex-result-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 10px; border: 1px solid var(--bg-3); border-radius: 10px; }
+.codex-result-row.ok { border-color: rgba(34, 197, 94, 0.35); }
+.codex-result-row.bad { border-color: rgba(244, 63, 94, 0.35); }
+.codex-result-main { display: grid; gap: 2px; min-width: 0; }
+.codex-result-main b { font-size: 13px; color: var(--ink-900); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.codex-result-main small { font-size: 12px; color: var(--ink-500); font-family: var(--mono, ui-monospace, monospace); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.codex-oauth-logs { max-height: 300px; overflow: auto; background: var(--bg-2); border: 1px solid var(--bg-3); border-radius: 10px; padding: 10px 12px; font-family: var(--mono, ui-monospace, monospace); font-size: 12px; line-height: 1.7; }
+.codex-oauth-logs p { margin: 0; color: var(--ink-600); word-break: break-all; }
+.codex-log-time { color: var(--ink-400); margin-right: 6px; }
+.codex-log-error { color: var(--err, #e11d48); }
+.codex-log-warning { color: var(--warn, #d97706); }
+.codex-log-ok { color: var(--ok, #16a34a); }
+.codex-log-empty { color: var(--ink-400); }

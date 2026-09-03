@@ -1778,6 +1778,9 @@ app = FastAPI(title="GPT Register FP", version="1.0.0", lifespan=_app_lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
 app.include_router(auth_router)
 
+from web.routes.codex_oauth import router as codex_oauth_router  # noqa: E402
+app.include_router(codex_oauth_router)
+
 from web.routes.account_groups import router as account_groups_router
 from web.routes.accounts_trash import router as accounts_trash_router
 app.include_router(account_groups_router)
