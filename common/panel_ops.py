@@ -37,7 +37,7 @@ TRASH_FILE = DATA_DIR / "account_trash.json"
 TRASH_RETENTION_DAYS = 60
 TRASH_MAX_ROWS = 2000
 BACKUP_RETENTION_DAYS = 7
-BACKUP_MAX_FILES = 60
+BACKUP_MAX_FILES = 20
 AUTO_BACKUP_MARK = "gpt-register-backup-auto-"
 OPS_STATE_FILE = DATA_DIR / "panel_operations.json"
 TASK_HISTORY_FILE = DATA_DIR / "task_history.json"
@@ -54,12 +54,18 @@ BACKUP_FILES = {
     "config.yaml": ROOT / "config.yaml",
     "account_groups.json": DATA_DIR / "account_groups.json",
     "outlook_token_state.json": DATA_DIR / "outlook_token_state.json",
+    "registration_proxy_pools.json": DATA_DIR / "registration_proxy_pools.json",
+    "trial_eligibility_proxy_pool.json": DATA_DIR / "trial_eligibility_proxy_pool.json",
 }
 BACKUP_DB_FILES = {
     "registered_accounts.sqlite3": DATA_DIR / "registered_accounts.sqlite3",
     "task_history.sqlite3": DATA_DIR / "task_history.sqlite3",
     "account_operation_logs.sqlite3": DATA_DIR / "account_operation_logs.sqlite3",
     "account_trash.json": DATA_DIR / "account_trash.json",
+}
+BACKUP_DIR_SOURCES = {
+    "cookies": ROOT / "cookies",
+    "tokens": ROOT / "tokens",
 }
 _LEGACY_RESTORE_FILES = {
     "registered_accounts.json": DATA_DIR / "registered_accounts.json",
@@ -356,6 +362,15 @@ def create_backup(*, auto: bool = False, retention_days: int | None = None) -> d
                         archive.write(snapshot, arcname=arcname)
                 elif source.is_file():
                     archive.write(source, arcname=arcname)
+            for prefix, source_dir in BACKUP_DIR_SOURCES.items():
+                if not source_dir.is_dir():
+                    continue
+                for member_file in sorted(source_dir.rglob("*")):
+                    if member_file.is_file():
+                        archive.write(
+                            member_file,
+                            arcname=f"{prefix}/{member_file.relative_to(source_dir).as_posix()}",
+                        )
     try:
         os.chmod(path, 0o600)
     except Exception:
@@ -434,6 +449,26 @@ def restore_backup(name: str) -> list[str]:
     restored: list[str] = []
     with zipfile.ZipFile(path) as archive:
         members = set(archive.namelist())
+        for prefix, target_dir in BACKUP_DIR_SOURCES.items():
+            for member in sorted(members):
+                if not member.startswith(prefix + "/"):
+                    continue
+                rel = member[len(prefix) + 1:]
+                if not rel or rel.endswith("/"):
+                    continue
+                rel_path = Path(rel)
+                if ".." in rel_path.parts:
+                    continue
+                target = target_dir / rel_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                tmp = target.with_name(target.name + ".restore-tmp")
+                tmp.write_bytes(archive.read(member))
+                os.replace(tmp, target)
+                try:
+                    os.chmod(target, 0o600)
+                except Exception:
+                    pass
+                restored.append(member)
         for arcname, target in BACKUP_DB_FILES.items():
             if arcname not in members:
                 continue
