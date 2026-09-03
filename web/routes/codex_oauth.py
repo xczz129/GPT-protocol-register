@@ -504,9 +504,9 @@ SMSBOWER_COUNTRY_INFO: dict[int, tuple[str, str, str]] = {
     66: ("France", "法国", "+33"), 68: ("Belgium", "比利时", "+32"),
     69: ("Bulgaria", "保加利亚", "+359"), 70: ("Hungary", "匈牙利", "+36"),
     71: ("Moldova", "摩尔多瓦", "+373"), 72: ("Switzerland", "瑞士", "+41"),
-    73: ("Georgia", "格鲁吉亚", "+995"), 74: ("Armenia", "亚美尼亚", "+374"),
+    73: ("Brazil", "巴西", "+55"), 74: ("Armenia", "亚美尼亚", "+374"),
     76: ("Greece", "希腊", "+30"), 78: ("Mongolia", "蒙古", "+976"),
-    79: ("Brazil", "巴西", "+55"), 80: ("Peru", "秘鲁", "+51"),
+    79: ("Peru", "秘鲁", "+51"), 80: ("Peru", "秘鲁", "+51"),
     81: ("Turkey", "土耳其", "+90"), 82: ("Nigeria", "尼日利亚", "+234"),
     83: ("Chile", "智利", "+56"), 84: ("Venezuela", "委内瑞拉", "+58"),
     85: ("Pakistan", "巴基斯坦", "+92"), 86: ("Ethiopia", "埃塞俄比亚", "+251"),
@@ -598,7 +598,7 @@ SMSBOWER_EXTRA_CALLING: dict[int, str] = {
 }
 
 
-_SMS_COUNTRIES_CACHE: dict = {"at": 0.0, "payload": None}
+_SMS_COUNTRIES_CACHE: dict = {"at": 0.0, "payload": None, "version": 2}
 
 
 def _smsbower_request(api_key: str, action: str, **params) -> str:
@@ -623,7 +623,13 @@ async def sms_countries(provider: str = "smsbower"):
         want = str(provider or "smsbower").strip().lower()
         import time as _time
 
-        if want != "firefox" and _SMS_COUNTRIES_CACHE["payload"] is not None and _time.time() - _SMS_COUNTRIES_CACHE["at"] < 60:
+        cache_payload = _SMS_COUNTRIES_CACHE.get("payload")
+        if (
+            want != "firefox"
+            and cache_payload is not None
+            and _SMS_COUNTRIES_CACHE.get("version") == 2
+            and _time.time() - _SMS_COUNTRIES_CACHE["at"] < 60
+        ):
             cached = dict(_SMS_COUNTRIES_CACHE["payload"])
             cached["cached"] = True
             return cached
@@ -722,9 +728,9 @@ async def sms_countries(provider: str = "smsbower"):
                 chn = str(info.get("chn") or "")
                 meta = SMSBOWER_COUNTRY_INFO.get(cid)
                 calling = meta[2] if meta else SMSBOWER_EXTRA_CALLING.get(cid, "")
-                display = chn if chn else eng
-                if meta and chn:
-                    display = chn
+                # Live names from getCountries win; the static table only
+                # supplies calling codes so ids can never mismatch names.
+                display = chn or eng or (meta[0] if meta else f"Country {cid}")
                 price_info = (prices.get(str(cid)) or {}).get("dr") or {}
                 count = int(price_info.get("count") or 0) if isinstance(price_info, dict) else 0
                 price = str(price_info.get("cost") or "") if isinstance(price_info, dict) else ""
