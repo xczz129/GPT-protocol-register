@@ -2262,3 +2262,9 @@ table.acct .col-actions { text-align: right; white-space: nowrap; }
 .sms-price-custom input { flex: 1; min-width: 0; padding: 6px 8px; border: 1px solid var(--bg-3); border-radius: 7px; background: var(--bg-2); color: var(--ink-800); font-size: 12px; }
 .sms-price-custom input:focus { outline: none; border-color: var(--acc, #6366f1); }
 .sms-price-custom button { flex: none; border: 1px solid var(--acc, #6366f1); color: var(--acc, #6366f1); background: none; border-radius: 7px; padding: 6px 10px; font-size: 12px; cursor: pointer; }
+﻿
+/* sms tier menu (provider tiers) */
+.sms-price-menu { min-width: 230px; max-height: 300px; overflow: auto; }
+.sms-price-menu button { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.sms-price-menu button b { font-family: var(--mono, ui-monospace, monospace); }
+.sms-price-menu button small { color: var(--ink-400); font-size: 11px; }

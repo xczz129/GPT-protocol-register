@@ -101,7 +101,13 @@ def _phone_requirement(data: Any) -> tuple:
 
 
 def _country_specs(sms_cfg: dict) -> list:
-    """Parse country order entries of the form "country" or "country:maxPrice"."""
+    """Parse country order entries.
+
+    Supported syntax per comma-separated entry:
+      country            -> provider choice left to the market
+      country:maxPrice   -> numeric price ceiling, e.g. 4:0.2
+      country@providerId -> specific provider tier, e.g. 73@3237
+    """
     provider = str(sms_cfg.get("provider") or "").strip().lower()
     key = "firefox_country_order" if provider == "firefox" else "country_order"
     specs: list = []
@@ -109,24 +115,42 @@ def _country_specs(sms_cfg: dict) -> list:
         item = raw.strip()
         if not item:
             continue
-        country, _, price = item.partition(":")
+        country, _, tail = item.partition(":")
         country = country.strip()
-        price = price.strip()
+        tail = tail.strip()
         if not country:
             continue
-        if price:
+        max_price = ""
+        if tail:
             try:
-                float(price)
+                float(tail)
+                max_price = tail
             except ValueError:
-                price = ""
-        specs.append((country, price or None))
+                max_price = ""
+        specs.append((country, max_price or None))
     if provider != "firefox":
         specs = [(c, p) for c, p in specs if str(c).isdigit()]
     return specs
 
 
+def _provider_specs(sms_cfg: dict) -> dict:
+    """Per-country provider id selections: {"73": "3237"}."""
+    raw = str(sms_cfg.get("provider_map") or "").strip()
+    out: dict = {}
+    for pair in raw.replace("，", ",").split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        country, _, pid = pair.partition("=")
+        country = country.strip()
+        pid = pid.strip()
+        if country and pid:
+            out[country] = pid
+    return out
+
+
 class _PanelSmsBowerClient(SmsBowerClient):
-    """SMSBower client with per-country maxPrice support."""
+    """SMSBower client with per-country provider/maxPrice support."""
 
     def __init__(self, settings: SmsSettings, country_specs: list, *, timeout: float = 30.0):
         super().__init__(settings, timeout=timeout)
@@ -134,11 +158,18 @@ class _PanelSmsBowerClient(SmsBowerClient):
 
     def acquire(self) -> SmsActivation:
         last_error = "没有可用号码"
-        for country, max_price in self.country_specs:
+        for country, extra in self.country_specs:
+            provider_ids = ""
+            max_price = ""
+            if isinstance(extra, dict):
+                provider_ids = str(extra.get("provider_id") or "").strip()
+                max_price = str(extra.get("max_price") or "").strip()
             params = {
                 "service": self.settings.service,
                 "country": country,
             }
+            if provider_ids:
+                params["providerIds"] = provider_ids
             price = max_price or self.settings.max_price
             if price:
                 params["maxPrice"] = price
@@ -263,7 +294,12 @@ def _process_one(rec: dict, sms_cfg: dict) -> dict:
         raise RuntimeError("账号缺少密码或 2FA 密钥,无法补发")
 
     settings = SmsSettings.from_mapping(sms_cfg)
-    sms = _sms_client(settings, _country_specs(sms_cfg))
+    provider_map = _provider_specs(sms_cfg)
+    specs = []
+    for country, max_price in _country_specs(sms_cfg):
+        pid = provider_map.get(str(country))
+        specs.append((country, {"provider_id": pid, "max_price": max_price} if pid else max_price))
+    sms = _sms_client(settings, specs)
 
     client = ProtocolClient(email, timeout=30)
     try:
@@ -626,6 +662,39 @@ async def sms_countries(provider: str = "smsbower"):
                 raise HTTPException(400, "请先保存 SMSBower API Key")
             countries_raw = _smsbower_request(api_key, "getCountries")
             prices_raw = _smsbower_request(api_key, "getPrices", service="dr")
+            tiers_raw = ""
+            try:
+                tiers_raw = _smsbower_request(api_key, "getPricesV3", service="dr")
+            except Exception:
+                tiers_raw = ""
+            tier_map: dict = {}
+            if tiers_raw.startswith("{"):
+                try:
+                    tiers_doc = json.loads(tiers_raw)
+                except Exception:
+                    tiers_doc = {}
+                for country_id, services in (tiers_doc or {}).items():
+                    if not isinstance(services, dict):
+                        continue
+                    rows = services.get("dr")
+                    if not isinstance(rows, dict):
+                        continue
+                    tiers = []
+                    for pid, info in rows.items():
+                        if not isinstance(info, dict):
+                            continue
+                        try:
+                            tiers.append(
+                                {
+                                    "id": str(info.get("provider_id") or pid),
+                                    "count": int(info.get("count") or 0),
+                                    "price": float(info.get("price") or 0),
+                                }
+                            )
+                        except (TypeError, ValueError):
+                            continue
+                    tiers.sort(key=lambda row: row["price"])
+                    tier_map[str(country_id)] = tiers
             import json as _json
 
             countries = _json.loads(countries_raw) if countries_raw.startswith("{") else {}
@@ -651,7 +720,14 @@ async def sms_countries(provider: str = "smsbower"):
                 count = int(price_info.get("count") or 0) if isinstance(price_info, dict) else 0
                 price = str(price_info.get("cost") or "") if isinstance(price_info, dict) else ""
                 out.append(
-                    {"id": str(cid), "name": display, "calling": calling, "count": count, "price": price}
+                    {
+                        "id": str(cid),
+                        "name": display,
+                        "calling": calling,
+                        "count": count,
+                        "price": price,
+                        "tiers": tier_map.get(str(cid)) or [],
+                    }
                 )
             out.sort(key=lambda row: (-row["count"], row["name"]))
             return {"ok": True, "provider": "smsbower", "items": out}
