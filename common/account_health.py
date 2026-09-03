@@ -362,9 +362,74 @@ def refresh_oauth_tokens(record: dict[str, Any], *, force: bool = False) -> dict
         session.close()
 
 
+def _proxy_clearance_config() -> dict[str, Any] | None:
+    """Read the shared proxy/clearance settings used by the protocol engine."""
+    try:
+        from config_loader import load_config
+
+        value = load_config().get("proxy_config")
+        return value if isinstance(value, dict) else None
+    except Exception:
+        return None
+
+
+def _protocol_session_request(
+    session: requests.Session,
+    url: str,
+    headers: dict[str, str],
+    proxy: str,
+    *,
+    attempts: int = 3,
+    timeout: float = 30.0,
+) -> requests.Response:
+    """Protocol-channel GET: CF clearance injection plus bounded retry.
+
+    Mirrors register.protocol.request_with_local_retry semantics for the
+    session endpoint: transport errors bubble up (the probe loop switches
+    proxies), throttling/gateway statuses retry with backoff, and clearance
+    cookies/UA are injected per attempt when a bundle is cached.
+    """
+    from common.proxy_clearance import headers_with_clearance
+
+    proxy_config = _proxy_clearance_config()
+    retryable = {408, 425, 429, 500, 502, 503, 504}
+    attempts = max(1, attempts)
+    last_error = ""
+    for attempt in range(attempts):
+        request_headers = headers_with_clearance(
+            proxy_config, headers, url, request_proxy=proxy
+        )
+        try:
+            response = session.get(url, headers=request_headers, timeout=timeout)
+        except Exception as exc:
+            message = str(exc)
+            if is_proxy_transport_error(message):
+                raise
+            last_error = message
+            if attempt + 1 >= attempts:
+                raise
+            time.sleep(min(4.0, 0.5 * (2 ** attempt)))
+            continue
+        status = int(getattr(response, "status_code", 0) or 0)
+        if status in retryable and attempt + 1 < attempts:
+            retry_after = 0.0
+            raw = str(getattr(response, "headers", {}).get("retry-after") or "").strip()
+            if raw.isdigit():
+                retry_after = float(raw)
+            time.sleep(min(8.0, max(0.25, retry_after or (0.5 * (2 ** attempt)))))
+            continue
+        return response
+    raise RuntimeError(f"session_refresh_no_response: {last_error}")
+
+
 def refresh_chatgpt_session_tokens(
     record: dict[str, Any], *, force: bool = False
 ) -> dict[str, Any]:
+    """Refresh the access token through the protocol channel.
+
+    Uses the stored NextAuth session cookie to call /api/auth/session with
+    the same clearance/retry machinery as the registration protocol engine.
+    """
     access_token = str(record.get("access_token") or "").strip()
     session_token = str(record.get("session_token") or "").strip()
     if not session_token or (
@@ -372,10 +437,9 @@ def refresh_chatgpt_session_tokens(
     ):
         return dict(record)
 
+    proxy = str(record.get("proxy") or "")
     identity = _request_identity(record)
-    session = _session(
-        str(record.get("proxy") or ""), impersonate=identity["impersonate"]
-    )
+    session = _session(proxy, impersonate=identity["impersonate"])
     try:
         session.cookies.set(
             "__Secure-next-auth.session-token",
@@ -383,6 +447,11 @@ def refresh_chatgpt_session_tokens(
             domain=".chatgpt.com",
             path="/",
         )
+        device_id = str(
+            record.get("device_id") or record.get("protocol_final_device_id") or ""
+        ).strip()
+        if device_id:
+            session.cookies.set("oai-did", device_id, domain=".chatgpt.com", path="/")
         headers = _identity_headers(identity)
         headers.update(
             {
@@ -391,11 +460,8 @@ def refresh_chatgpt_session_tokens(
                 "Cache-Control": "no-cache",
             }
         )
-        response = session.get(
-            f"{CHATGPT_BASE}/api/auth/session?update={int(time.time() * 1000)}",
-            headers=headers,
-            timeout=30,
-        )
+        session_url = f"{CHATGPT_BASE}/api/auth/session?update={int(time.time() * 1000)}"
+        response = _protocol_session_request(session, session_url, headers, proxy)
         try:
             data = response.json()
         except Exception:
