@@ -173,15 +173,6 @@ const mailForms = reactive({
   icloudText: "",
   icloudApiBase: "https://icloud.xbovo.online",
   icloudEnable: true,
-  domainEnable: false,
-  domainApiBase: "https://mail.xbovo.online",
-  domainUsername: "",
-  domainPassword: "",
-  domainDefault: "",
-  domainIndex: 0,
-  domainLocalLength: 12,
-  domainCapacity: 500,
-  domainOptions: [],
   maddyEnable: false,
   maddyApiBase: "https://120.53.232.195/api",
   maddyApiToken: "",
@@ -324,7 +315,6 @@ function fillForms() {
   if (!groups.value.some((item) => item.id === taskForm.groupId)) taskForm.groupId = groups.value[0]?.id || "";
   const outlook = provider("outlook_token");
   const icloud = provider("icloud_api");
-  const domain = provider("domain_api");
   const maddy = provider("maddy_webui");
   const fastmail = provider("fastmail_api");
   mailForms.outlookText = "";
@@ -332,15 +322,6 @@ function fillForms() {
   mailForms.icloudText = "";
   mailForms.icloudApiBase = icloud.api_base || "https://icloud.xbovo.online";
   mailForms.icloudEnable = icloud.enable !== false;
-  mailForms.domainEnable = domain.enable === true;
-  mailForms.domainApiBase = domain.api_base || "https://mail.xbovo.online";
-  mailForms.domainUsername = domain.username || "";
-  mailForms.domainPassword = "";
-  mailForms.domainDefault = domain.default_domain || domain.domain || "";
-  mailForms.domainIndex = Number(domain.domain_index || 0);
-  mailForms.domainLocalLength = Number(domain.local_length || 12);
-  mailForms.domainCapacity = Number(domain.capacity || 500);
-  mailForms.domainOptions = Array.isArray(domain.domains) ? [...domain.domains] : [];
   mailForms.maddyEnable = maddy.enable === true;
   mailForms.maddyApiBase = maddy.api_base || "https://120.53.232.195/api";
   const maddyMaskedKey = maddy.api_key_masked || maddy.api_token_masked || "";
@@ -1084,29 +1065,6 @@ async function saveIcloud() {
     loadMailboxes().catch(() => {});
   }
 }
-async function loadDomainOptions() {
-  const result = await run(
-    () => api("/api/domain-mail/domains", {
-      method: "POST",
-      body: jsonBody({
-        api_base: mailForms.domainApiBase,
-        username: mailForms.domainUsername,
-        password: mailForms.domainPassword,
-      }),
-    }),
-    (r) => `已读取 ${r.items?.length || 0} 个域名`,
-  );
-  if (result?.ok) {
-    mailForms.domainOptions = result.items || [];
-    if (!mailForms.domainDefault && mailForms.domainOptions.length) {
-      mailForms.domainDefault = mailForms.domainOptions[0];
-      mailForms.domainIndex = 0;
-    } else {
-      const idx = mailForms.domainOptions.indexOf(mailForms.domainDefault);
-      if (idx >= 0) mailForms.domainIndex = idx;
-    }
-  }
-}
 async function loadMaddyDomains() {
   const result = await run(
     () => api("/api/maddy-webui/domains", {
@@ -1122,35 +1080,6 @@ async function loadMaddyDomains() {
     const items = result.items || [];
     mailForms.maddyDomainsText = items.join("\n");
     mailForms.maddyDefaultDomain = result.default_domain || items[0] || mailForms.maddyDefaultDomain;
-  }
-}
-async function saveDomainMail() {
-  const domainIndex = Math.max(0, mailForms.domainOptions.indexOf(mailForms.domainDefault));
-  const result = await run(
-    () => api("/api/mailboxes", {
-      method: "PUT",
-      body: jsonBody({
-        provider_type: "domain_api",
-        mailboxes: "",
-        api_base: mailForms.domainApiBase,
-        username: mailForms.domainUsername,
-        password: mailForms.domainPassword,
-        default_domain: mailForms.domainDefault,
-        domains: mailForms.domainOptions,
-        domain_index: domainIndex,
-        local_length: mailForms.domainLocalLength,
-        capacity: mailForms.domainCapacity,
-        enable: mailForms.domainEnable,
-        append: true,
-      }),
-    }),
-    (r) => `域名邮箱配置已保存：动态容量 ${r.total || mailForms.domainCapacity}`,
-  );
-  if (result?.ok) {
-    mailForms.domainPassword = "";
-    status.value = { ...status.value, mail: result.mail || status.value.mail };
-    loadConfig().catch(() => {});
-    loadMailboxes().catch(() => {});
   }
 }
 async function saveMaddyMail() {
@@ -1836,7 +1765,7 @@ async function preflightRebind(payload = {}) {
       body: jsonBody({
         text,
         new_email: String(payload.new_email || "").trim(),
-        provider_type: payload.provider_type || "domain_api",
+        provider_type: payload.provider_type || "maddy_webui",
         reservation_id: String(previousReservationId || ""),
       }),
     });
@@ -1889,7 +1818,7 @@ async function startRebind(request = {}) {
       method: "POST",
       body: jsonBody({
         reservation_id: String(request.reservation_id || rebindPreflight.reservationId),
-        provider_type: request.provider_type || "domain_api",
+        provider_type: request.provider_type || "maddy_webui",
         concurrency,
       }),
     });
@@ -2656,7 +2585,7 @@ onBeforeUnmount(() => {
         <OperationProgress :progress="progress" />
         <TaskView v-if="active === 'task'" :status="status" :tasks="tasks" :groups="groups" :form="taskForm" :busy="busy" @start="startJob" @stop="stopJob" @pause="pauseJob" @resume="resumeJob" @retry-failed="retryFailedJobs" @create-group="(name) => createAccountGroup(name, true)" @reset-mail="resetMail" @refresh-accounts="loadAccounts" @refresh-tasks="loadTasks" @delete-tasks="deleteTasks" @navigate="navigate" />
         <BrowserView v-else-if="active === 'fingerprint'" :config="config" :capabilities="capabilities" :busy="busy" @save="saveBrowser" @refresh="loadCapabilities" />
-        <MailView v-else-if="active === 'mail'" :forms="mailForms" :mailboxes="mailboxes" :progress="progress" :busy="busy" @save-outlook="saveOutlook" @save-icloud="saveIcloud" @save-domain="saveDomainMail" @save-maddy="saveMaddyMail" @save-fastmail="saveFastmailMail" @load-domain-options="loadDomainOptions" @load-maddy-domains="loadMaddyDomains" @load-fastmail-accounts="loadFastmailAccounts" @refresh="loadMailboxes" @delete="deleteMailboxes" @state="updateMailboxState" />
+        <MailView v-else-if="active === 'mail'" :forms="mailForms" :mailboxes="mailboxes" :progress="progress" :busy="busy" @save-outlook="saveOutlook" @save-icloud="saveIcloud" @save-maddy="saveMaddyMail" @save-fastmail="saveFastmailMail" @load-maddy-domains="loadMaddyDomains" @load-fastmail-accounts="loadFastmailAccounts" @refresh="loadMailboxes" @delete="deleteMailboxes" @state="updateMailboxState" />
         <ProxyView v-else-if="active === 'proxy'" :form="proxyForm" :diagnostics="proxyDiagnostics" :progress="progress" :busy="busy" @save="saveProxy" @test="testProxies" />
         <TrialProxyView v-else-if="active === 'trial-proxy'" :form="trialProxyForm" :busy="busy" @save="saveTrialProxyPool" @refresh="loadTrialProxyPool" />
         <PlusEligibilityView v-else-if="active === 'plus-eligibility'" :form="tokenEligibilityForm" :state="tokenEligibility" @check="checkTokenEligibility" @clear="clearTokenEligibility" @batch-check="startBatchTokenEligibility" @batch-stop="stopBatchTokenEligibility" />

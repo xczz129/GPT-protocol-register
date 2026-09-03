@@ -27,7 +27,7 @@ const INPUT_STATE_KEY = "gpt-register-fp.rebind-input.v1";
 const sourceEmail = ref("");
 const targetMode = ref("auto");
 const targetEmail = ref("");
-const providerType = ref("domain_api");
+const providerType = ref("maddy_webui");
 const concurrency = ref(1);
 const pasteError = ref("");
 const restoringInput = ref(true);
@@ -93,10 +93,9 @@ const conflicts = computed(() => props.preflight?.conflicts || []);
 const progressItems = computed(() => Array.isArray(props.progress?.items) ? props.progress.items : []);
 
 function providerLabel(value) {
-  const provider = String(value || "domain_api");
-  if (provider === "maddy_webui") return "Maddy 域名邮箱";
+  const provider = String(value || "maddy_webui");
   if (provider === "fastmail_api") return "Fastmail 别名池";
-  return "域名邮箱 API";
+  return "Maddy 域名邮箱";
 }
 
 function credentialLabel(value) {
@@ -161,7 +160,7 @@ function clearForm() {
   sourceEmail.value = "";
   targetEmail.value = "";
   targetMode.value = "auto";
-  providerType.value = "domain_api";
+  providerType.value = "maddy_webui";
   concurrency.value = 1;
   pasteError.value = "";
   emit("reset");
@@ -188,7 +187,7 @@ onMounted(async () => {
       if (typeof saved.sourceEmail === "string") sourceEmail.value = saved.sourceEmail;
       if (["auto", "custom"].includes(saved.targetMode)) targetMode.value = saved.targetMode;
       if (typeof saved.targetEmail === "string") targetEmail.value = saved.targetEmail;
-      if (["domain_api", "maddy_webui", "fastmail_api"].includes(saved.providerType)) providerType.value = saved.providerType;
+      if (["maddy_webui", "fastmail_api"].includes(saved.providerType)) providerType.value = saved.providerType;
       if (Number.isFinite(Number(saved.concurrency))) concurrency.value = Math.min(20, Math.max(1, Number(saved.concurrency)));
     }
   } catch {
@@ -239,7 +238,7 @@ watch(concurrency, saveInputState);
         <div v-else class="rebind-auto-target"><RefreshCw :size="14" aria-hidden="true" /><span>预检时从所选邮箱池中原子预留</span></div>
         <small v-if="targetMode === 'custom' && targetEmail && !targetValid" class="rebind-error">批量指定时，新邮箱数量要与账号数量一致，且格式有效</small>
         <div class="rebind-inline-options">
-          <label>邮箱来源<select v-model="providerType" :disabled="props.busy || props.checking || progressRunning"><option value="domain_api">域名邮箱 API</option><option value="maddy_webui">Maddy 域名邮箱</option><option value="fastmail_api">Fastmail 别名池</option></select></label>
+          <label>邮箱来源<select v-model="providerType" :disabled="props.busy || props.checking || progressRunning"><option value="maddy_webui">Maddy 域名邮箱</option><option value="fastmail_api">Fastmail 别名池</option></select></label>
           <label>并发<input v-model.number="concurrency" type="number" min="1" max="20" inputmode="numeric" :disabled="props.busy || props.checking || progressRunning" /></label>
         </div>
       </div>

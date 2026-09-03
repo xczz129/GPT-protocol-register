@@ -4,7 +4,7 @@ import { api, jsonBody } from "../api.js";
 import AppPager from "./AppPager.vue";
 
 const props = defineProps({ forms: { type: Object, required: true }, mailboxes: { type: Array, default: () => [] }, progress: { type: Object, default: () => ({ items: [] }) }, busy: Boolean });
-const emit = defineEmits(["save-outlook", "save-icloud", "save-domain", "save-maddy", "save-fastmail", "load-domain-options", "load-maddy-domains", "load-fastmail-accounts", "refresh", "delete", "state"]);
+const emit = defineEmits(["save-outlook", "save-icloud", "save-maddy", "save-fastmail", "load-maddy-domains", "load-fastmail-accounts", "refresh", "delete", "state"]);
 const query = ref("");
 const provider = ref("auto");
 const stateFilter = ref("all");
@@ -28,7 +28,6 @@ watch([query, provider], () => { page.value = 1; selected.value = []; });
 function mailboxKey(item) { return `${item.provider_type}:${item.email}`; }
 function providerName(item) {
   if (item.provider_type === "icloud_api") return "iCloud";
-  if (item.provider_type === "domain_api") return "域名邮箱";
   if (item.provider_type === "maddy_webui") return "Maddy";
   if (item.provider_type === "fastmail_api") return "Fastmail";
   return "Outlook";
@@ -61,11 +60,6 @@ function reasonText(item) {
   if (reason.includes("known_deactivated")) return "已知账号被停用";
   if (reason.includes("registered_account")) return "曾通过本系统注册 · 账号记录已不在库中";
   return reason;
-}
-function syncDomainIndex() {
-  const list = Array.isArray(props.forms.domainOptions) ? props.forms.domainOptions : [];
-  const idx = list.indexOf(props.forms.domainDefault);
-  props.forms.domainIndex = idx >= 0 ? idx : 0;
 }
 function stopMessagePolling() {
   clearInterval(messageTimer);
@@ -139,31 +133,14 @@ onBeforeUnmount(stopMessagePolling);
     <div class="split">
       <div class="panel-soft">
         <div class="task-title-row"><div><h3>批量导入 Outlook</h3><p class="hint">email----password----client_id----refresh_token</p></div><label class="compact">取码模式<select v-model="forms.outlookMode"><option value="imap">IMAP</option><option value="graph">Graph</option><option value="auto">Auto</option></select></label></div>
-        <textarea v-model="forms.outlookText" rows="8" spellcheck="false" placeholder="user@outlook.com----password----client_id----refresh_token"></textarea>
+        <textarea v-model="forms.outlookText" rows="14" spellcheck="false" placeholder="user@outlook.com----password----client_id----refresh_token"></textarea>
         <div class="actions"><button class="primary" :disabled="busy || !forms.outlookText.trim()" @click="emit('save-outlook')">导入 Outlook</button></div>
       </div>
       <div class="panel-soft">
         <div class="task-title-row"><div><h3>批量导入 iCloud</h3><p class="hint">email----api_key</p></div><label class="checkline"><input v-model="forms.icloudEnable" type="checkbox" />启用</label></div>
         <label class="label-line">API Base<input v-model="forms.icloudApiBase" type="text" /></label>
-        <textarea v-model="forms.icloudText" rows="6" spellcheck="false" placeholder="user@icloud.com----alias_key"></textarea>
+        <textarea v-model="forms.icloudText" rows="12" spellcheck="false" placeholder="user@icloud.com----alias_key"></textarea>
         <div class="actions"><button class="primary" :disabled="busy || !forms.icloudText.trim()" @click="emit('save-icloud')">导入 iCloud</button></div>
-      </div>
-      <div class="panel-soft">
-        <div class="task-title-row"><div><h3>外接域名邮箱</h3><p class="hint">连接 mail.xbovo.online，按所选域名自动创建邮箱。</p></div><label class="checkline"><input v-model="forms.domainEnable" type="checkbox" />启用</label></div>
-        <label class="label-line">API Base<input v-model="forms.domainApiBase" type="text" placeholder="https://mail.xbovo.online" /></label>
-        <label class="label-line">账号<input v-model="forms.domainUsername" type="text" autocomplete="username" /></label>
-        <label class="label-line">密码<input v-model="forms.domainPassword" type="password" autocomplete="new-password" placeholder="留空保留已保存密码" /></label>
-        <label class="label-line">默认域名
-          <select v-if="forms.domainOptions?.length" v-model="forms.domainDefault" @change="syncDomainIndex">
-            <option v-for="(domain, index) in forms.domainOptions" :key="domain" :value="domain">{{ domain }}</option>
-          </select>
-          <input v-else v-model="forms.domainDefault" type="text" placeholder="例如 xb1219.com" />
-        </label>
-        <div class="form two">
-          <label>用户名长度<input v-model.number="forms.domainLocalLength" type="number" min="8" max="30" /></label>
-          <label>动态容量<input v-model.number="forms.domainCapacity" type="number" min="1" max="500" /></label>
-        </div>
-        <div class="actions"><button class="btn secondary" :disabled="busy || !forms.domainUsername.trim()" @click="emit('load-domain-options')">刷新域名</button><button class="primary" :disabled="busy || !forms.domainApiBase.trim() || !forms.domainUsername.trim()" @click="emit('save-domain')">保存域名邮箱</button></div>
       </div>
       <div class="panel-soft">
         <div class="task-title-row"><div><h3>Maddy WebUI</h3><p class="hint">X-API-Key + 域名列表。</p></div><label class="checkline"><input v-model="forms.maddyEnable" type="checkbox" />启用</label></div>
@@ -215,7 +192,7 @@ onBeforeUnmount(stopMessagePolling);
     </div>
     <div class="account-filters">
       <label class="search-field"><span>⌕</span><input v-model="query" type="search" placeholder="搜索邮箱、状态或失败原因" /></label>
-      <select v-model="provider"><option value="auto">全部邮箱</option><option value="outlook_token">Outlook</option><option value="icloud_api">iCloud</option><option value="domain_api">域名邮箱</option><option value="maddy_webui">Maddy</option><option value="fastmail_api">Fastmail</option></select>
+      <select v-model="provider"><option value="auto">全部邮箱</option><option value="outlook_token">Outlook</option><option value="icloud_api">iCloud</option><option value="maddy_webui">Maddy</option><option value="fastmail_api">Fastmail</option></select>
       <select v-model="stateFilter"><option value="all">全部状态</option><option value="available">可用</option><option value="in_use">占用</option><option value="used">已使用</option><option value="failed">失败</option><option value="cooldown">冷却</option><option value="token_invalid">凭证失效</option></select>
       <span class="filter-result">{{ filtered.length }} 个邮箱</span>
     </div>
@@ -243,6 +220,20 @@ onBeforeUnmount(stopMessagePolling);
 </template>
 
 <style scoped>
+.panel-soft {
+  display: flex;
+  flex-direction: column;
+}
+
+.panel-soft > textarea {
+  flex: 1;
+  min-height: 260px;
+}
+
+.panel-soft .actions {
+  margin-top: 10px;
+}
+
 .fastmail-pool {
   display: flex;
   flex-direction: column;

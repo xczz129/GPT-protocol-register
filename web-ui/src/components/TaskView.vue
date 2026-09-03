@@ -194,7 +194,6 @@ onBeforeUnmount(() => clearInterval(clockTimer));
         <div class="stat"><span class="key">邮箱合计</span><span class="value">可用 {{ status.mail?.available ?? 0 }} / 总数 {{ status.mail?.total ?? 0 }}</span></div>
         <div class="stat"><span class="key">Outlook</span><span class="value">可用 {{ provider('outlook_token').available ?? 0 }} / 总数 {{ provider('outlook_token').total ?? 0 }}</span></div>
         <div class="stat"><span class="key">iCloud</span><span class="value">可用 {{ provider('icloud_api').available ?? 0 }} / 总数 {{ provider('icloud_api').total ?? 0 }}</span></div>
-        <div class="stat"><span class="key">域名邮箱</span><span class="value">可用 {{ provider('domain_api').available ?? 0 }} / 总数 {{ provider('domain_api').total ?? 0 }}</span></div>
         <div class="stat"><span class="key">Maddy</span><span class="value">可用 {{ provider('maddy_webui').available ?? 0 }} / 总数 {{ provider('maddy_webui').total ?? 0 }}</span></div>
         <div class="stat"><span class="key">Fastmail</span><span class="value">可用 {{ provider('fastmail_api').available ?? 0 }} / 总数 {{ provider('fastmail_api').total ?? 0 }}</span></div>
         <div class="stat"><span class="key">代理池</span><span class="value">{{ status.proxy?.enabled ? `${status.proxy?.pool_count || 1} 条` : "关闭" }}</span></div>
