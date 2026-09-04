@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sys
 import threading
 import time
@@ -472,104 +473,141 @@ def _sms_config_section(cfg: dict) -> dict:
 # The id space follows the sms-activate family shared by SMSBower; calling
 # codes let the picker show the +44-style prefix before a number is bought.
 SMSBOWER_COUNTRY_INFO: dict[int, tuple[str, str, str]] = {
-    0: ("Russia", "俄罗斯", "+7"), 1: ("Ukraine", "乌克兰", "+380"),
-    2: ("Kazakhstan", "哈萨克斯坦", "+77"), 3: ("China", "中国", "+86"),
-    4: ("Philippines", "菲律宾", "+63"), 5: ("Myanmar", "缅甸", "+95"),
-    6: ("Indonesia", "印度尼西亚", "+62"), 7: ("Malaysia", "马来西亚", "+60"),
-    8: ("Kenya", "肯尼亚", "+254"), 9: ("Tanzania", "坦桑尼亚", "+255"),
-    10: ("Vietnam", "越南", "+84"), 11: ("Kyrgyzstan", "吉尔吉斯斯坦", "+996"),
-    12: ("USA", "美国", "+1"), 13: ("Israel", "以色列", "+972"),
-    14: ("Hong Kong", "香港", "+852"), 15: ("Poland", "波兰", "+48"),
-    16: ("England", "英国", "+44"), 17: ("Madagascar", "马达加斯加", "+261"),
-    18: ("Congo DR", "刚果(金)", "+243"), 19: ("Egypt", "埃及", "+20"),
-    20: ("India", "印度", "+91"), 21: ("Ireland", "爱尔兰", "+353"),
-    22: ("Cambodia", "柬埔寨", "+855"), 23: ("Laos", "老挝", "+856"),
-    24: ("Haiti", "海地", "+509"), 25: ("Ivory Coast", "科特迪瓦", "+225"),
-    26: ("Gambia", "冈比亚", "+220"), 27: ("Serbia", "塞尔维亚", "+381"),
-    28: ("Yemen", "也门", "+967"), 29: ("South Africa", "南非", "+27"),
-    30: ("Romania", "罗马尼亚", "+40"), 31: ("Colombia", "哥伦比亚", "+57"),
-    32: ("Estonia", "爱沙尼亚", "+372"), 33: ("Azerbaijan", "阿塞拜疆", "+994"),
-    34: ("Canada", "加拿大", "+1"), 35: ("Morocco", "摩洛哥", "+212"),
-    36: ("Ghana", "加纳", "+233"), 37: ("Argentina", "阿根廷", "+54"),
-    38: ("Uzbekistan", "乌兹别克斯坦", "+998"), 39: ("Cameroon", "喀麦隆", "+237"),
-    40: ("Chad", "乍得", "+235"), 41: ("Germany", "德国", "+49"),
-    42: ("Lithuania", "立陶宛", "+370"), 43: ("Croatia", "克罗地亚", "+385"),
-    44: ("Sweden", "瑞典", "+46"), 45: ("Iraq", "伊拉克", "+964"),
-    46: ("Netherlands", "荷兰", "+31"), 47: ("Latvia", "拉脱维亚", "+371"),
-    48: ("Austria", "奥地利", "+43"), 49: ("Belarus", "白俄罗斯", "+375"),
-    50: ("Thailand", "泰国", "+66"), 51: ("Saudi Arabia", "沙特阿拉伯", "+966"),
-    52: ("Mexico", "墨西哥", "+52"), 54: ("Eswatini", "斯威士兰", "+268"),
-    55: ("Liberia", "利比里亚", "+231"), 56: ("Slovakia", "斯洛伐克", "+421"),
-    57: ("Slovenia", "斯洛文尼亚", "+386"), 58: ("Bangladesh", "孟加拉国", "+880"),
-    59: ("Senegal", "塞内加尔", "+221"), 60: ("Trinidad & Tobago", "特立尼达和多巴哥", "+1868"),
-    61: ("Czech Republic", "捷克", "+420"), 62: ("Uganda", "乌干达", "+256"),
-    63: ("Spain", "西班牙", "+34"), 64: ("Italy", "意大利", "+39"),
-    66: ("France", "法国", "+33"), 68: ("Belgium", "比利时", "+32"),
-    69: ("Bulgaria", "保加利亚", "+359"), 70: ("Hungary", "匈牙利", "+36"),
-    71: ("Moldova", "摩尔多瓦", "+373"), 72: ("Switzerland", "瑞士", "+41"),
-    73: ("Brazil", "巴西", "+55"), 74: ("Armenia", "亚美尼亚", "+374"),
-    76: ("Greece", "希腊", "+30"), 78: ("Mongolia", "蒙古", "+976"),
-    79: ("Peru", "秘鲁", "+51"), 80: ("Peru", "秘鲁", "+51"),
-    81: ("Turkey", "土耳其", "+90"), 82: ("Nigeria", "尼日利亚", "+234"),
-    83: ("Chile", "智利", "+56"), 84: ("Venezuela", "委内瑞拉", "+58"),
-    85: ("Pakistan", "巴基斯坦", "+92"), 86: ("Ethiopia", "埃塞俄比亚", "+251"),
-    87: ("Mozambique", "莫桑比克", "+258"), 88: ("Burkina Faso", "布基纳法索", "+226"),
-    89: ("Togo", "多哥", "+228"), 90: ("Guinea", "几内亚", "+224"),
-    91: ("Ivory", "科特迪瓦", "+225"), 92: ("Sudan", "苏丹", "+249"),
-    93: ("Zambia", "赞比亚", "+260"), 94: ("Zimbabwe", "津巴布韦", "+263"),
-    95: ("Mali", "马里", "+223"), 96: ("Mauritius", "毛里求斯", "+230"),
-    97: ("Liberia", "利比里亚", "+231"), 98: ("Sierra Leone", "塞拉利昂", "+232"),
-    99: ("Chad", "乍得", "+235"), 101: ("Guinea-Bissau", "几内亚比绍", "+245"),
-    102: ("Congo", "刚果", "+242"), 103: ("Angola", "安哥拉", "+244"),
-    104: ("Sri Lanka", "斯里兰卡", "+94"), 105: ("Nepal", "尼泊尔", "+977"),
-    106: ("Ireland", "爱尔兰", "+353"), 107: ("Portugal", "葡萄牙", "+351"),
-    108: ("Cyprus", "塞浦路斯", "+357"), 109: ("Bulgaria", "保加利亚", "+359"),
-    110: ("Lithuania", "立陶宛", "+370"), 111: ("Serbia", "塞尔维亚", "+381"),
-    112: ("Kosovo", "科索沃", "+383"), 113: ("Bosnia", "波黑", "+387"),
-    114: ("North Macedonia", "北马其顿", "+389"), 115: ("Czech", "捷克", "+420"),
-    116: ("Guatemala", "危地马拉", "+502"), 117: ("Honduras", "洪都拉斯", "+504"),
-    118: ("Nicaragua", "尼加拉瓜", "+505"), 119: ("Panama", "巴拿马", "+507"),
-    120: ("Bolivia", "玻利维亚", "+591"), 121: ("Martinique", "马提尼克", "+596"),
-    122: ("Uruguay", "乌拉圭", "+598"), 123: ("Timor-Leste", "东帝汶", "+670"),
-    124: ("Brunei", "文莱", "+673"), 125: ("Papua", "巴布亚新几内亚", "+675"),
-    126: ("Fiji", "斐济", "+679"), 127: ("Niue", "纽埃", "+683"),
-    128: ("Samoa", "萨摩亚", "+685"), 129: ("Maldives", "马尔代夫", "+960"),
-    130: ("Lebanon", "黎巴嫩", "+961"), 131: ("Jordan", "约旦", "+962"),
-    132: ("Syria", "叙利亚", "+963"), 133: ("Iraq", "伊拉克", "+964"),
-    134: ("Kuwait", "科威特", "+965"), 135: ("Saudi", "沙特", "+966"),
-    136: ("Yemen", "也门", "+967"), 137: ("UAE", "阿联酋", "+971"),
-    138: ("Israel", "以色列", "+972"), 139: ("Bhutan", "不丹", "+975"),
-    140: ("Tajikistan", "塔吉克斯坦", "+992"), 141: ("Azerbaijan", "阿塞拜疆", "+994"),
-    142: ("Georgia", "格鲁吉亚", "+995"), 143: ("Kyrgyzstan", "吉尔吉斯斯坦", "+996"),
-    144: ("Uzbekistan", "乌兹别克斯坦", "+998"), 145: ("Taiwan", "台湾", "+886"),
-    146: ("Maldives", "马尔代夫", "+960"), 147: ("Jordan", "约旦", "+962"),
-    148: ("Bosnia", "波黑", "+387"), 149: ("Albania", "阿尔巴尼亚", "+355"),
-    150: ("Iceland", "冰岛", "+354"), 151: ("Indonesia", "印度尼西亚", "+62"),
-    152: ("Bosnia", "波黑", "+387"), 153: ("Lithuania", "立陶宛", "+370"),
-    154: ("Denmark", "丹麦", "+45"), 155: ("Norway", "挪威", "+47"),
-    156: ("Finland", "芬兰", "+358"), 157: ("Greenland", "格陵兰", "+299"),
-    158: ("Luxembourg", "卢森堡", "+352"), 159: ("Malta", "马耳他", "+356"),
-    160: ("Monaco", "摩纳哥", "+377"), 161: ("Andorra", "安道尔", "+376"),
-    162: ("Liechtenstein", "列支敦士登", "+423"), 163: ("San Marino", "圣马力诺", "+378"),
-    164: ("Algeria", "阿尔及利亚", "+213"), 165: ("Tunisia", "突尼斯", "+216"),
-    166: ("Libya", "利比亚", "+218"), 167: ("Gambia", "冈比亚", "+220"),
-    168: ("Benin", "贝宁", "+229"), 169: ("Niger", "尼日尔", "+227"),
-    170: ("Burundi", "布隆迪", "+257"), 171: ("Rwanda", "卢旺达", "+250"),
-    172: ("Djibouti", "吉布提", "+253"), 173: ("Eritrea", "厄立特里亚", "+291"),
-    174: ("Somalia", "索马里", "+252"), 175: ("Kenya", "肯尼亚", "+254"),
-    176: ("Tanzania", "坦桑尼亚", "+255"), 177: ("Uganda", "乌干达", "+256"),
-    178: ("Lesotho", "莱索托", "+266"), 179: ("Botswana", "博茨瓦纳", "+267"),
-    180: ("Malawi", "马拉维", "+265"), 181: ("Comoros", "科摩罗", "+269"),
-    182: ("Mauritania", "毛里塔尼亚", "+222"), 183: ("Mali", "马里", "+223"),
-    184: ("Cape Verde", "佛得角", "+238"), 185: ("Gabon", "加蓬", "+241"),
-    186: ("Congo", "刚果", "+242"), 187: ("Zaire", "扎伊尔", "+243"),
-    188: ("Central African", "中非", "+236"), 189: ("Equatorial Guinea", "赤道几内亚", "+240"),
-    190: ("South Sudan", "南苏丹", "+211"), 191: ("Afghanistan", "阿富汗", "+93"),
-    192: ("Sri Lanka", "斯里兰卡", "+94"), 193: ("Iran", "伊朗", "+98"),
-    194: ("Palestine", "巴勒斯坦", "+970"), 195: ("Oman", "阿曼", "+968"),
-    196: ("Qatar", "卡塔尔", "+974"), 197: ("Bahrain", "巴林", "+973"),
-    198: ("Kazakhstan", "哈萨克斯坦", "+77"), 199: ("Mongolia", "蒙古", "+976"),
+     0: ("Russian Federation", "俄罗斯联邦", "+7"),     1: ("Ukraine", "乌克兰", "+380"),     2: ("Kazakhstan", "哈萨克斯坦", "+7"),
+     3: ("China", "中国", "+86"),     4: ("Philippines", "菲律宾", "+63"),     5: ("Myanmar", "缅甸", "+95"),
+     6: ("Indonesia", "印度尼西亚", "+62"),     7: ("Malaysia", "马来西亚", "+60"),     8: ("Kenya", "肯尼亚", "+254"),
+     9: ("Tanzania", "坦桑尼亚", "+255"),     10: ("Viet nam", "越南", "+84"),     11: ("Kyrgyzstan", "吉尔吉斯斯坦", "+996"),
+     12: ("United States (virtual)", "美国（虚拟）", "+1"),     13: ("Israel", "以色列", "+972"),     14: ("Hong Kong", "香港", "+852"),
+     15: ("Poland", "波兰", "+48"),     16: ("United Kingdom", "英国", "+44"),     17: ("Madagascar", "马达加斯加", "+261"),
+     18: ("Congo (Dem. Republic)", "刚果（民主共和国）", "+243"),     19: ("Nigeria", "尼日利亚", "+234"),     20: ("Macau", "澳门", "+853"),
+     21: ("Egypt", "埃及", "+20"),     22: ("India", "印度", "+91"),     23: ("Ireland", "爱尔兰", "+353"),
+     24: ("Cambodia", "柬埔寨", "+855"),     25: ("Lao People`s", "老挝人民", "+856"),     26: ("Haiti", "海地", "+509"),
+     27: ("Cote d`Ivoire Ivory Coast", "科特迪瓦", "+225"),     28: ("Gambia", "冈比亚", "+220"),     29: ("Serbia", "塞尔维亚", "+381"),
+     30: ("Yemen", "也门", "+967"),     31: ("South Africa", "南非", "+27"),     32: ("Romania", "罗马尼亚", "+40"),
+     33: ("Colombia", "哥伦比亚", "+57"),     34: ("Estonia", "爱沙尼亚", "+372"),     35: ("Azerbaijan", "阿塞拜疆", "+994"),
+     36: ("Canada", "加拿大", "+1"),     37: ("Morocco", "摩洛哥", "+212"),     38: ("Ghana", "加纳", "+233"),
+     39: ("Argentinas", "阿根廷", "+54"),     40: ("Uzbekistan", "乌兹别克斯坦", "+998"),     41: ("Cameroon", "喀麦隆", "+237"),
+     42: ("Chad", "乍得", "+235"),     43: ("Germany", "德国", "+49"),     44: ("Lithuania", "立陶宛", "+370"),
+     45: ("Croatia", "克罗地亚", "+385"),     46: ("Sweden", "瑞典", "+46"),     47: ("Iraq", "伊拉克", "+964"),
+     48: ("Netherlands", "荷兰", "+31"),     49: ("Latvia", "拉脱维亚", "+371"),     50: ("Austria", "奥地利", "+43"),
+     51: ("Belarus", "白俄罗斯", "+375"),     52: ("Thailand", "泰国", "+66"),     53: ("Saudi Arabia", "沙特阿拉伯", "+966"),
+     54: ("Mexico", "墨西哥", "+52"),     55: ("Taiwan", "台湾", "+886"),     56: ("Spain", "西班牙", "+34"),
+     57: ("Iran", "伊朗", "+98"),     58: ("Algeria", "阿尔及利亚", "+213"),     59: ("Slovenia", "斯洛文尼亚", "+386"),
+     60: ("Bangladesh", "孟加拉国", "+880"),     61: ("Senegal", "塞内加尔", "+221"),     62: ("Turkey", "土耳其", "+90"),
+     63: ("Czech Republic", "捷克共和国", "+420"),     64: ("Sri Lanka", "斯里兰卡", "+94"),     65: ("Peru ", "秘鲁", "+51"),
+     66: ("Pakistan", "巴基斯坦", "+92"),     67: ("New Zealand", "新西兰", "+64"),     68: ("Guinea", "几内亚", "+224"),
+     69: ("Mali", "马里", "+223"),     70: ("Venezuela", "委内瑞拉", "+58"),     71: ("Ethiopia", "埃塞俄比亚", "+251"),
+     72: ("Mongolia", "蒙古", "+976"),     73: ("Brazil", "巴西", "+55"),     74: ("Afghanistan", "阿富汗", "+93"),
+     75: ("Uganda", "乌干达", "+256"),     76: ("Angola", "安哥拉", "+244"),     77: ("Cyprus", "塞浦路斯", "+357"),
+     78: ("France", "法国", "+33"),     79: ("Papua new gvineya", "巴布亚新几内亚", "+675"),     80: ("Mozambique", "莫桑比克", "+258"),
+     81: ("Nepal", "尼泊尔", "+977"),     82: ("Belgium", "比利时", "+32"),     83: ("Bulgaria", "保加利亚", "+359"),
+     84: ("Hungary", "匈牙利", "+36"),     85: ("Moldova, Republic of", "摩尔多瓦共和国", "+373"),     86: ("Italy", "意大利", "+39"),
+     87: ("Paraguay", "巴拉圭", "+595"),     88: ("Honduras", "洪都拉斯", "+504"),     89: ("Tunisia", "突尼斯", "+216"),
+     90: ("Nicaragua", "尼加拉瓜", "+505"),     91: ("Timor-Leste", "东帝汶", "+670"),     92: ("Bolivia", "玻利维亚", "+591"),
+     93: ("Costa Rica", "哥斯达黎加", "+506"),     94: ("Guatemala", "危地马拉", "+502"),     95: ("United Arab Emirates", "阿联酋", "+971"),
+     96: ("Zimbabwe", "津巴布韦", "+263"),     97: ("Puerto Rico", "波多黎各", "+1787"),     99: ("Togo", "多哥", "+228"),
+     100: ("Kuwait", "科威特", "+965"),     101: ("El Salvador", "萨尔瓦多", "+503"),     102: ("Libya", "利比亚", "+218"),
+     103: ("Jamaica", "牙买加", "+1876"),     104: ("Trinidad and Tobago", "特立尼达和多巴哥", "+1868"),     105: ("Ecuador", "厄瓜多尔", "+593"),
+     106: ("Swaziland", "斯威士兰", "+268"),     107: ("Oman", "阿曼", "+968"),     108: ("Bosnia and Herzegovina", "波斯尼亚和黑塞哥维那", "+387"),
+     109: ("Dominican Republic", "多米尼加共和国", "+1809"),     111: ("Qatar", "卡塔尔", "+974"),     112: ("Panama", "巴拿马", "+507"),
+     113: ("Cuba", "古巴", "+53"),     114: ("Mauritania", "毛里塔尼亚", "+222"),     115: ("Sierra Leone", "塞拉利昂", "+232"),
+     116: ("Jordan", "约旦", "+962"),     117: ("Portugal", "葡萄牙", "+351"),     118: ("Barbados", "巴巴多斯", "+1246"),
+     119: ("Burundi", "布隆迪", "+257"),     120: ("Benin", "贝宁", "+229"),     121: ("Brunei Darussalam", "文莱达鲁萨兰国", "+673"),
+     122: ("Bahamas", "巴哈马", "+1242"),     123: ("Botswana", "博茨瓦纳", "+267"),     124: ("Belize", "伯利兹", "+501"),
+     125: ("Central African Republic", "中非共和国", "+236"),     126: ("Dominica", "多米尼加", "+1767"),     127: ("Grenada", "格林纳达", "+1473"),
+     128: ("Georgia", "格鲁吉亚", "+995"),     129: ("Greece", "希腊", "+30"),     130: ("Guinea-Bissau", "几内亚比绍", "+245"),
+     131: ("Guyana", "古亚那", "+592"),     132: ("Iceland", "冰岛", "+354"),     133: ("Comoros", "科摩罗", "+269"),
+     134: ("Saint Kitts and Nevis", "圣基茨和尼维斯", "+1869"),     135: ("Liberia", "利比里亚", "+231"),     136: ("Lesotho", "莱索托", "+266"),
+     137: ("Malawi", "马拉维", "+265"),     138: ("Namibia", "纳米比亚", "+264"),     139: ("Niger", "尼日尔", "+227"),
+     140: ("Rwanda", "卢旺达", "+250"),     141: ("Slovakia", "斯洛伐克", "+421"),     142: ("Suriname", "苏里南", "+597"),
+     143: ("Tajikistan", "塔吉克斯坦", "+992"),     144: ("Monaco", "摩纳哥", "+377"),     145: ("Bahrain", "巴林", "+973"),
+     146: ("Reunion", "留尼汪岛", "+262"),     147: ("Zambia", "赞比亚", "+260"),     148: ("Armenia", "亚美尼亚", "+374"),
+     149: ("Somalia", "索马里", "+252"),     150: ("Congo", "刚果", "+242"),     151: ("Chile", "智利", "+56"),
+     152: ("Burkina Faso", "布基纳法索", "+226"),     153: ("Lebanon", "黎巴嫩", "+961"),     154: ("Gabon", "加蓬", "+241"),
+     155: ("Albania", "阿尔巴尼亚", "+355"),     156: ("Uruguay", "乌拉圭", "+598"),     157: ("Mauritius", "毛里求斯", "+230"),
+     158: ("Bhutan", "不丹", "+975"),     159: ("Maldives", "马尔代夫", "+960"),     160: ("Guadeloupe", "瓜德罗普", "+590"),
+     161: ("Turkmenistan", "土库曼斯坦", "+993"),     162: ("French Guiana", "法属圭亚那", "+594"),     163: ("Finland", "芬兰", "+358"),
+     164: ("Saint Lucia", "圣卢西亚", "+1758"),     165: ("Luxembourg", "卢森堡", "+352"),     166: ("Saint Vincent", "圣文森特", "+1784"),
+     167: ("Equatorial Guinea", "赤道几内亚", "+240"),     168: ("Djibouti", "吉布提", "+253"),     169: ("Antigua and Barbuda", "安提瓜和巴布达", "+1268"),
+     170: ("Cayman islands", "开曼群岛", "+1345"),     171: ("Montenegro", "黑山", "+382"),     172: ("Denmark", "丹麦", "+45"),
+     173: ("Switzerland", "瑞士", "+41"),     174: ("Norway", "挪威", "+47"),     175: ("Australia", "澳大利亚", "+254"),
+     176: ("Eritrea", "厄立特里亚", "+291"),     177: ("South Sudan", "南苏丹", "+211"),     178: ("Sao Tome and Principe", "圣多美和普林西比", "+239"),
+     179: ("Aruba", "阿鲁巴", "+297"),     180: ("Montserrat", "蒙特塞拉特", "+1664"),     181: ("Anguilla", "安圭拉", "+1264"),
+     183: ("Macedonia", "马其顿", "+389"),     184: ("Seychelles", "塞舌尔", "+248"),     185: ("New Caledonia", "新喀里多尼亚", "+687"),
+     186: ("Cape Verde", "佛得角", "+238"),     187: ("United States", "美国", "+1"),     188: ("Palestine", "巴勒斯坦", "+970"),
+     189: ("Fiji", "斐济", "+679"),     196: ("Singapore", "新加坡", "+65"),     199: ("Malta", "马耳他", "+356"),
+     201: ("Gibraltar", "Gibraltar", "+670"),     204: ("Niue", "Niue", "+683"),     1001: ("Japan", "日本", "+81"),
+     1002: ("Korea", "韩国", "+82"),     1003: ("Bermuda", "百慕大", "+1441"),     1004: ("Kosovo", "科索沃", "+383"),
+     1005: ("Liechtenstein", "列支敦士登", "+423"),     1006: ("Sint Maarten", "圣马丁岛", "+1721"),     1007: ("Vanuatu", "瓦努阿图", "+678"),
+     1008: ("Greenland", "格陵兰", "+299"),     1010: ("Sudan", "苏丹", "+249"),     1011: ("Martinique", "马提尼克", "+596"),
+     1333: ("Syrian Arab Republic", "叙利亚阿拉伯共和国", "+963"),
 }
+
+
+# Live provider spellings that don't match the names above (normalized keys).
+SMSBOWER_CALLING_ALIASES: dict[str, str] = {
+    "russianfederation": "+7", "unitedstates": "+1", "unitedstatesvirtual": "+1",
+    "unitedkingdom": "+44", "newzealand": "+64", "kazakhstan": "+7",
+    "argentinas": "+54", "cotedivoireivorycoast": "+225", "laopeoples": "+856",
+    "papuanewgvineya": "+675", "macedonia": "+389", "congodemrepublic": "+243",
+    "moldovarepublicof": "+373", "bruneidarussalam": "+673", "macau": "+853",
+    "singapore": "+65", "southkorea": "+82", "northkorea": "+850",
+    "swaziland": "+268", "ecuador": "+593", "elsalvador": "+503",
+    "paraguay": "+595", "costarica": "+506", "syrianarabrepublic": "+963",
+    "cuba": "+53", "japan": "+81", "korea": "+82", "bermuda": "+1441",
+    "sintmaarten": "+1721", "vanuatu": "+678", "guyana": "+592",
+    "suriname": "+597", "belize": "+501", "botswana": "+267", "lesotho": "+266",
+    "malawi": "+265", "namibia": "+264", "eritrea": "+291", "djibouti": "+253",
+    "somalia": "+252", "comoros": "+269", "capeverde": "+238",
+    "newcaledonia": "+687", "frenchguiana": "+594", "guadeloupe": "+590",
+    "martinique": "+596", "reunion": "+262", "seychelles": "+248",
+    "mauritania": "+222", "equatorialguinea": "+240",
+    "centralafricanrepublic": "+236", "southsudan": "+211", "turkmenistan": "+993",
+    "easttimor": "+670", "ivory": "+225", "gabon": "+241", "benin": "+229",
+    "togo": "+228", "niger": "+227", "burkinafaso": "+226", "sierraleone": "+232",
+    "mauritius": "+230", "eswatini": "+268", "timorleste": "+670",
+    "unitedarabemirates": "+971", "palestine": "+970", "montenegro": "+382",
+    "kosovo": "+383", "bosniaandherzegovina": "+387", "czechrepublic": "+420",
+    "dominicanrepublic": "+1809", "trinidadandtobago": "+1868",
+    "saudiarabia": "+966", "bahamas": "+1242", "barbados": "+1246",
+    "jamaica": "+1876", "puertorico": "+1787", "caymanislands": "+1345",
+    "anguilla": "+1264", "aruba": "+297", "montserrat": "+1664",
+    "dominica": "+1767", "saintkittsandnevis": "+1869", "saintlucia": "+1758",
+    "saintvincent": "+1784", "grenada": "+1473", "antiguaandbarbuda": "+1268",
+    "saotomeandprincipe": "+239",
+}
+
+
+def _norm_sms_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(name or "").strip().lower())
+
+
+def _smsbower_calling_for(eng: str, chn: str, cid: int) -> str:
+    """Resolve the +prefix by country name first, id second.
+
+    SMSBower reshuffles country ids from time to time; matching the
+    normalized live name keeps prefixes correct even when the id table
+    drifts out of date.
+    """
+    for name in (eng, chn):
+        key = _norm_sms_name(name)
+        if key and key in SMSBOWER_CALLING_BY_NAME:
+            return SMSBOWER_CALLING_BY_NAME[key]
+        text = str(name or "").strip()
+        if text and text in SMSBOWER_CALLING_BY_NAME:
+            return SMSBOWER_CALLING_BY_NAME[text]
+    meta = SMSBOWER_COUNTRY_INFO.get(cid)
+    if meta:
+        return meta[2]
+    return SMSBOWER_EXTRA_CALLING.get(cid, "")
+
+
+SMSBOWER_CALLING_BY_NAME: dict[str, str] = {}
+for _eng, _chn, _calling in SMSBOWER_COUNTRY_INFO.values():
+    for _key in (_norm_sms_name(_eng), str(_chn or "").strip()):
+        if _key:
+            SMSBOWER_CALLING_BY_NAME.setdefault(_key, _calling)
+SMSBOWER_CALLING_BY_NAME.update(SMSBOWER_CALLING_ALIASES)
 
 
 
@@ -730,7 +768,7 @@ async def sms_countries(provider: str = "smsbower"):
                 eng = str(info.get("eng") or info.get("rus") or f"Country {cid}")
                 chn = str(info.get("chn") or "")
                 meta = SMSBOWER_COUNTRY_INFO.get(cid)
-                calling = meta[2] if meta else SMSBOWER_EXTRA_CALLING.get(cid, "")
+                calling = _smsbower_calling_for(eng, chn, cid)
                 # Live names from getCountries win; the static table only
                 # supplies calling codes so ids can never mismatch names.
                 display = chn or eng or (meta[0] if meta else f"Country {cid}")

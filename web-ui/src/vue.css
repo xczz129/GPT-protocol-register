@@ -1353,9 +1353,55 @@ table.acct .col-actions { text-align: right; white-space: nowrap; }
 .password-custom-form { display: flex; flex-direction: column; gap: 10px; }
 .password-custom-hint { font-size: 11px; color: var(--ink-400); }
 .password-dialog-error { color: var(--err); font-size: 12px; }
-.password-random-note { font-size: 11px; color: var(--ink-400); }
-.password-mode { display: flex; gap: 6px; }
-.password-mode .btn { flex: 1; }
+.password-random-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  background: var(--bg-inset);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  font-size: 12px;
+  color: var(--ink-400);
+}
+.password-random-note svg { flex: none; margin-top: 1px; color: var(--primary-400); }
+.password-random-note b { display: block; color: var(--ink-700); font-size: 12.5px; margin-bottom: 2px; }
+.password-random-note small { display: block; font-size: 11.5px; line-height: 1.5; }
+.password-mode {
+  display: inline-flex;
+  gap: 4px;
+  padding: 4px;
+  width: 100%;
+  background: var(--bg-inset);
+  border: 1px solid var(--line);
+  border-radius: 11px;
+}
+.password-mode button {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 8px 14px;
+  background: transparent;
+  border: none;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  font-family: var(--sans);
+  color: var(--ink-500);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, box-shadow 0.15s;
+  white-space: nowrap;
+}
+.password-mode button:hover { color: var(--ink-800); background: var(--bg-3); }
+.password-mode button:disabled { opacity: 0.45; cursor: not-allowed; }
+.password-mode button.active {
+  background: var(--primary-600);
+  color: #fff;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), 0 1px 3px rgba(99, 102, 241, 0.28);
+}
+.password-mode button.active svg { color: rgba(255, 255, 255, 0.9); }
 .account-log-dialog { width: min(760px, 100%); }
 .account-log-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .account-log-id { font-family: var(--mono); font-size: 11px; color: var(--primary-300); }
@@ -1612,7 +1658,6 @@ table.acct .col-actions { text-align: right; white-space: nowrap; }
 .account-load-status { display: flex; align-items: center; gap: 12px; font-size: 12px; color: var(--ink-500); }
 .account-load-error { color: var(--err); font-size: 12.5px; padding: 12px 14px; background: var(--accent-rose-light); border: 1px solid rgba(251, 113, 133, 0.3); border-radius: var(--r-md); }
 .health-error { color: var(--err); font-size: 12px; }
-.reauth-concurrency-field, .reauth-mode-field { display: flex; flex-direction: column; gap: 6px; }
 
 /* ===== Browser View ===== */
 .browser-grid {
@@ -2240,6 +2285,12 @@ table.acct .col-actions { text-align: right; white-space: nowrap; }
 .concurrency-save { font-size: 12px; padding: 7px 10px; }
 .concurrency-save.saved { border-color: var(--ok, #16a34a); color: var(--ok, #16a34a); }
 .concurrency-spacer { flex: 1; }
+.concurrency-mode { display: grid; gap: 8px; margin: 14px 0 4px; }
+.concurrency-mode-label { font-size: 13px; color: var(--ink-600); font-weight: 600; }
+.seg-controls { display: inline-flex; gap: 4px; padding: 4px; border: 1px solid var(--bg-3); border-radius: 10px; background: var(--bg-1); width: fit-content; }
+.seg-btn { border: none; background: transparent; color: var(--ink-600); font-size: 13px; font-weight: 600; padding: 7px 18px; border-radius: 7px; cursor: pointer; transition: background .15s ease, color .15s ease; }
+.seg-btn:hover { color: var(--ink-800); }
+.seg-btn.active { background: var(--acc, #6366f1); color: #fff; }
 /* sms country picker v2 */
 .sms-country-dialog { width: min(880px, 100%); }
 .sms-country-toolbar { display: flex; align-items: center; gap: 8px; padding: 10px 0 12px; flex-wrap: wrap; }

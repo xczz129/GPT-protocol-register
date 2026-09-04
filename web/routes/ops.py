@@ -656,6 +656,10 @@ async def operations():
 class UiSettingsUpdate(BaseModel):
     health_workers: int = Field(default=10, ge=1, le=20)
     reauth_workers: int = Field(default=3, ge=1, le=20)
+    trial_workers: int = Field(default=20, ge=1, le=20)
+    refresh_at_workers: int = Field(default=10, ge=1, le=10)
+    reauth_mode: str = Field(default="protocol")
+    trial_channel: str = Field(default="v4")
 
 
 @router.get("/api/ui-settings")
@@ -674,6 +678,10 @@ async def ui_settings_get():
             "ok": True,
             "health_workers": max(1, min(_int(raw.get("health_workers"), 10), 20)),
             "reauth_workers": max(1, min(_int(raw.get("reauth_workers"), 3), 20)),
+            "trial_workers": max(1, min(_int(raw.get("trial_workers"), 20), 20)),
+            "trial_channel": "nerver" if str(raw.get("trial_channel") or "").strip().lower() == "nerver" else "v4",
+            "refresh_at_workers": max(1, min(_int(raw.get("refresh_at_workers"), 10), 10)),
+            "reauth_mode": "browser" if str(raw.get("reauth_mode") or "").strip().lower() == "browser" else "protocol",
         }
 
     return await asyncio.to_thread(_do)
@@ -688,6 +696,10 @@ async def ui_settings_update(body: UiSettingsUpdate):
                 {
                     "health_workers": max(1, min(int(body.health_workers or 10), 20)),
                     "reauth_workers": max(1, min(int(body.reauth_workers or 3), 20)),
+                    "trial_workers": max(1, min(int(body.trial_workers or 20), 20)),
+                    "trial_channel": "nerver" if str(body.trial_channel or "").strip().lower() == "nerver" else "v4",
+                    "refresh_at_workers": max(1, min(int(body.refresh_at_workers or 10), 10)),
+                    "reauth_mode": "browser" if str(body.reauth_mode or "").strip().lower() == "browser" else "protocol",
                 }
             )
         return {"ok": True}

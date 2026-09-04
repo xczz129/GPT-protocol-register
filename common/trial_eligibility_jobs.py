@@ -21,6 +21,7 @@ from common.trial_eligibility import (
     _status_fields,
     account_access_token,
     check_trial_eligibility,
+    check_trial_eligibility_nerver,
     is_trial_probe_retryable,
 )
 from common.trial_proxy_pool import selected_trial_proxies
@@ -56,8 +57,9 @@ class TrialEligibilityJobs:
         self,
         records: list[dict[str, Any]],
         *,
-        concurrency: int = 5,
+        concurrency: int = 20,
         attempts: int = 8,
+        channel: str = "v4",
     ) -> dict[str, Any]:
         selected = [
             dict(record)
@@ -82,13 +84,13 @@ class TrialEligibilityJobs:
                 "total": len(selected),
                 "done": 0,
                 "eligible": 0,
-                "discount": 0,
                 "ineligible": 0,
                 "failed": 0,
                 "stopped": 0,
                 "current": "",
-                "concurrency": max(1, min(5, int(concurrency or 1))),
+                "concurrency": max(1, min(20, int(concurrency or 1))),
                 "attempts": max(1, min(20, int(attempts or 1))),
+                "channel": "nerver" if str(channel or "").strip().lower() == "nerver" else "v4",
                 "created_at": _now(),
                 "started_at": "",
                 "finished_at": "",
@@ -129,10 +131,51 @@ class TrialEligibilityJobs:
                 item.update(status="running", started_at=_now())
                 self.jobs[job_id]["current"] = email
 
+            channel = "nerver" if str(self.jobs[job_id].get("channel") or "v4") == "nerver" else "v4"
+            if channel == "nerver":
+                last_error: BaseException | None = None
+                for attempt in range(1, 3):
+                    if stop_event.is_set():
+                        return "stopped", {}, "任务已停止", attempt - 1
+                    try:
+                        result = check_trial_eligibility_nerver(record.get("access_token"))
+                        fields = _status_fields(result)
+                        fields["trial_eligibility_method"] = "nerver_check"
+                        fields["trial_eligibility_proxy_mode"] = "nerver"
+                        update_account_record_fields(
+                            {account_delete_key(record): fields}, include_records=False
+                        )
+                        if result.get("eligibility_status") == "invalid":
+                            return "failed", result, str(result.get("label") or "AT 已过期"), attempt
+                        eligibility_status = str(result.get("eligibility_status") or "").lower()
+                        if eligibility_status in {"eligible", "active"}:
+                            state = "eligible"
+                        else:
+                            state = "ineligible"
+                        return state, result, "", attempt
+                    except Exception as error:
+                        last_error = error
+                        if attempt >= 2:
+                            break
+                        time.sleep(min(2.0, 0.25 * attempt))
+                fields = {
+                    "trial_eligibility_status": "error",
+                    "trial_eligibility_label": "检测失败",
+                    "trial_eligibility_checked_at": _now(),
+                    "trial_eligibility_reason": "request_error",
+                    "trial_eligibility_method": "nerver_check",
+                    "trial_eligibility_proxy_mode": "nerver",
+                    "trial_eligibility_error": str(last_error or "nerver_check_failed")[:500],
+                }
+                update_account_record_fields(
+                    {account_delete_key(record): fields}, include_records=False
+                )
+                return "failed", {}, str(last_error or "nerver_check_failed"), 2
+
             country, proxies = selected_trial_proxies(limit=max_attempts)
             routes = proxies if proxies else [""]
             route_mode = f"{country} proxy" if proxies and country else "direct"
-            last_error: BaseException | None = None
+            last_error = None
             for attempt, proxy in enumerate(routes, 1):
                 if stop_event.is_set():
                     return "stopped", {}, "任务已停止", attempt - 1
@@ -152,8 +195,6 @@ class TrialEligibilityJobs:
                         state = "failed"
                     elif eligibility_status in {"eligible", "active"}:
                         state = "eligible"
-                    elif eligibility_status == "discount":
-                        state = "discount"
                     else:
                         state = "ineligible"
                     return state, result, "", attempt
@@ -264,6 +305,8 @@ class TrialEligibilityJobs:
                                 attempt=attempt,
                                 finished_at=_now(),
                             )
+                            if state == "discount":
+                                state = "ineligible"
                             job[state] = int(job.get(state) or 0) + 1
                             job["done"] = int(job.get("done") or 0) + 1
                             job["stage"] = f"{job['done']} / {job['total']} 已完成"

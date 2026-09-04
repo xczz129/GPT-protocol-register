@@ -9,6 +9,7 @@ eligibility response; it does not create a checkout or payment method.
 
 from __future__ import annotations
 
+import os
 import time
 import uuid
 import threading
@@ -31,6 +32,9 @@ from proxy_util import is_proxy_transport_error
 
 PROMO_CAMPAIGN_ID = "plus-1-month-free"
 ACCOUNT_CHECK_PATH = "/backend-api/accounts/check/v4-2023-04-27"
+NERVER_CHECK_URL = os.environ.get(
+    "NERVER_CHECK_URL", "https://cha.nerver.cc/api/v1/check"
+)
 
 # Registration must finish and persist the account before the network probe is
 # started.  Keep automatic backfill deliberately small: explicit eligibility
@@ -679,19 +683,14 @@ def check_trial_eligibility(
         reason = "active_subscription"
     elif campaign_id == PROMO_CAMPAIGN_ID:
         status = "plus_eligible"
-        label = "可领 Plus 试用"
+        label = "可领 Plus 免费试用"
         eligibility_status = "eligible"
         reason = "eligible_promo_campaign"
-    elif campaigns:
-        status = "discount"
-        label = "有折扣优惠"
-        eligibility_status = "discount"
-        reason = "discount_campaign"
     else:
         status = "free"
-        label = "Free（当前无试用资格）"
+        label = "无免费试用"
         eligibility_status = "ineligible"
-        reason = "promo_campaign_not_available"
+        reason = "no_free_trial"
 
     checked_epoch = time.time()
     _emit(line_callback, f"资格结果：{label} · campaign={campaign_id or '-'}")
@@ -717,4 +716,115 @@ def check_trial_eligibility(
         "checked_epoch": round(checked_epoch, 3),
         "proxy_mode": mode,
         "elapsed_seconds": round(time.monotonic() - started, 1),
+    }
+
+
+def check_trial_eligibility_nerver(
+    access_token: Any,
+    *,
+    timeout: float = 30.0,
+) -> dict[str, Any]:
+    """Check Plus free-trial eligibility through the nerver AC checker API.
+
+    POSTs the access token to ``https://cha.nerver.cc/api/v1/check`` and maps
+    the response onto the same result shape as :func:`check_trial_eligibility`.
+    Only the ``plus-1-month-free`` campaign counts as eligible; discount
+    campaigns are reported as ineligible.
+    """
+    from curl_cffi import requests as _requests
+
+    token = str(access_token or "").strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    if not token:
+        raise TrialEligibilityError("missing access_token")
+    started = time.monotonic()
+    checked_epoch = time.time()
+    try:
+        response = _requests.post(
+            NERVER_CHECK_URL,
+            json={"token": token},
+            timeout=max(5.0, float(timeout)),
+        )
+    except Exception as error:
+        raise TrialEligibilityError(
+            f"nerver_check_request_failed: {str(error)[:300]}"
+        ) from error
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    if not isinstance(payload, dict):
+        raise TrialEligibilityError(
+            f"nerver_check_http_{status_code}: invalid json response"
+        )
+    base = {
+        "provider": "nerver_check",
+        "plan_type": str(payload.get("plan_type") or "free").strip().lower() or "free",
+        "is_deactivated": False,
+        "promo_campaign_id": "",
+        "checked_at": datetime.fromtimestamp(checked_epoch, timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z"),
+        "checked_epoch": round(checked_epoch, 3),
+        "proxy_mode": "nerver",
+        "elapsed_seconds": round(time.monotonic() - started, 1),
+    }
+    reason = str(payload.get("reason") or "")
+    if not payload.get("token_ok"):
+        if reason == "jwt-expired":
+            # Token parses but has expired; the account itself may still be
+            # alive, so report a dedicated state instead of marking invalid.
+            return {
+                **base,
+                "eligible": False,
+                "eligibility_status": "invalid",
+                "status": "at_expired",
+                "label": "AT 已过期",
+                "reason": reason,
+                "has_active_subscription": False,
+                "jwt_expired": True,
+            }
+        detail = " ".join(
+            part
+            for part in (
+                reason,
+                str(payload.get("message") or ""),
+                str(payload.get("error") or ""),
+            )
+            if part
+        )
+        raise TrialEligibilityError(
+            f"nerver_check_http_{status_code}: {detail[:300] or 'check failed'}"
+        )
+    eligible = bool(payload.get("eligible"))
+    plus_active = base["plan_type"] == "plus"
+    if eligible:
+        result_status, label, eligibility_status = (
+            "plus_eligible",
+            "可领 Plus 免费试用",
+            "eligible",
+        )
+        result_reason = reason or "eligible"
+        base["promo_campaign_id"] = PROMO_CAMPAIGN_ID
+    elif plus_active:
+        result_status, label, eligibility_status = (
+            "plus_active",
+            "Plus 生效中",
+            "active",
+        )
+        result_reason = "active_subscription"
+    else:
+        result_status, label, eligibility_status = ("free", "无免费试用", "ineligible")
+        result_reason = reason or "not-eligible"
+    return {
+        **base,
+        "eligible": eligible,
+        "eligibility_status": eligibility_status,
+        "status": result_status,
+        "label": label,
+        "reason": result_reason,
+        "has_active_subscription": plus_active,
+        "jwt_expired": False,
     }

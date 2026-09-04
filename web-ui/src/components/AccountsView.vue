@@ -35,14 +35,16 @@ const props = defineProps({
   codexOauthRunning: Boolean, 
   healthProgress: { type: Object, default: () => ({}) }, 
   reauthProgress: { type: Object, default: () => ({}) }, 
-  trialProgress: { type: Object, default: () => ({}) } 
+  trialProgress: { type: Object, default: () => ({}) },
+  refreshAtProgress: { type: Object, default: () => ({}) }
 });
 
 const emit = defineEmits([
   "refresh", "health", "reauth", "security-repair", "password-change", "totp-change", 
   "account-logs", "stop-reauth", "delete", "delete-invalid", "download", "copy-selected-at", "codex-oauth", "import-accounts", 
   "export-selected-at", "export-security", "create-group", "rename-group", "delete-group", 
-  "move-group", "export-group", "copy-at", "copy-credential", "copy-value", "trial-check"
+  "move-group", "export-group", "copy-at", "copy-credential", "copy-value", "trial-check",
+  "copy-session", "refresh-at"
 ]);
 
 const query = ref("");
@@ -57,8 +59,6 @@ const newGroupName = ref("");
 const pageSize = ref(20);
 const page = ref(1);
 const selected = ref([]);
-const reauthMode = ref("protocol");
-const reauthConcurrency = ref(3);
 const copiedFeedback = ref({});
 
 function triggerCopied(key) {
@@ -104,6 +104,7 @@ const accountIndex = computed(() => {
   const securityRepairKeys = [];
   const securityOperationKeys = [];
   const accessTokenKeys = new Set();
+  const refreshAtKeys = new Set();
   let usable = 0;
   let deactivated = 0;
   let checked = 0;
@@ -127,6 +128,7 @@ const accountIndex = computed(() => {
         && !!item.has_totp);
     if (!isDeactivated && passwordConfirmed && item.has_totp && key) securityOperationKeys.push(key);
     if (item.has_access_token && key) accessTokenKeys.add(key);
+    if (!isDeactivated && item.has_session_token && key) refreshAtKeys.add(key);
   }
   return {
     stats: { total: rows.length, usable, deactivated, checked },
@@ -136,6 +138,7 @@ const accountIndex = computed(() => {
     securityRepairKeys,
     securityOperationKeys,
     accessTokenKeys,
+    refreshAtKeys,
   };
 });
 
@@ -149,10 +152,8 @@ const accountLoadBlocked = computed(() => props.accountsLoading || !!props.accou
 const invalidKeys = computed(() => accountIndex.value.invalidKeys);
 const invalidCount = computed(() => invalidKeys.value.length);
 const reauthKeys = computed(() => accountIndex.value.reauthKeys);
-const protocolReauthKeys = computed(() => accountIndex.value.protocolReauthKeys);
-const reauthTargetKeys = computed(() => reauthMode.value === "protocol" ? protocolReauthKeys.value : reauthKeys.value);
 const selectedReauthKeys = computed(() => {
-  const available = new Set(reauthTargetKeys.value);
+  const available = new Set(reauthKeys.value);
   return selected.value.filter((key) => available.has(key));
 });
 const securityRepairKeys = computed(() => accountIndex.value.securityRepairKeys);
@@ -230,6 +231,11 @@ const searchTextByItem = computed(() => {
 
 const reauthPercent = computed(() => props.reauthProgress.total ? Math.round((props.reauthProgress.done / props.reauthProgress.total) * 100) : 0);
 const trialPercent = computed(() => props.trialProgress.total ? Math.round((props.trialProgress.done / props.trialProgress.total) * 100) : 0);
+const refreshAtPercent = computed(() => props.refreshAtProgress.total ? Math.round((props.refreshAtProgress.done / props.refreshAtProgress.total) * 100) : 0);
+const selectedRefreshAtKeys = computed(() => {
+  const available = accountIndex.value.refreshAtKeys;
+  return selected.value.filter((key) => available.has(key));
+});
 const reauthModeLabel = computed(() => props.reauthProgress.mode === "protocol" ? "协议" : "浏览器");
 const reauthOperationLabel = computed(() => ({
   reauth: "重新登录",
@@ -636,6 +642,21 @@ function moveSelected() {
           </div>
         </div>
 
+        <div v-if="refreshAtProgress.total" class="health-progress" :class="{ active: refreshAtProgress.running }" aria-live="polite">
+          <div class="health-progress-head">
+            <strong>{{ refreshAtProgress.running ? "刷新 AT 进行中" : "最近一次刷新 AT 完成" }}</strong>
+            <span>{{ refreshAtProgress.done }} / {{ refreshAtProgress.total }} · {{ refreshAtPercent }}%</span>
+          </div>
+          <div class="health-progress-track"><i :style="{ width: `${refreshAtPercent}%` }"></i></div>
+          <div class="health-progress-meta">
+            <span v-if="refreshAtProgress.current">当前：{{ refreshAtProgress.current }}</span>
+            <span>已刷新 {{ refreshAtProgress.refreshed || 0 }}</span>
+            <span>AT未变化 {{ refreshAtProgress.unchanged || 0 }}</span>
+            <span>失败 {{ refreshAtProgress.failed || 0 }}</span>
+            <span>已停止 {{ refreshAtProgress.stopped || 0 }}</span>
+          </div>
+        </div>
+
         <!-- 筛选栏 -->
         <div class="account-filters">
           <label class="search-field">
@@ -679,27 +700,17 @@ function moveSelected() {
           <button class="btn secondary" type="button" :disabled="!selected.length || busy" title="取消所有分页中已选择的账号" @click="clearAllSelected"><X :size="14" aria-hidden="true" />取消（{{ selected.length }}）</button>
           <button class="btn primary" :disabled="!accounts.length || busy" :title="selected.length ? '下载选中的账号' : '下载全部账号'" @click="emit('download', selected.length ? selected : null)"><Download :size="14" aria-hidden="true" />{{ selected.length ? `下载选中(${selected.length})` : "下载全部" }}</button>
           <button class="btn secondary" :disabled="!selectedAccessTokenKeys.length || busy || copyingAt" title="复制选中账号的完整 Access Token" @click="emit('copy-selected-at', selected)"><Copy :size="14" aria-hidden="true" />{{ copyingAt ? "读取AT中" : "复制选中AT" }}</button><button class="btn secondary" type="button" :disabled="!selected.length || busy || codexOauthRunning" title="对选中账号接码" @click="emit('codex-oauth', selected)"><Smartphone :size="14" aria-hidden="true" />接码</button><button class="btn secondary" type="button" :disabled="busy || codexOauthRunning" title="粘贴 邮箱----密码----2FA 导入新账号" @click="emit('import-accounts')"><Upload :size="14" aria-hidden="true" />导入账号</button>
+          <button class="btn secondary" :disabled="(!selectedRefreshAtKeys.length && !accounts.length) || busy || refreshAtProgress.running" :title="selectedRefreshAtKeys.length ? `刷新选中 ${selectedRefreshAtKeys.length} 个账号的 AT（需有 Session）` : '刷新全部临期/过期账号的 AT（需有 Session，自动跳过已封号）'" @click="emit('refresh-at', selectedRefreshAtKeys.length ? { keys: selectedRefreshAtKeys } : { all_accounts: true })">{{ refreshAtProgress.running ? "刷新AT中…" : (selectedRefreshAtKeys.length ? `刷新AT选中(${selectedRefreshAtKeys.length})` : "刷新AT") }}</button>
           <button class="btn secondary" :disabled="!selectedAccessTokenKeys.length || busy" title="导出选中账号的完整 Access Token" @click="emit('export-selected-at', selected)">导出选中AT</button>
           <button class="btn secondary" :disabled="!selected.length || busy" title="导出选中账号、密码和完整 TOTP 密钥" @click="emit('export-security', selected)">导出账号+密码+2FA</button>
           <button class="btn secondary" :disabled="!accounts.length || busy || accountLoadBlocked || healthProgress.running" :title="selected.length ? '测活选中的账号' : '测活全部账号(跳过已封号)'" @click="emit('health', selected.length ? selected : null)">{{ healthProgress.running ? "测活中…" : (selected.length ? `测活选中(${selected.length})` : "测活全部") }}</button>
           <button class="btn secondary" :disabled="!accounts.length || busy || accountLoadBlocked" :title="selected.length ? '检测选中账号的 Free 资格' : '检测全部账号的 Free 资格'" @click="emit('trial-check', selected.length ? { keys: selected, force: false } : { all_accounts: true, force: false })">{{ selected.length ? `检测资格选中(${selected.length})` : "检测全部 Free 资格" }}</button>
           
-          <label class="reauth-mode-field">
-            <span>登录方式</span>
-            <select v-model="reauthMode" :disabled="busy">
-              <option value="protocol">协议</option>
-              <option value="browser">浏览器（手动选择）</option>
-            </select>
-          </label>
-          <label class="reauth-mode-field reauth-concurrency-field">
-            <span>并发</span>
-            <input v-model.number="reauthConcurrency" type="number" min="1" :disabled="busy || reauthProgress.running" />
-          </label>
-          
-          <button class="btn secondary" :disabled="!reauthTargetKeys.length || busy || reauthProgress.running" :title="selectedReauthKeys.length ? '重新登录选中的账号' : `重新登录全部可恢复账号(${reauthTargetKeys.length})`" @click="emit('reauth', { keys: selectedReauthKeys.length ? selectedReauthKeys : reauthTargetKeys, mode: reauthMode, concurrency: Math.max(1, Math.floor(Number(reauthConcurrency) || 3)) })">{{ reauthProgress.running ? "登录中…" : (selectedReauthKeys.length ? `重新登录选中(${selectedReauthKeys.length})` : `重新登录全部(${reauthTargetKeys.length})`) }}</button>
-          <button class="btn primary" :disabled="!selectedSecurityRepairKeys.length || busy || reauthProgress.running" @click="emit('security-repair', { keys: selectedSecurityRepairKeys, concurrency: Math.max(1, Math.floor(Number(reauthConcurrency) || 3)) })">补全安全字段（{{ selectedSecurityRepairKeys.length }}）</button>
-          <button class="btn secondary" :disabled="!selectedSecurityOperationKeys.length || busy || reauthProgress.running" @click="emit('password-change', { keys: selectedSecurityOperationKeys, concurrency: Math.max(1, Math.floor(Number(reauthConcurrency) || 3)) })">修改密码（{{ selectedSecurityOperationKeys.length }}）</button>
-          <button class="btn secondary" :disabled="!selectedSecurityOperationKeys.length || busy || reauthProgress.running" @click="emit('totp-change', { keys: selectedSecurityOperationKeys, concurrency: Math.max(1, Math.floor(Number(reauthConcurrency) || 3)) })">修改 2FA（{{ selectedSecurityOperationKeys.length }}）</button>
+
+          <button class="btn secondary" :disabled="!reauthKeys.length || busy || reauthProgress.running" :title="selectedReauthKeys.length ? '重新登录选中的账号' : `重新登录全部可恢复账号(${reauthKeys.length})`" @click="emit('reauth', { keys: selectedReauthKeys })">{{ reauthProgress.running ? "登录中…" : (selectedReauthKeys.length ? `重新登录选中(${selectedReauthKeys.length})` : `重新登录全部(${reauthKeys.length})`) }}</button>
+          <button class="btn primary" :disabled="!selectedSecurityRepairKeys.length || busy || reauthProgress.running" @click="emit('security-repair', { keys: selectedSecurityRepairKeys })">补全安全字段（{{ selectedSecurityRepairKeys.length }}）</button>
+          <button class="btn secondary" :disabled="!selectedSecurityOperationKeys.length || busy || reauthProgress.running" @click="emit('password-change', { keys: selectedSecurityOperationKeys })">修改密码（{{ selectedSecurityOperationKeys.length }}）</button>
+          <button class="btn secondary" :disabled="!selectedSecurityOperationKeys.length || busy || reauthProgress.running" @click="emit('totp-change', { keys: selectedSecurityOperationKeys })">修改 2FA（{{ selectedSecurityOperationKeys.length }}）</button>
           
           <button class="btn danger" :disabled="!invalidCount || busy" @click="emit('delete-invalid', invalidKeys)"><Trash2 :size="14" aria-hidden="true" />删除失效（{{ invalidCount }}）</button>
           <select v-model="moveTarget" aria-label="移动目标分组"><option v-for="group in groups" :key="group.id" :value="group.id">移至：{{ group.name }}</option></select>
@@ -824,6 +835,17 @@ function moveSelected() {
                       <span>{{ !item.has_access_token ? "缺失" : copyingAt ? "读取中…" : "复制 Token" }}</span>
                       <Copy :size="11" aria-hidden="true" />
                     </button>
+                    <button
+                      class="copy-pill-btn cred-chip"
+                      type="button"
+                      :disabled="!item.has_session_token || copyingAt"
+                      :title="item.has_session_token ? '点击复制 Session Token' : '该账号没有 Session'"
+                      @click="emit('copy-session', item)"
+                    >
+                      <em>Session</em>
+                      <span>{{ !item.has_session_token ? "缺失" : copyingAt ? "读取中…" : "复制 Token" }}</span>
+                      <Copy :size="11" aria-hidden="true" />
+                    </button>
                     <small v-if="item.c2a_upload_status" :class="['capsule-badge', 'acct-c2a', item.c2a_upload_status === 'success' ? 'plus' : 'free']">
                       c2a {{ item.c2a_upload_status === 'success' ? '已上传' : '失败' }}
                     </small>
@@ -868,6 +890,16 @@ function moveSelected() {
                 <!-- 操作按钮组 -->
                 <td class="col-actions" data-label="操作">
                   <div class="account-row-actions">
+                    <button
+                      class="btn secondary row-icon-btn"
+                      type="button"
+                      :disabled="busy || refreshAtProgress.running || !item.delete_key || item.is_deactivated || !item.has_session_token"
+                      title="刷新AT"
+                      aria-label="刷新 Access Token"
+                      @click="emit('refresh-at', { keys: [item.delete_key] })"
+                    >
+                      <RefreshCw :size="13" aria-hidden="true" />
+                    </button>
                     <button
                       class="btn secondary row-icon-btn"
                       type="button"

@@ -88,7 +88,7 @@ class TrialEligibilityTests(unittest.TestCase):
         make_session.assert_called_once_with("", impersonate="firefox147")
         self.assertTrue(session.closed)
 
-    def test_discount_campaign_is_reported_as_promotion(self):
+    def test_discount_campaign_is_not_free_trial(self):
         response = _Response(
             200,
             {
@@ -108,8 +108,8 @@ class TrialEligibilityTests(unittest.TestCase):
                 {"email": "fixture@example.com", "access_token": "AT"}
             )
         self.assertFalse(result["eligible"])
-        self.assertEqual(result["eligibility_status"], "discount")
-        self.assertEqual(result["label"], "有折扣优惠")
+        self.assertEqual(result["eligibility_status"], "ineligible")
+        self.assertEqual(result["label"], "无免费试用")
         self.assertTrue(result["has_promotion"])
         self.assertEqual(result["promotion_count"], 1)
 
@@ -286,7 +286,7 @@ class TrialEligibilityTests(unittest.TestCase):
         self.assertEqual(job["status"], "success")
         self.assertEqual(job["eligible"], 1)
 
-    def test_batch_job_enforces_five_worker_limit(self):
+    def test_batch_job_enforces_worker_limit(self):
         manager = TrialEligibilityJobs()
         lock = threading.Lock()
         active = 0
@@ -329,8 +329,8 @@ class TrialEligibilityTests(unittest.TestCase):
             started = manager.start(records, concurrency=20)
             job = self._wait_for_job(manager, started["job_id"])
 
-        self.assertEqual(started["concurrency"], 5)
-        self.assertEqual(peak, 5)
+        self.assertEqual(started["concurrency"], 20)
+        self.assertEqual(peak, 7)
         self.assertEqual(job["done"], 7)
         self.assertEqual(job["ineligible"], 7)
 

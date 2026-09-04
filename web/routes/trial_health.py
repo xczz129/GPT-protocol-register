@@ -25,22 +25,29 @@ class AccountHealthRequest(BulkDeleteRequest):
     workers: int = Field(10, ge=1, le=20)
 
 
+def _normalize_channel(value: Any) -> str:
+    return "nerver" if str(value or "").strip().lower() == "nerver" else "v4"
+
+
 class AccountTrialEligibilityRequest(BaseModel):
     keys: list[str] = Field(default_factory=list, max_length=1000)
     all_accounts: bool = False
     force: bool = False
-    concurrency: int = Field(default=5, ge=1, le=5)
+    concurrency: int = Field(default=20, ge=1, le=20)
+    channel: str = "v4"
 
 
 class TokenTrialEligibilityRequest(BaseModel):
     access_token: str = ""
     use_configured_proxy: bool = True
+    channel: str = "v4"
 
 
 class TokenTrialEligibilityBatchRequest(BaseModel):
     access_tokens: list[str] = Field(default_factory=list)
     use_configured_proxy: bool = True
-    workers: int = Field(default=4, ge=1, le=8)
+    channel: str = "v4"
+    workers: int = Field(default=20, ge=1, le=20)
 
 
 class TrialProxyCountryItem(BaseModel):
@@ -57,14 +64,25 @@ class TrialProxyConfigRequest(BaseModel):
 @router.post("/api/accounts/trial-eligibility")
 async def accounts_trial_eligibility(body: AccountTrialEligibilityRequest):
     """Queue direct Plus/free-trial checks for selected or all accounts."""
-    records = await asyncio.to_thread(_state()._load_accounts)
-    wanted = {str(key or "").strip() for key in body.keys if str(key or "").strip()}
-    selected = [
-        record for record in records
-        if (body.all_accounts or _state()._account_key(record) in wanted)
-        and str(record.get("plan_type") or "free").strip().lower() == "free"
-        and not _state().account_is_deactivated(record)
-    ]
+    if body.all_accounts:
+        candidates = await asyncio.to_thread(_state()._load_accounts)
+    else:
+        wanted = {str(key or "").strip() for key in body.keys if str(key or "").strip()}
+        records_by_key = await asyncio.to_thread(
+            _state()._records_by_keys_with_fallback, wanted
+        )
+        candidates = list(records_by_key.values())
+    selected: list[Any] = []
+    requested = 0
+    skipped_known_deactivated = 0
+    for record in candidates:
+        if str(record.get("plan_type") or "free").strip().lower() != "free":
+            continue
+        requested += 1
+        if _state().account_is_deactivated(record):
+            skipped_known_deactivated += 1
+            continue
+        selected.append(record)
     if not selected:
         raise HTTPException(400, "没有可检测的 Free 账号")
     effective_concurrency, resource_mode = _state()._trial_eligibility_resource_budget(
@@ -76,6 +94,7 @@ async def accounts_trial_eligibility(body: AccountTrialEligibilityRequest):
             selected,
             concurrency=effective_concurrency,
             attempts=8,
+            channel=_normalize_channel(body.channel),
         )
     except ValueError as error:
         raise HTTPException(400, str(error)) from error
@@ -84,26 +103,8 @@ async def accounts_trial_eligibility(body: AccountTrialEligibilityRequest):
     return {
         "ok": True,
         **job,
-        "requested": len(
-            [
-                record
-                for record in records
-                if (body.all_accounts or _state()._account_key(record) in wanted)
-                and str(record.get("plan_type") or "free").strip().lower() == "free"
-            ]
-        ),
-        "skipped_known_deactivated": max(
-            0,
-            len(
-                [
-                    record
-                    for record in records
-                    if (body.all_accounts or _state()._account_key(record) in wanted)
-                    and str(record.get("plan_type") or "free").strip().lower() == "free"
-                    and _state().account_is_deactivated(record)
-                ]
-            ),
-        ),
+        "requested": requested,
+        "skipped_known_deactivated": max(0, skipped_known_deactivated),
         "requested_concurrency": body.concurrency,
         "effective_concurrency": effective_concurrency,
         "resource_mode": resource_mode,
@@ -131,8 +132,19 @@ async def accounts_trial_eligibility_stop(job_id: str):
     return {"ok": True, **job}
 
 
-async def _token_trial_eligibility_core(token: str, use_configured_proxy: bool) -> dict[str, Any]:
+async def _token_trial_eligibility_core(
+    token: str, use_configured_proxy: bool, channel: str = "v4"
+) -> dict[str, Any]:
     """Single-token check shared by the single and batch endpoints."""
+    if _normalize_channel(channel) == "nerver":
+        try:
+            result = await asyncio.to_thread(
+                _state().check_trial_eligibility_nerver, token
+            )
+        except _state().TrialEligibilityError as error:
+            raise HTTPException(502, f"nerver 资格检测失败: {str(error)[:240]}") from error
+        return {"ok": True, "channel": "nerver", **result}
+
     country = ""
     if use_configured_proxy:
         country, first_proxy = await asyncio.to_thread(_state().selected_trial_proxy)
@@ -180,6 +192,7 @@ async def _token_trial_eligibility_core(token: str, use_configured_proxy: bool) 
     }
     return {
         "ok": True,
+        "channel": "v4",
         **result,
         "eligible_promo_campaigns": active_campaigns,
         "has_promotion": bool(active_campaigns),
@@ -202,7 +215,9 @@ async def token_trial_eligibility(body: TokenTrialEligibilityRequest):
     token = _normalize_access_token(body.access_token)
     if len(token) < 20 or len(token) > 20_000:
         raise HTTPException(400, "请输入完整的 Access Token")
-    return await _token_trial_eligibility_core(token, body.use_configured_proxy)
+    return await _token_trial_eligibility_core(
+        token, body.use_configured_proxy, body.channel
+    )
 
 
 @router.post("/api/trial-eligibility/check-tokens")
@@ -221,14 +236,16 @@ async def token_trial_eligibility_batch(body: TokenTrialEligibilityBatchRequest)
     if len(tokens) > 200:
         raise HTTPException(400, "单次最多批量检测 200 个 Access Token")
 
-    workers = max(1, min(int(body.workers), 8))
+    workers = max(1, min(int(body.workers), 20))
     semaphore = asyncio.Semaphore(workers)
 
     async def run_one(index: int, token: str) -> dict[str, Any]:
         tail = token[-10:]
         async with semaphore:
             try:
-                payload = await _token_trial_eligibility_core(token, body.use_configured_proxy)
+                payload = await _token_trial_eligibility_core(
+                    token, body.use_configured_proxy, body.channel
+                )
             except HTTPException as error:
                 detail = str(error.detail) if error.detail is not None else "检测失败"
                 return {"index": index, "token_tail": tail, "ok": False, "error": detail[:240]}

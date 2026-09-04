@@ -8,7 +8,6 @@ import {
   CloudCog,
   Contact,
   FileDown,
-  Globe2,
   LogIn,
   Mail,
   Moon,
@@ -43,8 +42,7 @@ const sections = [
   {
     label: "资格与连接",
     items: [
-      ["trial-proxy", Globe2, "资格代理"],
-      ["plus-eligibility", ShieldCheck, "Plus 资格"],
+      ["plus-eligibility", ShieldCheck, "Plus 免费试用"],
       ["chatgpt2api", Cable, "chatgpt2api"],
       ["logs", ClipboardList, "日志"],
     ],

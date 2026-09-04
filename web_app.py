@@ -92,6 +92,7 @@ from common.trial_eligibility import (
     TrialEligibilityError,
     account_access_token as _stored_access_token,
     check_trial_eligibility,
+    check_trial_eligibility_nerver,
     is_trial_probe_retryable,
     schedule_unchecked_trial_checks,
 )
@@ -1673,6 +1674,14 @@ async def _shutdown_active_background_jobs() -> None:
         TRIAL_ELIGIBILITY_JOBS.stop(trial_id)
         waits.append(("trial", None, TRIAL_ELIGIBILITY_JOBS, trial_id))
 
+    from common.session_refresh import SESSION_REFRESH_JOBS
+
+    refresh_at = SESSION_REFRESH_JOBS.active()
+    if refresh_at and refresh_at.get("status") in {"queued", "running", "stopping"}:
+        refresh_at_id = str(refresh_at.get("job_id") or "")
+        SESSION_REFRESH_JOBS.stop(refresh_at_id)
+        waits.append(("refresh_at", None, SESSION_REFRESH_JOBS, refresh_at_id))
+
     async def wait_one(
         label: str,
         thread: threading.Thread | None,
@@ -2575,7 +2584,7 @@ async def accounts_export_access_tokens(body: BulkDeleteRequest):
 async def account_credentials(body: AccountCredentialsRequest):
     """Return one explicitly requested password, TOTP secret, or current code."""
     field = str(body.field or "").strip().lower()
-    if field not in {"password", "totp_secret", "totp_code", "refresh_token"}:
+    if field not in {"password", "totp_secret", "totp_code", "refresh_token", "session_token"}:
         raise HTTPException(400, "不支持的凭据字段")
     target = str(body.key or "").strip()
     records = await asyncio.to_thread(_records_by_keys_with_fallback, [target])
@@ -2592,6 +2601,11 @@ async def account_credentials(body: AccountCredentialsRequest):
         value = str(account.get("totp_secret") or "").strip()
         if not value:
             raise HTTPException(409, "该账号没有已保存的 TOTP 密钥")
+        payload = {"ok": True, "field": field, "value": value}
+    elif field == "session_token":
+        value = str(account.get("session_token") or "").strip()
+        if not value:
+            raise HTTPException(409, "该账号没有已保存的 Session Token")
         payload = {"ok": True, "field": field, "value": value}
     else:
         secret = str(account.get("totp_secret") or "").strip()
@@ -2641,6 +2655,18 @@ from web.routes.trial_health import accounts_health, accounts_health_progress  #
 
 from web.routes.accounts_reauth import router as accounts_reauth_router
 app.include_router(accounts_reauth_router)
+
+from web.routes.refresh_at import router as refresh_at_router  # noqa: E402
+
+app.include_router(refresh_at_router)
+
+from web.routes.refresh_at import (  # noqa: E402,F401
+    AccountRefreshAtRequest,
+    accounts_refresh_at,
+    accounts_refresh_at_job,
+    accounts_refresh_at_progress,
+    accounts_refresh_at_stop,
+)
 
 from web.routes.accounts_reauth import (  # noqa: E402,F401
     AccountEmailReauthRequest,

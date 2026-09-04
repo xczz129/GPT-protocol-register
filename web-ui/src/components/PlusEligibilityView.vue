@@ -9,22 +9,28 @@ const emit = defineEmits(["check", "clear", "batch-check", "batch-stop"]);
 const showToken = ref(false);
 const mode = ref("single");
 
-const offers = computed(() => Object.entries(props.state.result?.eligible_promo_campaigns || {}).filter(([, value]) => value != null));
+const isNerver = computed(() => props.form.channel === "nerver");
 const resultTitle = computed(() => {
   const result = props.state.result;
   if (!result) return "";
   if (result.is_deactivated) return "账号已封号";
+  if (result.status === "at_expired" || result.jwt_expired) return "AT 已过期";
   if (result.has_active_subscription) return "Plus 已生效";
   if (result.eligible) return "可领 Plus 免费试用";
-  if (result.has_promotion) return "检测到优惠活动";
-  return "当前没有可用优惠";
+  return "无免费试用";
 });
 const resultTone = computed(() => {
   const result = props.state.result;
   if (!result) return "neutral";
-  if (result.is_deactivated) return "danger";
+  if (result.is_deactivated || result.status === "at_expired" || result.jwt_expired) return "danger";
   if (result.eligible || result.has_active_subscription) return "eligible";
-  return result.has_promotion ? "offer" : "neutral";
+  return "neutral";
+});
+const channelText = computed(() => {
+  const result = props.state.result;
+  if (!result) return "-";
+  if (result.provider === "nerver_check" || result.proxy_mode === "nerver") return "nerver";
+  return `v4 · ${result.proxy_country || result.proxy_mode || "direct"}`;
 });
 
 const batch = computed(() => props.state.batch || { running: false, total: 0, done: 0, results: [], stopped: false });
@@ -51,16 +57,7 @@ const batchSummary = computed(() => {
 });
 
 function statusText(value) {
-  return ({ plus_eligible: "符合试用资格", plus_active: "Plus 生效中", free: "Free", banned: "已封号" })[String(value || "")] || value || "-";
-}
-function campaignId(value) {
-  if (typeof value === "string") return value;
-  if (!value || typeof value !== "object") return "-";
-  return value.id || value.campaign_id || value.offer_id || value.code || "-";
-}
-function campaignDetail(value) {
-  if (typeof value === "string") return value;
-  try { return JSON.stringify(value, null, 2); } catch { return String(value || "-"); }
+  return ({ plus_eligible: "符合试用资格", plus_active: "Plus 生效中", free: "无免费试用", at_expired: "AT 已过期", banned: "已封号" })[String(value || "")] || value || "-";
 }
 function check() {
   if (!String(props.form.accessToken || "").trim() || props.state.loading) return;
@@ -75,7 +72,7 @@ function batchCheck() {
 <template>
   <section class="card plus-eligibility-page">
     <div class="card-h">
-      <div><h2>Plus 试用资格检测</h2><p class="subtle">检查当前套餐、Plus 试用资格与账号可用优惠，支持多 Token 批量识别。</p></div>
+      <div><h2>Plus 免费试用</h2><p class="subtle">检查账号是否符合 Plus 1 个月免费试用资格；支持 v4（ChatGPT 直查）与 nerver 双渠道，支持批量。</p></div>
       <button class="btn secondary" type="button" :disabled="state.loading || batch.running || (!form.accessToken && !form.batchTokens && !state.result && !batch.results.length)" @click="emit('clear')">清空</button>
     </div>
 
@@ -87,7 +84,14 @@ function batchCheck() {
           <button type="button" :class="['exit-option', { active: mode === 'batch' }]" :disabled="state.loading || batch.running" @click="mode = 'batch'">批量检测</button>
         </div>
       </div>
-      <div class="plus-mode" role="group" aria-label="检测网络模式">
+      <div class="plus-mode" role="group" aria-label="检测渠道">
+        <span class="exit-label">检测渠道</span>
+        <div class="exit-options">
+          <button type="button" :class="['exit-option', { active: !isNerver }]" :disabled="state.loading || batch.running" @click="form.channel = 'v4'">v4 接口</button>
+          <button type="button" :class="['exit-option', { active: isNerver }]" :disabled="state.loading || batch.running" @click="form.channel = 'nerver'">nerver 接口</button>
+        </div>
+      </div>
+      <div v-if="!isNerver" class="plus-mode" role="group" aria-label="检测网络模式">
         <span class="exit-label">检测网络</span>
         <div class="exit-options">
           <button type="button" :class="['exit-option', { active: !form.useConfiguredProxy }]" :disabled="state.loading || batch.running" @click="form.useConfiguredProxy = false">本机直连</button>
@@ -108,7 +112,7 @@ function batchCheck() {
         <button class="btn primary plus-check-button" type="button" :disabled="state.loading || !String(form.accessToken || '').trim()" @click="check">{{ state.loading ? "检测中…" : "开始检测" }}</button>
       </div>
 
-      <div v-if="state.loading" class="plus-check-loading"><span></span><strong>正在读取账号资格与优惠活动</strong></div>
+      <div v-if="state.loading" class="plus-check-loading"><span></span><strong>正在读取账号免费试用资格</strong></div>
       <div v-if="state.error" class="plus-check-error">{{ state.error }}</div>
 
       <div v-if="state.result" :class="['plus-check-result', resultTone]">
@@ -119,24 +123,13 @@ function batchCheck() {
         <div class="plus-result-metrics">
           <div><span>账号状态</span><strong>{{ statusText(state.result.status) }}</strong></div>
           <div><span>当前套餐</span><strong>{{ String(state.result.plan_type || 'free').toUpperCase() }}</strong></div>
-          <div><span>Plus 试用</span><strong>{{ state.result.eligible ? "有资格" : "无资格" }}</strong></div>
-          <div><span>优惠活动</span><strong>{{ state.result.has_promotion ? `有 · ${state.result.promotion_count || offers.length}` : "没有" }}</strong></div>
-          <div><span>活动代码</span><strong>{{ state.result.promo_campaign_id || '-' }}</strong></div>
-          <div><span>检测出口</span><strong>{{ state.result.proxy_country || state.result.proxy_mode || 'direct' }}</strong></div>
+          <div><span>免费试用</span><strong>{{ state.result.eligible ? "有资格" : "无资格" }}</strong></div>
+          <div><span>检测渠道</span><strong>{{ channelText }}</strong></div>
         </div>
 
         <div class="plus-result-detail">
           <span>判定依据</span><code>{{ state.result.reason || '-' }}</code>
           <span>请求耗时</span><code>{{ state.result.elapsed_seconds ?? '-' }}s</code>
-        </div>
-
-        <div class="plus-offers">
-          <div class="plus-offers-head"><strong>优惠活动明细</strong><span>{{ offers.length }} 项</span></div>
-          <div v-if="!offers.length" class="plus-offers-empty">当前账号未返回优惠活动。</div>
-          <article v-for="([name, offer]) in offers" :key="name">
-            <div><strong>{{ name }}</strong><code>{{ campaignId(offer) }}</code></div>
-            <pre>{{ campaignDetail(offer) }}</pre>
-          </article>
         </div>
       </div>
     </template>
@@ -150,6 +143,7 @@ function batchCheck() {
           </label>
           <div class="plus-batch-side">
             <div class="plus-batch-count"><span>已识别</span><b>{{ parsedCount }}</b><span>个 Token</span></div>
+            <label class="plus-workers-field"><span>并发</span><input v-model.number="form.workers" type="number" min="1" max="20" :disabled="batch.running" /></label>
             <div class="plus-batch-actions">
               <button class="btn primary" type="button" :disabled="batch.running || !parsedCount" @click="batchCheck">{{ batch.running ? "检测中…" : "开始批量检测" }}</button>
               <button v-if="batch.running" class="btn danger" type="button" @click="emit('batch-stop')">停止</button>
@@ -173,7 +167,7 @@ function batchCheck() {
         <div v-if="batch.results.length" class="plus-batch-table">
           <table>
             <thead>
-              <tr><th>#</th><th>Token</th><th>状态</th><th>套餐</th><th>试用资格</th><th>优惠</th><th>耗时</th><th>说明</th></tr>
+              <tr><th>#</th><th>Token</th><th>状态</th><th>套餐</th><th>免费试用</th><th>耗时</th><th>说明</th></tr>
             </thead>
             <tbody>
               <tr v-for="(row, index) in batch.results" :key="index" :class="{ 'row-err': !row.ok }">
@@ -182,13 +176,13 @@ function batchCheck() {
                 <td>
                   <span v-if="!row.ok" class="pill failed">失败</span>
                   <span v-else-if="row.banned" class="pill failed">已封号</span>
+                  <span v-else-if="row.status === 'at_expired'" class="pill failed">AT 已过期</span>
                   <span v-else-if="row.plusActive" class="pill run">Plus 生效</span>
                   <span v-else-if="row.eligible" class="pill success">可领试用</span>
                   <span v-else class="pill">无资格</span>
                 </td>
                 <td class="mono">{{ row.ok && row.plan ? String(row.plan).toUpperCase() : "-" }}</td>
                 <td>{{ row.ok ? (row.eligible ? "有" : "无") : "-" }}</td>
-                <td class="mono">{{ row.ok ? row.promotions : "-" }}</td>
                 <td class="mono">{{ row.elapsed != null ? row.elapsed + "s" : "-" }}</td>
                 <td class="plus-batch-note" :title="row.error || row.reason || ''">{{ row.error || row.reason || "-" }}</td>
               </tr>
@@ -199,3 +193,18 @@ function batchCheck() {
     </template>
   </section>
 </template>
+
+<style scoped>
+.plus-workers-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+.plus-workers-field span {
+  color: var(--text-dim, #8b8b8b);
+}
+.plus-workers-field input {
+  width: 76px;
+}
+</style>

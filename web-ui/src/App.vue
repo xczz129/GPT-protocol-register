@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, reactive, ref, shallowRef } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from "vue";
 import { LogOut, Menu, RefreshCw } from "@lucide/vue";
 import { api, apiUrl, downloadPost, jsonBody } from "./api.js";
 import AccountsView from "./components/AccountsView.vue";
@@ -33,8 +33,7 @@ const views = {
   fingerprint: ["指纹浏览器", "检查可用运行环境并管理指纹参数"],
   mail: ["邮箱池", "维护 Outlook、iCloud、域名邮箱、Maddy 与 Fastmail"],
   proxy: ["代理设置", "配置注册出站、资源代理与清障服务"],
-  "trial-proxy": ["资格代理", "为 0元资格检测单独设置按国家划分的出口代理"],
-  "plus-eligibility": ["Plus 试用资格", "使用 Access Token 检查当前套餐、试用资格和优惠活动"],
+  "plus-eligibility": ["Plus 免费试用", "检查账号是否符合 Plus 1 个月免费试用；支持 v4 与 nerver 双渠道"],
   chatgpt2api: ["chatgpt2api", "管理账号自动上传与连接状态"],
   logs: ["实时日志", "查看任务执行过程与异常信息"],
   accounts: ["账号记录", "搜索、分页、测活并导出已注册账号"],
@@ -100,6 +99,7 @@ const rebindProgress = reactive({ jobId: "", running: false, stopping: false, st
 const rebindChecking = ref(false);
 const rebindRequestBusy = ref(false);
 const trialProgress = reactive({ running: false, total: 0, done: 0, current: "", eligible: 0, ineligible: 0, failed: 0, stopped: 0, jobId: "" });
+const refreshAtProgress = reactive({ running: false, total: 0, done: 0, current: "", refreshed: 0, unchanged: 0, failed: 0, stopped: 0, jobId: "" });
 let noticeTimer = null;
 let dialogResolve = null;
 let passwordChangeDialogResolve = null;
@@ -120,6 +120,7 @@ let rebindJobId = "";
 let rebindCompletionAnnounced = "";
 let rebindInputGeneration = 0;
 let trialProgressTimer = null;
+let refreshAtProgressTimer = null;
 let streamReconnectTimer = null;
 let streamSeeded = false;
 let logStreamVersion = 0;
@@ -196,7 +197,26 @@ const mailForms = reactive({
 });
 const proxyForm = reactive({ enabled: false, rotate: true, mode: "single_proxy", url: "", resourceUrl: "", clearanceMode: "none", flareUrl: "", flareProxy: "", poolFile: "data/proxy_pool.txt", poolText: "", poolTextTouched: false, poolTextComplete: false, poolCount: 0, poolUniqueCount: 0, selectedCountry: "", countries: [], countryPoolPath: "" });
 const trialProxyForm = reactive({ selected_country: "", countries: [] });
-const tokenEligibilityForm = reactive({ accessToken: "", batchTokens: "", useConfiguredProxy: true });
+const tokenEligibilityForm = reactive({ accessToken: "", batchTokens: "", useConfiguredProxy: true, channel: "v4", workers: 20 });
+let tokenEligibilitySynced = false;
+// 页面上切换检测渠道时，立即保存为默认渠道，账号列表的资格检测弹窗会跟随此默认值
+watch(() => tokenEligibilityForm.channel, async (value) => {
+  const channel = value === "nerver" ? "nerver" : "v4";
+  try {
+    if (!uiSettingsLoaded) await loadUiSettings();
+    if (uiSettings.value.trial_channel === channel) return;
+    const payload = {
+      health_workers: Number(uiSettings.value.health_workers) || 10,
+      reauth_workers: Number(uiSettings.value.reauth_workers) || 3,
+      trial_workers: Math.max(1, Math.min(20, Math.floor(Number(uiSettings.value.trial_workers) || 20))),
+      refresh_at_workers: Math.max(1, Math.min(10, Math.floor(Number(uiSettings.value.refresh_at_workers) || 10))),
+      reauth_mode: uiSettings.value.reauth_mode === "browser" ? "browser" : "protocol",
+      trial_channel: channel,
+    };
+    await api("/api/ui-settings", { method: "PUT", body: jsonBody(payload) });
+    uiSettings.value = payload;
+  } catch {}
+});
 const tokenEligibility = reactive({ loading: false, error: "", result: null, batch: { running: false, total: 0, done: 0, current: "", results: [], stopped: false } });
 const integrationForm = reactive({ enabled: false, autoUpload: true, url: "", key: "", groupId: "" });
 const maintenanceForm = reactive({ enabled: false, intervalHours: 12, workers: 10, autoDeleteInvalid: false, webhookUrl: "", notifyOnComplete: false, notifyOnPoolLow: false, poolLowThreshold: 3 });
@@ -263,6 +283,7 @@ function navigate(name, updateHash = true) {
     if (reservationId) void releaseRebindReservation(reservationId);
     resetRebindPreflight();
   }
+  if (name === "trial-proxy") name = "plus-eligibility";
   active.value = views[name] ? name : "task";
   sidebarOpen.value = false;
   document.title = `${title.value} · GPT Register FP`;
@@ -884,8 +905,15 @@ async function loadActiveView() {
   if (active.value === "task") return loadTasks();
   if (active.value === "fingerprint") return loadCapabilities();
   if (active.value === "mail") return loadMailboxes();
-  if (active.value === "trial-proxy") return loadTrialProxyPool();
-  if (active.value === "plus-eligibility") return Promise.resolve();
+  if (active.value === "plus-eligibility") {
+    if (!tokenEligibilitySynced) {
+      if (!uiSettingsLoaded) await loadUiSettings();
+      tokenEligibilityForm.channel = uiSettings.value.trial_channel === "nerver" ? "nerver" : "v4";
+      tokenEligibilityForm.workers = Math.max(1, Math.min(20, Math.floor(Number(uiSettings.value.trial_workers) || 20)));
+      tokenEligibilitySynced = true;
+    }
+    return loadTrialProxyPool();
+  }
   if (active.value === "accounts") return Promise.all([loadAccounts(), resumeHealthProgress()]);
   if (active.value === "credential-export" || active.value === "protocol-login") return loadAccounts();
   if (active.value === "rebind") return resumeRebindProgress();
@@ -920,7 +948,7 @@ async function initialize() {
     ]);
     if (!activeLoad) await loadActiveView();
     fillForms();
-    await Promise.all([resumeHealthProgress(), resumeReauthProgress(), resumeTrialProgress()]);
+    await Promise.all([resumeHealthProgress(), resumeReauthProgress(), resumeTrialProgress(), resumeRefreshAtProgress()]);
     connectStream();
   } catch (error) {
     notify(error.message, "err");
@@ -1212,10 +1240,10 @@ async function checkTokenEligibility() {
   try {
     const result = await api("/api/trial-eligibility/check-token", {
       method: "POST",
-      body: jsonBody({ access_token: accessToken, use_configured_proxy: !!tokenEligibilityForm.useConfiguredProxy }),
+      body: jsonBody({ access_token: accessToken, use_configured_proxy: !!tokenEligibilityForm.useConfiguredProxy, channel: tokenEligibilityForm.channel === "nerver" ? "nerver" : "v4" }),
     });
     tokenEligibility.result = result;
-    notify(result.eligible ? "检测完成：可领 Plus 免费试用" : result.has_promotion ? "检测完成：发现可用优惠" : result.label || "检测完成：当前没有可用优惠", result.is_deactivated ? "err" : "ok");
+    notify(result.eligible ? "检测完成：可领 Plus 免费试用" : result.label || "检测完成：无免费试用", result.is_deactivated || result.status === "at_expired" ? "err" : "ok");
   } catch (error) {
     tokenEligibility.error = error?.message || "Plus 资格检测失败";
     notify(tokenEligibility.error, "err");
@@ -1255,7 +1283,8 @@ async function startBatchTokenEligibility() {
     return;
   }
   Object.assign(batch, { running: true, total: tokens.length, done: 0, results: [], stopped: false });
-  const chunkSize = 8;
+  const workers = Math.max(1, Math.min(20, Math.floor(Number(tokenEligibilityForm.workers) || 20)));
+  const chunkSize = workers;
   try {
     for (let offset = 0; offset < tokens.length; offset += chunkSize) {
       if (batch.stopped) break;
@@ -1263,7 +1292,7 @@ async function startBatchTokenEligibility() {
       try {
         const data = await api("/api/trial-eligibility/check-tokens", {
           method: "POST",
-          body: jsonBody({ access_tokens: chunk, use_configured_proxy: !!tokenEligibilityForm.useConfiguredProxy, workers: 4 }),
+          body: jsonBody({ access_tokens: chunk, use_configured_proxy: !!tokenEligibilityForm.useConfiguredProxy, channel: tokenEligibilityForm.channel === "nerver" ? "nerver" : "v4", workers }),
         });
         for (const row of data?.results || []) {
           batch.results.push({
@@ -1933,14 +1962,14 @@ async function healthAccounts(keys, options = {}) {
   }
   const requestCount = all ? Math.max(knownTotal, targetKeys.length) : targetKeys.length;
   const savedHealthWorkers = Math.max(1, Math.min(20, Math.floor(Number(uiSettings.value.health_workers) || 10)));
-  const pickedWorkers = await openConcurrencyDialog({
+  const picked = await openConcurrencyDialog({
     title,
     message: options.description || `请求 ${requestCount} 条账号记录，已封号记录自动跳过。`,
     value: savedHealthWorkers,
     kind: "health",
   });
-  if (!pickedWorkers) return;
-  const workers = Math.max(1, Math.min(20, Math.floor(Number(pickedWorkers) || savedHealthWorkers)));
+  if (!picked) return;
+  const workers = Math.max(1, Math.min(20, Math.floor(Number(picked.workers) || savedHealthWorkers)));
   Object.assign(healthProgress, { running: true, requested: requestCount, actualTotal: Math.max(0, requestCount - knownSkipped), total: Math.max(0, requestCount - knownSkipped), done: 0, checked: 0, usable: 0, unavailable: knownSkipped, skippedKnownDeactivated: knownSkipped, deactivated: knownSkipped, invalidOther: 0, current: `${workers} 路协议请求并发`, alive: 0, limited: 0, invalid: 0, reauthRequired: 0, error: 0, requestedWorkers: workers, workers, throttled: false, resourceMode: "normal", updates: [] });
   startHealthProgressPolling();
   healthRequestActive = true;
@@ -2004,9 +2033,25 @@ async function trialEligibilityAccounts(payload = {}) {
   const targetKeys = Array.isArray(payload.keys) ? payload.keys.filter((key) => freeKeys.has(key)) : [];
   if (!payload.all_accounts && !targetKeys.length) return;
   const count = payload.all_accounts ? freeKeys.size : targetKeys.length;
-  if (!await confirmInside(`将按资格代理配置检测 ${count} 个 Free 账号的 0元资格；Plus 账号自动跳过，检测在后台执行。`, { title: "0元资格检测", confirmText: "开始检测" })) return;
+  const savedTrialWorkers = Math.max(1, Math.min(20, Math.floor(Number(uiSettings.value.trial_workers) || 20)));
+  const savedTrialChannel = uiSettings.value.trial_channel === "nerver" ? "nerver" : "v4";
+  const picked = await openConcurrencyDialog({
+    title: "Plus 免费试用检测",
+    message: `将检测 ${count} 个 Free 账号的 Plus 免费试用资格；Plus 账号自动跳过，检测在后台执行。`,
+    value: savedTrialWorkers,
+    kind: "trial",
+    max: 20,
+    mode: savedTrialChannel,
+    modeOptions: [{ value: "v4", label: "v4 接口" }, { value: "nerver", label: "nerver 接口" }],
+    modeMessages: {
+      v4: `将按资格代理配置走 ChatGPT v4 接口检测 ${count} 个 Free 账号；Plus 账号自动跳过。`,
+      nerver: `将通过 nerver 接口检测 ${count} 个 Free 账号的免费试用资格（无需代理）；Plus 账号自动跳过。`,
+    },
+  });
+  if (!picked) return;
+  const trialChannel = picked.mode === "nerver" ? "nerver" : "v4";
   try {
-    const job = await api("/api/accounts/trial-eligibility", { method: "POST", body: jsonBody({ keys: targetKeys, all_accounts: !!payload.all_accounts, force: !!payload.force, concurrency: 5 }) });
+    const job = await api("/api/accounts/trial-eligibility", { method: "POST", body: jsonBody({ keys: targetKeys, all_accounts: !!payload.all_accounts, force: !!payload.force, concurrency: Math.max(1, Math.min(20, Math.floor(Number(picked.workers) || savedTrialWorkers))), channel: trialChannel }) });
     applyTrialProgress(job);
     pollTrialProgress();
   } catch (error) { notify(error?.message || "资格检测启动失败", "err"); }
@@ -2033,25 +2078,89 @@ async function pollTrialProgress() {
     notify(`0元资格检测完成：符合 ${trialProgress.eligible}，不符合 ${trialProgress.ineligible}，失败 ${trialProgress.failed}`, trialProgress.failed ? "err" : "ok");
   } catch (error) { trialProgressTimer = setTimeout(pollTrialProgress, 1800); }
 }
+async function refreshAtAccounts(payload = {}) {
+  if (accountLoadError.value) {
+    notify("账号列表加载不完整，请点击刷新列表重试后再刷新 AT", "err");
+    return;
+  }
+  if (accountsLoading.value) {
+    try { await loadAccounts(); } catch (error) { notify(error?.message || "账号列表仍在加载，暂时无法刷新 AT", "err"); return; }
+  }
+  const explicitKeys = Array.isArray(payload?.keys) ? payload.keys.filter(Boolean) : [];
+  const all = !explicitKeys.length && !!payload?.all_accounts;
+  if (!explicitKeys.length && !all) return;
+  const savedWorkers = Math.max(1, Math.min(10, Math.floor(Number(uiSettings.value.refresh_at_workers) || 10)));
+  let workers = 1;
+  if (explicitKeys.length > 1 || all) {
+    const targetLabel = all ? "全部临期/过期账号" : `${explicitKeys.length} 个账号`;
+    const picked = await openConcurrencyDialog({
+      title: "刷新 AT",
+      message: `将通过 Session Token 为${targetLabel}重签 Access Token；已封号、无 Session 的账号自动跳过，刷新在后台执行。`,
+      value: savedWorkers,
+      kind: "refresh_at",
+      max: 10,
+    });
+    if (!picked) return;
+    workers = Math.max(1, Math.min(10, Math.floor(Number(picked.workers) || savedWorkers)));
+  }
+  try {
+    const job = await api("/api/accounts/refresh-at", { method: "POST", body: jsonBody({ keys: explicitKeys, all_accounts: all, concurrency: workers }) });
+    applyRefreshAtProgress(job);
+    pollRefreshAtProgress();
+  } catch (error) { notify(error?.message || "刷新 AT 启动失败", "err"); }
+}
+function applyRefreshAtProgress(job) {
+  Object.assign(refreshAtProgress, { jobId: job.job_id || "", running: ["queued", "running", "stopping"].includes(job.status), total: Number(job.total || 0), done: Number(job.done || 0), current: job.current || "", refreshed: Number(job.refreshed || 0), unchanged: Number(job.unchanged || 0), failed: Number(job.failed || 0), stopped: Number(job.stopped || 0) });
+}
+async function resumeRefreshAtProgress() {
+  try {
+    const result = await api("/api/accounts/refresh-at/progress");
+    if (!result?.job?.job_id) return;
+    applyRefreshAtProgress(result.job);
+    if (refreshAtProgress.running) pollRefreshAtProgress();
+  } catch {}
+}
+async function pollRefreshAtProgress() {
+  if (!refreshAtProgress.jobId) return;
+  clearTimeout(refreshAtProgressTimer);
+  try {
+    const job = await api(`/api/accounts/refresh-at/${encodeURIComponent(refreshAtProgress.jobId)}`);
+    applyRefreshAtProgress(job);
+    if (refreshAtProgress.running) { refreshAtProgressTimer = setTimeout(pollRefreshAtProgress, 900); return; }
+    await loadAccounts();
+    notify(`刷新 AT 完成：已刷新 ${refreshAtProgress.refreshed}，AT 未变化 ${refreshAtProgress.unchanged}，失败 ${refreshAtProgress.failed}`, refreshAtProgress.failed ? "err" : "ok");
+  } catch (error) { refreshAtProgressTimer = setTimeout(pollRefreshAtProgress, 1800); }
+}
 async function reauthAccounts(request) {
-  const targetKeys = [...(Array.isArray(request) ? request : request?.keys || [])].filter(Boolean);
-  const mode = request?.mode === "browser" ? "browser" : "protocol";
-  const modeLabel = mode === "protocol" ? "协议" : "浏览器";
+  const explicitKeys = [...(Array.isArray(request) ? request : request?.keys || [])].filter(Boolean);
+  const allKeys = accounts.value.filter((item) => item?.reauth_available && item?.delete_key).map((item) => item.delete_key);
+  const targetKeys = explicitKeys.length ? explicitKeys : allKeys;
   if (!targetKeys.length || reauthProgress.running) return;
   const savedReauthWorkers = Math.max(1, Math.min(20, Math.floor(Number(uiSettings.value.reauth_workers) || 3)));
-  const pickedConcurrency = await openConcurrencyDialog({
-    title: `重新登录账号 · ${modeLabel}`,
-    message: mode === "protocol"
-      ? `将 ${targetKeys.length} 个账号使用已保存的密码和 TOTP 2FA 重新登录，不读取邮箱验证码。`
-      : `将 ${targetKeys.length} 个账号使用浏览器重新登录并读取邮箱验证码。`,
-    value: savedReauthWorkers || Math.max(1, Math.floor(Number(request?.concurrency) || 3)),
+  const requestedMode = request?.mode === "browser" || request?.mode === "protocol" ? request.mode : (uiSettings.value.reauth_mode === "browser" ? "browser" : "protocol");
+  const credentialKeys = new Set(accounts.value.filter((item) => item?.has_password && item?.has_totp && item?.delete_key).map((item) => item.delete_key));
+  const protocolCount = targetKeys.filter((key) => credentialKeys.has(key)).length;
+  const picked = await openConcurrencyDialog({
+    title: "重新登录账号",
+    value: savedReauthWorkers,
     kind: "reauth",
+    mode: requestedMode,
+    modeOptions: [{ value: "protocol", label: "协议" }, { value: "browser", label: "浏览器" }],
+    modeMessages: {
+      protocol: protocolCount
+        ? `将 ${protocolCount} 个账号使用已保存的密码和 TOTP 2FA 重新登录，不读取邮箱验证码。`
+        : "所选账号没有同时保存密码和 TOTP 2FA 的记录，请改用浏览器方式。",
+      browser: `将 ${targetKeys.length} 个账号使用浏览器重新登录并读取邮箱验证码。`,
+    },
   });
-  if (!pickedConcurrency) return;
-  const concurrency = Math.max(1, Math.floor(Number(pickedConcurrency) || 3));
-  Object.assign(reauthProgress, { running: true, stopping: false, mode, operation: "reauth", concurrency, total: targetKeys.length, done: 0, current: `${concurrency} 路并发`, success: 0, failed: 0, cancelled: 0, last: "", lastStatus: "", lastMessage: "" });
+  if (!picked) return;
+  const mode = picked.mode === "browser" ? "browser" : "protocol";
+  const concurrency = Math.max(1, Math.floor(Number(picked.workers) || 3));
+  const finalKeys = mode === "protocol" ? targetKeys.filter((key) => credentialKeys.has(key)) : targetKeys;
+  if (!finalKeys.length) { notify("所选账号没有同时保存密码和 TOTP 2FA 的记录，无法走协议登录", "err"); return; }
+  Object.assign(reauthProgress, { running: true, stopping: false, mode, operation: "reauth", concurrency, total: finalKeys.length, done: 0, current: `${concurrency} 路并发`, success: 0, failed: 0, cancelled: 0, last: "", lastStatus: "", lastMessage: "" });
   try {
-    const value = await api("/api/accounts/reauth/start", { method: "POST", body: jsonBody({ keys: targetKeys, mode, concurrency }) });
+    const value = await api("/api/accounts/reauth/start", { method: "POST", body: jsonBody({ keys: finalKeys, mode, concurrency }) });
     reauthCompletionAnnounced = "";
     applyReauthProgress(value);
     scheduleReauthProgressPoll(250, true);
@@ -2122,9 +2231,15 @@ async function startProtocolLoginByEmail(request = {}) {
 }
 async function repairSecurityAccounts(request) {
   const targetKeys = [...(Array.isArray(request) ? request : request?.keys || [])].filter(Boolean);
-  const concurrency = Math.max(1, Math.floor(Number(request?.concurrency) || 3));
   if (!targetKeys.length || reauthProgress.running) return;
-  if (!await confirmInside(`将 ${targetKeys.length} 个账号按 ${concurrency} 路并发补全缺失的密码和 TOTP 2FA，已存在字段会跳过。`, { title: "补全账号安全字段", confirmText: "开始补全" })) return;
+  const picked = await openConcurrencyDialog({
+    title: "补全账号安全字段",
+    message: `将 ${targetKeys.length} 个账号补全缺失的密码和 TOTP 2FA，已存在字段会跳过。`,
+    value: Math.max(1, Math.min(20, Math.floor(Number(uiSettings.value.reauth_workers) || 3))),
+    kind: "reauth",
+  });
+  if (!picked) return;
+  const concurrency = Math.max(1, Math.floor(Number(picked.workers) || 3));
   Object.assign(reauthProgress, { running: true, stopping: false, mode: "protocol", operation: "security_repair", concurrency, total: targetKeys.length, done: 0, current: `${concurrency} 路并发`, success: 0, failed: 0, cancelled: 0, last: "", lastStatus: "", lastMessage: "" });
   try {
     const value = await api("/api/accounts/security-repair/start", { method: "POST", body: jsonBody({ keys: targetKeys, mode: "protocol", concurrency }) });
@@ -2139,7 +2254,6 @@ async function repairSecurityAccounts(request) {
 }
 async function startAccountSecurityBatch(request, operation) {
   const targetKeys = [...(Array.isArray(request) ? request : request?.keys || [])].filter(Boolean);
-  const concurrency = Math.max(1, Math.floor(Number(request?.concurrency) || 3));
   if (!targetKeys.length || reauthProgress.running) return;
   let newPassword = "";
   let confirmPassword = "";
@@ -2150,10 +2264,17 @@ async function startAccountSecurityBatch(request, operation) {
     passwordMode = passwordSelection.passwordMode;
     newPassword = passwordSelection.newPassword || "";
     confirmPassword = passwordSelection.confirmPassword || "";
-  } else if (!await confirmInside(
-    `将 ${targetKeys.length} 个账号停用旧 2FA 因子并重新启用 TOTP，完成后会保存新的密钥。`,
-    { title: "修改账号 2FA", confirmText: "开始修改" },
-  )) return;
+  }
+  const picked = await openConcurrencyDialog({
+    title: operation === "password_change" ? "修改账号密码" : "修改账号 2FA",
+    message: operation === "password_change"
+      ? `将 ${targetKeys.length} 个账号按所选策略更新密码。`
+      : `将 ${targetKeys.length} 个账号停用旧 2FA 因子并重新启用 TOTP，完成后会保存新的密钥。`,
+    value: Math.max(1, Math.min(20, Math.floor(Number(uiSettings.value.reauth_workers) || 3))),
+    kind: "reauth",
+  });
+  if (!picked) return;
+  const concurrency = Math.max(1, Math.floor(Number(picked.workers) || 3));
   const operationLabel = operation === "password_change" ? "修改密码" : "修改 2FA";
   Object.assign(reauthProgress, {
     running: true,
@@ -2358,6 +2479,19 @@ async function copyAccessToken(account) {
   }
 }
 
+async function copySessionToken(account) {
+  if (!account?.delete_key || !account.has_session_token || copyingAccessToken.value) return;
+  copyingAccessToken.value = true;
+  try {
+    const result = await api("/api/accounts/credentials", { method: "POST", body: jsonBody({ key: account.delete_key, field: "session_token" }) });
+    await copyOrReveal(result.value, { title: `复制 ${account.email || "账号"} 的 Session`, successMessage: "Session Token 已复制" });
+  } catch (error) {
+    notify(error?.message || "Session 复制失败", "err");
+  } finally {
+    copyingAccessToken.value = false;
+  }
+}
+
 async function copyAccountCredential(account, field) {
   if (!account?.delete_key || !field) return;
   try {
@@ -2553,15 +2687,16 @@ function smsCountryIds() { const text = smsForm.provider === "firefox" ? smsForm
 const smsCountries = computed(() => { if (smsForm.provider === "firefox") { const dock = String(smsForm.firefoxDockingCode || "").trim(); return dock ? [dock] : []; } const list = String(smsForm.countryOrder || "").split(/[,,]/).map((s) => s.trim()).filter(Boolean); return list.map((raw) => { const parsed = parseSmsCountryToken(raw); const id = parsed?.id || raw; const hit = (smsCountryDialog.items || []).find((item) => String(item.id) === String(id)); const label = hit ? `${hit.name}${hit.calling || ""}` : id; if (parsed?.providerId) { const pids = String(parsed.providerId).split(",").map((p) => `#${p.trim()}`).filter(Boolean); return `${label} ${pids.join("→")}`; } if (parsed?.price) { return `${label}≤$${parsed.price}`; } return label; }); });
 async function openSmsCountryPicker() { smsCountryDialog.open = true; smsCountryDialog.loading = true; smsCountryDialog.error = ""; smsCountryDialog.selected = []; smsCountryDialog.items = []; for (const raw of smsCountryIds()) { const parsed = parseSmsCountryToken(raw); if (!parsed?.id) continue; smsCountryDialog.selected.push(parsed.id); if (parsed.price) { smsCountryPrices[parsed.id] = parsed.price; } else { delete smsCountryPrices[parsed.id]; } if (parsed.providerId) { smsCountryProviders[parsed.id] = parsed.providerId; } else { delete smsCountryProviders[parsed.id]; } } try { const value = await api(`/api/sms-countries?provider=${encodeURIComponent(smsForm.provider)}`); smsCountryDialog.items = value.items || []; } catch (error) { smsCountryDialog.error = error?.message || "获取国家列表失败"; } finally { smsCountryDialog.loading = false; } }
 function toggleSmsCountry(id) { const value = String(id); const list = smsCountryDialog.selected; const index = list.indexOf(value); if (index >= 0) { list.splice(index, 1); delete smsCountryPrices[value]; delete smsCountryProviders[value]; } else { list.push(value); } rebuildSmsCountryOrder(); }
-const uiSettings = ref({ health_workers: 10, reauth_workers: 3 });
+const uiSettings = ref({ health_workers: 10, reauth_workers: 3, trial_workers: 20, refresh_at_workers: 10, reauth_mode: "protocol", trial_channel: "v4" });
 let uiSettingsLoaded = false;
 async function loadUiSettings() { try { const value = await api("/api/ui-settings"); uiSettings.value = value || {}; uiSettingsLoaded = true; } catch {} }
-const concurrencyDialog = reactive({ open: false, title: "", message: "", value: 10, kind: "health" });
+const concurrencyDialog = reactive({ open: false, title: "", message: "", value: 10, kind: "health", max: 20, mode: "protocol", modeOptions: [], modeMessages: {} });
 let concurrencyDialogResolve = null;
-async function openConcurrencyDialog({ title, message, value, kind }) {
+async function openConcurrencyDialog({ title, message, value, kind, max, mode, modeOptions, modeMessages }) {
   if (!uiSettingsLoaded) await loadUiSettings();
   if (concurrencyDialogResolve) { const stale = concurrencyDialogResolve; concurrencyDialogResolve = null; stale(null); }
-  Object.assign(concurrencyDialog, { open: true, title: title || "并发设置", message: message || "", value: Math.max(1, Math.min(20, Math.floor(Number(value) || 1))), kind: kind || "health" });
+  const ceiling = Math.max(1, Math.floor(Number(max) || 20));
+  Object.assign(concurrencyDialog, { open: true, title: title || "并发设置", message: message || "", value: Math.max(1, Math.min(ceiling, Math.floor(Number(value) || 1))), kind: kind || "health", max: ceiling, mode: mode || "protocol", modeOptions: Array.isArray(modeOptions) ? modeOptions : [], modeMessages: modeMessages && typeof modeMessages === "object" ? modeMessages : {} });
   return new Promise((resolve) => { concurrencyDialogResolve = resolve; });
 }
 function closeConcurrencyDialog(result) {
@@ -2570,11 +2705,24 @@ function closeConcurrencyDialog(result) {
   concurrencyDialogResolve = null;
   resolve?.(result);
 }
-async function saveConcurrencyDefault(value) {
-  const workers = Math.max(1, Math.min(20, Math.floor(Number(value) || 1)));
-  const payload = { health_workers: Number(uiSettings.value.health_workers) || 10, reauth_workers: Number(uiSettings.value.reauth_workers) || 3 };
-  if (concurrencyDialog.kind === "health") { payload.health_workers = workers; } else { payload.reauth_workers = workers; }
-  try { await api("/api/ui-settings", { method: "PUT", body: jsonBody(payload) }); uiSettings.value = payload; notify("并发默认值已保存", "ok"); } catch (error) { notify(error?.message || "保存失败", "err"); }
+async function saveConcurrencyDefault(pick) {
+  const picked = pick && typeof pick === "object" ? pick : { workers: pick };
+  const ceiling = Math.max(1, Math.floor(Number(concurrencyDialog.max) || 20));
+  const workers = Math.max(1, Math.min(ceiling, Math.floor(Number(picked.workers) || 1)));
+  const mode = picked.mode === "browser" ? "browser" : "protocol";
+  const payload = {
+    health_workers: Number(uiSettings.value.health_workers) || 10,
+    reauth_workers: Number(uiSettings.value.reauth_workers) || 3,
+    trial_workers: Math.max(1, Math.min(20, Math.floor(Number(uiSettings.value.trial_workers) || 20))),
+    refresh_at_workers: Math.max(1, Math.min(10, Math.floor(Number(uiSettings.value.refresh_at_workers) || 10))),
+    reauth_mode: uiSettings.value.reauth_mode === "browser" ? "browser" : "protocol",
+    trial_channel: uiSettings.value.trial_channel === "nerver" ? "nerver" : "v4",
+  };
+  if (concurrencyDialog.kind === "health") { payload.health_workers = workers; }
+  else if (concurrencyDialog.kind === "trial") { payload.trial_workers = Math.min(20, workers); payload.trial_channel = picked.mode === "nerver" ? "nerver" : "v4"; }
+  else if (concurrencyDialog.kind === "refresh_at") { payload.refresh_at_workers = Math.min(10, workers); }
+  else { payload.reauth_workers = workers; payload.reauth_mode = mode; }
+  try { await api("/api/ui-settings", { method: "PUT", body: jsonBody(payload) }); uiSettings.value = payload; notify("默认值已保存", "ok"); } catch (error) { notify(error?.message || "保存失败", "err"); }
 }
 const importAccountsDialog = reactive({ open: false });
 async function submitImportAccounts(text) { const value = String(text || "").trim(); if (!value) return; await run(() => api("/api/codex-oauth/import", { method: "POST", body: jsonBody({ text: value }) }), "导入任务已启动"); importAccountsDialog.open = false; codexOauthDialog.open = true; stopCodexOauthPolling(); codexOauthTimer = setInterval(async () => { try { codexOauthStatus.value = await api("/api/codex-oauth/status"); if (!codexOauthStatus.value.running) stopCodexOauthPolling(); } catch { stopCodexOauthPolling(); } }, 2000); }
@@ -2624,6 +2772,7 @@ onBeforeUnmount(() => {
   stopHealthProgressPolling();
   clearTimeout(reauthProgressTimer);
   clearTimeout(rebindProgressTimer);
+  clearTimeout(refreshAtProgressTimer);
   if (!rebindProgress.running && !rebindRequestBusy.value && rebindPreflight.reservationId) {
     const reservationId = rebindPreflight.reservationId;
     resetRebindPreflight();
@@ -2660,11 +2809,13 @@ onBeforeUnmount(() => {
         <BrowserView v-else-if="active === 'fingerprint'" :config="config" :capabilities="capabilities" :busy="busy" @save="saveBrowser" @refresh="loadCapabilities" />
         <MailView v-else-if="active === 'mail'" :forms="mailForms" :mailboxes="mailboxes" :progress="progress" :busy="busy" @save-outlook="saveOutlook" @save-icloud="saveIcloud" @save-maddy="saveMaddyMail" @save-fastmail="saveFastmailMail" @load-maddy-domains="loadMaddyDomains" @load-fastmail-accounts="loadFastmailAccounts" @refresh="loadMailboxes" @delete="deleteMailboxes" @state="updateMailboxState" />
         <ProxyView v-else-if="active === 'proxy'" :form="proxyForm" :diagnostics="proxyDiagnostics" :progress="progress" :busy="busy" @save="saveProxy" @test="testProxies" />
-        <TrialProxyView v-else-if="active === 'trial-proxy'" :form="trialProxyForm" :busy="busy" @save="saveTrialProxyPool" @refresh="loadTrialProxyPool" />
-        <PlusEligibilityView v-else-if="active === 'plus-eligibility'" :form="tokenEligibilityForm" :state="tokenEligibility" @check="checkTokenEligibility" @clear="clearTokenEligibility" @batch-check="startBatchTokenEligibility" @batch-stop="stopBatchTokenEligibility" />
+        <template v-else-if="active === 'plus-eligibility'">
+          <PlusEligibilityView :form="tokenEligibilityForm" :state="tokenEligibility" @check="checkTokenEligibility" @clear="clearTokenEligibility" @batch-check="startBatchTokenEligibility" @batch-stop="stopBatchTokenEligibility" />
+          <TrialProxyView :form="trialProxyForm" :busy="busy" @save="saveTrialProxyPool" @refresh="loadTrialProxyPool" />
+        </template>
         <IntegrationView v-else-if="active === 'chatgpt2api'" :form="integrationForm" :groups="groups" :progress="progress" :busy="busy" @save="saveIntegration" @test="testIntegration" @upload="uploadIntegration" />
         <LogsView v-else-if="active === 'logs'" :logs="logs" :connected="connected" @refresh="loadLogs" @download="downloadLogs" @clear="logs = []" />
-        <AccountsView v-else-if="active === 'accounts'" :accounts="accounts" :accounts-loading="accountsLoading" :account-load-progress="accountLoadProgress" :account-load-error="accountLoadError" :groups="groups" :proxy-countries="proxyForm.countries" :busy="busy" :copying-at="copyingAccessToken" :health-progress="healthProgress" :reauth-progress="reauthProgress" :trial-progress="trialProgress" @refresh="loadAccounts" @health="healthAccounts" @trial-check="trialEligibilityAccounts" @reauth="reauthAccounts" @security-repair="repairSecurityAccounts" @password-change="changeAccountPasswords" @totp-change="changeAccountTotp" @account-logs="openAccountLogs" @stop-reauth="stopReauth" @delete="deleteAccounts" @delete-invalid="deleteInvalidAccounts" @download="downloadAccounts" @copy-selected-at="copySelectedAccessTokens" @export-selected-at="exportSelectedAccessTokens" @export-security="exportSecurityCredentials" @create-group="createAccountGroup" @rename-group="renameAccountGroup" @delete-group="deleteAccountGroup" @move-group="moveAccountsToGroup" @export-group="exportGroupCredentials" @copy-at="copyAccessToken" @copy-credential="copyAccountCredential" @copy-value="copyValue" @codex-oauth="runCodexOauth" @import-accounts="importAccountsDialog.open = true" :codex-oauth-running="codexOauthRunning" />
+        <AccountsView v-else-if="active === 'accounts'" :accounts="accounts" :accounts-loading="accountsLoading" :account-load-progress="accountLoadProgress" :account-load-error="accountLoadError" :groups="groups" :proxy-countries="proxyForm.countries" :busy="busy" :copying-at="copyingAccessToken" :health-progress="healthProgress" :reauth-progress="reauthProgress" :trial-progress="trialProgress" :refresh-at-progress="refreshAtProgress" @refresh="loadAccounts" @health="healthAccounts" @trial-check="trialEligibilityAccounts" @refresh-at="refreshAtAccounts" @reauth="reauthAccounts" @security-repair="repairSecurityAccounts" @password-change="changeAccountPasswords" @totp-change="changeAccountTotp" @account-logs="openAccountLogs" @stop-reauth="stopReauth" @delete="deleteAccounts" @delete-invalid="deleteInvalidAccounts" @download="downloadAccounts" @copy-selected-at="copySelectedAccessTokens" @export-selected-at="exportSelectedAccessTokens" @export-security="exportSecurityCredentials" @create-group="createAccountGroup" @rename-group="renameAccountGroup" @delete-group="deleteAccountGroup" @move-group="moveAccountsToGroup" @export-group="exportGroupCredentials" @copy-at="copyAccessToken" @copy-session="copySessionToken" @copy-credential="copyAccountCredential" @copy-value="copyValue" @codex-oauth="runCodexOauth" @import-accounts="importAccountsDialog.open = true" :codex-oauth-running="codexOauthRunning" />
         <RebindView v-else-if="active === 'rebind'" :progress="rebindProgress" :preflight="rebindPreflight" :busy="busy || rebindRequestBusy" :checking="rebindChecking" @preflight="preflightRebind" @start="startRebind" @stop="stopRebind" @reset="resetRebindForInput" @input-change="resetRebindForInput" />
         <CredentialExportView v-else-if="active === 'credential-export'" :accounts="accounts" :busy="busy" @export="exportSecurityByEmail" />
         <ProtocolLoginView v-else-if="active === 'protocol-login'" :accounts="accounts" :progress="reauthProgress" :health-progress="healthProgress" :preflight="protocolLoginPreflight" :busy="busy" @start="startProtocolLoginByEmail" @stop="stopReauth" @health="healthProtocolLoginEmails" @input-change="resetProtocolLoginResultsForInput" />
@@ -2676,7 +2827,7 @@ onBeforeUnmount(() => {
     <AppDialog :dialog="dialog" @confirm="closeDialog" @cancel="closeDialog(false)" />
     <PasswordChangeDialog :open="passwordChangeDialog.open" :count="passwordChangeDialog.count" @confirm="closePasswordChangeDialog" @cancel="closePasswordChangeDialog(false)" />
     <ClipboardDialog :open="clipboardDialog.open" :title="clipboardDialog.title" :value="clipboardDialog.value" @close="closeClipboardDialog" @copied="clipboardDialogCopied" />
-    <ConcurrencyDialog :open="concurrencyDialog.open" :title="concurrencyDialog.title" :message="concurrencyDialog.message" :value="concurrencyDialog.value" @confirm="closeConcurrencyDialog" @cancel="closeConcurrencyDialog(null)" @save="saveConcurrencyDefault" />
+    <ConcurrencyDialog :open="concurrencyDialog.open" :title="concurrencyDialog.title" :message="concurrencyDialog.message" :value="concurrencyDialog.value" :max="concurrencyDialog.max" :mode="concurrencyDialog.mode" :mode-options="concurrencyDialog.modeOptions" :mode-messages="concurrencyDialog.modeMessages" @confirm="closeConcurrencyDialog" @cancel="closeConcurrencyDialog(null)" @save="saveConcurrencyDefault" />
     <SmsCountryPicker :open="smsCountryDialog.open" :provider="smsForm.provider" :items="smsCountryDialog.items" :selected="smsCountryDialog.selected" :loading="smsCountryDialog.loading" :error="smsCountryDialog.error" :prices="smsCountryPrices" :providers="smsCountryProviders" @close="smsCountryDialog.open = false" @toggle="toggleSmsCountry" @set-price="setSmsCountryPrice" @set-provider="setSmsCountryProvider" />
     <ImportAccountsDialog :open="importAccountsDialog.open" :busy="busy" @close="importAccountsDialog.open = false" @submit="submitImportAccounts" />
     <CodexOauthDialog :open="codexOauthDialog.open" :status="codexOauthStatus" @close="closeCodexOauth" @stop="stopCodexOauth" @copy="codexCopyRt" />

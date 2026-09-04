@@ -4487,7 +4487,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
         config_token = protocol._MAIL_CONFIG.set(scoped_config)
         try:
             with patch(
-                "register.protocol.read_mail_code",
+                "register.protocol_context.read_mail_code",
                 return_value=None,
             ) as read_code:
                 result = protocol.wait_for_code(mailbox)
@@ -4544,10 +4544,10 @@ class ProtocolAndHealthTests(unittest.TestCase):
             return code
 
         with (
-            patch("register.protocol.create_mailbox", return_value=mailbox),
-            patch("register.protocol.wait_for_code", side_effect=read_code) as wait_code,
-            patch("register.protocol.mark_mailbox_result") as mailbox_result,
-            patch("register.protocol.step") as protocol_step,
+            patch("register.protocol_registrar.create_mailbox", return_value=mailbox),
+            patch("register.protocol_registrar.wait_for_code", side_effect=read_code) as wait_code,
+            patch("register.protocol_registrar.mark_mailbox_result") as mailbox_result,
+            patch("register.protocol_registrar.step") as protocol_step,
         ):
             result = registrar.register(1)
 
@@ -4610,8 +4610,8 @@ class ProtocolAndHealthTests(unittest.TestCase):
             return code
 
         with (
-            patch("register.protocol.wait_for_code", side_effect=read_code) as wait_code,
-            patch("register.protocol.step") as protocol_step,
+            patch("register.protocol_registrar.wait_for_code", side_effect=read_code) as wait_code,
+            patch("register.protocol_registrar.step") as protocol_step,
         ):
             result = registrar._complete_post_registration_password(
                 "retry@example.com",
@@ -4674,10 +4674,10 @@ class ProtocolAndHealthTests(unittest.TestCase):
 
         with (
             patch(
-                "register.protocol.wait_for_code",
+                "register.protocol_registrar.wait_for_code",
                 side_effect=read_reused_code,
             ),
-            patch("register.protocol.step"),
+            patch("register.protocol_registrar.step"),
         ):
             result = registrar._complete_post_registration_password(
                 "reused-code@example.com",
@@ -4730,10 +4730,10 @@ class ProtocolAndHealthTests(unittest.TestCase):
 
         with (
             patch(
-                "register.protocol.wait_for_code",
+                "register.protocol_registrar.wait_for_code",
                 side_effect=["111222", "333444"],
             ),
-            patch("register.protocol.step") as protocol_step,
+            patch("register.protocol_registrar.step") as protocol_step,
         ):
             result = registrar._complete_post_registration_password(
                 "invalid-state@example.com",
@@ -4788,10 +4788,10 @@ class ProtocolAndHealthTests(unittest.TestCase):
         )
 
         with (
-            patch("register.protocol.wait_for_code", return_value="123456"),
-            patch("register.protocol.random.uniform", return_value=2.0),
-            patch("register.protocol.time.sleep") as sleep,
-            patch("register.protocol.step") as protocol_step,
+            patch("register.protocol_registrar.wait_for_code", return_value="123456"),
+            patch("register.protocol_registrar.random.uniform", return_value=2.0),
+            patch("register.protocol_registrar.time.sleep") as sleep,
+            patch("register.protocol_registrar.step") as protocol_step,
         ):
             result = registrar._complete_post_registration_password(
                 "rate-limited@example.com",
@@ -4848,10 +4848,10 @@ class ProtocolAndHealthTests(unittest.TestCase):
 
         with (
             patch(
-                "register.protocol.wait_for_code",
+                "register.protocol_registrar.wait_for_code",
                 side_effect=["111222", "333444"],
             ),
-            patch("register.protocol.step"),
+            patch("register.protocol_registrar.step"),
         ):
             with self.assertRaisesRegex(RuntimeError, "password_reset_required"):
                 registrar._complete_post_registration_password(
@@ -6032,11 +6032,11 @@ class ProtocolAndHealthTests(unittest.TestCase):
             },
         )()
         with (
-            patch("register.protocol.step"),
-            patch("register.protocol.wait_for_code", return_value="123456"),
-            patch("register.protocol.validate_otp", return_value=(response, "")),
+            patch("register.protocol_registrar.step"),
+            patch("register.protocol_registrar.wait_for_code", return_value="123456"),
+            patch("register.protocol_registrar.validate_otp", return_value=(response, "")),
             patch(
-                "register.protocol.exchange_tokens_from_continue_url",
+                "register.protocol_registrar.exchange_tokens_from_continue_url",
                 return_value={"access_token": "token"},
             ),
         ):
@@ -6115,13 +6115,13 @@ class ProtocolAndHealthTests(unittest.TestCase):
             response(verified_result),
         ]
         with (
-            patch("register.protocol.build_sentinel_token", return_value="sentinel"),
-            patch("register.protocol.totp_code", return_value="123456"),
+            patch("register.protocol_registrar.build_sentinel_token", return_value="sentinel"),
+            patch("register.protocol_registrar.totp_code", return_value="123456"),
             patch(
-                "register.protocol.request_with_local_retry",
+                "register.protocol_registrar.request_with_local_retry",
                 side_effect=[(item, "") for item in responses],
             ) as request,
-            patch("register.protocol.step") as protocol_step,
+            patch("register.protocol_registrar.step") as protocol_step,
         ):
             tokens = registrar.login_with_password_totp(
                 "user@example.com",
@@ -6249,7 +6249,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
             "Failed to perform, curl: (28) Connection timed out after 30000 milliseconds"
         )
         errors = []
-        with patch("register.protocol.PlatformRegistrar", return_value=registrar):
+        with patch("register.protocol_ops.PlatformRegistrar", return_value=registrar):
             result = login_with_password_totp_one(
                 1,
                 email="proxy-timeout@example.com",
@@ -6273,7 +6273,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
         )
         task_events = []
         account_events = []
-        with patch("register.protocol.PlatformRegistrar", return_value=registrar):
+        with patch("register.protocol_ops.PlatformRegistrar", return_value=registrar):
             result = login_with_password_totp_one(
                 4,
                 email="audit@example.com",
@@ -6309,7 +6309,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
             "account_id": "account-id",
         }
         account_events = []
-        with patch("register.protocol.PlatformRegistrar", return_value=registrar):
+        with patch("register.protocol_ops.PlatformRegistrar", return_value=registrar):
             result = change_password_one(
                 2,
                 email="change@example.com",
@@ -6339,7 +6339,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
             return_value={"access_token": "fresh", "refresh_token": "refresh"}
         )
         mailbox = {"provider": "icloud_api"}
-        with patch("register.protocol.wait_for_code", return_value="123456"):
+        with patch("register.protocol_registrar.wait_for_code", return_value="123456"):
             tokens = registrar._passwordless_login("user@icloud.com", mailbox, 1)
 
         self.assertEqual(tokens["access_token"], "fresh")
@@ -6365,7 +6365,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
         ]
         session = MagicMock()
         session.request.side_effect = responses
-        with patch("register.protocol.time.sleep") as sleep:
+        with patch("register.protocol_http.time.sleep") as sleep:
             response, error = request_with_local_retry(
                 session, "get", "https://auth.openai.com/example", retry_attempts=2
             )
@@ -6400,14 +6400,14 @@ class ProtocolAndHealthTests(unittest.TestCase):
 
         with (
             patch(
-                "register.protocol.request_with_local_retry",
+                "register.protocol_registrar.request_with_local_retry",
                 side_effect=[(challenge, ""), (success, "")],
             ) as request,
             patch(
-                "register.protocol._headers_with_clearance",
+                "register.protocol_registrar._headers_with_clearance",
                 side_effect=lambda headers, *_args, **_kwargs: headers,
             ),
-            patch("register.protocol.step"),
+            patch("register.protocol_registrar.step"),
         ):
             response = registrar._navigate_auth_step(
                 "https://chatgpt.com/api/auth/callback/openai",
@@ -6442,9 +6442,9 @@ class ProtocolAndHealthTests(unittest.TestCase):
         token = protocol._PROXY_CONFIG.set(task_proxy_config)
         try:
             with (
-                patch("register.protocol.refresh_clearance", return_value=None) as refresh,
-                patch("register.protocol.clearance_error", return_value="fixture error"),
-                patch("register.protocol.step"),
+                patch("register.protocol_registrar.refresh_clearance", return_value=None) as refresh,
+                patch("register.protocol_registrar.clearance_error", return_value="fixture error"),
+                patch("register.protocol_registrar.step"),
             ):
                 result = registrar._refresh_cloudflare_clearance(
                     "https://chatgpt.com/",
@@ -6717,11 +6717,11 @@ class ProtocolAndHealthTests(unittest.TestCase):
         ]
         with (
             patch(
-                "register.protocol.request_with_local_retry",
+                "register.protocol_registrar.request_with_local_retry",
                 side_effect=[(item, "") for item in responses],
             ) as request,
-            patch("register.protocol._totp_code", return_value="575850") as totp,
-            patch("register.protocol.step"),
+            patch("register.protocol_registrar._totp_code", return_value="575850") as totp,
+            patch("register.protocol_registrar.step"),
         ):
             result = registrar._enroll_totp({"access_token": "access-token"}, 7)
 
@@ -6800,11 +6800,11 @@ class ProtocolAndHealthTests(unittest.TestCase):
 
         with (
             patch(
-                "register.protocol._totp_code",
+                "register.protocol_registrar._totp_code",
                 side_effect=["111111", "111111", "222222"],
             ),
-            patch("register.protocol.time.sleep") as sleep,
-            patch("register.protocol.step") as protocol_step,
+            patch("register.protocol_registrar.time.sleep") as sleep,
+            patch("register.protocol_registrar.step") as protocol_step,
         ):
             result = registrar._enroll_totp(
                 {"access_token": "access-token"},
@@ -6887,8 +6887,8 @@ class ProtocolAndHealthTests(unittest.TestCase):
         )
 
         with (
-            patch("register.protocol._totp_code", return_value="575850"),
-            patch("register.protocol.step"),
+            patch("register.protocol_registrar._totp_code", return_value="575850"),
+            patch("register.protocol_registrar.step"),
         ):
             result = registrar._enroll_totp(
                 {"access_token": "access-token"},
@@ -6985,9 +6985,9 @@ class ProtocolAndHealthTests(unittest.TestCase):
         sleeps = []
 
         with (
-            patch("register.protocol._totp_code", return_value="575850"),
-            patch("register.protocol.time.sleep", side_effect=sleeps.append),
-            patch("register.protocol.step"),
+            patch("register.protocol_registrar._totp_code", return_value="575850"),
+            patch("register.protocol_registrar.time.sleep", side_effect=sleeps.append),
+            patch("register.protocol_registrar.step"),
         ):
             registrar._enroll_totp(
                 {"access_token": "access-token"},
@@ -7029,8 +7029,8 @@ class ProtocolAndHealthTests(unittest.TestCase):
                 stopped["value"] = True
 
             with (
-                patch("register.protocol.time.sleep", side_effect=stop_after_sleep),
-                patch("register.protocol.step"),
+                patch("register.protocol_registrar.time.sleep", side_effect=stop_after_sleep),
+                patch("register.protocol_registrar.step"),
             ):
                 with self.assertRaises(JobCancelled):
                     registrar._enroll_totp(
@@ -7079,10 +7079,10 @@ class ProtocolAndHealthTests(unittest.TestCase):
         }
         partials = []
         with (
-            patch("register.protocol.PlatformRegistrar", return_value=registrar),
-            patch("register.protocol.create_mailbox", return_value=mailbox),
-            patch("register.protocol._random_password", return_value="generated"),
-            patch("register.protocol.mark_mailbox_result") as mailbox_result,
+            patch("register.protocol_ops.PlatformRegistrar", return_value=registrar),
+            patch("register.protocol_ops.create_mailbox", return_value=mailbox),
+            patch("register.protocol_ops._random_password", return_value="generated"),
+            patch("register.protocol_ops.mark_mailbox_result") as mailbox_result,
         ):
             result = repair_security_one(
                 1,
@@ -7126,10 +7126,10 @@ class ProtocolAndHealthTests(unittest.TestCase):
         }
         partials = []
         with (
-            patch("register.protocol.PlatformRegistrar", return_value=registrar),
-            patch("register.protocol.create_mailbox", return_value=mailbox),
-            patch("register.protocol._random_password", return_value="generated"),
-            patch("register.protocol.mark_mailbox_result") as mailbox_result,
+            patch("register.protocol_ops.PlatformRegistrar", return_value=registrar),
+            patch("register.protocol_ops.create_mailbox", return_value=mailbox),
+            patch("register.protocol_ops._random_password", return_value="generated"),
+            patch("register.protocol_ops.mark_mailbox_result") as mailbox_result,
         ):
             with self.assertRaisesRegex(RuntimeError, "mfa enrollment failed"):
                 repair_security_one(
@@ -7168,10 +7168,10 @@ class ProtocolAndHealthTests(unittest.TestCase):
             "provider": "icloud_api",
         }
         with (
-            patch("register.protocol.PlatformRegistrar", return_value=registrar),
-            patch("register.protocol.create_mailbox", return_value=mailbox),
-            patch("register.protocol._random_password", return_value="Aa1!generated"),
-            patch("register.protocol.mark_mailbox_result"),
+            patch("register.protocol_ops.PlatformRegistrar", return_value=registrar),
+            patch("register.protocol_ops.create_mailbox", return_value=mailbox),
+            patch("register.protocol_ops._random_password", return_value="Aa1!generated"),
+            patch("register.protocol_ops.mark_mailbox_result"),
         ):
             result = repair_security_one(
                 1,
@@ -7213,14 +7213,14 @@ class ProtocolAndHealthTests(unittest.TestCase):
         }
         partials = []
         with (
-            patch("register.protocol.PlatformRegistrar", return_value=registrar),
-            patch("register.protocol.create_mailbox", return_value=mailbox),
+            patch("register.protocol_ops.PlatformRegistrar", return_value=registrar),
+            patch("register.protocol_ops.create_mailbox", return_value=mailbox),
             patch(
-                "register.protocol._random_password",
+                "register.protocol_ops._random_password",
                 return_value="Aa1!confirmed-password",
             ),
-            patch("register.protocol.mark_mailbox_result") as mailbox_result,
-            patch("register.protocol.step"),
+            patch("register.protocol_ops.mark_mailbox_result") as mailbox_result,
+            patch("register.protocol_ops.step"),
         ):
             result = repair_security_one(
                 1,
@@ -7300,11 +7300,11 @@ class ProtocolAndHealthTests(unittest.TestCase):
             "provider": "icloud_api",
         }
         with (
-            patch("register.protocol.PlatformRegistrar", return_value=registrar),
-            patch("register.protocol.create_mailbox", return_value=mailbox),
-            patch("register.protocol._random_password", return_value="generated"),
-            patch("register.protocol.mark_mailbox_result"),
-            patch("register.protocol.step"),
+            patch("register.protocol_ops.PlatformRegistrar", return_value=registrar),
+            patch("register.protocol_ops.create_mailbox", return_value=mailbox),
+            patch("register.protocol_ops._random_password", return_value="generated"),
+            patch("register.protocol_ops.mark_mailbox_result"),
+            patch("register.protocol_ops.step"),
         ):
             result = repair_security_one(
                 1,
@@ -7361,11 +7361,11 @@ class ProtocolAndHealthTests(unittest.TestCase):
         }
         partials = []
         with (
-            patch("register.protocol.PlatformRegistrar", return_value=registrar),
-            patch("register.protocol.create_mailbox", return_value=mailbox),
-            patch("register.protocol._random_password", return_value="generated"),
-            patch("register.protocol.mark_mailbox_result"),
-            patch("register.protocol.step"),
+            patch("register.protocol_ops.PlatformRegistrar", return_value=registrar),
+            patch("register.protocol_ops.create_mailbox", return_value=mailbox),
+            patch("register.protocol_ops._random_password", return_value="generated"),
+            patch("register.protocol_ops.mark_mailbox_result"),
+            patch("register.protocol_ops.step"),
         ):
             result = repair_security_one(
                 1,
@@ -7422,10 +7422,10 @@ class ProtocolAndHealthTests(unittest.TestCase):
         }
         partials = []
         with (
-            patch("register.protocol.PlatformRegistrar", return_value=registrar),
-            patch("register.protocol.create_mailbox", return_value=mailbox),
-            patch("register.protocol.mark_mailbox_result"),
-            patch("register.protocol.step"),
+            patch("register.protocol_ops.PlatformRegistrar", return_value=registrar),
+            patch("register.protocol_ops.create_mailbox", return_value=mailbox),
+            patch("register.protocol_ops.mark_mailbox_result"),
+            patch("register.protocol_ops.step"),
         ):
             result = repair_security_one(
                 1,
@@ -7465,9 +7465,9 @@ class ProtocolAndHealthTests(unittest.TestCase):
         }
         partials = []
         with (
-            patch("register.protocol.PlatformRegistrar", return_value=registrar),
-            patch("register.protocol.step"),
-            patch("register.protocol.mark_mailbox_result"),
+            patch("register.protocol_ops.PlatformRegistrar", return_value=registrar),
+            patch("register.protocol_ops.step"),
+            patch("register.protocol_ops.mark_mailbox_result"),
         ):
             result = repair_security_one(
                 1,
@@ -7517,9 +7517,9 @@ class ProtocolAndHealthTests(unittest.TestCase):
         registrar._read_chatgpt_session.return_value = refreshed_tokens
         partials = []
         with (
-            patch("register.protocol.PlatformRegistrar", return_value=registrar),
-            patch("register.protocol.step"),
-            patch("register.protocol.mark_mailbox_result"),
+            patch("register.protocol_ops.PlatformRegistrar", return_value=registrar),
+            patch("register.protocol_ops.step"),
+            patch("register.protocol_ops.mark_mailbox_result"),
         ):
             result = repair_security_one(
                 1,
@@ -7583,11 +7583,11 @@ class ProtocolAndHealthTests(unittest.TestCase):
         }
         partials = []
         with (
-            patch("register.protocol.PlatformRegistrar", return_value=registrar),
-            patch("register.protocol.create_mailbox", return_value=mailbox),
-            patch("register.protocol._random_password", return_value="generated"),
-            patch("register.protocol.mark_mailbox_result"),
-            patch("register.protocol.step"),
+            patch("register.protocol_ops.PlatformRegistrar", return_value=registrar),
+            patch("register.protocol_ops.create_mailbox", return_value=mailbox),
+            patch("register.protocol_ops._random_password", return_value="generated"),
+            patch("register.protocol_ops.mark_mailbox_result"),
+            patch("register.protocol_ops.step"),
         ):
             result = repair_security_one(
                 1,
@@ -7637,11 +7637,11 @@ class ProtocolAndHealthTests(unittest.TestCase):
         }
         partials = []
         with (
-            patch("register.protocol.PlatformRegistrar", return_value=registrar),
-            patch("register.protocol.create_mailbox", return_value=mailbox),
-            patch("register.protocol._random_password", return_value="generated"),
-            patch("register.protocol.mark_mailbox_result"),
-            patch("register.protocol.step"),
+            patch("register.protocol_ops.PlatformRegistrar", return_value=registrar),
+            patch("register.protocol_ops.create_mailbox", return_value=mailbox),
+            patch("register.protocol_ops._random_password", return_value="generated"),
+            patch("register.protocol_ops.mark_mailbox_result"),
+            patch("register.protocol_ops.step"),
         ):
             result = repair_security_one(
                 1,
@@ -7689,10 +7689,10 @@ class ProtocolAndHealthTests(unittest.TestCase):
         registrar._complete_post_registration_password.side_effect = confirm_password
         partials = []
         with (
-            patch("register.protocol.PlatformRegistrar", return_value=registrar),
-            patch("register.protocol.create_mailbox", return_value=mailbox),
-            patch("register.protocol._random_password", return_value="Aa1!new-confirmed"),
-            patch("register.protocol.mark_mailbox_result") as mailbox_result,
+            patch("register.protocol_ops.PlatformRegistrar", return_value=registrar),
+            patch("register.protocol_ops.create_mailbox", return_value=mailbox),
+            patch("register.protocol_ops._random_password", return_value="Aa1!new-confirmed"),
+            patch("register.protocol_ops.mark_mailbox_result") as mailbox_result,
         ):
             result = repair_security_one(
                 1,
@@ -7765,10 +7765,10 @@ class ProtocolAndHealthTests(unittest.TestCase):
         }
         partials = []
         with (
-            patch("register.protocol.PlatformRegistrar", return_value=registrar),
-            patch("register.protocol.create_mailbox", return_value=mailbox),
-            patch("register.protocol._random_password", return_value="generated"),
-            patch("register.protocol.mark_mailbox_result"),
+            patch("register.protocol_ops.PlatformRegistrar", return_value=registrar),
+            patch("register.protocol_ops.create_mailbox", return_value=mailbox),
+            patch("register.protocol_ops._random_password", return_value="generated"),
+            patch("register.protocol_ops.mark_mailbox_result"),
         ):
             result = repair_security_one(
                 1,
@@ -7831,9 +7831,9 @@ class ProtocolAndHealthTests(unittest.TestCase):
         mailbox = {"address": "existing-mfa@example.com"}
 
         with (
-            patch("register.protocol.wait_for_code", return_value="123456"),
-            patch("register.protocol.mark_mailbox_code_boundary"),
-            patch("register.protocol.step"),
+            patch("register.protocol_registrar.wait_for_code", return_value="123456"),
+            patch("register.protocol_registrar.mark_mailbox_code_boundary"),
+            patch("register.protocol_registrar.step"),
         ):
             with self.assertRaisesRegex(RuntimeError, "password_reset_required"):
                 registrar._complete_post_registration_password(
@@ -7922,15 +7922,15 @@ class ProtocolAndHealthTests(unittest.TestCase):
             "provider": "icloud_api",
         }
         with (
-            patch("register.protocol.create_mailbox", return_value=mailbox),
+            patch("register.protocol_registrar.create_mailbox", return_value=mailbox),
             patch(
-                "register.protocol.wait_for_code",
+                "register.protocol_registrar.wait_for_code",
                 side_effect=["123456", "654321"],
             ),
-            patch("register.protocol.mark_mailbox_result"),
-            patch("register.protocol.step"),
+            patch("register.protocol_registrar.mark_mailbox_result"),
+            patch("register.protocol_registrar.step"),
             patch(
-                "register.protocol._random_password",
+                "register.protocol_registrar._random_password",
                 return_value="Aa1!protocol-test",
             ),
         ):
@@ -8024,11 +8024,11 @@ class ProtocolAndHealthTests(unittest.TestCase):
         }
 
         with (
-            patch("register.protocol.create_mailbox", return_value=mailbox),
-            patch("register.protocol.wait_for_code", return_value="123456"),
-            patch("register.protocol.mark_mailbox_result"),
-            patch("register.protocol.step"),
-            patch("register.protocol._random_password", return_value="generated"),
+            patch("register.protocol_registrar.create_mailbox", return_value=mailbox),
+            patch("register.protocol_registrar.wait_for_code", return_value="123456"),
+            patch("register.protocol_registrar.mark_mailbox_result"),
+            patch("register.protocol_registrar.step"),
+            patch("register.protocol_registrar._random_password", return_value="generated"),
         ):
             result = registrar.register(1)
 
@@ -8071,10 +8071,10 @@ class ProtocolAndHealthTests(unittest.TestCase):
         }
 
         with (
-            patch("register.protocol.create_mailbox", return_value=mailbox),
-            patch("register.protocol.wait_for_code", return_value="123456"),
-            patch("register.protocol.mark_mailbox_result") as mailbox_result,
-            patch("register.protocol.step"),
+            patch("register.protocol_registrar.create_mailbox", return_value=mailbox),
+            patch("register.protocol_registrar.wait_for_code", return_value="123456"),
+            patch("register.protocol_registrar.mark_mailbox_result") as mailbox_result,
+            patch("register.protocol_registrar.step"),
         ):
             with self.assertRaisesRegex(
                 RuntimeError, "existing_account_mfa_credentials_missing"
@@ -8145,11 +8145,11 @@ class ProtocolAndHealthTests(unittest.TestCase):
         }
 
         with (
-            patch("register.protocol.create_mailbox", return_value=mailbox),
-            patch("register.protocol.wait_for_code", return_value="123456"),
-            patch("register.protocol.mark_mailbox_result"),
-            patch("register.protocol._random_password", return_value="generated"),
-            patch("register.protocol.step"),
+            patch("register.protocol_registrar.create_mailbox", return_value=mailbox),
+            patch("register.protocol_registrar.wait_for_code", return_value="123456"),
+            patch("register.protocol_registrar.mark_mailbox_result"),
+            patch("register.protocol_registrar._random_password", return_value="generated"),
+            patch("register.protocol_registrar.step"),
         ):
             result = registrar.register(1)
 
@@ -8230,11 +8230,11 @@ class ProtocolAndHealthTests(unittest.TestCase):
         partials = []
 
         with (
-            patch("register.protocol.create_mailbox", return_value=mailbox),
-            patch("register.protocol.wait_for_code", return_value="123456"),
-            patch("register.protocol.mark_mailbox_result"),
-            patch("register.protocol._random_password", return_value="generated"),
-            patch("register.protocol.step"),
+            patch("register.protocol_registrar.create_mailbox", return_value=mailbox),
+            patch("register.protocol_registrar.wait_for_code", return_value="123456"),
+            patch("register.protocol_registrar.mark_mailbox_result"),
+            patch("register.protocol_registrar._random_password", return_value="generated"),
+            patch("register.protocol_registrar.step"),
         ):
             with self.assertRaisesRegex(RuntimeError, "mfa enrollment interrupted"):
                 registrar.register(1, partial_sink=partials.append)
@@ -8293,11 +8293,11 @@ class ProtocolAndHealthTests(unittest.TestCase):
         partials = []
 
         with (
-            patch("register.protocol.create_mailbox", return_value=mailbox),
-            patch("register.protocol.wait_for_code", return_value="123456"),
-            patch("register.protocol.mark_mailbox_result") as mailbox_result,
-            patch("register.protocol._random_password", return_value="generated"),
-            patch("register.protocol.step"),
+            patch("register.protocol_registrar.create_mailbox", return_value=mailbox),
+            patch("register.protocol_registrar.wait_for_code", return_value="123456"),
+            patch("register.protocol_registrar.mark_mailbox_result") as mailbox_result,
+            patch("register.protocol_registrar._random_password", return_value="generated"),
+            patch("register.protocol_registrar.step"),
         ):
             with self.assertRaisesRegex(RuntimeError, "CONNECT tunnel failed"):
                 registrar.register(1, partial_sink=partials.append)
@@ -8344,15 +8344,15 @@ class ProtocolAndHealthTests(unittest.TestCase):
 
         with (
             patch(
-                "register.protocol.build_sentinel_with_so_token",
+                "register.protocol_registrar.build_sentinel_with_so_token",
                 return_value=("sentinel", "so-token", "oai-sc"),
             ),
             patch(
-                "register.protocol.request_with_local_retry",
+                "register.protocol_registrar.request_with_local_retry",
                 return_value=(response, ""),
             ),
-            patch("register.protocol._set_oai_sc_cookie"),
-            patch("register.protocol.step"),
+            patch("register.protocol_registrar._set_oai_sc_cookie"),
+            patch("register.protocol_registrar.step"),
         ):
             result = registrar._create_account("Fixture User", "1990-01-01", 1)
 
@@ -8375,12 +8375,12 @@ class ProtocolAndHealthTests(unittest.TestCase):
             },
         )
         with (
-            patch("register.protocol.build_sentinel_token", return_value="sentinel"),
+            patch("register.protocol_registrar.build_sentinel_token", return_value="sentinel"),
             patch(
-                "register.protocol.request_with_local_retry",
+                "register.protocol_registrar.request_with_local_retry",
                 return_value=(response, ""),
             ) as request,
-            patch("register.protocol.step"),
+            patch("register.protocol_registrar.step"),
         ):
             result = registrar._add_password("Aa1!protocol-test", 1)
 
@@ -8422,12 +8422,12 @@ class ProtocolAndHealthTests(unittest.TestCase):
             },
         )
         with (
-            patch("register.protocol.build_sentinel_token", return_value="sentinel"),
+            patch("register.protocol_registrar.build_sentinel_token", return_value="sentinel"),
             patch(
-                "register.protocol.request_with_local_retry",
+                "register.protocol_registrar.request_with_local_retry",
                 return_value=(response, ""),
             ) as request,
-            patch("register.protocol.step"),
+            patch("register.protocol_registrar.step"),
         ):
             result = registrar._add_password(
                 "Aa1!protocol-test",
@@ -8463,10 +8463,10 @@ class ProtocolAndHealthTests(unittest.TestCase):
         )
         with (
             patch(
-                "register.protocol.request_with_local_retry",
+                "register.protocol_registrar.request_with_local_retry",
                 return_value=(response, ""),
             ) as request,
-            patch("register.protocol.step"),
+            patch("register.protocol_registrar.step"),
         ):
             result = registrar._send_password_reset_otp(1)
 
@@ -8503,10 +8503,10 @@ class ProtocolAndHealthTests(unittest.TestCase):
         )
         with (
             patch(
-                "register.protocol.request_with_local_retry",
+                "register.protocol_registrar.request_with_local_retry",
                 return_value=(response, ""),
             ) as request,
-            patch("register.protocol.step"),
+            patch("register.protocol_registrar.step"),
         ):
             registrar._send_password_reset_otp(1, referer_path="/reset-password")
 
@@ -8545,10 +8545,10 @@ class ProtocolAndHealthTests(unittest.TestCase):
         ]
         with (
             patch(
-                "register.protocol.request_with_local_retry",
+                "register.protocol_registrar.request_with_local_retry",
                 side_effect=responses,
             ) as request,
-            patch("register.protocol.step"),
+            patch("register.protocol_registrar.step"),
         ):
             registrar._start_password_add_authorize("user@example.com", 1)
 
@@ -8623,11 +8623,11 @@ class ProtocolAndHealthTests(unittest.TestCase):
 
         with (
             patch(
-                "register.protocol.request_with_local_retry",
+                "register.protocol_registrar.request_with_local_retry",
                 return_value=(response, ""),
             ),
-            patch("register.protocol._is_cloudflare_challenge", return_value=False),
-            patch("register.protocol.step") as protocol_step,
+            patch("register.protocol_registrar._is_cloudflare_challenge", return_value=False),
+            patch("register.protocol_registrar.step") as protocol_step,
         ):
             with self.assertRaisesRegex(RuntimeError, "rate_limit_exceeded"):
                 registrar._navigate_auth_step(
@@ -8853,7 +8853,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
             "accept_language": "en-US,en;q=0.9",
         }
 
-        with patch("register.protocol.step"):
+        with patch("register.protocol_registrar.step"):
             result = registrar._complete_chatgpt_session(
                 "nextauth@example.com", "Password1!", 1
             )
@@ -8919,10 +8919,10 @@ class ProtocolAndHealthTests(unittest.TestCase):
 
         with (
             patch(
-                "register.protocol._headers_with_clearance",
+                "register.protocol_registrar._headers_with_clearance",
                 side_effect=lambda headers, *_args, **_kwargs: headers,
             ),
-            patch("register.protocol.step"),
+            patch("register.protocol_registrar.step"),
         ):
             result = registrar._complete_chatgpt_session(
                 "existing@example.com",
@@ -8973,7 +8973,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
             "accept_language": "en-US,en;q=0.9",
         }
 
-        with patch("register.protocol.step"):
+        with patch("register.protocol_registrar.step"):
             result = registrar._complete_chatgpt_session(
                 "new@example.com", "", 1, start_only=True
             )

@@ -102,7 +102,7 @@ class ProtocolRuntimeTests(unittest.TestCase):
         self.assertTrue(first_wave.isdisjoint(retry_wave))
 
     def test_create_session_uses_scoped_tls_setting(self):
-        with patch("register.protocol.requests.Session") as session_factory:
+        with patch("register.protocol_http.requests.Session") as session_factory:
             with activate_runtime(
                 ProtocolRuntimeSettings(tls_verify="/tmp/fixture-ca.pem")
             ):
@@ -279,9 +279,9 @@ class ProtocolLoginTests(unittest.TestCase):
             "openai-sentinel-so-token": "SO_TOKEN",
         }
         with (
-            patch("register.protocol._build_sentinel_headers", return_value=sentinel_headers) as build,
+            patch("register.protocol_http._build_sentinel_headers", return_value=sentinel_headers) as build,
             patch(
-                "register.protocol.request_with_local_retry",
+                "register.protocol_http.request_with_local_retry",
                 return_value=(response, ""),
             ) as request,
         ):
@@ -350,16 +350,16 @@ class ProtocolLoginTests(unittest.TestCase):
 
         with (
             activate_runtime(ProtocolRuntimeSettings(verify_chatgpt_me=False)),
-            patch("register.protocol.request_with_local_retry", return_value=(SimpleNamespace(status_code=200), "")) as request,
-            patch("register.protocol._response_json", return_value=payload),
-            patch("register.protocol._nextauth_session_cookie", return_value="SESSION"),
-            patch("register.protocol.build_account_record", return_value={
+            patch("register.protocol_registrar.request_with_local_retry", return_value=(SimpleNamespace(status_code=200), "")) as request,
+            patch("register.protocol_registrar._response_json", return_value=payload),
+            patch("register.protocol_registrar._nextauth_session_cookie", return_value="SESSION"),
+            patch("register.protocol_registrar.build_account_record", return_value={
                 "access_token": "AT",
                 "account_id": "acc_1234567890",
                 "plan_type": "free",
                 "expires_at": "",
             }),
-            patch("register.protocol._cookie_values", return_value={}),
+            patch("register.protocol_registrar._cookie_values", return_value={}),
         ):
             result = registrar._read_chatgpt_session("fixture@example.com", "pw", 1)
 
