@@ -45,7 +45,7 @@ _DEFAULT_JAPAN_LANGUAGE = "ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6"
 
 # 测活路径的 token 刷新快速失败参数：慢代理不应把单账号测活拖过 1 分钟，
 # 完整刷新交给「刷新AT/重新登录」批量任务。
-_PROBE_REFRESH_TIMEOUT = 12.0
+_PROBE_REFRESH_TIMEOUT = 8.0
 _PROBE_REFRESH_ATTEMPTS = 1
 
 
@@ -578,7 +578,7 @@ def fetch_remote_account_info(record: dict[str, Any]) -> dict[str, Any]:
                 (
                     "me",
                     lambda: _response_json(
-                        session.get(CHATGPT_BASE + me_path, timeout=12),
+                        session.get(CHATGPT_BASE + me_path, timeout=8),
                         me_path,
                     ),
                 ),
@@ -593,7 +593,7 @@ def fetch_remote_account_info(record: dict[str, Any]) -> dict[str, Any]:
                                 "conversation_id": None,
                                 "timezone_offset_min": timezone_offset,
                             },
-                            timeout=12,
+                            timeout=8,
                         ),
                         init_path,
                     ),
@@ -605,7 +605,7 @@ def fetch_remote_account_info(record: dict[str, Any]) -> dict[str, Any]:
                             CHATGPT_BASE
                             + account_path
                             + f"?timezone_offset_min={timezone_offset}",
-                            timeout=12,
+                            timeout=8,
                         ),
                         account_path,
                     ),

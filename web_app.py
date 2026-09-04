@@ -1296,6 +1296,18 @@ try:  # 服务重启后恢复被打断的测活进度(检查点不存在时为�
     _account_health_checkpoint_restore()
 except Exception:
     pass
+
+
+def _prewarm_config_cache() -> None:
+    # 后台预热 config 缓存:6000+ 行 YAML 首次解析要秒级,
+    # 预热后重启后的首个面板请求不再吃这个冷启动开销。
+    try:
+        _read_config()
+    except Exception:
+        pass
+
+
+threading.Thread(target=_prewarm_config_cache, daemon=True, name="config-prewarm").start()
 from web.routes.security_ops import (  # noqa: E402,F401
     _SECURITY_PASSWORD_MIN_LENGTH,
     _account_requires_protocol_reauth,

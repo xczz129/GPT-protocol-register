@@ -384,8 +384,16 @@ async def accounts_health(body: AccountHealthRequest):
 
     if not body.delete_all and not body.keys:
         raise HTTPException(400, "请选择要测活的账号，或明确使用全部测活")
-    records = await asyncio.to_thread(_state()._load_accounts)
-    keys = [] if body.delete_all else body.keys
+    if body.delete_all:
+        records = await asyncio.to_thread(_state()._load_accounts)
+        keys = []
+    else:
+        # 按需查询:省掉全量加载(7000+ 行)的固定秒级开销
+        records_by_key = await asyncio.to_thread(
+            _state()._records_by_keys_with_fallback, body.keys
+        )
+        records = list(records_by_key.values())
+        keys = body.keys
     probe_records, skipped_records = _state().select_health_check_records(records, keys=keys)
     requested = len(probe_records) + len(skipped_records)
     actual_total = len(probe_records)
