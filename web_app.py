@@ -2378,7 +2378,7 @@ from web.routes.chatgpt2api import (  # noqa: E402,F401
 @app.get("/api/accounts")
 async def accounts(limit: int = 200, offset: int = 0):
     def _do():
-        cap = max(1, min(limit, 1000))
+        cap = max(1, min(limit, 20000))
         start = max(0, offset)
 
         def _stamp(path: Path) -> int:
@@ -2397,7 +2397,7 @@ async def accounts(limit: int = 200, offset: int = 0):
         # to one store revision and only publish a page if no writer committed
         # while those reads were being assembled. The browser uses this same
         # revision to reject mixed-version page batches.
-        for _attempt in range(5):
+        for _attempt in range(8):
             revision = account_store_revision(ACCOUNTS_FILE)
             groups_stamp = _stamp(GROUPS_FILE)
             cache_key = (cap, start, revision, groups_stamp)
@@ -2419,15 +2419,11 @@ async def accounts(limit: int = 200, offset: int = 0):
                     if cached and now - cached[0] < 5.0:
                         return cached[1]
 
-                if account_store_revision(ACCOUNTS_FILE) != expected_revision:
-                    raise _RevisionChanged
                 total = count_accounts(ACCOUNTS_FILE)
                 groups = _groups_with_counts()
                 names = {item["id"]: item["name"] for item in groups}
                 default_id = groups[0]["id"]
                 items = load_account_public_views(cap, ACCOUNTS_FILE, offset=start)
-                if account_store_revision(ACCOUNTS_FILE) != expected_revision:
-                    raise _RevisionChanged
 
                 slim = []
                 for a in items:
@@ -2440,8 +2436,6 @@ async def accounts(limit: int = 200, offset: int = 0):
                     item["group_id"] = group_id
                     item["group_name"] = names[group_id]
                     slim.append(item)
-                if account_store_revision(ACCOUNTS_FILE) != expected_revision:
-                    raise _RevisionChanged
                 payload = {
                     "count": total,
                     "total": total,

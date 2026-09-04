@@ -154,7 +154,7 @@ let lastMaintenanceHealthDone = -1;
 let lastStatusLoadedAt = 0;
 let lastRegistrationBatchId = "";
 let lastRegistrationSuccessCount = 0;
-const accountFetchLimit = 1000;
+const accountFetchLimit = 10000;
 // The account endpoint is paginated. Fetching pages serially makes a full
 // account refresh wait for every disk/cache round-trip; keep a small bound so
 // the browser and API are not flooded while still reducing wall-clock time.

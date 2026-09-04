@@ -53,6 +53,7 @@ const searchNeedle = ref("");
 const statusFilter = ref("all");
 const planFilter = ref("all");
 const offerFilter = ref("all");
+const smsFilter = ref("all");
 const groupFilter = ref("all");
 const groupQuery = ref("");
 const moveTarget = ref("");
@@ -133,7 +134,7 @@ const accountIndex = computed(() => {
         && !!item.has_totp);
     if (!isDeactivated && passwordConfirmed && item.has_totp && key) securityOperationKeys.push(key);
     if (item.has_access_token && key) accessTokenKeys.add(key);
-    if (!isDeactivated && item.has_session_token && key) refreshAtKeys.add(key);
+    if (!isDeactivated && key) refreshAtKeys.add(key);
   }
   return {
     stats: { total: rows.length, usable, deactivated, checked, expiredAt },
@@ -282,6 +283,7 @@ const filtered = computed(() => {
   const status = statusFilter.value;
   const plan = planFilter.value;
   const offer = offerFilter.value;
+  const sms = smsFilter.value;
   const group = groupFilter.value;
   const textIndex = searchTextByItem.value;
 
@@ -301,6 +303,8 @@ const filtered = computed(() => {
     if (plan !== "all" && planType(item) !== plan) return false;
     if (offer === "trial" && item.trial_eligibility_status !== "eligible") return false;
     if (offer === "no-trial" && item.trial_eligibility_status === "eligible") return false;
+    if (sms === "sms" && !item.has_refresh_token) return false;
+    if (sms === "no-sms" && item.has_refresh_token) return false;
     if (!needle) return true;
     const values = textIndex?.get(item);
     return values ? values.some((val) => val.includes(needle)) : true;
@@ -826,6 +830,11 @@ function moveSelected() {
             <option value="trial">有试用</option>
             <option value="no-trial">无试用</option>
           </select>
+          <select v-model="smsFilter" aria-label="接码筛选">
+            <option value="all">全部接码</option>
+            <option value="sms">已接码</option>
+            <option value="no-sms">未接码</option>
+          </select>
           <select v-model.number="pageSize" aria-label="每页数量">
             <option :value="10">10 / 页</option>
             <option :value="20">20 / 页</option>
@@ -841,7 +850,7 @@ function moveSelected() {
           <button class="btn secondary" type="button" :disabled="!selected.length || busy" title="取消所有分页中已选择的账号" @click="clearAllSelected"><X :size="14" aria-hidden="true" />取消（{{ selected.length }}）</button>
           <button class="btn primary" :disabled="!accounts.length || busy" :title="selected.length ? '下载选中的账号' : '下载全部账号'" @click="emit('download', selected.length ? selected : null)"><Download :size="14" aria-hidden="true" />{{ selected.length ? `下载选中(${selected.length})` : "下载全部" }}</button>
           <button class="btn secondary" :disabled="!selectedAccessTokenKeys.length || busy || copyingAt" title="复制选中账号的完整 Access Token" @click="emit('copy-selected-at', selected)"><Copy :size="14" aria-hidden="true" />{{ copyingAt ? "读取AT中" : "复制选中AT" }}</button><button class="btn secondary" type="button" :disabled="!selected.length || busy || codexOauthRunning" title="对选中账号接码" @click="emit('codex-oauth', selected)"><Smartphone :size="14" aria-hidden="true" />接码</button><button class="btn secondary" type="button" :disabled="busy || codexOauthRunning" title="粘贴 邮箱----密码----2FA 导入新账号" @click="emit('import-accounts')"><Upload :size="14" aria-hidden="true" />导入账号</button>
-          <button class="btn secondary" :disabled="(!selectedRefreshAtKeys.length && !accounts.length) || busy || refreshAtProgress.running" :title="selectedRefreshAtKeys.length ? `刷新选中 ${selectedRefreshAtKeys.length} 个账号的 AT（需有 Session）` : `刷新全部临期/过期账号的 AT（已过期 ${expiredAtCount} 个，需有 Session，自动跳过已封号）`" @click="emit('refresh-at', selectedRefreshAtKeys.length ? { keys: selectedRefreshAtKeys } : { all_accounts: true })">{{ refreshAtProgress.running ? "刷新AT中…" : (selectedRefreshAtKeys.length ? `刷新AT选中(${selectedRefreshAtKeys.length})` : `刷新AT(${expiredAtCount})`) }}</button>
+          <button class="btn secondary" :disabled="(!selectedRefreshAtKeys.length && !accounts.length) || busy || refreshAtProgress.running" :title="selectedRefreshAtKeys.length ? `刷新选中 ${selectedRefreshAtKeys.length} 个账号的 AT（无Session自动跳过）` : `刷新全部失效AT账号（已过期 ${expiredAtCount} 个，无Session自动跳过已封号）`" @click="emit('refresh-at', selectedRefreshAtKeys.length ? { keys: selectedRefreshAtKeys } : { all_accounts: true })">{{ refreshAtProgress.running ? "刷新AT中…" : (selectedRefreshAtKeys.length ? `刷新AT选中(${selectedRefreshAtKeys.length})` : `刷新AT(${expiredAtCount})`) }}</button>
           <button class="btn secondary" :disabled="!selectedAccessTokenKeys.length || busy" title="导出选中账号的完整 Access Token" @click="emit('export-selected-at', selected)">导出选中AT</button>
           <button class="btn secondary" :disabled="!selected.length || busy" title="导出选中账号、密码和完整 TOTP 密钥" @click="emit('export-security', selected)">导出账号+密码+2FA</button>
           <button class="btn secondary" :disabled="!accounts.length || busy || accountLoadBlocked || healthProgress.running" :title="selected.length ? '测活选中的账号' : '测活全部账号(跳过已封号)'" @click="emit('health', selected.length ? selected : null)">{{ healthProgress.running ? "测活中…" : (selected.length ? `测活选中(${selected.length})` : "测活全部") }}</button>

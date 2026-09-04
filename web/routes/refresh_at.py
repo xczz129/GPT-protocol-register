@@ -34,8 +34,8 @@ async def accounts_refresh_at(body: AccountRefreshAtRequest):
     """Refresh stored ATs through the nerver session service.
 
     Explicit keys are always attempted (single-account or hand-picked rows).
-    The all-accounts mode only covers records whose AT already expired or
-    expires soon.  Deactivated records and records without a session token
+    The all-accounts mode only covers records whose AT already
+    expired (near-expiry rows are left alone).  Deactivated records and records without a session token
     are skipped in both modes.
     """
     wanted = {str(key or "").strip() for key in body.keys if str(key or "").strip()}
@@ -56,7 +56,7 @@ async def accounts_refresh_at(body: AccountRefreshAtRequest):
         if not str(record.get("session_token") or "").strip():
             skipped_no_session += 1
             continue
-        if body.all_accounts and not access_token_needs_refresh(record):
+        if body.all_accounts and not access_token_needs_refresh(record, window=0):
             skipped_fresh += 1
             continue
         selected.append(record)
