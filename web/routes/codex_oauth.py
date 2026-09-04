@@ -90,6 +90,20 @@ _RT_HISTORY_PATH = Path("/root/full/gpt-register-fp/data/codex_rt_history.json")
 _RT_HISTORY_LOCK = threading.Lock()
 
 
+def _clip_history_logs(logs: list) -> list:
+    """Normalize and cap per-account flow logs persisted into RT history."""
+    rows = [
+        {
+            "t": str(item.get("t") or ""),
+            "level": str(item.get("level") or "info"),
+            "m": str(item.get("m") or "")[:300],
+        }
+        for item in (logs or [])
+        if isinstance(item, dict)
+    ]
+    return rows[-200:]
+
+
 def _append_rt_history(email: str, entry: dict) -> None:
     """Persist the latest RT-reissue outcome per account (newest first)."""
     email = str(email or "").strip().lower()
@@ -332,13 +346,21 @@ def _auto_phone(client, sms, log) -> None:
     raise RuntimeError(f"接码 {attempts_max} 次均失败: {last_error[:160]}")
 
 
-def _process_one(rec: dict, sms_cfg: dict) -> dict:
+def _process_one(rec: dict, sms_cfg: dict, steps: list | None = None) -> dict:
     email = str(rec.get("email") or "").strip()
     password = str(rec.get("password") or "")
     totp = str(rec.get("totp_secret") or "")
 
     def log(message: str, level: str = "info") -> None:
         _log(f"{email} | {message}", level)
+        if steps is not None:
+            steps.append(
+                {
+                    "t": datetime.now().strftime("%H:%M:%S"),
+                    "level": level,
+                    "m": str(message)[:300],
+                }
+            )
 
     if not password or not totp:
         raise RuntimeError("账号缺少密码或 2FA 密钥,无法补发")
@@ -414,6 +436,7 @@ def _process_one(rec: dict, sms_cfg: dict) -> dict:
             "expires_in": token.get("expires_in"),
             "error": "",
             "phone": phone_used,
+            "logs": list(steps or []),
         }
     finally:
         try:
@@ -428,8 +451,9 @@ def _run_batch(records: list, sms_cfg: dict) -> None:
             if _STOP.is_set():
                 _log("任务已停止(剩余账号跳过)", "warning")
                 break
+            steps: list = []
             try:
-                result = _process_one(rec, sms_cfg)
+                result = _process_one(rec, sms_cfg, steps)
                 with _LOCK:
                     _STATE["success"] += 1
                     _STATE["results"].append(result)
@@ -441,6 +465,7 @@ def _run_batch(records: list, sms_cfg: dict) -> None:
                         "rt": str(result.get("refresh_token") or "")[:600],
                         "phone": str(result.get("phone") or ""),
                         "error": "",
+                        "logs": _clip_history_logs(result.get("logs") or steps),
                     },
                 )
             except Exception as exc:
@@ -463,6 +488,7 @@ def _run_batch(records: list, sms_cfg: dict) -> None:
                         "rt": "",
                         "phone": "",
                         "error": str(exc)[:300],
+                        "logs": _clip_history_logs(steps),
                     },
                 )
                 _log(f"{rec.get('email')} | 失败: {exc}", "error")

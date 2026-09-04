@@ -277,7 +277,8 @@ onBeforeUnmount(() => clearInterval(clockTimer));
           </button>
 
           <div v-if="expandedTasks.has(task.card_id || task.index)" class="task-steps">
-            <div v-for="(step, index) in (task.steps || []).slice(-8)" :key="index" class="task-step">
+            <div v-if="(task.steps || []).length" class="task-steps-count">共 {{ task.steps.length }} 条日志 · 可上下滚动</div>
+            <div v-for="(step, index) in (task.steps || [])" :key="index" class="task-step">
               <span>{{ step.time }}</span>
               {{ step.text }}
             </div>

@@ -2771,8 +2771,21 @@ async function saveSmsConfig() { await run(() => api("/api/sms-config", { method
 async function testSmsConfig() { await run(() => api("/api/sms-config/test", { method: "POST", body: "{}" }), (r) => r.message || "测试完成"); }
 const codexHistoryDialog = reactive({ open: false, loading: false, email: "", key: "", hasRt: false, rows: [] });
 const codexHistoryEmailKey = computed(() => codexHistoryDialog.key || "");
+const expandedHistoryLogs = ref(new Set());
+function toggleHistoryLogs(index) {
+  const next = new Set(expandedHistoryLogs.value);
+  if (next.has(index)) next.delete(index); else next.add(index);
+  expandedHistoryLogs.value = next;
+}
+function historyLogClass(level) {
+  if (level === "error") return "codex-log-error";
+  if (level === "warning") return "codex-log-warning";
+  if (level === "ok") return "codex-log-ok";
+  return "";
+}
 async function openCodexHistory(account) {
   Object.assign(codexHistoryDialog, { open: true, loading: true, email: account?.email || "", key: account?.delete_key || "", hasRt: !!account?.has_refresh_token, rows: [] });
+  expandedHistoryLogs.value = new Set();
   try {
     const result = await api(`/api/codex-oauth/history?emails=${encodeURIComponent(account?.email || "")}`);
     codexHistoryDialog.rows = (result?.history || {})[String(account?.email || "").toLowerCase()] || [];
@@ -2995,12 +3008,20 @@ onBeforeUnmount(() => {
             <div v-else-if="!codexHistoryDialog.rows.length" class="empty-card">暂无接码历史记录</div>
             <div v-else class="codex-history-list">
               <div v-for="(row, index) in codexHistoryDialog.rows" :key="index" class="codex-history-row" :class="row.status">
-                <div class="codex-history-main">
-                  <b>{{ row.status === "success" ? "接码成功" : "接码失败" }}<span v-if="row.phone" class="codex-phone"> · {{ row.phone }}</span></b>
-                  <small>{{ row.at }}<template v-if="row.error"> · {{ row.error }}</template></small>
-                  <small v-if="row.rt" class="codex-rt">RT: {{ row.rt.slice(0, 36) }}…</small>
+                <div class="codex-history-row-main">
+                  <div class="codex-history-main">
+                    <b>{{ row.status === "success" ? "接码成功" : "接码失败" }}<span v-if="row.phone" class="codex-phone"> · {{ row.phone }}</span></b>
+                    <small>{{ row.at }}<template v-if="row.error"> · {{ row.error }}</template></small>
+                    <small v-if="row.rt" class="codex-rt">RT: {{ row.rt.slice(0, 36) }}…</small>
+                  </div>
+                  <div class="codex-history-row-actions">
+                    <button v-if="(row.logs || []).length" class="btn secondary sm" type="button" @click="toggleHistoryLogs(index)">{{ expandedHistoryLogs.has(index) ? "收起日志" : `流程日志(${row.logs.length})` }}</button>
+                    <button v-if="row.rt" class="btn secondary sm" type="button" @click="copyHistoryRt(row)">复制RT</button>
+                  </div>
                 </div>
-                <button v-if="row.rt" class="btn secondary sm" type="button" @click="copyHistoryRt(row)">复制RT</button>
+                <div v-if="expandedHistoryLogs.has(index) && (row.logs || []).length" class="codex-history-flow">
+                  <p v-for="(line, li) in row.logs" :key="li" :class="historyLogClass(line.level)"><span class="codex-log-time">{{ line.t }}</span>{{ line.m }}</p>
+                </div>
               </div>
             </div>
           </div>

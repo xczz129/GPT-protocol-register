@@ -221,7 +221,7 @@ class JobState:
                 steps = card.setdefault("steps", [])
                 if isinstance(steps, list):
                     steps.append({"time": now, "text": step, "status": status or card.get("status")})
-                    del steps[:-18]
+                    del steps[:-200]
             card["updated_at"] = now
             card["updated_at_epoch"] = now_epoch
             self._task_revision += 1

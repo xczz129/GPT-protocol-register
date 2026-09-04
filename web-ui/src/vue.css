@@ -1475,7 +1475,11 @@ table.acct .col-actions { text-align: right; white-space: nowrap; }
 .task-name { font-size: 12.5px; font-weight: 600; color: var(--ink-800); word-break: break-all; }
 .task-sub { font-size: 11px; color: var(--ink-400); font-family: var(--mono); }
 .task-main { flex: 1; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
-.task-steps { display: flex; flex-direction: column; gap: 5px; margin-top: 4px; }
+.task-steps { display: flex; flex-direction: column; gap: 5px; margin-top: 4px; max-height: 320px; overflow-y: auto; overscroll-behavior: contain; padding: 4px 8px 4px 4px; }
+.task-steps-count { font-size: 11px; color: var(--ink-400); margin-bottom: 2px; }
+.task-steps::-webkit-scrollbar { width: 8px; }
+.task-steps::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; }
+.task-steps::-webkit-scrollbar-thumb:hover { background: var(--ink-400); }
 .task-step {
   display: flex;
   align-items: center;
@@ -2391,10 +2395,17 @@ table.acct .col-actions { text-align: right; white-space: nowrap; }
 .dock-hint { display: block; margin-top: 4px; font-size: 11px; color: var(--ink-400); }
 
 /* ---- 接码历史对话框 ---- */
-.codex-history-dialog { width: min(560px, 100%); }
+.codex-history-dialog { width: min(720px, 100%); }
 .codex-hint { display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--ink-600); margin-bottom: 12px; }
 .codex-history-list { display: flex; flex-direction: column; gap: 8px; max-height: 46vh; overflow-y: auto; }
-.codex-history-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg-inset); }
+.codex-history-row { display: flex; flex-direction: column; align-items: stretch; gap: 8px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg-inset); }
+.codex-history-row-main { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.codex-history-row-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.codex-history-flow { max-height: 260px; overflow-y: auto; overscroll-behavior: contain; background: var(--bg-2); border: 1px solid var(--bg-3); border-radius: 8px; padding: 8px 10px; font-family: var(--mono, ui-monospace, monospace); font-size: 12px; line-height: 1.7; }
+.codex-history-flow p { margin: 0; color: var(--ink-700); word-break: break-all; }
+.codex-history-flow::-webkit-scrollbar { width: 8px; }
+.codex-history-flow::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; }
+.codex-history-flow::-webkit-scrollbar-thumb:hover { background: var(--ink-400); }
 
 /* 设备信息（注册环境）弹窗 */
 .device-info-dialog { width: min(760px, calc(100vw - 32px)); }
