@@ -164,6 +164,40 @@ function canvasElement() {
   return element;
 }
 
+function pdfNavigatorMocks(isFirefox) {
+  // Chrome: 5 个具名 PDF 插件；Firefox: 5 个同名 "PDF Viewer" 插件。
+  const chromeNames = ['PDF Viewer', 'Chrome PDF Viewer', 'Chromium PDF Viewer', 'Microsoft Edge PDF Viewer', 'WebKit built-in PDF'];
+  const firefoxNames = ['PDF Viewer', 'PDF Viewer', 'PDF Viewer', 'PDF Viewer', 'PDF Viewer'];
+  const names = isFirefox ? firefoxNames : chromeNames;
+  const plugins = names.map((name) => ({
+    name,
+    filename: 'internal-pdf-viewer',
+    description: 'Portable Document Format',
+    length: 2,
+    0: { type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format', enabledPlugin: null },
+    1: { type: 'text/pdf', suffixes: 'pdf', description: 'Portable Document Format', enabledPlugin: null },
+  }));
+  plugins.forEach((plugin) => {
+    plugin[0].enabledPlugin = plugin;
+    plugin[1].enabledPlugin = plugin;
+    if (!plugins[plugin.name]) plugins[plugin.name] = plugin;
+  });
+  plugins.item = (index) => plugins[index] || null;
+  plugins.namedItem = (name) => plugins[name] || null;
+  plugins.refresh = () => {};
+  const mimeTypes = [
+    { type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format', enabledPlugin: null },
+    { type: 'text/pdf', suffixes: 'pdf', description: 'Portable Document Format', enabledPlugin: null },
+  ];
+  mimeTypes[0].enabledPlugin = plugins[0];
+  mimeTypes[1].enabledPlugin = plugins[0];
+  mimeTypes.item = (index) => mimeTypes[index] || null;
+  mimeTypes.namedItem = (name) => mimeTypes.find((entry) => entry.type === name) || null;
+  return { plugins, mimeTypes };
+}
+
+const pdfMocks = pdfNavigatorMocks(isFirefox);
+
 const context = {
   console: { log() {}, error() {}, warn() {} },
   setTimeout,
@@ -228,10 +262,27 @@ const context = {
     platform: navigatorProfile.platform || 'Win32',
     vendor: navigatorProfile.vendor ?? '',
     hardwareConcurrency: navigatorProfile.hardwareConcurrency || 8,
-    ...(!isFirefox ? { deviceMemory: navigatorProfile.deviceMemory || 8 } : {}),
+    ...(!isFirefox ? {
+      deviceMemory: navigatorProfile.deviceMemory || 8,
+      pdfViewerEnabled: navigatorProfile.pdfViewerEnabled === undefined ? true : !!navigatorProfile.pdfViewerEnabled,
+      connection: {
+        effectiveType: (navigatorProfile.connection && navigatorProfile.connection.effectiveType) || '4g',
+        rtt: (navigatorProfile.connection && navigatorProfile.connection.rtt) || 50,
+        downlink: (navigatorProfile.connection && navigatorProfile.connection.downlink) || 10,
+        saveData: !!(navigatorProfile.connection && navigatorProfile.connection.saveData),
+        onchange: null,
+      },
+    } : {
+      pdfViewerEnabled: false,
+      oscpu: navigatorProfile.userAgent || input.userAgent,
+      buildID: '20181001000000',
+    }),
     maxTouchPoints: navigatorProfile.maxTouchPoints || 0,
     cookieEnabled: true,
     onLine: true,
+    webdriver: false,
+    plugins: pdfMocks.plugins,
+    mimeTypes: pdfMocks.mimeTypes,
     storage: {
       estimate: async () => ({
         quota: navigatorProfile.storageQuota || 274877906944,

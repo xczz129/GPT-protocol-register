@@ -49,6 +49,20 @@ _WINDOWS_TZ_STANDARD = {
     "Europe/Paris": "Romance Standard Time",
     "Europe/Istanbul": "Turkey Time",
     "Asia/Kolkata": "India Standard Time",
+    "Europe/Rome": "W. Europe Standard Time",
+    "Europe/Madrid": "Romance Standard Time",
+    "Europe/Amsterdam": "W. Europe Standard Time",
+    "Europe/Zurich": "W. Europe Standard Time",
+    "Europe/Stockholm": "W. Europe Standard Time",
+    "Europe/Oslo": "W. Europe Standard Time",
+    "Europe/Copenhagen": "Romance Standard Time",
+    "Europe/Helsinki": "FLE Standard Time",
+    "Europe/Vienna": "W. Europe Standard Time",
+    "Europe/Brussels": "Romance Standard Time",
+    "Europe/Dublin": "GMT Standard Time",
+    "Europe/Lisbon": "GMT Standard Time",
+    "Europe/Warsaw": "Central European Standard Time",
+    "Pacific/Auckland": "New Zealand Standard Time",
 }
 _WINDOWS_TZ_DAYLIGHT = {
     "Australia/Sydney": "AUS Eastern Daylight Time",
@@ -57,6 +71,20 @@ _WINDOWS_TZ_DAYLIGHT = {
     "Europe/London": "GMT Daylight Time",
     "Europe/Berlin": "W. Europe Daylight Time",
     "Europe/Paris": "Romance Daylight Time",
+    "Europe/Rome": "W. Europe Daylight Time",
+    "Europe/Madrid": "Romance Daylight Time",
+    "Europe/Amsterdam": "W. Europe Daylight Time",
+    "Europe/Zurich": "W. Europe Daylight Time",
+    "Europe/Stockholm": "W. Europe Daylight Time",
+    "Europe/Oslo": "W. Europe Daylight Time",
+    "Europe/Copenhagen": "Romance Daylight Time",
+    "Europe/Helsinki": "FLE Daylight Time",
+    "Europe/Vienna": "W. Europe Daylight Time",
+    "Europe/Brussels": "Romance Daylight Time",
+    "Europe/Dublin": "GMT Daylight Time",
+    "Europe/Lisbon": "GMT Daylight Time",
+    "Europe/Warsaw": "Central European Daylight Time",
+    "Pacific/Auckland": "New Zealand Daylight Time",
 }
 
 
@@ -664,7 +692,8 @@ def _sdk_profile(
     except (TypeError, ValueError):
         hardware_concurrency = 8
     try:
-        device_memory = max(1, int(profile.get("device_memory") or 8))
+        # 真实 Chrome 的 navigator.deviceMemory 上限是 8GB，更高值不可能出现。
+        device_memory = min(8, max(1, int(profile.get("device_memory") or 8)))
     except (TypeError, ValueError):
         device_memory = 8
     try:
@@ -676,6 +705,31 @@ def _sdk_profile(
         timezone_offset_minutes = int(timezone_offset)
     except (TypeError, ValueError):
         timezone_offset_minutes = 0
+    try:
+        platform_major = int(str(profile.get("platform_version") or "10.0.0").split(".", 1)[0])
+    except (TypeError, ValueError):
+        platform_major = 10
+    # Win11（Chromium platformVersion >= 13）任务栏 48px，Win10 为 40px。
+    taskbar_px = 48 if platform_major >= 13 else 40
+    avail_height = max(600, height - taskbar_px)
+    browser_family = str(profile.get("browser_family") or "firefox").strip().lower()
+    is_chrome = browser_family == "chrome"
+    try:
+        storage_quota_gb = float(profile.get("storage_quota_gb") or 256)
+    except (TypeError, ValueError):
+        storage_quota_gb = 256.0
+    try:
+        storage_usage_mb = float(profile.get("storage_usage_mb") or 152)
+    except (TypeError, ValueError):
+        storage_usage_mb = 152.0
+    try:
+        connection_rtt = int(float(profile.get("connection_rtt") or 50))
+    except (TypeError, ValueError):
+        connection_rtt = 50
+    try:
+        connection_downlink = round(float(profile.get("connection_downlink") or 10), 2)
+    except (TypeError, ValueError):
+        connection_downlink = 10.0
     return {
         "url": page_url,
         "referer": referer,
@@ -690,16 +744,26 @@ def _sdk_profile(
             "hardwareConcurrency": hardware_concurrency,
             "deviceMemory": device_memory,
             "maxTouchPoints": max_touch_points,
+            "pdfViewerEnabled": is_chrome,
+            "pluginCount": 5,
+            "storageQuota": int(storage_quota_gb * 1024 ** 3),
+            "storageUsage": int(storage_usage_mb * 1024 ** 2),
+            "connection": {
+                "effectiveType": "4g",
+                "rtt": connection_rtt,
+                "downlink": connection_downlink,
+                "saveData": False,
+            },
         },
         "screen": {
             "width": width,
             "height": height,
             "availWidth": width,
-            "availHeight": max(600, height - 40),
+            "availHeight": avail_height,
             "innerWidth": max(800, width - 17),
-            "innerHeight": max(600, height - 111),
+            "innerHeight": max(600, avail_height - 111),
             "outerWidth": width,
-            "outerHeight": height,
+            "outerHeight": avail_height,
             "colorDepth": 24,
             "pixelDepth": 24,
             "devicePixelRatio": float(profile.get("device_pixel_ratio") or 1),

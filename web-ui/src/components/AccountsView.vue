@@ -101,6 +101,7 @@ const accountIndex = computed(() => {
   const rows = props.accounts || [];
   const invalidKeys = [];
   const reauthKeys = [];
+  const reloginKeys = [];
   const protocolReauthKeys = [];
   const securityRepairKeys = [];
   const securityOperationKeys = [];
@@ -119,6 +120,7 @@ const accountIndex = computed(() => {
     if (health !== "unknown") checked += 1;
     if (!isDeactivated && item.at_expired) expiredAt += 1;
     if (!isDeactivated && health === "invalid" && key) invalidKeys.push(key);
+    if (!isDeactivated && key) reloginKeys.push(key);
     if (item.reauth_available && key) {
       reauthKeys.push(key);
       if (item.has_password && item.has_totp) protocolReauthKeys.push(key);
@@ -137,6 +139,7 @@ const accountIndex = computed(() => {
     stats: { total: rows.length, usable, deactivated, checked, expiredAt },
     invalidKeys,
     reauthKeys,
+    reloginKeys,
     protocolReauthKeys,
     securityRepairKeys,
     securityOperationKeys,
@@ -156,8 +159,10 @@ const accountLoadBlocked = computed(() => props.accountsLoading || !!props.accou
 const invalidKeys = computed(() => accountIndex.value.invalidKeys);
 const invalidCount = computed(() => invalidKeys.value.length);
 const reauthKeys = computed(() => accountIndex.value.reauthKeys);
+// 重新登录支持选中任意未封号账号（含正常账号）；未选中时回落到全部异常账号。
+const reloginKeys = computed(() => accountIndex.value.reloginKeys);
 const selectedReauthKeys = computed(() => {
-  const available = new Set(reauthKeys.value);
+  const available = new Set(reloginKeys.value);
   return selected.value.filter((key) => available.has(key));
 });
 const securityRepairKeys = computed(() => accountIndex.value.securityRepairKeys);
@@ -832,7 +837,7 @@ function moveSelected() {
           <button class="btn secondary" :disabled="!accounts.length || busy || accountLoadBlocked" :title="selected.length ? '检测选中账号的 Free 资格' : '检测全部账号的 Free 资格'" @click="emit('trial-check', selected.length ? { keys: selected, force: false } : { all_accounts: true, force: false })">{{ selected.length ? `检测资格选中(${selected.length})` : "检测全部 Free 资格" }}</button>
           
 
-          <button class="btn secondary" :disabled="!reauthKeys.length || busy || reauthProgress.running" :title="selectedReauthKeys.length ? '重新登录选中的账号' : `重新登录全部可恢复账号(${reauthKeys.length})`" @click="emit('reauth', { keys: selectedReauthKeys })">{{ reauthProgress.running ? "登录中…" : (selectedReauthKeys.length ? `重新登录选中(${selectedReauthKeys.length})` : `重新登录全部(${reauthKeys.length})`) }}</button>
+          <button class="btn secondary" :disabled="(!selectedReauthKeys.length && !reauthKeys.length) || busy || reauthProgress.running" :title="selectedReauthKeys.length ? `重新登录选中的 ${selectedReauthKeys.length} 个账号（协议方式需有密码和2FA）` : `重新登录全部可恢复账号(${reauthKeys.length})`" @click="emit('reauth', { keys: selectedReauthKeys })">{{ reauthProgress.running ? "登录中…" : (selectedReauthKeys.length ? `重新登录选中(${selectedReauthKeys.length})` : `重新登录全部(${reauthKeys.length})`) }}</button>
           <button class="btn primary" :disabled="!selectedSecurityRepairKeys.length || busy || reauthProgress.running" @click="emit('security-repair', { keys: selectedSecurityRepairKeys })">补全安全字段（{{ selectedSecurityRepairKeys.length }}）</button>
           <button class="btn secondary" :disabled="!selectedSecurityOperationKeys.length || busy || reauthProgress.running" @click="emit('password-change', { keys: selectedSecurityOperationKeys })">修改密码（{{ selectedSecurityOperationKeys.length }}）</button>
           <button class="btn secondary" :disabled="!selectedSecurityOperationKeys.length || busy || reauthProgress.running" @click="emit('totp-change', { keys: selectedSecurityOperationKeys })">修改 2FA（{{ selectedSecurityOperationKeys.length }}）</button>

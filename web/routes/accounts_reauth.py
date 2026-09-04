@@ -104,8 +104,8 @@ async def account_reauthenticate_start(body: AccountReauthBatchRequest):
         account = record_map.get(key)
         if account is None:
             raise HTTPException(404, "所选账号中存在已删除记录，请刷新列表后重试")
-        if not _state().account_public_view(account).get("reauth_available"):
-            raise HTTPException(409, f"{account.get('email') or key} 当前不支持重新登录")
+        if _state().account_public_view(account).get("is_deactivated"):
+            raise HTTPException(409, f"{account.get('email') or key} 已封号，不支持重新登录")
         account_protocol = _state()._account_requires_protocol_reauth(account)
         if (reauth_mode == "protocol" or account_protocol) and not _state()._protocol_reauth_credentials_ready(account):
             raise HTTPException(
@@ -502,8 +502,8 @@ async def account_reauthenticate(body: AccountReauthRequest):
     account = next((item for item in records if _state()._account_key(item) == target), None)
     if account is None:
         raise HTTPException(404, "账号不存在")
-    if not _state().account_public_view(account).get("reauth_available"):
-        raise HTTPException(409, "该账号当前不支持重新登录")
+    if _state().account_public_view(account).get("is_deactivated"):
+        raise HTTPException(409, "该账号已封号，不支持重新登录")
     try:
         reauth_mode = _state()._normalize_reauth_mode(body.mode)
     except ValueError as error:
