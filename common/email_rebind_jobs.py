@@ -236,7 +236,10 @@ class EmailRebindJobs:
             except Exception as error:  # terminal classification happens below
                 return index, None, error
         try:
-            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix=f"rebind-{job_id[:6]}") as pool:
+            with ThreadPoolExecutor(
+                max_workers=max(1, min(int(workers or 1), len(records))),
+                thread_name_prefix=f"rebind-{job_id[:6]}",
+            ) as pool:
                 futures = [pool.submit(one, index, record) for index, record in enumerate(records)]
                 for future in as_completed(futures):
                     index, result, error = future.result()

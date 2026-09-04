@@ -1016,8 +1016,18 @@ def _refresh_account_health_resource_state() -> None:
     with _ACCOUNT_HEALTH_PROGRESS_LOCK:
         if not _ACCOUNT_HEALTH_PROGRESS.get("running"):
             return
+        actual_total = max(
+            1,
+            int(
+                _ACCOUNT_HEALTH_PROGRESS.get("actual_total")
+                or _ACCOUNT_HEALTH_PROGRESS.get("total")
+                or 1
+            ),
+        )
+        budget_workers = workers
+        workers = max(1, min(workers, actual_total))
         _ACCOUNT_HEALTH_PROGRESS["workers"] = workers
-        _ACCOUNT_HEALTH_PROGRESS["throttled"] = workers < requested
+        _ACCOUNT_HEALTH_PROGRESS["throttled"] = budget_workers < requested
         _ACCOUNT_HEALTH_PROGRESS["resource_mode"] = mode
 
 
@@ -1109,7 +1119,10 @@ def _start_account_health_progress(
         int(requested if requested is not None else actual_total + skipped),
     )
     requested_workers = max(1, int(workers))
-    actual_workers, resource_mode = _account_health_resource_budget(requested_workers)
+    budget_workers, resource_mode = _account_health_resource_budget(requested_workers)
+    # 线程池实际按 min(workers, 账号数) 开线程，进度展示与实际一致；
+    # 账号数不足导致的截断不算资源压并发（throttled 仍按预算口径）。
+    actual_workers = max(1, min(budget_workers, actual_total or 1))
     updates_enabled = actual_total <= _ACCOUNT_HEALTH_INLINE_UPDATE_LIMIT
     with _ACCOUNT_HEALTH_PROGRESS_LOCK:
         _ACCOUNT_HEALTH_PROGRESS.clear()
@@ -1133,7 +1146,7 @@ def _start_account_health_progress(
             error=0,
             requested_workers=requested_workers,
             workers=actual_workers,
-            throttled=actual_workers < requested_workers,
+            throttled=budget_workers < requested_workers,
             resource_mode=resource_mode,
             updates={},
             updates_enabled=updates_enabled,

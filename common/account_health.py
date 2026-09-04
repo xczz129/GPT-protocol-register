@@ -43,6 +43,12 @@ _DEFAULT_JAPAN_LOCALE = "ja-JP"
 _DEFAULT_JAPAN_LANGUAGE = "ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6"
 
 
+# 测活路径的 token 刷新快速失败参数：慢代理不应把单账号测活拖过 1 分钟，
+# 完整刷新交给「刷新AT/重新登录」批量任务。
+_PROBE_REFRESH_TIMEOUT = 12.0
+_PROBE_REFRESH_ATTEMPTS = 1
+
+
 class _HealthWorkerGate:
     """Coordinate optional caller-provided limits without imposing a default cap."""
 
@@ -307,7 +313,9 @@ def _identity_headers(identity: dict[str, str]) -> dict[str, str]:
     return headers
 
 
-def refresh_oauth_tokens(record: dict[str, Any], *, force: bool = False) -> dict[str, Any]:
+def refresh_oauth_tokens(
+    record: dict[str, Any], *, force: bool = False, timeout: float = 60.0
+) -> dict[str, Any]:
     access_token = str(record.get("access_token") or "").strip()
     refresh_token = str(record.get("refresh_token") or "").strip()
     if not refresh_token or (access_token and not force and not _needs_refresh(access_token)):
@@ -333,7 +341,7 @@ def refresh_oauth_tokens(record: dict[str, Any], *, force: bool = False) -> dict
                 "refresh_token": refresh_token,
                 "client_id": str(record.get("oauth_client_id") or "").strip() or OAUTH_CLIENT_ID,
             },
-            timeout=60,
+            timeout=timeout,
         )
         try:
             data = response.json()
@@ -423,7 +431,11 @@ def _protocol_session_request(
 
 
 def refresh_chatgpt_session_tokens(
-    record: dict[str, Any], *, force: bool = False
+    record: dict[str, Any],
+    *,
+    force: bool = False,
+    timeout: float = 30.0,
+    attempts: int = 3,
 ) -> dict[str, Any]:
     """Refresh the access token through the protocol channel.
 
@@ -461,7 +473,10 @@ def refresh_chatgpt_session_tokens(
             }
         )
         session_url = f"{CHATGPT_BASE}/api/auth/session?update={int(time.time() * 1000)}"
-        response = _protocol_session_request(session, session_url, headers, proxy)
+        response = _protocol_session_request(
+            session, session_url, headers, proxy,
+            attempts=attempts, timeout=timeout,
+        )
         try:
             data = response.json()
         except Exception:
@@ -714,10 +729,16 @@ def check_account(
 
     def refresh_for_probe(*, force: bool = False) -> None:
         source = {**current, "proxy": probe_proxy}
+        # 快速失败：测活只保证拿到可用 AT 探测，慢刷新交给批量刷新任务。
         refreshed = (
-            refresh_chatgpt_session_tokens(source, force=force)
+            refresh_chatgpt_session_tokens(
+                source,
+                force=force,
+                timeout=_PROBE_REFRESH_TIMEOUT,
+                attempts=_PROBE_REFRESH_ATTEMPTS,
+            )
             if current.get("session_token")
-            else refresh_oauth_tokens(source, force=force)
+            else refresh_oauth_tokens(source, force=force, timeout=_PROBE_REFRESH_TIMEOUT)
         )
         apply_refreshed(refreshed)
 
@@ -757,7 +778,10 @@ def check_account(
                     if current.get("session_token"):
                         try:
                             refreshed = refresh_chatgpt_session_tokens(
-                                {**current, "proxy": probe_proxy}, force=True
+                                {**current, "proxy": probe_proxy},
+                                force=True,
+                                timeout=_PROBE_REFRESH_TIMEOUT,
+                                attempts=_PROBE_REFRESH_ATTEMPTS,
                             )
                             apply_refreshed(refreshed)
                         except InvalidAccessTokenError as exc:
@@ -768,7 +792,9 @@ def check_account(
                                 "missing renewable credential"
                             )
                         refreshed = refresh_oauth_tokens(
-                            {**current, "proxy": probe_proxy}, force=True
+                            {**current, "proxy": probe_proxy},
+                            force=True,
+                            timeout=_PROBE_REFRESH_TIMEOUT,
                         )
                         apply_refreshed(refreshed)
                     remote = fetch_remote_account_info({**current, "proxy": probe_proxy})

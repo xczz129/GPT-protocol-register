@@ -2812,7 +2812,12 @@ class WebPanelLogicTests(unittest.TestCase):
             result = check_account(source)
 
         self.assertEqual(result["health_status"], "alive")
-        self.assertEqual(nextauth.call_args_list[-1].kwargs, {"force": True})
+        from common.account_health import _PROBE_REFRESH_TIMEOUT
+
+        self.assertEqual(
+            nextauth.call_args_list[-1].kwargs,
+            {"force": True, "timeout": _PROBE_REFRESH_TIMEOUT, "attempts": 1},
+        )
         oauth.assert_not_called()
 
     def test_mail_stats_do_not_count_active_cooldown_as_available(self):
@@ -10490,7 +10495,8 @@ class ProtocolAndHealthTests(unittest.TestCase):
             self.assertEqual(progress["done"], 2)
             self.assertEqual(progress["total"], 3)
             self.assertEqual(progress["requested_workers"], 8)
-            self.assertEqual(progress["workers"], 8)
+            # 线程数按账号数截断：3 个账号最多 3 路。
+            self.assertEqual(progress["workers"], 3)
             self.assertFalse(progress["throttled"])
             self.assertEqual(progress["resource_mode"], "normal")
             self.assertEqual(progress["requested"], 3)
@@ -10596,7 +10602,8 @@ class ProtocolAndHealthTests(unittest.TestCase):
             web_app._start_account_health_progress(4, 10)
             snapshot = web_app._account_health_progress_snapshot()
             self.assertEqual(snapshot["requested_workers"], 10)
-            self.assertEqual(snapshot["workers"], 10)
+            # 4 个账号最多 4 路并发，账号不足不算 throttled。
+            self.assertEqual(snapshot["workers"], 4)
             self.assertFalse(snapshot["throttled"])
             self.assertEqual(snapshot["resource_mode"], "normal")
             web_app._finish_account_health_progress()

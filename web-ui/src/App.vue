@@ -1437,7 +1437,7 @@ async function resumeHealthCheck() {
   if (healthProgress.running) { notify("账号批量测活正在运行，请等待当前任务完成", "err"); return; }
   if (!healthProgress.pendingCount) { notify("没有可续跑的测活账号", "err"); return; }
   const workers = Math.max(1, Math.min(20, Math.floor(Number(healthProgress.requestedWorkers) || Number(uiSettings.value.health_workers) || 20)));
-  Object.assign(healthProgress, { running: true, done: 0, checked: 0, usable: 0, unavailable: 0, invalidOther: 0, current: `${workers} 路协议请求并发`, alive: 0, limited: 0, invalid: 0, reauthRequired: 0, error: 0, updates: [], interrupted: false, pendingCount: 0, message: "", requestedWorkers: workers, workers });
+  Object.assign(healthProgress, { running: true, done: 0, checked: 0, usable: 0, unavailable: 0, invalidOther: 0, current: `${Math.min(workers, Math.max(1, Number(healthProgress.pendingCount) || 1))} 路协议请求并发`, alive: 0, limited: 0, invalid: 0, reauthRequired: 0, error: 0, updates: [], interrupted: false, pendingCount: 0, message: "", requestedWorkers: workers, workers });
   startHealthProgressPolling();
   healthRequestActive = true;
   healthServerRunObserved = false;
@@ -2043,7 +2043,7 @@ async function healthAccounts(keys, options = {}) {
   });
   if (!picked) return;
   const workers = Math.max(1, Math.min(20, Math.floor(Number(picked.workers) || savedHealthWorkers)));
-  Object.assign(healthProgress, { running: true, requested: requestCount, actualTotal: Math.max(0, requestCount - knownSkipped), total: Math.max(0, requestCount - knownSkipped), done: 0, checked: 0, usable: 0, unavailable: knownSkipped, skippedKnownDeactivated: knownSkipped, deactivated: knownSkipped, invalidOther: 0, current: `${workers} 路协议请求并发`, alive: 0, limited: 0, invalid: 0, reauthRequired: 0, error: 0, requestedWorkers: workers, workers, throttled: false, resourceMode: "normal", updates: [], interrupted: false, pendingCount: 0, message: "" });
+  Object.assign(healthProgress, { running: true, requested: requestCount, actualTotal: Math.max(0, requestCount - knownSkipped), total: Math.max(0, requestCount - knownSkipped), done: 0, checked: 0, usable: 0, unavailable: knownSkipped, skippedKnownDeactivated: knownSkipped, deactivated: knownSkipped, invalidOther: 0, current: `${Math.min(workers, Math.max(1, requestCount - knownSkipped))} 路协议请求并发`, alive: 0, limited: 0, invalid: 0, reauthRequired: 0, error: 0, requestedWorkers: workers, workers, throttled: false, resourceMode: "normal", updates: [], interrupted: false, pendingCount: 0, message: "" });
   startHealthProgressPolling();
   healthRequestActive = true;
   healthServerRunObserved = false;
