@@ -6,6 +6,23 @@ from __future__ import annotations
 import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, unquote
+
+
+def _encode_proxy_credential(value: object) -> str:
+    """Percent-encode proxy credentials for the URL userinfo component.
+
+    代理商的地域参数会带空格（如 ``city-Bernau bei Berlin``），直接拼进
+    ``http://user:pass@host`` 会让 curl 直接拒绝整个请求（错误 5:
+    Unsupported proxy syntax）。先 unquote 再 quote：已编码的输入保持稳定
+    （幂等），原始空格/非 ASCII 字符则被正确编码。
+    """
+    text = str(value or "")
+    try:
+        text = unquote(text)
+    except Exception:
+        pass
+    return quote(text, safe="")
 
 
 def normalize_proxy_url(url: str | None) -> str:
@@ -18,30 +35,41 @@ def normalize_proxy_url(url: str | None) -> str:
             if len(bits) >= 3 and ":" in bits[0]:
                 host, port = bits[0].rsplit(":", 1)
                 username, password = bits[1], bits[2]
-                url = f"http://{username}:{password}@{host}:{port}"
+                url = f"http://{_encode_proxy_credential(username)}:{_encode_proxy_credential(password)}@{host}:{port}"
         elif "@" in url:
             left, right = url.split("@", 1)
             if ":" in left and ":" in right:
                 host, port = left.rsplit(":", 1)
                 username, password = right.split(":", 1)
                 if port.isdigit():
-                    url = f"http://{username}:{password}@{host}:{port}"
+                    url = f"http://{_encode_proxy_credential(username)}:{_encode_proxy_credential(password)}@{host}:{port}"
             if "://" not in url:
                 url = "http://" + url
         else:
             parts = url.split(":")
             if len(parts) == 4 and parts[1].isdigit():
                 host, port, username, password = parts
-                url = f"http://{username}:{password}@{host}:{port}"
+                url = f"http://{_encode_proxy_credential(username)}:{_encode_proxy_credential(password)}@{host}:{port}"
             elif len(parts) == 4 and parts[3].isdigit():
                 username, password, host, port = parts
-                url = f"http://{username}:{password}@{host}:{port}"
+                url = f"http://{_encode_proxy_credential(username)}:{_encode_proxy_credential(password)}@{host}:{port}"
             else:
                 url = "http://" + url
     if re.match(r"^socks://", url, re.IGNORECASE):
         url = "socks5h" + url[5:]
     elif re.match(r"^socks4a?://", url, re.IGNORECASE):
         url = re.sub(r"^socks4a?://", "socks4://", url, count=1, flags=re.IGNORECASE)
+    # 直贴的完整 URL 若 userinfo 含原始空格/非 ASCII 同样会让 curl 报错 5，
+    # 按相同规则修复。
+    if "://" in url:
+        scheme, rest = url.split("://", 1)
+        userinfo, at, hostpart = rest.rpartition("@")
+        if at and (" " in userinfo or any(ord(ch) > 127 for ch in userinfo)):
+            user, _, password = userinfo.partition(":")
+            url = (
+                f"{scheme}://{_encode_proxy_credential(user)}:"
+                f"{_encode_proxy_credential(password)}@{hostpart}"
+            )
     return url
 
 

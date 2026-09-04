@@ -1216,6 +1216,29 @@ class ProxyFormatTests(unittest.TestCase):
         self.assertEqual(normalize_proxy_url("socks://host:1080"), "socks5h://host:1080")
         self.assertEqual(proxy_brief("http://verylongusername123456789:pw@host:8080"), "host:8080 user=verylonguserna...456789")
 
+    def test_normalize_proxy_encodes_spaces_in_credentials(self):
+        from common.country_identity import country_code_from_proxy
+
+        # 代理商地域参数带空格（如德国 Brandenburg 的 Bernau bei Berlin）
+        # 时，凭据必须 percent-encode，否则 curl 报错 5。
+        normalized = normalize_proxy_url(
+            "sg.cliproxy.io:3010:gaiv1166199-region-DE-st-Brandenburg-city-Bernau bei Berlin-sid-ucgNn6yf-t-5:123REDACTED-DOMAIN-API-PASSWORD"
+        )
+        self.assertNotIn(" ", normalized)
+        self.assertEqual(
+            normalized,
+            "http://gaiv1166199-region-DE-st-Brandenburg-city-Bernau%20bei%20Berlin-sid-ucgNn6yf-t-5:123REDACTED-DOMAIN-API-PASSWORD@sg.cliproxy.io:3010",
+        )
+        # 已编码的输入保持稳定，不二次编码。
+        self.assertEqual(normalize_proxy_url(normalized), normalized)
+        # 国家识别不受编码影响。
+        self.assertEqual(country_code_from_proxy(normalized), "DE")
+        # 直贴完整 URL 且 userinfo 带空格时同样修复。
+        self.assertEqual(
+            normalize_proxy_url("http://user name:pass word@host:8080"),
+            "http://user%20name:pass%20word@host:8080",
+        )
+
     def test_flaresolverr_solution_filters_foreign_cookies(self):
         from common.proxy_clearance import _bundle_from_solution
 
