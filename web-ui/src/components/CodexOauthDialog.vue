@@ -6,7 +6,7 @@ const props = defineProps({
   open: Boolean,
   status: { type: Object, default: () => ({}) },
 });
-const emit = defineEmits(["close", "stop", "copy"]);
+const emit = defineEmits(["close", "stop", "copy", "resume"]);
 
 const logsEl = ref(null);
 const copiedKey = ref("");
@@ -76,9 +76,11 @@ async function copyRt(rt, email) {
             <span>{{ status.done || 0 }} / {{ status.total || 0 }} · 成功 {{ status.success || 0 }} · 失败 {{ status.failed || 0 }}<template v-if="status.running"> · 运行中…</template><template v-else> · 已结束</template></span>
             <div class="row-btns">
               <button v-if="status.running" class="btn danger sm" type="button" @click="emit('stop')">停止</button>
+              <button v-if="!status.running && Number(status.pending_count || 0) > 0" class="btn primary sm" type="button" @click="emit('resume')">继续接码剩余 {{ status.pending_count }} 个</button>
               <button class="btn secondary sm" type="button" @click="emit('close')">关闭</button>
             </div>
           </div>
+          <p v-if="!status.running && (status.logs || []).length && (status.logs || []).some((line) => line.level === 'warning')" class="codex-hint"><Smartphone :size="14" aria-hidden="true" /> {{ (status.logs || []).filter((line) => line.level === 'warning').slice(-1)[0]?.m || "" }}</p>
           <div class="codex-oauth-body">
             <div v-if="(status.results || []).length" class="codex-oauth-results">
               <div v-for="(item, index) in status.results" :key="`${item.email}-${index}`" :class="['codex-result-row', item.status === 'success' ? 'ok' : 'bad']">

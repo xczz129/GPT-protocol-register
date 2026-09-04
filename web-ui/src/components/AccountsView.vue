@@ -41,7 +41,7 @@ const props = defineProps({
 });
 
 const emit = defineEmits([
-  "refresh", "health", "reauth", "security-repair", "password-change", "totp-change", 
+  "refresh", "health", "resume-health", "resume-trial", "reauth", "security-repair", "password-change", "totp-change", 
   "account-logs", "stop-reauth", "delete", "delete-invalid", "download", "copy-selected-at", "codex-oauth", "import-accounts", 
   "export-selected-at", "export-security", "create-group", "rename-group", "delete-group", 
   "move-group", "export-group", "copy-at", "copy-credential", "copy-value", "trial-check",
@@ -735,8 +735,9 @@ function moveSelected() {
         <!-- 进度看板 -->
         <div v-if="healthProgress.requested || healthProgress.total" class="health-progress" :class="{ active: healthProgress.running }" aria-live="polite">
           <div class="health-progress-head">
-            <strong>{{ healthProgress.running ? "账号测活进行中" : "最近一次测活完成" }}</strong>
+            <strong>{{ healthProgress.running ? "账号测活进行中" : (healthProgress.pendingCount ? "测活任务已中断" : "最近一次测活完成") }}</strong>
             <span>{{ healthProgress.done }} / {{ healthProgress.total }} 实际检测 · {{ healthPercent }}%</span>
+            <button v-if="!healthProgress.running && healthProgress.pendingCount" class="btn secondary reauth-stop-btn" type="button" @click="emit('resume-health')">继续检测剩余 {{ healthProgress.pendingCount }} 个</button>
           </div>
           <div class="health-progress-track"><i :style="{ width: `${healthPercent}%` }"></i></div>
           <div class="health-progress-meta">
@@ -751,6 +752,7 @@ function moveSelected() {
             <span>待续期 {{ healthProgress.reauthRequired || 0 }}</span>
             <span>其它失效 {{ healthProgress.invalidOther || 0 }}</span>
             <span>错误 {{ healthProgress.error || 0 }}</span>
+            <span v-if="!healthProgress.running && healthProgress.message" class="health-progress-warning">{{ healthProgress.message }}</span>
           </div>
         </div>
 
@@ -776,8 +778,9 @@ function moveSelected() {
 
         <div v-if="trialProgress.total" class="health-progress" :class="{ active: trialProgress.running }" aria-live="polite">
           <div class="health-progress-head">
-            <strong>{{ trialProgress.running ? "0元资格检测中" : "最近一次0元资格检测完成" }}</strong>
+            <strong>{{ trialProgress.running ? "0元资格检测中" : (trialProgress.pendingCount ? "0元资格检测已中断" : "最近一次0元资格检测完成") }}</strong>
             <span>{{ trialProgress.done }} / {{ trialProgress.total }} · {{ trialPercent }}%</span>
+            <button v-if="!trialProgress.running && trialProgress.pendingCount" class="btn secondary reauth-stop-btn" type="button" @click="emit('resume-trial')">继续检测剩余 {{ trialProgress.pendingCount }} 个</button>
           </div>
           <div class="health-progress-track"><i :style="{ width: `${trialPercent}%` }"></i></div>
           <div class="health-progress-meta">
@@ -786,6 +789,7 @@ function moveSelected() {
             <span>不符合 {{ trialProgress.ineligible || 0 }}</span>
             <span>失败 {{ trialProgress.failed || 0 }}</span>
             <span>已停止 {{ trialProgress.stopped || 0 }}</span>
+            <span v-if="!trialProgress.running && trialProgress.message" class="health-progress-warning">{{ trialProgress.message }}</span>
           </div>
         </div>
 

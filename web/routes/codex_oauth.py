@@ -44,6 +44,8 @@ from codex_oauth.sms import (  # noqa: E402
     parse_firefox_docking_code,
 )
 
+from common import task_checkpoint  # noqa: E402
+
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 
 
@@ -79,6 +81,79 @@ def _log(message: str, level: str = "info") -> None:
         overflow = len(_STATE["logs"]) - _MAX_LOGS
         if overflow > 0:
             del _STATE["logs"][:overflow]
+
+
+# ---------------------------------------------------------------------------
+# 接码任务检查点:进度落盘,服务重启后恢复显示并支持续跑剩余账号。
+_SMS_CHECKPOINT_TASK = "codex_sms"
+_SMS_CHECKPOINT_SAVER = task_checkpoint.DebouncedCheckpointSaver(
+    _SMS_CHECKPOINT_TASK, interval=2.0
+)
+_SMS_CHECKPOINT_EMAILS: list[str] = []
+_SMS_CHECKPOINT_DONE: set[str] = set()
+
+
+def _sms_checkpoint_payload(running: bool) -> dict:
+    with _LOCK:
+        snapshot = {
+            key: value
+            for key, value in _STATE.items()
+            if key not in {"logs", "results", "pending_emails"}
+        }
+        results = [dict(row) for row in (_STATE.get("results") or [])][-200:]
+    return {
+        "version": 1,
+        "task_type": _SMS_CHECKPOINT_TASK,
+        "running": bool(running),
+        "completed": not running,
+        "emails": list(_SMS_CHECKPOINT_EMAILS),
+        "done_emails": sorted(_SMS_CHECKPOINT_DONE),
+        "results": results,
+        "snapshot": snapshot,
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def _restore_sms_checkpoint() -> None:
+    """服务启动时恢复未完成的接码任务(interrupted + 剩余账号)。"""
+    checkpoint = task_checkpoint.load_checkpoint(_SMS_CHECKPOINT_TASK)
+    if not checkpoint or checkpoint.get("completed"):
+        return
+    emails = [str(email) for email in (checkpoint.get("emails") or []) if str(email)]
+    done = {str(email) for email in (checkpoint.get("done_emails") or []) if str(email)}
+    pending = [email for email in emails if email not in done]
+    snapshot = dict(checkpoint.get("snapshot") or {})
+    interrupted = bool(checkpoint.get("running"))
+    if interrupted:
+        message = (
+            f"服务重启，接码任务中断：已完成 {len(done)} / {len(emails)}，"
+            f"剩余 {len(pending)} 个账号可续跑"
+        )
+    else:
+        message = f"接码任务已停止：剩余 {len(pending)} 个账号可续跑"
+    _SMS_CHECKPOINT_EMAILS.extend(emails)
+    _SMS_CHECKPOINT_DONE.update(done)
+    with _LOCK:
+        _STATE.update(
+            running=False,
+            interrupted=interrupted,
+            total=len(emails),
+            done=len(done),
+            success=max(0, int(snapshot.get("success") or 0)),
+            failed=max(0, int(snapshot.get("failed") or 0)),
+            logs=[{"t": datetime.now().strftime("%H:%M:%S"), "level": "warning", "m": message}],
+            results=[dict(row) for row in (checkpoint.get("results") or [])],
+            started_at=str(snapshot.get("started_at") or ""),
+            finished_at="",
+            pending_emails=pending,
+            pending_count=len(pending),
+        )
+
+
+try:
+    _restore_sms_checkpoint()
+except Exception:
+    pass
 
 
 _RT_HISTORY_PATH = Path("/root/full/gpt-register-fp/data/codex_rt_history.json")
@@ -464,10 +539,29 @@ def _run_batch(records: list, sms_cfg: dict) -> None:
             finally:
                 with _LOCK:
                     _STATE["done"] += 1
+                email_key = str(rec.get("email") or "").strip().lower()
+                if email_key:
+                    _SMS_CHECKPOINT_DONE.add(email_key)
+                    _SMS_CHECKPOINT_SAVER.submit(
+                        lambda: _sms_checkpoint_payload(running=True)
+                    )
     finally:
         with _LOCK:
             _STATE["running"] = False
             _STATE["finished_at"] = datetime.now().isoformat(timespec="seconds")
+            # 停止时算出剩余账号供续跑(全部完成时为空)
+            pending_emails = [
+                email
+                for email in _SMS_CHECKPOINT_EMAILS
+                if email not in _SMS_CHECKPOINT_DONE
+            ]
+            _STATE["pending_emails"] = pending_emails
+            _STATE["pending_count"] = len(pending_emails)
+            _STATE["interrupted"] = False
+        if _STOP.is_set():
+            _SMS_CHECKPOINT_SAVER.flush_now(lambda: _sms_checkpoint_payload(running=False))
+        else:
+            task_checkpoint.clear_checkpoint(_SMS_CHECKPOINT_TASK)
 
 
 # ---------------------------------------------------------------------------
@@ -1077,6 +1171,9 @@ async def codex_oauth_import(body: CodexOauthImportRequest):
                     "results": [],
                     "started_at": datetime.now().isoformat(timespec="seconds"),
                     "finished_at": "",
+                    "interrupted": False,
+                    "pending_emails": [],
+                    "pending_count": 0,
                 }
             )
         _STOP.clear()
@@ -1096,6 +1193,56 @@ class CodexOauthRunRequest(BaseModel):
     emails: list = Field(default_factory=list, max_length=200)
 
 
+def _start_sms_batch(wanted: set[str]) -> dict:
+    """按选中邮箱启动接码批次(run/resume 共用)。"""
+    records = _state().load_accounts(_state().ACCOUNTS_FILE)
+    picked = [
+        dict(rec)
+        for rec in records
+        if str(rec.get("email") or "").strip().lower() in wanted
+    ]
+    if not picked:
+        raise HTTPException(404, "选中账号在库中不存在")
+    cfg = _state()._read_config()
+    sms_cfg = _sms_config_section(cfg)
+    settings = SmsSettings.from_mapping(sms_cfg)
+    if not settings.enabled or not settings.credentials_configured:
+        raise HTTPException(400, f"接码未启用或未配置凭证({settings.provider_label})")
+    with _LOCK:
+        _STATE.update(
+            {
+                "running": True,
+                "total": len(picked),
+                "done": 0,
+                "success": 0,
+                "failed": 0,
+                "logs": [],
+                "results": [],
+                "started_at": datetime.now().isoformat(timespec="seconds"),
+                "finished_at": "",
+                "interrupted": False,
+                "pending_emails": [],
+                "pending_count": 0,
+            }
+        )
+        _SMS_CHECKPOINT_EMAILS[:] = [
+            str(rec.get("email") or "").strip().lower() for rec in picked
+        ]
+        _SMS_CHECKPOINT_DONE.clear()
+    task_checkpoint.save_checkpoint(
+        _SMS_CHECKPOINT_TASK, _sms_checkpoint_payload(running=True)
+    )
+    _STOP.clear()
+    threading.Thread(
+        target=_run_batch,
+        args=(picked, sms_cfg),
+        name="codex-oauth-batch",
+        daemon=True,
+    ).start()
+    _log(f"任务启动:{len(picked)} 个账号 · 接码渠道 {settings.provider_label}")
+    return {"ok": True, "total": len(picked)}
+
+
 @router.post("/api/codex-oauth/run")
 async def codex_oauth_run(body: CodexOauthRunRequest):
     def _do():
@@ -1105,42 +1252,26 @@ async def codex_oauth_run(body: CodexOauthRunRequest):
         wanted = {str(e).strip().lower() for e in body.emails if str(e).strip()}
         if not wanted:
             raise HTTPException(400, "未选择账号")
-        records = _state().load_accounts(_state().ACCOUNTS_FILE)
-        picked = [
-            dict(rec)
-            for rec in records
-            if str(rec.get("email") or "").strip().lower() in wanted
-        ]
-        if not picked:
-            raise HTTPException(404, "选中账号在库中不存在")
-        cfg = _state()._read_config()
-        sms_cfg = _sms_config_section(cfg)
-        settings = SmsSettings.from_mapping(sms_cfg)
-        if not settings.enabled or not settings.credentials_configured:
-            raise HTTPException(400, f"接码未启用或未配置凭证({settings.provider_label})")
+        return _start_sms_batch(wanted)
+
+    return await asyncio.to_thread(_do)
+
+
+@router.post("/api/codex-oauth/resume")
+async def codex_oauth_resume():
+    """续跑被打断/已停止的接码任务(只处理剩余账号)。"""
+    def _do():
         with _LOCK:
-            _STATE.update(
-                {
-                    "running": True,
-                    "total": len(picked),
-                    "done": 0,
-                    "success": 0,
-                    "failed": 0,
-                    "logs": [],
-                    "results": [],
-                    "started_at": datetime.now().isoformat(timespec="seconds"),
-                    "finished_at": "",
-                }
-            )
-        _STOP.clear()
-        threading.Thread(
-            target=_run_batch,
-            args=(picked, sms_cfg),
-            name="codex-oauth-batch",
-            daemon=True,
-        ).start()
-        _log(f"任务启动:{len(picked)} 个账号 · 接码渠道 {settings.provider_label}")
-        return {"ok": True, "total": len(picked)}
+            if _STATE["running"]:
+                raise HTTPException(409, "已有接码任务在运行")
+            pending = [
+                str(email).strip().lower()
+                for email in (_STATE.get("pending_emails") or [])
+                if str(email).strip()
+            ]
+        if not pending:
+            raise HTTPException(400, "没有可续跑的账号（任务未中断或已全部完成）")
+        return _start_sms_batch({email for email in pending})
 
     return await asyncio.to_thread(_do)
 

@@ -24,6 +24,7 @@ from common.trial_eligibility import (
     check_trial_eligibility_nerver,
     is_trial_probe_retryable,
 )
+from common import task_checkpoint
 from common.trial_proxy_pool import selected_trial_proxies
 
 
@@ -52,6 +53,29 @@ class TrialEligibilityJobs:
         self.threads: dict[str, threading.Thread] = {}
         self.stop_events: dict[str, threading.Event] = {}
         self.active_job_id = ""
+        # 检查点:任务进度落盘,服务重启后恢复并支持续跑
+        self._checkpoint_task = "trial_eligibility"
+        self._checkpoint_done: set[str] = set()
+        self._checkpoint_saver = task_checkpoint.DebouncedCheckpointSaver(
+            self._checkpoint_task, interval=2.0
+        )
+
+    def _checkpoint_payload(self, job_id: str, running: bool) -> dict[str, Any]:
+        with self.lock:
+            job = self.jobs.get(job_id) or {}
+            items = job.get("items") or []
+            snapshot = {key: value for key, value in job.items() if key != "items"}
+        return {
+            "version": 1,
+            "task_type": self._checkpoint_task,
+            "running": bool(running),
+            "completed": not running,
+            "keys": [str(item.get("key") or "") for item in items],
+            "emails": [str(item.get("email") or "") for item in items],
+            "done_keys": sorted(self._checkpoint_done),
+            "snapshot": snapshot,
+            "saved_at": _now(),
+        }
 
     def start(
         self,
@@ -98,6 +122,11 @@ class TrialEligibilityJobs:
             }
             self.jobs[job_id] = job
             self.active_job_id = job_id
+            self._checkpoint_done.clear()
+            task_checkpoint.save_checkpoint(
+                self._checkpoint_task,
+                self._checkpoint_payload(job_id, running=True),
+            )
             stop_event = threading.Event()
             self.stop_events[job_id] = stop_event
             thread = threading.Thread(
@@ -310,6 +339,12 @@ class TrialEligibilityJobs:
                             job[state] = int(job.get(state) or 0) + 1
                             job["done"] = int(job.get("done") or 0) + 1
                             job["stage"] = f"{job['done']} / {job['total']} 已完成"
+                        item_key = str(item.get("key") or "")
+                        if item_key:
+                            self._checkpoint_done.add(item_key)
+                            self._checkpoint_saver.submit(
+                                lambda: self._checkpoint_payload(job_id, running=True)
+                            )
                         if not stop_event.is_set():
                             submit_next()
                 if stop_event.is_set():
@@ -326,6 +361,13 @@ class TrialEligibilityJobs:
                 )
                 if self.active_job_id == job_id:
                     self.active_job_id = ""
+            # 检查点收尾:全部跑完(含失败)清除;停止保留供续跑
+            if not stopped:
+                task_checkpoint.clear_checkpoint(self._checkpoint_task)
+            else:
+                self._checkpoint_saver.flush_now(
+                    lambda: self._checkpoint_payload(job_id, running=False)
+                )
 
     def snapshot(self, job_id: str) -> dict[str, Any] | None:
         with self.lock:
@@ -359,3 +401,56 @@ class TrialEligibilityJobs:
 
 
 TRIAL_ELIGIBILITY_JOBS = TrialEligibilityJobs()
+
+
+def _restore_trial_eligibility_checkpoint() -> None:
+    """服务启动时恢复未完成的优惠检测任务(interrupted + 剩余账号)。"""
+    checkpoint = task_checkpoint.load_checkpoint(
+        TRIAL_ELIGIBILITY_JOBS._checkpoint_task
+    )
+    if not checkpoint or checkpoint.get("completed"):
+        return
+    keys = [str(key) for key in (checkpoint.get("keys") or []) if str(key)]
+    emails = [str(email) for email in (checkpoint.get("emails") or [])]
+    emails_by_key = dict(zip(keys, emails))
+    done = {str(key) for key in (checkpoint.get("done_keys") or []) if str(key)}
+    pending = [key for key in keys if key not in done]
+    snapshot = dict(checkpoint.get("snapshot") or {})
+    interrupted = bool(checkpoint.get("running"))
+    job = dict(snapshot)
+    job.update(
+        {
+            "job_id": "restored-" + uuid.uuid4().hex[:8],
+            "status": "interrupted",
+            "stage": (
+                f"服务重启中断：已完成 {len(done)} / {len(keys)}，剩余 {len(pending)} 个可续跑"
+                if interrupted
+                else f"任务已停止：剩余 {len(pending)} 个可续跑"
+            ),
+            "current": "",
+            "finished_at": _now(),
+            "interrupted": interrupted,
+            "pending_keys": pending,
+            "items": [
+                {
+                    "key": key,
+                    "email": emails_by_key.get(key, ""),
+                    "account_id": "",
+                    "status": "queued",
+                    "result": None,
+                    "error": "",
+                    "attempt": 0,
+                }
+                for key in pending
+            ],
+        }
+    )
+    with TRIAL_ELIGIBILITY_JOBS.lock:
+        TRIAL_ELIGIBILITY_JOBS.jobs[job["job_id"]] = job
+        TRIAL_ELIGIBILITY_JOBS.active_job_id = job["job_id"]
+
+
+try:
+    _restore_trial_eligibility_checkpoint()
+except Exception:
+    pass

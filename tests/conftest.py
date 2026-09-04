@@ -12,7 +12,14 @@ database; tests that pass an explicit ``path`` keep full control.
 """
 from __future__ import annotations
 
+import os
+import tempfile
+
 import pytest
+
+# 任务检查点(测活/检测试用/接码的重启恢复文件)必须与生产数据隔离:
+# 在任何被测模块导入 task_checkpoint 之前重定向到临时目录。
+os.environ.setdefault("TASK_CHECKPOINT_DIR", tempfile.mkdtemp(prefix="task-ckpt-"))
 
 
 @pytest.fixture(autouse=True)

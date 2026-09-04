@@ -91,14 +91,14 @@ const passwordChangeDialog = reactive({ open: false, count: 0 });
 const clipboardDialog = reactive({ open: false, title: "", value: "", successMessage: "" });
 const accountLogDialog = reactive({ open: false, account: null, logs: [], total: 0, loading: false, error: "" });
 const copyingAccessToken = ref(false);
-const healthProgress = reactive({ running: false, requested: 0, actualTotal: 0, total: 0, done: 0, checked: 0, usable: 0, unavailable: 0, skippedKnownDeactivated: 0, deactivated: 0, invalidOther: 0, current: "", alive: 0, limited: 0, invalid: 0, reauthRequired: 0, error: 0, requestedWorkers: 0, workers: 0, throttled: false, resourceMode: "normal", updates: [] });
+const healthProgress = reactive({ running: false, requested: 0, actualTotal: 0, total: 0, done: 0, checked: 0, usable: 0, unavailable: 0, skippedKnownDeactivated: 0, deactivated: 0, invalidOther: 0, current: "", alive: 0, limited: 0, invalid: 0, reauthRequired: 0, error: 0, requestedWorkers: 0, workers: 0, throttled: false, resourceMode: "normal", updates: [], interrupted: false, pendingCount: 0, message: "" });
 const reauthProgress = reactive({ running: false, stopping: false, mode: "protocol", operation: "reauth", concurrency: 3, total: 0, done: 0, current: "", success: 0, failed: 0, cancelled: 0, last: "", lastStatus: "", lastMessage: "", items: [] });
 const protocolLoginPreflight = reactive({ requested: 0, matched: 0, submitted: 0, invalidFormat: [], notFound: [], missingCredentials: [] });
 const rebindPreflight = reactive({ eligible: false, requested: 0, matched: 0, eligibleCount: 0, source: null, sources: [], target: null, items: [], reservationId: "", invalidFormat: [], invalidTargets: [], notFound: [], missingCredentials: [], conflicts: [], message: "" });
 const rebindProgress = reactive({ jobId: "", running: false, stopping: false, status: "", mode: "protocol", operation: "email_rebind", concurrency: 1, total: 0, done: 0, current: "", success: 0, failed: 0, cancelled: 0, last: "", lastStatus: "", lastMessage: "", message: "", skipped: [], items: [] });
 const rebindChecking = ref(false);
 const rebindRequestBusy = ref(false);
-const trialProgress = reactive({ running: false, total: 0, done: 0, current: "", eligible: 0, ineligible: 0, failed: 0, stopped: 0, jobId: "" });
+const trialProgress = reactive({ running: false, total: 0, done: 0, current: "", eligible: 0, ineligible: 0, failed: 0, stopped: 0, jobId: "", interrupted: false, pendingCount: 0, message: "" });
 const refreshAtProgress = reactive({ running: false, total: 0, done: 0, current: "", refreshed: 0, unchanged: 0, failed: 0, stopped: 0, jobId: "" });
 let noticeTimer = null;
 let dialogResolve = null;
@@ -948,7 +948,8 @@ async function initialize() {
     ]);
     if (!activeLoad) await loadActiveView();
     fillForms();
-    await Promise.all([resumeHealthProgress(), resumeReauthProgress(), resumeTrialProgress(), resumeRefreshAtProgress()]);
+    await Promise.all([resumeHealthProgress(), resumeReauthProgress(), resumeTrialProgress(), resumeRefreshAtProgress(), resumeCodexProgress()]);
+    void promptInterruptedTasks();
     connectStream();
   } catch (error) {
     notify(error.message, "err");
@@ -1383,6 +1384,9 @@ function applyHealthProgress(value) {
     throttled: !!value.throttled,
     resourceMode: value.resource_mode || "normal",
     updates,
+    interrupted: !!value.interrupted,
+    pendingCount: Math.max(0, Number(value.pending_count || 0)),
+    message: value.message || "",
   });
   return true;
 }
@@ -1427,6 +1431,92 @@ async function pollHealthProgress(force = false) {
 async function resumeHealthProgress() {
   const value = await pollHealthProgress(true);
   if (value?.running) startHealthProgressPolling();
+}
+
+async function resumeHealthCheck() {
+  if (healthProgress.running) { notify("账号批量测活正在运行，请等待当前任务完成", "err"); return; }
+  if (!healthProgress.pendingCount) { notify("没有可续跑的测活账号", "err"); return; }
+  const workers = Math.max(1, Math.min(20, Math.floor(Number(healthProgress.requestedWorkers) || Number(uiSettings.value.health_workers) || 20)));
+  Object.assign(healthProgress, { running: true, done: 0, checked: 0, usable: 0, unavailable: 0, invalidOther: 0, current: `${workers} 路协议请求并发`, alive: 0, limited: 0, invalid: 0, reauthRequired: 0, error: 0, updates: [], interrupted: false, pendingCount: 0, message: "", requestedWorkers: workers, workers });
+  startHealthProgressPolling();
+  healthRequestActive = true;
+  healthServerRunObserved = false;
+  try {
+    const result = await api("/api/accounts/health/resume", { method: "POST", body: jsonBody({ workers }) });
+    const value = await pollHealthProgress(true);
+    if (!value) applyHealthProgress({ ...result, running: false });
+    scheduleAccountsRefresh(100);
+    notify(`测活续跑完成：实际检测 ${healthProgress.checked} 条；可用 ${healthProgress.usable}，待续期 ${healthProgress.reauthRequired}，其它失效 ${healthProgress.invalidOther}，错误 ${healthProgress.error}`);
+  } catch (error) {
+    const value = await pollHealthProgress(true);
+    if (value?.running) {
+      notify("测活请求连接已结束，后台仍在检测，页面将继续同步进度");
+    } else {
+      scheduleAccountsRefresh(100);
+      notify(error?.message || "测活续跑失败", "err");
+    }
+  } finally {
+    healthRequestActive = false;
+    healthServerRunObserved = false;
+    if (healthProgress.running) startHealthProgressPolling();
+  }
+}
+
+async function resumeTrialCheck() {
+  if (trialProgress.running) { notify("已有优惠检测批次正在运行", "err"); return; }
+  if (!trialProgress.pendingCount) { notify("没有可续跑的检测账号", "err"); return; }
+  const savedTrialWorkers = Math.max(1, Math.min(20, Math.floor(Number(uiSettings.value.trial_workers) || 20)));
+  const savedTrialChannel = uiSettings.value.trial_channel === "nerver" ? "nerver" : "v4";
+  try {
+    const job = await api("/api/accounts/trial-eligibility/resume", { method: "POST", body: jsonBody({ concurrency: savedTrialWorkers, channel: savedTrialChannel }) });
+    applyTrialProgress(job);
+    pollTrialProgress();
+    notify(`0元资格检测续跑已启动：剩余 ${job.total || 0} 个账号`, "ok");
+  } catch (error) { notify(error?.message || "资格检测续跑失败", "err"); }
+}
+
+async function resumeCodexProgress() {
+  try { codexOauthStatus.value = await api("/api/codex-oauth/status"); } catch {}
+}
+
+async function resumeCodexBatch() {
+  if (codexOauthStatus.value.running) { notify("已有接码任务在运行", "err"); return; }
+  if (!Number(codexOauthStatus.value.pending_count || 0)) { notify("没有可续跑的接码账号", "err"); return; }
+  await run(() => api("/api/codex-oauth/resume", { method: "POST", body: "{}" }), "接码续跑已启动");
+  codexOauthDialog.open = true;
+  stopCodexOauthPolling();
+  codexOauthTimer = setInterval(async () => { try { codexOauthStatus.value = await api("/api/codex-oauth/status"); if (!codexOauthStatus.value.running) stopCodexOauthPolling(); } catch { stopCodexOauthPolling(); } }, 2000);
+}
+
+async function promptInterruptedTasks() {
+  // 服务重启恢复检查点后,提示续跑被打断的任务
+  try {
+    if (healthProgress.pendingCount > 0 && !healthProgress.running) {
+      const ok = await openDialog({
+        title: "测活任务中断",
+        message: `${healthProgress.message || "测活任务未完成"}。是否继续检测剩余 ${healthProgress.pendingCount} 个账号？`,
+        confirmText: "继续检测",
+      });
+      if (ok) { void resumeHealthCheck(); return; }
+    }
+    if (trialProgress.pendingCount > 0 && !trialProgress.running) {
+      const ok = await openDialog({
+        title: "0元资格检测中断",
+        message: `${trialProgress.message || "0元资格检测未完成"}。是否继续检测剩余 ${trialProgress.pendingCount} 个账号？`,
+        confirmText: "继续检测",
+      });
+      if (ok) { void resumeTrialCheck(); return; }
+    }
+    const smsPending = Number(codexOauthStatus.value.pending_count || 0);
+    if (smsPending > 0 && !codexOauthStatus.value.running) {
+      const ok = await openDialog({
+        title: "接码任务中断",
+        message: `接码任务未完成：已完成 ${codexOauthStatus.value.done || 0} / ${codexOauthStatus.value.total || 0}。是否继续接码剩余 ${smsPending} 个账号？`,
+        confirmText: "继续接码",
+      });
+      if (ok) { void resumeCodexBatch(); return; }
+    }
+  } catch {}
 }
 
 function applyReauthProgress(value) {
@@ -1970,7 +2060,7 @@ async function healthAccounts(keys, options = {}) {
   });
   if (!picked) return;
   const workers = Math.max(1, Math.min(20, Math.floor(Number(picked.workers) || savedHealthWorkers)));
-  Object.assign(healthProgress, { running: true, requested: requestCount, actualTotal: Math.max(0, requestCount - knownSkipped), total: Math.max(0, requestCount - knownSkipped), done: 0, checked: 0, usable: 0, unavailable: knownSkipped, skippedKnownDeactivated: knownSkipped, deactivated: knownSkipped, invalidOther: 0, current: `${workers} 路协议请求并发`, alive: 0, limited: 0, invalid: 0, reauthRequired: 0, error: 0, requestedWorkers: workers, workers, throttled: false, resourceMode: "normal", updates: [] });
+  Object.assign(healthProgress, { running: true, requested: requestCount, actualTotal: Math.max(0, requestCount - knownSkipped), total: Math.max(0, requestCount - knownSkipped), done: 0, checked: 0, usable: 0, unavailable: knownSkipped, skippedKnownDeactivated: knownSkipped, deactivated: knownSkipped, invalidOther: 0, current: `${workers} 路协议请求并发`, alive: 0, limited: 0, invalid: 0, reauthRequired: 0, error: 0, requestedWorkers: workers, workers, throttled: false, resourceMode: "normal", updates: [], interrupted: false, pendingCount: 0, message: "" });
   startHealthProgressPolling();
   healthRequestActive = true;
   healthServerRunObserved = false;
@@ -2057,7 +2147,7 @@ async function trialEligibilityAccounts(payload = {}) {
   } catch (error) { notify(error?.message || "资格检测启动失败", "err"); }
 }
 function applyTrialProgress(job) {
-  Object.assign(trialProgress, { jobId: job.job_id || "", running: ["queued", "running", "stopping"].includes(job.status), total: Number(job.total || 0), done: Number(job.done || 0), current: job.current || "", eligible: Number(job.eligible || 0), ineligible: Number(job.ineligible || 0), failed: Number(job.failed || 0), stopped: Number(job.stopped || 0) });
+  Object.assign(trialProgress, { jobId: job.job_id || "", running: ["queued", "running", "stopping"].includes(job.status), total: Number(job.total || 0), done: Number(job.done || 0), current: job.current || "", eligible: Number(job.eligible || 0), ineligible: Number(job.ineligible || 0), failed: Number(job.failed || 0), stopped: Number(job.stopped || 0), interrupted: job.status === "interrupted", pendingCount: Math.max(0, Number((job.pending_keys || []).length || 0)), message: job.stage || "" });
 }
 async function resumeTrialProgress() {
   try {
@@ -2883,7 +2973,7 @@ onBeforeUnmount(() => {
         </template>
         <IntegrationView v-else-if="active === 'chatgpt2api'" :form="integrationForm" :groups="groups" :progress="progress" :busy="busy" @save="saveIntegration" @test="testIntegration" @upload="uploadIntegration" />
         <LogsView v-else-if="active === 'logs'" :logs="logs" :connected="connected" @refresh="loadLogs" @download="downloadLogs" @clear="logs = []" />
-        <AccountsView v-else-if="active === 'accounts'" :accounts="accounts" :accounts-loading="accountsLoading" :account-load-progress="accountLoadProgress" :account-load-error="accountLoadError" :groups="groups" :proxy-countries="proxyForm.countries" :busy="busy" :copying-at="copyingAccessToken" :health-progress="healthProgress" :reauth-progress="reauthProgress" :trial-progress="trialProgress" :refresh-at-progress="refreshAtProgress" @refresh="loadAccounts" @health="healthAccounts" @trial-check="trialEligibilityAccounts" @refresh-at="refreshAtAccounts" @reauth="reauthAccounts" @security-repair="repairSecurityAccounts" @password-change="changeAccountPasswords" @totp-change="changeAccountTotp" @account-logs="openAccountLogs" @stop-reauth="stopReauth" @delete="deleteAccounts" @delete-invalid="deleteInvalidAccounts" @download="downloadAccounts" @copy-selected-at="copySelectedAccessTokens" @export-selected-at="exportSelectedAccessTokens" @export-security="exportSecurityCredentials" @create-group="createAccountGroup" @rename-group="renameAccountGroup" @delete-group="deleteAccountGroup" @move-group="moveAccountsToGroup" @export-group="exportGroupCredentials" @copy-at="copyAccessToken" @copy-session="copySessionToken" @copy-credential="copyAccountCredential" @copy-value="copyValue" @codex-oauth="runCodexOauth" @import-accounts="importAccountsDialog.open = true" :codex-oauth-running="codexOauthRunning" />
+        <AccountsView v-else-if="active === 'accounts'" :accounts="accounts" :accounts-loading="accountsLoading" :account-load-progress="accountLoadProgress" :account-load-error="accountLoadError" :groups="groups" :proxy-countries="proxyForm.countries" :busy="busy" :copying-at="copyingAccessToken" :health-progress="healthProgress" :reauth-progress="reauthProgress" :trial-progress="trialProgress" :refresh-at-progress="refreshAtProgress" @refresh="loadAccounts" @health="healthAccounts" @resume-health="resumeHealthCheck" @resume-trial="resumeTrialCheck" @trial-check="trialEligibilityAccounts" @refresh-at="refreshAtAccounts" @reauth="reauthAccounts" @security-repair="repairSecurityAccounts" @password-change="changeAccountPasswords" @totp-change="changeAccountTotp" @account-logs="openAccountLogs" @stop-reauth="stopReauth" @delete="deleteAccounts" @delete-invalid="deleteInvalidAccounts" @download="downloadAccounts" @copy-selected-at="copySelectedAccessTokens" @export-selected-at="exportSelectedAccessTokens" @export-security="exportSecurityCredentials" @create-group="createAccountGroup" @rename-group="renameAccountGroup" @delete-group="deleteAccountGroup" @move-group="moveAccountsToGroup" @export-group="exportGroupCredentials" @copy-at="copyAccessToken" @copy-session="copySessionToken" @copy-credential="copyAccountCredential" @copy-value="copyValue" @codex-oauth="runCodexOauth" @import-accounts="importAccountsDialog.open = true" :codex-oauth-running="codexOauthRunning" />
         <RebindView v-else-if="active === 'rebind'" :progress="rebindProgress" :preflight="rebindPreflight" :busy="busy || rebindRequestBusy" :checking="rebindChecking" @preflight="preflightRebind" @start="startRebind" @stop="stopRebind" @reset="resetRebindForInput" @input-change="resetRebindForInput" />
         <CredentialExportView v-else-if="active === 'credential-export'" :accounts="accounts" :busy="busy" @export="exportSecurityByEmail" />
         <ProtocolLoginView v-else-if="active === 'protocol-login'" :accounts="accounts" :progress="reauthProgress" :health-progress="healthProgress" :preflight="protocolLoginPreflight" :busy="busy" @start="startProtocolLoginByEmail" @stop="stopReauth" @health="healthProtocolLoginEmails" @input-change="resetProtocolLoginResultsForInput" />
@@ -2898,7 +2988,7 @@ onBeforeUnmount(() => {
     <ConcurrencyDialog :open="concurrencyDialog.open" :title="concurrencyDialog.title" :message="concurrencyDialog.message" :value="concurrencyDialog.value" :max="concurrencyDialog.max" :mode="concurrencyDialog.mode" :mode-options="concurrencyDialog.modeOptions" :mode-messages="concurrencyDialog.modeMessages" @confirm="closeConcurrencyDialog" @cancel="closeConcurrencyDialog(null)" @save="saveConcurrencyDefault" />
     <SmsCountryPicker :open="smsCountryDialog.open" :provider="smsForm.provider" :items="smsCountryDialog.items" :selected="smsCountryDialog.selected" :loading="smsCountryDialog.loading" :error="smsCountryDialog.error" :prices="smsCountryPrices" :providers="smsCountryProviders" @close="smsCountryDialog.open = false" @toggle="toggleSmsCountry" @set-price="setSmsCountryPrice" @set-provider="setSmsCountryProvider" />
     <ImportAccountsDialog :open="importAccountsDialog.open" :busy="busy" @close="importAccountsDialog.open = false" @submit="submitImportAccounts" />
-    <CodexOauthDialog :open="codexOauthDialog.open" :status="codexOauthStatus" @close="closeCodexOauth" @stop="stopCodexOauth" @copy="codexCopyRt" />
+    <CodexOauthDialog :open="codexOauthDialog.open" :status="codexOauthStatus" @close="closeCodexOauth" @stop="stopCodexOauth" @copy="codexCopyRt" @resume="resumeCodexBatch" />
     <Teleport to="body">
       <Transition name="dialog-fade">
         <div v-if="codexHistoryDialog.open" class="app-dialog-mask" @click.self="closeCodexHistory">

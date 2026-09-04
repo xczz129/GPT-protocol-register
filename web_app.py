@@ -51,6 +51,7 @@ from common.account_groups import (
 )
 from common.account_store import (
     ACCOUNTS_DB_FILE,
+    account_delete_key,
     account_email_set,
     account_group_counts,
     account_health_counts,
@@ -97,6 +98,7 @@ from common.trial_eligibility import (
     schedule_unchecked_trial_checks,
 )
 from common.trial_eligibility_jobs import TRIAL_ELIGIBILITY_JOBS
+from common import task_checkpoint
 from common.email_rebind_jobs import EmailRebindJobs
 from common.trial_proxy_pool import (
     read_trial_proxy_config,
@@ -966,6 +968,15 @@ _ACCOUNT_HEALTH_PROGRESS: dict[str, Any] = {
     "updates_enabled": True,
 }
 
+# ---------------------------------------------------------------------------
+# 测活检查点:任务进度落盘,服务重启后恢复显示并支持续跑剩余账号。
+_ACCOUNT_HEALTH_CHECKPOINT_TASK = "health_check"
+_ACCOUNT_HEALTH_CHECKPOINT_KEYS: list[str] = []
+_ACCOUNT_HEALTH_DONE_KEYS: set[str] = set()
+_ACCOUNT_HEALTH_CHECKPOINT_SAVER = task_checkpoint.DebouncedCheckpointSaver(
+    _ACCOUNT_HEALTH_CHECKPOINT_TASK, interval=2.0
+)
+
 
 def _account_health_resource_budget(requested_workers: int) -> tuple[int, str]:
     # Operator choice: health checks are no longer throttled to a single
@@ -1008,6 +1019,80 @@ def _refresh_account_health_resource_state() -> None:
         _ACCOUNT_HEALTH_PROGRESS["workers"] = workers
         _ACCOUNT_HEALTH_PROGRESS["throttled"] = workers < requested
         _ACCOUNT_HEALTH_PROGRESS["resource_mode"] = mode
+
+
+def _account_health_checkpoint_payload(
+    running: bool, *, completed: bool = False
+) -> dict[str, Any]:
+    with _ACCOUNT_HEALTH_PROGRESS_LOCK:
+        snapshot = {
+            key: value
+            for key, value in _ACCOUNT_HEALTH_PROGRESS.items()
+            if key != "updates"
+        }
+    return {
+        "version": 1,
+        "task_type": _ACCOUNT_HEALTH_CHECKPOINT_TASK,
+        "running": bool(running),
+        "completed": bool(completed),
+        "params": {
+            "keys": list(_ACCOUNT_HEALTH_CHECKPOINT_KEYS),
+            "workers": max(1, int(snapshot.get("requested_workers") or 1)),
+        },
+        "done_keys": sorted(_ACCOUNT_HEALTH_DONE_KEYS),
+        "snapshot": snapshot,
+        "saved_at": _now_iso(),
+    }
+
+
+def _account_health_checkpoint_begin(keys: list[Any], *, workers: int) -> None:
+    global _ACCOUNT_HEALTH_CHECKPOINT_KEYS
+    _ACCOUNT_HEALTH_CHECKPOINT_KEYS = [
+        str(key).strip() for key in keys if str(key).strip()
+    ]
+    _ACCOUNT_HEALTH_DONE_KEYS.clear()
+    task_checkpoint.save_checkpoint(
+        _ACCOUNT_HEALTH_CHECKPOINT_TASK,
+        _account_health_checkpoint_payload(running=True),
+    )
+
+
+def _account_health_checkpoint_restore() -> None:
+    """服务启动时恢复未完成的测活进度(interrupted/已停止 + 剩余账号)。"""
+    global _ACCOUNT_HEALTH_CHECKPOINT_KEYS
+    checkpoint = task_checkpoint.load_checkpoint(_ACCOUNT_HEALTH_CHECKPOINT_TASK)
+    if not checkpoint or checkpoint.get("completed"):
+        return
+    params = checkpoint.get("params") or {}
+    keys = [str(key) for key in (params.get("keys") or []) if str(key)]
+    done_keys = {str(key) for key in (checkpoint.get("done_keys") or []) if str(key)}
+    pending = [key for key in keys if key not in done_keys]
+    snapshot = dict(checkpoint.get("snapshot") or {})
+    interrupted = bool(checkpoint.get("running"))
+    if interrupted:
+        message = (
+            f"服务重启，测活任务中断：已完成 {snapshot.get('done', 0)} / "
+            f"{snapshot.get('total', 0)}，剩余 {len(pending)} 个账号可续跑"
+        )
+    else:
+        message = str(snapshot.get("message") or "测活任务已停止")
+        if pending:
+            message += f"，剩余 {len(pending)} 个账号可续跑"
+    _ACCOUNT_HEALTH_CHECKPOINT_KEYS = keys
+    _ACCOUNT_HEALTH_DONE_KEYS.clear()
+    _ACCOUNT_HEALTH_DONE_KEYS.update(done_keys)
+    with _ACCOUNT_HEALTH_PROGRESS_LOCK:
+        _ACCOUNT_HEALTH_PROGRESS.clear()
+        _ACCOUNT_HEALTH_PROGRESS.update(snapshot)
+        _ACCOUNT_HEALTH_PROGRESS.update(
+            running=False,
+            interrupted=interrupted,
+            pending_keys=pending,
+            pending_count=len(pending),
+            message=message,
+            finished_at=_now_iso(),
+            updates={},
+        )
 
 
 def _start_account_health_progress(
@@ -1111,6 +1196,13 @@ def _update_account_health_progress(
                 if isinstance(updates, dict):
                     updates[delete_key] = public_item
     _refresh_account_health_resource_state()
+    # 检查点:记录已完成账号并防抖落盘(服务重启可恢复进度)。
+    done_key = account_delete_key(item)
+    if done_key:
+        _ACCOUNT_HEALTH_DONE_KEYS.add(done_key)
+        _ACCOUNT_HEALTH_CHECKPOINT_SAVER.submit(
+            lambda: _account_health_checkpoint_payload(running=True)
+        )
 
 
 def _finish_account_health_progress(
@@ -1146,6 +1238,32 @@ def _finish_account_health_progress(
             _ACCOUNT_HEALTH_PROGRESS["done"] = max(
                 0, int(result.get("checked") or 0)
             )
+    # 检查点收尾:正常完成清除;取消/异常保留(running=false)供续跑。
+    # 正常完成时 pending 恒为空:被跳过的封号账号不会触发 item 回调,
+    # 不能把它们算进"剩余可续跑"。
+    global _ACCOUNT_HEALTH_CHECKPOINT_KEYS
+    pending = (
+        []
+        if result is not None
+        else [
+            key
+            for key in _ACCOUNT_HEALTH_CHECKPOINT_KEYS
+            if key not in _ACCOUNT_HEALTH_DONE_KEYS
+        ]
+    )
+    with _ACCOUNT_HEALTH_PROGRESS_LOCK:
+        _ACCOUNT_HEALTH_PROGRESS["pending_keys"] = pending
+        _ACCOUNT_HEALTH_PROGRESS["pending_count"] = len(pending)
+        if result is not None:
+            _ACCOUNT_HEALTH_PROGRESS["interrupted"] = False
+    if result is not None:
+        _ACCOUNT_HEALTH_CHECKPOINT_KEYS = []
+        _ACCOUNT_HEALTH_DONE_KEYS.clear()
+        task_checkpoint.clear_checkpoint(_ACCOUNT_HEALTH_CHECKPOINT_TASK)
+    else:
+        _ACCOUNT_HEALTH_CHECKPOINT_SAVER.flush_now(
+            lambda: _account_health_checkpoint_payload(running=False)
+        )
 
 
 def _account_health_progress_snapshot(*, include_updates: bool = True) -> dict[str, Any]:
@@ -1160,6 +1278,11 @@ def _account_health_progress_snapshot(*, include_updates: bool = True) -> dict[s
         else:
             snapshot["updates"] = {}
         return snapshot
+
+try:  # 服务重启后恢复被打断的测活进度(检查点不存在时为空操作)
+    _account_health_checkpoint_restore()
+except Exception:
+    pass
 from web.routes.security_ops import (  # noqa: E402,F401
     _SECURITY_PASSWORD_MIN_LENGTH,
     _account_requires_protocol_reauth,
