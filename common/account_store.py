@@ -1481,17 +1481,22 @@ def account_is_usable(record: dict[str, Any]) -> bool:
     }
 
 
-def account_access_token_expired(record: dict[str, Any]) -> bool:
-    """Return True when the stored AT parses and its exp has already passed."""
+def _access_token_expires_at(record: dict[str, Any]) -> int:
+    """Return the stored AT's JWT exp epoch (0 when absent/unparseable)."""
     token = _s(record.get("access_token"))
     if not token:
-        return False
+        return 0
     try:
         segment = token.split(".")[1]
         segment += "=" * (-len(segment) % 4)
-        expires_at = int(json.loads(base64.urlsafe_b64decode(segment)).get("exp") or 0)
+        return int(json.loads(base64.urlsafe_b64decode(segment)).get("exp") or 0)
     except Exception:
-        return False
+        return 0
+
+
+def account_access_token_expired(record: dict[str, Any]) -> bool:
+    """Return True when the stored AT parses and its exp has already passed."""
+    expires_at = _access_token_expires_at(record)
     return expires_at > 0 and expires_at <= int(time.time())
 
 
@@ -1580,6 +1585,7 @@ def account_public_view(record: dict[str, Any]) -> dict[str, Any]:
         "last_invalid_at": record.get("last_invalid_at"),
         "has_access_token": has_access_token,
         "at_expired": account_access_token_expired(record),
+        "at_expires_epoch": _access_token_expires_at(record),
         "has_refresh_token": bool(record.get("refresh_token")),
         "has_session_token": bool(record.get("session_token")),
         "source_type": record.get("source_type"),
@@ -1660,13 +1666,19 @@ def load_account_public_views(
             params = (start,)
         rows = connection.execute(sql, params).fetchall()
         result: list[dict[str, Any]] = []
+        now = time.time()
         for row in rows:
             try:
                 item = json.loads(str(row[0]))
             except Exception:
                 continue
             if isinstance(item, dict):
-                result.append(_normalize_trial_public_view(item))
+                normalized = _normalize_trial_public_view(item)
+                # at_expired 是随时间变化的派生值：public_payload 只存稳定的
+                # at_expires_epoch，这里每次读取都按当前时间重算。
+                expires_at = int(normalized.get("at_expires_epoch") or 0)
+                normalized["at_expired"] = expires_at > 0 and expires_at <= now
+                result.append(normalized)
         return result
     finally:
         connection.close()
