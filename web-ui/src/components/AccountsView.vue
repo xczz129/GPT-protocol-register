@@ -108,6 +108,7 @@ const accountIndex = computed(() => {
   const securityOperationKeys = [];
   const accessTokenKeys = new Set();
   const refreshAtKeys = new Set();
+  const atRiskKeys = [];
   let usable = 0;
   let deactivated = 0;
   let checked = 0;
@@ -135,6 +136,8 @@ const accountIndex = computed(() => {
     if (!isDeactivated && passwordConfirmed && item.has_totp && key) securityOperationKeys.push(key);
     if (item.has_access_token && key) accessTokenKeys.add(key);
     if (!isDeactivated && key) refreshAtKeys.add(key);
+    // 刷新AT/重新登录共用的"待处理"口径：测活失败 ∪ AT过期(或缺失)，未封号。
+    if (!isDeactivated && key && (["invalid", "error", "reauth_required"].includes(health) || item.at_expired || !item.has_access_token)) atRiskKeys.push(key);
   }
   return {
     stats: { total: rows.length, usable, deactivated, checked, expiredAt },
@@ -146,11 +149,13 @@ const accountIndex = computed(() => {
     securityOperationKeys,
     accessTokenKeys,
     refreshAtKeys,
+    atRiskKeys,
   };
 });
 
 const accountStats = computed(() => accountIndex.value.stats);
-const expiredAtCount = computed(() => accountIndex.value.stats.expiredAt || 0);
+// 刷新AT/重新登录共用的待处理数量（测活失败 ∪ AT过期/缺失，未封号），保证两个按钮数字一致。
+const atRiskCount = computed(() => accountIndex.value.atRiskKeys.length);
 const accountLoadPercent = computed(() => {
   const total = Number(props.accountLoadProgress?.total || 0);
   const loaded = Number(props.accountLoadProgress?.loaded || props.accounts.length || 0);
@@ -159,7 +164,6 @@ const accountLoadPercent = computed(() => {
 const accountLoadBlocked = computed(() => props.accountsLoading || !!props.accountLoadError);
 const invalidKeys = computed(() => accountIndex.value.invalidKeys);
 const invalidCount = computed(() => invalidKeys.value.length);
-const reauthKeys = computed(() => accountIndex.value.reauthKeys);
 // 重新登录支持选中任意未封号账号（含正常账号）；未选中时回落到全部异常账号。
 const reloginKeys = computed(() => accountIndex.value.reloginKeys);
 const selectedReauthKeys = computed(() => {
@@ -854,14 +858,14 @@ function moveSelected() {
           <button class="btn secondary" type="button" :disabled="!selected.length || busy" title="取消所有分页中已选择的账号" @click="clearAllSelected"><X :size="14" aria-hidden="true" />取消（{{ selected.length }}）</button>
           <button class="btn primary" :disabled="!accounts.length || busy" :title="selected.length ? '下载选中的账号' : '下载全部账号'" @click="emit('download', selected.length ? selected : null)"><Download :size="14" aria-hidden="true" />{{ selected.length ? `下载选中(${selected.length})` : "下载全部" }}</button>
           <button class="btn secondary" :disabled="!selectedAccessTokenKeys.length || busy || copyingAt" title="复制选中账号的完整 Access Token" @click="emit('copy-selected-at', selected)"><Copy :size="14" aria-hidden="true" />{{ copyingAt ? "读取AT中" : "复制选中AT" }}</button><button class="btn secondary" type="button" :disabled="!selected.length || busy || codexOauthRunning" title="对选中账号接码" @click="emit('codex-oauth', selected)"><Smartphone :size="14" aria-hidden="true" />接码</button><button class="btn secondary" type="button" :disabled="busy || codexOauthRunning" title="粘贴 邮箱----密码----2FA 导入新账号" @click="emit('import-accounts')"><Upload :size="14" aria-hidden="true" />导入账号</button>
-          <button class="btn secondary" :disabled="(!selectedRefreshAtKeys.length && !accounts.length) || busy || refreshAtProgress.running" :title="selectedRefreshAtKeys.length ? `刷新选中 ${selectedRefreshAtKeys.length} 个账号的 AT（无Session自动跳过）` : `刷新全部失效AT账号（已过期 ${expiredAtCount} 个，无Session自动跳过已封号）`" @click="emit('refresh-at', selectedRefreshAtKeys.length ? { keys: selectedRefreshAtKeys } : { all_accounts: true })">{{ refreshAtProgress.running ? "刷新AT中…" : (selectedRefreshAtKeys.length ? `刷新AT选中(${selectedRefreshAtKeys.length})` : `刷新AT(${expiredAtCount})`) }}</button>
+          <button class="btn secondary" :disabled="(!selectedRefreshAtKeys.length && !atRiskCount) || busy || refreshAtProgress.running" :title="selectedRefreshAtKeys.length ? `刷新选中 ${selectedRefreshAtKeys.length} 个账号的 AT（无Session自动跳过）` : `刷新全部待处理账号（测活失败或AT过期/缺失共 ${atRiskCount} 个，无Session自动跳过已封号）`" @click="emit('refresh-at', selectedRefreshAtKeys.length ? { keys: selectedRefreshAtKeys } : { all_accounts: true })">{{ refreshAtProgress.running ? "刷新AT中…" : (selectedRefreshAtKeys.length ? `刷新AT选中(${selectedRefreshAtKeys.length})` : `刷新AT(${atRiskCount})`) }}</button>
           <button class="btn secondary" :disabled="!selectedAccessTokenKeys.length || busy" title="导出选中账号的完整 Access Token" @click="emit('export-selected-at', selected)">导出选中AT</button>
           <button class="btn secondary" :disabled="!selected.length || busy" title="导出选中账号、密码和完整 TOTP 密钥" @click="emit('export-security', selected)">导出账号+密码+2FA</button>
           <button class="btn secondary" :disabled="!accounts.length || busy || accountLoadBlocked || healthProgress.running" :title="selected.length ? '测活选中的账号' : '测活全部账号(跳过已封号)'" @click="emit('health', selected.length ? selected : null)">{{ healthProgress.running ? "测活中…" : (selected.length ? `测活选中(${selected.length})` : "测活全部") }}</button>
           <button class="btn secondary" :disabled="!accounts.length || busy || accountLoadBlocked" :title="selected.length ? '检测选中账号的 Free 资格' : '检测全部账号的 Free 资格'" @click="emit('trial-check', selected.length ? { keys: selected, force: false } : { all_accounts: true, force: false })">{{ selected.length ? `检测资格选中(${selected.length})` : "检测全部 Free 资格" }}</button>
           
 
-          <button class="btn secondary" :disabled="(!selectedReauthKeys.length && !reauthKeys.length) || busy || reauthProgress.running" :title="selectedReauthKeys.length ? `重新登录选中的 ${selectedReauthKeys.length} 个账号（协议方式需有密码和2FA）` : `重新登录全部可恢复账号(${reauthKeys.length})`" @click="emit('reauth', { keys: selectedReauthKeys })">{{ reauthProgress.running ? "登录中…" : (selectedReauthKeys.length ? `重新登录选中(${selectedReauthKeys.length})` : `重新登录全部(${reauthKeys.length})`) }}</button>
+          <button class="btn secondary" :disabled="(!selectedReauthKeys.length && !atRiskCount) || busy || reauthProgress.running" :title="selectedReauthKeys.length ? `重新登录选中的 ${selectedReauthKeys.length} 个账号（协议方式需有密码和2FA）` : `重新登录全部待处理账号(${atRiskCount})，与刷新AT同一口径`" @click="emit('reauth', { keys: selectedReauthKeys })">{{ reauthProgress.running ? "登录中…" : (selectedReauthKeys.length ? `重新登录选中(${selectedReauthKeys.length})` : `重新登录全部(${atRiskCount})`) }}</button>
           <button class="btn primary" :disabled="!selectedSecurityRepairKeys.length || busy || reauthProgress.running" @click="emit('security-repair', { keys: selectedSecurityRepairKeys })">补全安全字段（{{ selectedSecurityRepairKeys.length }}）</button>
           <button class="btn secondary" :disabled="!selectedSecurityOperationKeys.length || busy || reauthProgress.running" @click="emit('password-change', { keys: selectedSecurityOperationKeys })">修改密码（{{ selectedSecurityOperationKeys.length }}）</button>
           <button class="btn secondary" :disabled="!selectedSecurityOperationKeys.length || busy || reauthProgress.running" @click="emit('totp-change', { keys: selectedSecurityOperationKeys })">修改 2FA（{{ selectedSecurityOperationKeys.length }}）</button>

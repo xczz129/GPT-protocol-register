@@ -1479,15 +1479,6 @@ async function resumeCodexProgress() {
   try { codexOauthStatus.value = await api("/api/codex-oauth/status"); } catch {}
 }
 
-async function resumeCodexBatch() {
-  if (codexOauthStatus.value.running) { notify("已有接码任务在运行", "err"); return; }
-  if (!Number(codexOauthStatus.value.pending_count || 0)) { notify("没有可续跑的接码账号", "err"); return; }
-  await run(() => api("/api/codex-oauth/resume", { method: "POST", body: "{}" }), "接码续跑已启动");
-  codexOauthDialog.open = true;
-  stopCodexOauthPolling();
-  codexOauthTimer = setInterval(async () => { try { codexOauthStatus.value = await api("/api/codex-oauth/status"); if (!codexOauthStatus.value.running) stopCodexOauthPolling(); } catch { stopCodexOauthPolling(); } }, 2000);
-}
-
 async function promptInterruptedTasks() {
   // 服务重启恢复检查点后,提示续跑被打断的任务
   try {
@@ -1507,15 +1498,7 @@ async function promptInterruptedTasks() {
       });
       if (ok) { void resumeTrialCheck(); return; }
     }
-    const smsPending = Number(codexOauthStatus.value.pending_count || 0);
-    if (smsPending > 0 && !codexOauthStatus.value.running) {
-      const ok = await openDialog({
-        title: "接码任务中断",
-        message: `接码任务未完成：已完成 ${codexOauthStatus.value.done || 0} / ${codexOauthStatus.value.total || 0}。是否继续接码剩余 ${smsPending} 个账号？`,
-        confirmText: "继续接码",
-      });
-      if (ok) { void resumeCodexBatch(); return; }
-    }
+    // 接码不提供续跑：一个账号只能绑定一次手机号，中断后剩余账号需手动重新发起。
   } catch {}
 }
 
@@ -2223,7 +2206,12 @@ async function pollRefreshAtProgress() {
 }
 async function reauthAccounts(request) {
   const explicitKeys = [...(Array.isArray(request) ? request : request?.keys || [])].filter(Boolean);
-  const allKeys = accounts.value.filter((item) => item?.reauth_available && item?.delete_key).map((item) => item.delete_key);
+  // 与"刷新AT"同一口径：测活失败 ∪ AT过期/缺失，未封号（刷新AT按钮显示同一数量）。
+  const allKeys = accounts.value.filter((item) => {
+    if (!item?.delete_key || item.is_deactivated) return false;
+    const health = String(item.health_status || "").toLowerCase();
+    return ["invalid", "error", "reauth_required"].includes(health) || item.at_expired || !item.has_access_token;
+  }).map((item) => item.delete_key);
   const targetKeys = explicitKeys.length ? explicitKeys : allKeys;
   if (!targetKeys.length || reauthProgress.running) return;
   const savedReauthWorkers = Math.max(1, Math.min(20, Math.floor(Number(uiSettings.value.reauth_workers) || 3)));
@@ -2988,7 +2976,7 @@ onBeforeUnmount(() => {
     <ConcurrencyDialog :open="concurrencyDialog.open" :title="concurrencyDialog.title" :message="concurrencyDialog.message" :value="concurrencyDialog.value" :max="concurrencyDialog.max" :mode="concurrencyDialog.mode" :mode-options="concurrencyDialog.modeOptions" :mode-messages="concurrencyDialog.modeMessages" @confirm="closeConcurrencyDialog" @cancel="closeConcurrencyDialog(null)" @save="saveConcurrencyDefault" />
     <SmsCountryPicker :open="smsCountryDialog.open" :provider="smsForm.provider" :items="smsCountryDialog.items" :selected="smsCountryDialog.selected" :loading="smsCountryDialog.loading" :error="smsCountryDialog.error" :prices="smsCountryPrices" :providers="smsCountryProviders" @close="smsCountryDialog.open = false" @toggle="toggleSmsCountry" @set-price="setSmsCountryPrice" @set-provider="setSmsCountryProvider" />
     <ImportAccountsDialog :open="importAccountsDialog.open" :busy="busy" @close="importAccountsDialog.open = false" @submit="submitImportAccounts" />
-    <CodexOauthDialog :open="codexOauthDialog.open" :status="codexOauthStatus" @close="closeCodexOauth" @stop="stopCodexOauth" @copy="codexCopyRt" @resume="resumeCodexBatch" />
+    <CodexOauthDialog :open="codexOauthDialog.open" :status="codexOauthStatus" @close="closeCodexOauth" @stop="stopCodexOauth" @copy="codexCopyRt" />
     <Teleport to="body">
       <Transition name="dialog-fade">
         <div v-if="codexHistoryDialog.open" class="app-dialog-mask" @click.self="closeCodexHistory">

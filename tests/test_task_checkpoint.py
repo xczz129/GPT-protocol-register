@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""任务进度检查点测试:测活/检测试用/接码的重启恢复与续跑数据。"""
+"""任务进度检查点测试:测活/检测试用的重启恢复与续跑数据。"""
 from __future__ import annotations
 
 import json
@@ -35,32 +35,6 @@ def reset_health_state():
     yield
     web_app._ACCOUNT_HEALTH_CHECKPOINT_KEYS = []
     web_app._ACCOUNT_HEALTH_DONE_KEYS.clear()
-
-
-@pytest.fixture()
-def reset_sms_state():
-    from web.routes import codex_oauth
-
-    with codex_oauth._LOCK:
-        codex_oauth._STATE.update(
-            running=False,
-            total=0,
-            done=0,
-            success=0,
-            failed=0,
-            logs=[],
-            results=[],
-            started_at="",
-            finished_at="",
-            interrupted=False,
-            pending_emails=[],
-            pending_count=0,
-        )
-    codex_oauth._SMS_CHECKPOINT_EMAILS[:] = []
-    codex_oauth._SMS_CHECKPOINT_DONE.clear()
-    yield
-    codex_oauth._SMS_CHECKPOINT_EMAILS[:] = []
-    codex_oauth._SMS_CHECKPOINT_DONE.clear()
 
 
 @pytest.fixture()
@@ -325,67 +299,4 @@ class TestTrialCheckpoint:
             tej.TRIAL_ELIGIBILITY_JOBS.wait(job["job_id"], 10)
 
 
-class TestSmsCheckpoint:
-    @pytest.fixture()
-    def codex(self, reset_sms_state):
-        from web.routes import codex_oauth
-
-        return codex_oauth
-
-    def test_restore_interrupted(self, codex, ckpt_dir):
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
-        (ckpt_dir / "codex_sms.json").write_text(
-            json.dumps(
-                {
-                    "version": 1,
-                    "running": True,
-                    "completed": False,
-                    "emails": ["a@x.com", "b@x.com", "c@x.com"],
-                    "done_emails": ["a@x.com"],
-                    "results": [{"email": "a@x.com", "status": "success"}],
-                    "snapshot": {
-                        "running": True,
-                        "total": 3,
-                        "done": 1,
-                        "success": 1,
-                        "failed": 0,
-                        "started_at": "2026-09-05T00:00:00",
-                    },
-                },
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
-        codex._restore_sms_checkpoint()
-        with codex._LOCK:
-            state = dict(codex._STATE)
-        assert state["running"] is False
-        assert state["interrupted"] is True
-        assert state["pending_emails"] == ["b@x.com", "c@x.com"]
-        assert state["pending_count"] == 2
-        assert state["total"] == 3
-        assert any("服务重启" in line["m"] for line in state["logs"])
-
-    def test_restore_skips_completed(self, codex, ckpt_dir):
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
-        (ckpt_dir / "codex_sms.json").write_text(
-            json.dumps(
-                {"running": False, "completed": True, "emails": [], "done_emails": []}
-            ),
-            encoding="utf-8",
-        )
-        codex._restore_sms_checkpoint()
-        with codex._LOCK:
-            assert codex._STATE.get("interrupted") is False
-
-    def test_checkpoint_payload_caps_results(self, codex):
-        with codex._LOCK:
-            codex._STATE.update(
-                running=True,
-                results=[
-                    {"email": f"u{i}@x.com", "status": "success"} for i in range(300)
-                ],
-            )
-        payload = codex._sms_checkpoint_payload(running=True)
-        assert len(payload["results"]) == 200
-        assert payload["results"][-1]["email"] == "u299@x.com"
+# 接码不再提供断点续跑：一个账号只能绑定一次手机号，中断后由操作者手动重新发起。

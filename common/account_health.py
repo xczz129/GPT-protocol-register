@@ -598,24 +598,23 @@ def fetch_remote_account_info(record: dict[str, Any]) -> dict[str, Any]:
             )
         payloads: dict[str, dict[str, Any]] = {}
         errors: list[BaseException] = []
-        # 快速失败：先发 me。401(InvalidAccessTokenError,token 已死)直接判死，
-        # 跳过 init/accounts 两个请求；其他错误(如 5xx 临时故障)继续跑完
-        # 剩余请求，保留"多请求错误中优先采信 401"的既有判定。
-        try:
-            payloads["me"] = requests_to_run[0][1]()
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except InvalidAccessTokenError:
-            raise
-        except BaseException as exc:
-            errors.append(exc)
-        for name, request in requests_to_run[1:]:
-            try:
-                payloads[name] = request()
-            except (KeyboardInterrupt, SystemExit):
-                raise
-            except BaseException as exc:
-                errors.append(exc)
+        # 并行发送 me/init/accounts 三个请求（对齐 chatgpt2api v3.2.2
+        # get_user_info 的并行探测）：单账号测活耗时由 3 个串行 RTT 降为
+        # 1 个并行 RTT；错误判定保持"多请求错误中优先采信 401"。
+        # curl_cffi Session 默认 use_thread_local_curl=True，工作线程各持
+        # 独立 Curl 句柄，同一 Session 并发请求是安全的。
+        with ThreadPoolExecutor(max_workers=len(requests_to_run)) as probe_executor:
+            probe_futures = {
+                probe_executor.submit(request): name
+                for name, request in requests_to_run
+            }
+            for future, name in probe_futures.items():
+                try:
+                    payloads[name] = future.result()
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except BaseException as exc:
+                    errors.append(exc)
         for name, payload in payloads.items():
             _raise_if_deactivated(payload, source=name)
         accounts = payloads.get("accounts") or {}
