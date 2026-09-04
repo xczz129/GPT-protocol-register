@@ -8,6 +8,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from common.account_health import normalized_health_status
 from common.session_refresh import (
     SESSION_REFRESH_JOBS,
     access_token_needs_refresh,
@@ -34,9 +35,10 @@ async def accounts_refresh_at(body: AccountRefreshAtRequest):
     """Refresh stored ATs through the nerver session service.
 
     Explicit keys are always attempted (single-account or hand-picked rows).
-    The all-accounts mode only covers records whose AT already
-    expired (near-expiry rows are left alone).  Deactivated records and records without a session token
-    are skipped in both modes.
+    The all-accounts mode covers every account whose health check
+    failed or whose AT already expired (near-expiry rows are left alone),
+    matching the re-login scope.  Deactivated records and records without a
+    session token are skipped in both modes.
     """
     wanted = {str(key or "").strip() for key in body.keys if str(key or "").strip()}
     if not body.all_accounts and not wanted:
@@ -56,9 +58,14 @@ async def accounts_refresh_at(body: AccountRefreshAtRequest):
         if not str(record.get("session_token") or "").strip():
             skipped_no_session += 1
             continue
-        if body.all_accounts and not access_token_needs_refresh(record, window=0):
-            skipped_fresh += 1
-            continue
+        if body.all_accounts:
+            # 口径与"重新登录"对齐：测活失败(token 被撤销/异常)或 AT 已过期，
+            # 两者取并集；健康且 AT 未过期的账号不刷。
+            health = normalized_health_status(record)
+            at_dead = access_token_needs_refresh(record, window=0)
+            if health not in {"invalid", "error", "reauth_required"} and not at_dead:
+                skipped_fresh += 1
+                continue
         selected.append(record)
     if not selected:
         raise HTTPException(

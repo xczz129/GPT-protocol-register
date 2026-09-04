@@ -563,7 +563,7 @@ def fetch_remote_account_info(record: dict[str, Any]) -> dict[str, Any]:
                 (
                     "me",
                     lambda: _response_json(
-                        session.get(CHATGPT_BASE + me_path, timeout=20),
+                        session.get(CHATGPT_BASE + me_path, timeout=12),
                         me_path,
                     ),
                 ),
@@ -578,7 +578,7 @@ def fetch_remote_account_info(record: dict[str, Any]) -> dict[str, Any]:
                                 "conversation_id": None,
                                 "timezone_offset_min": timezone_offset,
                             },
-                            timeout=20,
+                            timeout=12,
                         ),
                         init_path,
                     ),
@@ -590,7 +590,7 @@ def fetch_remote_account_info(record: dict[str, Any]) -> dict[str, Any]:
                             CHATGPT_BASE
                             + account_path
                             + f"?timezone_offset_min={timezone_offset}",
-                            timeout=20,
+                            timeout=12,
                         ),
                         account_path,
                     ),
@@ -598,10 +598,18 @@ def fetch_remote_account_info(record: dict[str, Any]) -> dict[str, Any]:
             )
         payloads: dict[str, dict[str, Any]] = {}
         errors: list[BaseException] = []
-        # curl_cffi Session is intentionally kept on one thread. Besides being
-        # safer for session state, this limits a 10-account health batch to 10
-        # simultaneous requests instead of a burst of 30 from one gateway.
-        for name, request in requests_to_run:
+        # 快速失败：先发 me。401(InvalidAccessTokenError,token 已死)直接判死，
+        # 跳过 init/accounts 两个请求；其他错误(如 5xx 临时故障)继续跑完
+        # 剩余请求，保留"多请求错误中优先采信 401"的既有判定。
+        try:
+            payloads["me"] = requests_to_run[0][1]()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except InvalidAccessTokenError:
+            raise
+        except BaseException as exc:
+            errors.append(exc)
+        for name, request in requests_to_run[1:]:
             try:
                 payloads[name] = request()
             except (KeyboardInterrupt, SystemExit):

@@ -232,6 +232,10 @@ class SessionRefreshJobs:
                 "session_token": result["session_token"],
                 "last_token_refresh_at": _now(),
                 "last_token_refresh_error": "",
+                # 刷出有效 AT 说明账号活着：把测活失败状态归位，
+                # 让该账号退出"测活失败/待重登"池（与重新登录口径对齐）。
+                "health_status": "alive",
+                "health_error": "",
             }
             if result.get("plan_type"):
                 fields["plan_type"] = result["plan_type"]

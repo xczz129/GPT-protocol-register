@@ -206,7 +206,7 @@ watch(() => tokenEligibilityForm.channel, async (value) => {
     if (!uiSettingsLoaded) await loadUiSettings();
     if (uiSettings.value.trial_channel === channel) return;
     const payload = {
-      health_workers: Number(uiSettings.value.health_workers) || 10,
+      health_workers: Number(uiSettings.value.health_workers) || 20,
       reauth_workers: Number(uiSettings.value.reauth_workers) || 3,
       trial_workers: Math.max(1, Math.min(20, Math.floor(Number(uiSettings.value.trial_workers) || 20))),
       refresh_at_workers: Math.max(1, Math.min(10, Math.floor(Number(uiSettings.value.refresh_at_workers) || 10))),
@@ -1961,7 +1961,7 @@ async function healthAccounts(keys, options = {}) {
     if (item?.is_deactivated && (all || wantedKeys.has(item.delete_key))) knownSkipped += 1;
   }
   const requestCount = all ? Math.max(knownTotal, targetKeys.length) : targetKeys.length;
-  const savedHealthWorkers = Math.max(1, Math.min(20, Math.floor(Number(uiSettings.value.health_workers) || 10)));
+  const savedHealthWorkers = Math.max(1, Math.min(20, Math.floor(Number(uiSettings.value.health_workers) || 20)));
   const picked = await openConcurrencyDialog({
     title,
     message: options.description || `请求 ${requestCount} 条账号记录，已封号记录自动跳过。`,
@@ -2755,7 +2755,7 @@ function smsCountryIds() { const text = smsForm.provider === "firefox" ? smsForm
 const smsCountries = computed(() => { if (smsForm.provider === "firefox") { const dock = String(smsForm.firefoxDockingCode || "").trim(); return dock ? [dock] : []; } const list = String(smsForm.countryOrder || "").split(/[,,]/).map((s) => s.trim()).filter(Boolean); return list.map((raw) => { const parsed = parseSmsCountryToken(raw); const id = parsed?.id || raw; const hit = (smsCountryDialog.items || []).find((item) => String(item.id) === String(id)); const label = hit ? `${hit.name}${hit.calling || ""}` : id; if (parsed?.providerId) { const pids = String(parsed.providerId).split(",").map((p) => `#${p.trim()}`).filter(Boolean); return `${label} ${pids.join("→")}`; } if (parsed?.price) { return `${label}≤$${parsed.price}`; } return label; }); });
 async function openSmsCountryPicker() { smsCountryDialog.open = true; smsCountryDialog.loading = true; smsCountryDialog.error = ""; smsCountryDialog.selected = []; smsCountryDialog.items = []; for (const raw of smsCountryIds()) { const parsed = parseSmsCountryToken(raw); if (!parsed?.id) continue; smsCountryDialog.selected.push(parsed.id); if (parsed.price) { smsCountryPrices[parsed.id] = parsed.price; } else { delete smsCountryPrices[parsed.id]; } if (parsed.providerId) { smsCountryProviders[parsed.id] = parsed.providerId; } else { delete smsCountryProviders[parsed.id]; } } try { const value = await api(`/api/sms-countries?provider=${encodeURIComponent(smsForm.provider)}`); smsCountryDialog.items = value.items || []; } catch (error) { smsCountryDialog.error = error?.message || "获取国家列表失败"; } finally { smsCountryDialog.loading = false; } }
 function toggleSmsCountry(id) { const value = String(id); const list = smsCountryDialog.selected; const index = list.indexOf(value); if (index >= 0) { list.splice(index, 1); delete smsCountryPrices[value]; delete smsCountryProviders[value]; } else { list.push(value); } rebuildSmsCountryOrder(); }
-const uiSettings = ref({ health_workers: 10, reauth_workers: 3, trial_workers: 20, refresh_at_workers: 10, reauth_mode: "protocol", trial_channel: "v4" });
+const uiSettings = ref({ health_workers: 20, reauth_workers: 3, trial_workers: 20, refresh_at_workers: 10, reauth_mode: "protocol", trial_channel: "v4" });
 let uiSettingsLoaded = false;
 async function loadUiSettings() { try { const value = await api("/api/ui-settings"); uiSettings.value = value || {}; uiSettingsLoaded = true; } catch {} }
 const concurrencyDialog = reactive({ open: false, title: "", message: "", value: 10, kind: "health", max: 20, mode: "protocol", modeOptions: [], modeMessages: {} });
@@ -2779,7 +2779,7 @@ async function saveConcurrencyDefault(pick) {
   const workers = Math.max(1, Math.min(ceiling, Math.floor(Number(picked.workers) || 1)));
   const mode = picked.mode === "browser" ? "browser" : "protocol";
   const payload = {
-    health_workers: Number(uiSettings.value.health_workers) || 10,
+    health_workers: Number(uiSettings.value.health_workers) || 20,
     reauth_workers: Number(uiSettings.value.reauth_workers) || 3,
     trial_workers: Math.max(1, Math.min(20, Math.floor(Number(uiSettings.value.trial_workers) || 20))),
     refresh_at_workers: Math.max(1, Math.min(10, Math.floor(Number(uiSettings.value.refresh_at_workers) || 10))),
