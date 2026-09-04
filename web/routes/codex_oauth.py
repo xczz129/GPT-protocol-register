@@ -90,15 +90,26 @@ def _phone_requirement(data: Any) -> tuple:
     if isinstance(auth_step, dict):
         step = str(auth_step.get("step") or auth_step.get("id") or "")
     step = step or str(data.get("step") or data.get("next") or "")
+    # MFA verify responses signal the next page via continue_url + page.type,
+    # e.g. continue_url=https://auth.openai.com/add-phone, page.type=add_phone.
+    continue_url = str(data.get("continue_url") or "")
+    page = data.get("page")
+    page_type = str(page.get("type") or "") if isinstance(page, dict) else ""
     lowered = str(data.get("error") or "").lower()
     if "add-phone" in step or "phone_verification" in step:
         return True, step
+    if "add-phone" in continue_url.lower():
+        return True, continue_url
+    if "phone" in page_type.lower():
+        return True, page_type
     if "add-phone" in lowered:
         return True, str(data.get("error"))
     if step and "phone" in step.lower():
         return True, step
     if "workspace" in step or "consent" in step:
         return False, step
+    if "workspace" in page_type.lower() or "consent" in page_type.lower():
+        return False, page_type
     return None, step
 
 
