@@ -200,6 +200,7 @@ class TrialEligibilityTests(unittest.TestCase):
             "promo_campaign_id": "plus-1-month-free",
         }
         with (
+            patch.object(trial_eligibility, "_auto_check_channel", return_value="v4"),
             patch(
                 "common.trial_proxy_pool.selected_trial_proxies",
                 return_value=("JP", ["http://proxy-a", "http://proxy-b"]),
@@ -229,6 +230,7 @@ class TrialEligibilityTests(unittest.TestCase):
     def test_exhausted_jp_routes_remain_recheckable(self):
         failure = trial_eligibility.TrialEligibilityError("account_check_http_429: busy")
         with (
+            patch.object(trial_eligibility, "_auto_check_channel", return_value="v4"),
             patch(
                 "common.trial_proxy_pool.selected_trial_proxies",
                 return_value=("JP", ["http://proxy-a", "http://proxy-b"]),
@@ -248,6 +250,79 @@ class TrialEligibilityTests(unittest.TestCase):
         self.assertEqual(fields["trial_eligibility_checked_at"], "")
         self.assertEqual(fields["trial_eligibility_reason"], "route_retry_pending")
         self.assertEqual(fields["trial_eligibility_proxy_mode"], "JP proxy")
+
+    def test_scheduled_probe_uses_nerver_channel_when_configured(self):
+        checked = {
+            "eligibility_status": "eligible",
+            "label": "可领 Plus 免费试用",
+            "status": "plus_eligible",
+            "promo_campaign_id": "plus-1-month-free",
+        }
+        with (
+            patch.object(trial_eligibility, "_auto_check_channel", return_value="nerver"),
+            patch.object(
+                trial_eligibility,
+                "check_trial_eligibility_nerver",
+                return_value=checked,
+            ) as nerver_probe,
+            patch.object(trial_eligibility, "check_trial_eligibility") as v4_probe,
+            patch.object(trial_eligibility, "_queue_result") as queued,
+        ):
+            trial_eligibility._run_scheduled_check(
+                {"email": "fixture@example.com", "access_token": "AT"},
+                "PATH",
+                "KEY",
+            )
+
+        v4_probe.assert_not_called()
+        nerver_probe.assert_called_once_with("AT")
+        fields = queued.call_args.args[1]
+        self.assertEqual(fields["trial_eligibility_status"], "eligible")
+        self.assertEqual(fields["trial_eligibility_method"], "nerver_check")
+        self.assertEqual(fields["trial_eligibility_proxy_mode"], "nerver")
+
+    def test_scheduled_probe_nerver_error_marks_failed_without_v4_fallback(self):
+        failure = trial_eligibility.TrialEligibilityError("nerver_check_http_500: busy")
+        with (
+            patch.object(trial_eligibility, "_auto_check_channel", return_value="nerver"),
+            patch.object(
+                trial_eligibility,
+                "check_trial_eligibility_nerver",
+                side_effect=failure,
+            ),
+            patch.object(trial_eligibility, "check_trial_eligibility") as v4_probe,
+            patch.object(trial_eligibility, "_queue_result") as queued,
+        ):
+            trial_eligibility._run_scheduled_check(
+                {"email": "fixture@example.com", "access_token": "AT"},
+                "PATH",
+                "KEY",
+            )
+
+        v4_probe.assert_not_called()
+        fields = queued.call_args.args[1]
+        self.assertEqual(fields["trial_eligibility_status"], "error")
+        self.assertEqual(fields["trial_eligibility_reason"], "request_error")
+        self.assertEqual(fields["trial_eligibility_method"], "nerver_check")
+        self.assertEqual(fields["trial_eligibility_proxy_mode"], "nerver")
+
+    def test_auto_check_channel_reads_ui_settings(self):
+        trial_eligibility._AUTO_CHANNEL_CACHE = (0.0, "v4")
+        with patch(
+            "config_loader.load_config",
+            return_value={"ui_settings": {"trial_channel": "nerver"}},
+        ):
+            self.assertEqual(trial_eligibility._auto_check_channel(), "nerver")
+        trial_eligibility._AUTO_CHANNEL_CACHE = (0.0, "v4")
+        with patch(
+            "config_loader.load_config",
+            return_value={"ui_settings": {"trial_channel": "v4"}},
+        ):
+            self.assertEqual(trial_eligibility._auto_check_channel(), "v4")
+        trial_eligibility._AUTO_CHANNEL_CACHE = (0.0, "v4")
+        with patch("config_loader.load_config", side_effect=RuntimeError("boom")):
+            self.assertEqual(trial_eligibility._auto_check_channel(), "v4")
+        trial_eligibility._AUTO_CHANNEL_CACHE = (0.0, "v4")
 
     def test_batch_job_uses_jp_proxy_and_persists_result(self):
         manager = TrialEligibilityJobs()

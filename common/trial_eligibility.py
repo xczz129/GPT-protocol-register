@@ -292,13 +292,46 @@ def _queue_result(key: str, fields: dict[str, Any], path: Any) -> None:
     _AUTO_CHECK_RESULT_QUEUE.put((key, fields, path))
 
 
+_AUTO_CHANNEL_LOCK = threading.Lock()
+_AUTO_CHANNEL_CACHE: tuple[float, str] = (0.0, "v4")
+_AUTO_CHANNEL_TTL_SECONDS = 30.0
+
+
+def _auto_check_channel() -> str:
+    """注册自动检测通道：跟随 ui_settings.trial_channel 全局默认配置。"""
+    global _AUTO_CHANNEL_CACHE
+    now = time.monotonic()
+    with _AUTO_CHANNEL_LOCK:
+        cached_at, cached = _AUTO_CHANNEL_CACHE
+        if now - cached_at < _AUTO_CHANNEL_TTL_SECONDS:
+            return cached
+    channel = "v4"
+    try:
+        from config_loader import load_config
+
+        settings = (load_config() or {}).get("ui_settings")
+        raw = settings.get("trial_channel") if isinstance(settings, dict) else None
+        if str(raw or "").strip().lower() == "nerver":
+            channel = "nerver"
+    except Exception:
+        channel = "v4"
+    with _AUTO_CHANNEL_LOCK:
+        _AUTO_CHANNEL_CACHE = (now, channel)
+    return channel
+
+
 def _run_scheduled_check(record: dict[str, Any], path, key: str) -> None:
     from common.trial_proxy_pool import selected_trial_proxies
 
     queued = False
     country = ""
     route_mode = "direct"
+    method = "accounts_check_v4"
     last_error: Exception | None = None
+    channel = _auto_check_channel()
+    if channel == "nerver":
+        method = "nerver_check"
+        route_mode = "nerver"
     try:
         from common.account_operation_log import record_operation_event
 
@@ -311,25 +344,29 @@ def _run_scheduled_check(record: dict[str, Any], path, key: str) -> None:
     except Exception:
         pass
     try:
-        country, proxies = selected_trial_proxies(limit=_AUTO_CHECK_PROXY_ATTEMPTS)
-        attempts = proxies if proxies else [""]
-        route_mode = f"{country} proxy" if proxies and country else "direct"
         result: dict[str, Any] | None = None
-        for attempt, proxy in enumerate(attempts, 1):
-            try:
-                result = check_trial_eligibility(record, proxy=proxy, direct=not bool(proxy))
-                break
-            except InvalidAccessTokenError:
-                raise
-            except Exception as error:
-                last_error = error
-                if is_trial_probe_retryable(error) and attempt < len(attempts):
-                    time.sleep(0.6 * attempt)
-                    continue
-                break
+        if channel == "nerver":
+            result = check_trial_eligibility_nerver(_access_token(record))
+        else:
+            country, proxies = selected_trial_proxies(limit=_AUTO_CHECK_PROXY_ATTEMPTS)
+            attempts = proxies if proxies else [""]
+            route_mode = f"{country} proxy" if proxies and country else "direct"
+            for attempt, proxy in enumerate(attempts, 1):
+                try:
+                    result = check_trial_eligibility(record, proxy=proxy, direct=not bool(proxy))
+                    break
+                except InvalidAccessTokenError:
+                    raise
+                except Exception as error:
+                    last_error = error
+                    if is_trial_probe_retryable(error) and attempt < len(attempts):
+                        time.sleep(0.6 * attempt)
+                        continue
+                    break
         if result is None:
             raise TrialEligibilityError(str(last_error or "account_check_failed"))
         fields = _status_fields(result)
+        fields["trial_eligibility_method"] = method
         fields["trial_eligibility_proxy_mode"] = route_mode
         _trace_trial_result(record, result, route_mode=route_mode)
         _queue_result(key, fields, path)
@@ -344,7 +381,7 @@ def _run_scheduled_check(record: dict[str, Any], path, key: str) -> None:
                 "trial_eligibility_label": "AT 已失效",
                 "trial_eligibility_checked_at": now,
                 "trial_eligibility_reason": "token_invalidated",
-                "trial_eligibility_method": "accounts_check_v4",
+                "trial_eligibility_method": method,
                 "trial_eligibility_proxy_mode": route_mode,
                 "trial_eligibility_error": str(error)[:500],
                 "health_status": "invalid",
@@ -370,7 +407,7 @@ def _run_scheduled_check(record: dict[str, Any], path, key: str) -> None:
                 # it eligible for the next explicit/automatic retry.
                 "trial_eligibility_checked_at": "" if retryable else datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "trial_eligibility_reason": "route_retry_pending" if retryable else "request_error",
-                "trial_eligibility_method": "accounts_check_v4",
+                "trial_eligibility_method": method,
                 "trial_eligibility_proxy_mode": route_mode,
                 "trial_eligibility_error": str(error)[:500],
             },
@@ -422,14 +459,15 @@ def schedule_trial_eligibility_check(
         if not force and str(record.get("trial_eligibility_checked_at") or "").strip():
             return False
         _AUTO_CHECK_PENDING.add(key)
+    channel = _auto_check_channel()
     pending = {
         "trial_eligibility_status": "pending",
         "trial_eligibility_label": "检测中",
         "trial_eligibility_checked_at": "",
         "trial_eligibility_reason": "queued",
         "trial_eligibility_campaign_id": "",
-        "trial_eligibility_method": "accounts_check_v4",
-        "trial_eligibility_proxy_mode": "direct",
+        "trial_eligibility_method": "nerver_check" if channel == "nerver" else "accounts_check_v4",
+        "trial_eligibility_proxy_mode": "nerver" if channel == "nerver" else "direct",
         "trial_eligibility_error": "",
     }
     record.update(pending)
@@ -452,14 +490,15 @@ def schedule_unchecked_trial_checks(records: list[dict[str, Any]], *, force: boo
     )
 
     path = path or ACCOUNTS_FILE
+    channel = _auto_check_channel()
     pending = {
         "trial_eligibility_status": "pending",
         "trial_eligibility_label": "检测中",
         "trial_eligibility_checked_at": "",
         "trial_eligibility_reason": "queued",
         "trial_eligibility_campaign_id": "",
-        "trial_eligibility_method": "accounts_check_v4",
-        "trial_eligibility_proxy_mode": "direct",
+        "trial_eligibility_method": "nerver_check" if channel == "nerver" else "accounts_check_v4",
+        "trial_eligibility_proxy_mode": "nerver" if channel == "nerver" else "direct",
         "trial_eligibility_error": "",
     }
     selected: list[tuple[str, dict[str, Any]]] = []
