@@ -347,7 +347,6 @@ async def trial_proxy_pool_save(body: TrialProxyConfigRequest):
     return {"ok": True, **config}
 
 
-@router_health.post("/api/accounts/health")
 def _account_health_response(result: dict, requested: int) -> dict:
     include_rows = requested <= _state()._ACCOUNT_HEALTH_INLINE_UPDATE_LIMIT
     return {
@@ -379,6 +378,7 @@ def _account_health_response(result: dict, requested: int) -> dict:
     }
 
 
+@router_health.post("/api/accounts/health")
 async def accounts_health(body: AccountHealthRequest):
     from common.account_health import check_accounts
 
