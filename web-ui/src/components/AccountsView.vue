@@ -248,7 +248,7 @@ const totpCodes = ref({});
 const totpLoading = ref({});
 const totpNow = ref(Date.now());
 let totpTickTimer = null;
-onMounted(() => { totpTickTimer = setInterval(() => { totpNow.value = Date.now(); }, 1000); });
+onMounted(() => { totpTickTimer = setInterval(() => { totpNow.value = Date.now(); autoRefreshTotps(); }, 1000); });
 const visibleGroups = computed(() => {
   const needle = groupQuery.value.trim().toLowerCase();
   return needle
@@ -399,25 +399,39 @@ function totpDisplay(item) {
   if (entry?.error) return "获取失败";
   return totpLoading.value[item.delete_key] ? "获取中…" : "获取验证码";
 }
+async function fetchTotpCode(key) {
+  if (totpLoading.value[key]) return null;
+  totpLoading.value[key] = true;
+  try {
+    const res = await api("/api/accounts/credentials", { method: "POST", body: jsonBody({ key, field: "totp_code" }) });
+    if (res.code) {
+      totpCodes.value[key] = { code: res.code, expiresAt: Date.now() + Math.max(3, res.remaining ?? 30) * 1000 };
+      return totpCodes.value[key];
+    }
+    totpCodes.value[key] = { error: res.message || "解码失败" };
+  } catch (err) {
+    totpCodes.value[key] = { error: err.message || "解码异常" };
+  } finally {
+    totpLoading.value[key] = false;
+  }
+  return null;
+}
 async function handleTotpClick(item) {
   const entry = totpEntry(item);
   if (entry?.code) {
     copyTextDirect(entry.code, `totp_code_${item.delete_key}`);
     return;
   }
-  totpLoading.value[item.delete_key] = true;
-  try {
-    const res = await api("/api/accounts/credentials", { method: "POST", body: jsonBody({ key: item.delete_key, field: "totp_code" }) });
-    if (res.code) {
-      totpCodes.value[item.delete_key] = { code: res.code, expiresAt: Date.now() + Math.max(3, res.remaining ?? 30) * 1000 };
-      copyTextDirect(res.code, `totp_code_${item.delete_key}`);
-    } else {
-      totpCodes.value[item.delete_key] = { error: res.message || "解码失败" };
-    }
-  } catch (err) {
-    totpCodes.value[item.delete_key] = { error: err.message || "解码异常" };
-  } finally {
-    totpLoading.value[item.delete_key] = false;
+  const fresh = await fetchTotpCode(item.delete_key);
+  if (fresh?.code) copyTextDirect(fresh.code, `totp_code_${item.delete_key}`);
+}
+function autoRefreshTotps() {
+  if (document.hidden) return;
+  for (const [key, entry] of Object.entries(totpCodes.value)) {
+    // 仅自动续期获取成功过的验证码；失败的等用户手动重试
+    if (!entry?.expiresAt || entry.error) continue;
+    if (Date.now() < entry.expiresAt - 1200) continue;
+    fetchTotpCode(key);
   }
 }
 

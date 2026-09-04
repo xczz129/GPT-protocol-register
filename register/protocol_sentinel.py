@@ -15,8 +15,10 @@ import subprocess
 import threading
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
+from zoneinfo import ZoneInfo
 
 from register.protocol_turnstile import solve_turnstile_token
 from register.protocol_runtime import current_runtime_settings
@@ -29,6 +31,53 @@ SENTINEL_BOOTSTRAP_URL = "https://sentinel.openai.com/backend-api/sentinel/sdk.j
 SENTINEL_FRAME_URL = "https://sentinel.openai.com/backend-api/sentinel/frame.html"
 SENTINEL_REQ_URL = "https://sentinel.openai.com/backend-api/sentinel/req"
 DEFAULT_SENTINEL_SDK_URL = "https://sentinel.openai.com/sentinel/20260219f9f6/sdk.js"
+# Windows 本地化时区显示名（Firefox Date.toString() 括号里的部分）。
+# 必须与 timezone_offset_min 保持一致，否则构成自相矛盾的指纹信号。
+_WINDOWS_TZ_STANDARD = {
+    "Asia/Tokyo": "Japan Standard Time",
+    "Asia/Seoul": "Korea Standard Time",
+    "Asia/Manila": "Philippine Standard Time",
+    "Asia/Singapore": "Singapore Standard Time",
+    "Asia/Bangkok": "Indochina Time",
+    "Asia/Ho_Chi_Minh": "SE Asia Standard Time",
+    "Australia/Sydney": "AUS Eastern Standard Time",
+    "America/Sao_Paulo": "E. South America Standard Time",
+    "America/New_York": "Eastern Standard Time",
+    "America/Toronto": "Eastern Standard Time",
+    "Europe/London": "GMT Standard Time",
+    "Europe/Berlin": "W. Europe Standard Time",
+    "Europe/Paris": "Romance Standard Time",
+    "Europe/Istanbul": "Turkey Time",
+}
+_WINDOWS_TZ_DAYLIGHT = {
+    "Australia/Sydney": "AUS Eastern Daylight Time",
+    "America/New_York": "Eastern Daylight Time",
+    "America/Toronto": "Eastern Daylight Time",
+    "Europe/London": "GMT Daylight Time",
+    "Europe/Berlin": "W. Europe Daylight Time",
+    "Europe/Paris": "Romance Daylight Time",
+}
+
+
+def _windows_timezone_display(timezone_name: str, *, offset_minutes: int) -> str:
+    """Return the Windows zone label a real Firefox would render for this zone."""
+    name = str(timezone_name or "").strip()
+    standard = _WINDOWS_TZ_STANDARD.get(name)
+    if standard is None:
+        # 未知 IANA 时区：保留旧行为，避免臆造更假的名称。
+        return "Japan Standard Time" if offset_minutes == -540 else "Coordinated Universal Time"
+    daylight = _WINDOWS_TZ_DAYLIGHT.get(name)
+    if daylight:
+        try:
+            now = datetime.now(ZoneInfo(name))
+            dst = now.dst()
+            if dst is not None and dst.total_seconds() > 0:
+                return daylight
+        except Exception:
+            pass
+    return standard
+
+
 _SENTINEL_WORKER = Path(__file__).resolve().parent / "sentinel_vm" / "runtime_worker.js"
 # Each worker reserves a full Node/V8 runtime and the live SDK can create several
 # timers and VM contexts. Keep this local compute gate bounded without reducing
@@ -244,7 +293,10 @@ class SentinelTokenGenerator:
         sign = "+" if offset_minutes <= 0 else "-"
         absolute = abs(offset_minutes)
         hours, minutes = divmod(absolute, 60)
-        zone_name = "Japan Standard Time" if offset_minutes == -540 else "Coordinated Universal Time"
+        zone_name = _windows_timezone_display(
+            str(self.device_profile.get("timezone") or ""),
+            offset_minutes=offset_minutes,
+        )
         local_stamp = time.strftime(
             f"%a %b %d %Y %H:%M:%S GMT{sign}{hours:02d}{minutes:02d} ({zone_name})",
             time.gmtime(time.time() - offset_minutes * 60),
