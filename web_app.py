@@ -2637,6 +2637,72 @@ async def account_credentials(body: AccountCredentialsRequest):
     )
 
 
+@app.post("/api/accounts/device-info")
+async def account_device_info(body: AccountCredentialsRequest):
+    """Return the registration fingerprint snapshot for one account."""
+    target = str(body.key or "").strip()
+    records = await asyncio.to_thread(_records_by_keys_with_fallback, [target])
+    account = records.get(target)
+    if account is None:
+        raise HTTPException(404, "账号不存在")
+
+    fingerprint: dict[str, Any] = {}
+    raw_fp = account.get("register_fingerprint")
+    if isinstance(raw_fp, str) and raw_fp.strip().startswith("{"):
+        try:
+            loaded = json.loads(raw_fp)
+        except ValueError:
+            loaded = None
+        if isinstance(loaded, dict):
+            fingerprint = loaded
+    if not fingerprint:
+        # 老账号没有完整存档：从平铺字段尽量还原注册环境。
+        flat_map = {
+            "browser_family": "browser_family",
+            "impersonate": "tls_impersonate",
+            "user_agent": "user_agent",
+            "sec_ch_ua": "sec_ch_ua",
+            "sec_ch_ua_full_version_list": "sec_ch_ua_full_version_list",
+            "accept_language": "accept_language",
+            "timezone": "timezone",
+            "timezone_offset_min": "timezone_offset_min",
+            "platform": "protocol_platform",
+            "screen": "protocol_screen",
+            "hardware_concurrency": "protocol_hardware_concurrency",
+            "device_memory": "protocol_device_memory",
+            "device_pixel_ratio": "protocol_device_pixel_ratio",
+            "navigator_vendor": "protocol_navigator_vendor",
+            "max_touch_points": "protocol_max_touch_points",
+            "webgl_vendor": "protocol_webgl_vendor",
+            "webgl_renderer": "protocol_webgl_renderer",
+            "profile_id": "protocol_profile_id",
+        }
+        fingerprint = {
+            new_key: str(account.get(old_key) or "")
+            for new_key, old_key in flat_map.items()
+            if str(account.get(old_key) or "").strip()
+        }
+        if not fingerprint.get("impersonate"):
+            browser_type = str(account.get("browser_type") or "")
+            if browser_type.startswith("curl_cffi/"):
+                fingerprint["impersonate"] = browser_type.split("/", 1)[1]
+
+    payload = {
+        "ok": True,
+        "email": str(account.get("email") or ""),
+        "fingerprint": fingerprint,
+        "proxy": str(account.get("proxy") or ""),
+        "registered_at": str(account.get("registered_at") or ""),
+        "registration_method": str(account.get("registration_method") or ""),
+        "device_id": str(account.get("device_id") or fingerprint.get("device_id") or ""),
+        "has_snapshot": bool(raw_fp),
+    }
+    return JSONResponse(
+        payload,
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
+
+
 from web.routes.accounts_io import router as accounts_io_router  # noqa: E402
 
 app.include_router(accounts_io_router)

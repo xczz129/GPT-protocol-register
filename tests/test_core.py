@@ -6463,22 +6463,36 @@ class ProtocolAndHealthTests(unittest.TestCase):
     def test_protocol_fingerprint_variants_remain_internally_consistent(self):
         from register.protocol import _make_browser_fingerprint
 
+        screens = {
+            "1920x1080", "1536x864", "1366x768", "1707x960",
+            "1600x900", "2560x1440", "1920x1200",
+            "1280x720", "1440x900", "1680x1050", "2560x1600", "3840x2160",
+        }
         samples = [_make_browser_fingerprint() for _ in range(40)]
+        families = set()
         for fingerprint in samples:
+            family = fingerprint["browser_family"]
+            families.add(family)
+            self.assertIn(family, {"firefox", "chrome"})
             self.assertEqual(
-                fingerprint["impersonate"], f"firefox{fingerprint['major']}"
+                fingerprint["impersonate"], f"{family}{fingerprint['major']}"
             )
-            self.assertIn(
-                f"Firefox/{fingerprint['full_version']}", fingerprint["user_agent"]
-            )
-            self.assertEqual(fingerprint["sec_ch_ua"], "")
-            self.assertNotIn("Chrome", fingerprint["user_agent"])
-            self.assertNotIn("Google", fingerprint["user_agent"])
-            self.assertIn(fingerprint["screen"], {
-                "1920x1080", "1536x864", "1366x768",
-                "1600x900", "2560x1440", "1920x1200",
-                "1280x720", "1440x900", "1680x1050", "2560x1600",
-            })
+            self.assertIn(fingerprint["screen"], screens)
+            if family == "firefox":
+                self.assertIn(
+                    f"Firefox/{fingerprint['full_version']}", fingerprint["user_agent"]
+                )
+                self.assertEqual(fingerprint["sec_ch_ua"], "")
+                self.assertNotIn("Chrome", fingerprint["user_agent"])
+                self.assertEqual(fingerprint["navigator_vendor"], "")
+            else:
+                self.assertIn(
+                    f"Chrome/{fingerprint['full_version']}", fingerprint["user_agent"]
+                )
+                self.assertIn("Google Chrome", fingerprint["sec_ch_ua"])
+                self.assertIn("Chromium", fingerprint["sec_ch_ua"])
+                self.assertNotIn("Firefox", fingerprint["user_agent"])
+                self.assertEqual(fingerprint["navigator_vendor"], "Google Inc.")
         self.assertEqual(len({item["profile_id"] for item in samples}), len(samples))
 
     def test_japan_proxy_uses_japanese_language_and_tokyo_clock(self):

@@ -10,6 +10,7 @@ import {
   Eye, 
   EyeOff, 
   KeyRound, 
+  Monitor, 
   Pencil, 
   Plus, 
   RefreshCw, 
@@ -249,6 +250,7 @@ const totpLoading = ref({});
 const totpNow = ref(Date.now());
 let totpTickTimer = null;
 onMounted(() => { totpTickTimer = setInterval(() => { totpNow.value = Date.now(); autoRefreshTotps(); }, 1000); });
+onBeforeUnmount(() => { if (totpTickTimer) clearInterval(totpTickTimer); });
 const visibleGroups = computed(() => {
   const needle = groupQuery.value.trim().toLowerCase();
   return needle
@@ -434,6 +436,110 @@ function autoRefreshTotps() {
     fetchTotpCode(key);
   }
 }
+
+const deviceDialog = ref({
+  open: false, key: "", email: "", loading: false, error: "",
+  fingerprint: null, proxy: "", registered_at: "", registration_method: "", device_id: "", has_snapshot: false,
+});
+
+async function openDeviceInfo(item) {
+  deviceDialog.value = {
+    open: true, key: item.delete_key, email: item.email, loading: true, error: "",
+    fingerprint: null, proxy: item.proxy || "", registered_at: item.registered_at || "",
+    registration_method: "", device_id: "", has_snapshot: false,
+  };
+  try {
+    const res = await api("/api/accounts/device-info", { method: "POST", body: jsonBody({ key: item.delete_key }) });
+    deviceDialog.value = {
+      ...deviceDialog.value,
+      loading: false,
+      fingerprint: res.fingerprint || {},
+      proxy: res.proxy || deviceDialog.value.proxy,
+      registered_at: res.registered_at || deviceDialog.value.registered_at,
+      registration_method: res.registration_method || "",
+      device_id: res.device_id || "",
+      has_snapshot: !!res.has_snapshot,
+    };
+  } catch (err) {
+    deviceDialog.value = { ...deviceDialog.value, loading: false, error: err.message || "加载失败" };
+  }
+}
+function closeDeviceInfo() {
+  deviceDialog.value.open = false;
+}
+function deviceFamilyLabel(fp) {
+  const family = String(fp?.browser_family || "firefox").toLowerCase();
+  const version = fp?.full_version || fp?.major || "";
+  const name = family === "chrome" ? "Chrome" : "Firefox";
+  return version ? `${name} ${version}` : name;
+}
+function deviceTzLabel(fp) {
+  if (!fp?.timezone) return "";
+  const raw = fp.timezone_offset_min;
+  if (raw === undefined || raw === null || raw === "") return fp.timezone;
+  const off = Number(raw);
+  if (Number.isNaN(off)) return fp.timezone;
+  const sign = off <= 0 ? "+" : "-";
+  const abs = Math.abs(off);
+  const h = Math.floor(abs / 60);
+  const m = abs % 60;
+  return `${fp.timezone} (UTC${sign}${h}${m ? ":" + String(m).padStart(2, "0") : ""})`;
+}
+const deviceGroups = computed(() => {
+  const fp = deviceDialog.value.fingerprint || {};
+  const d = deviceDialog.value;
+  const mem = fp.device_memory ? `${fp.device_memory} GB` : "";
+  return [
+    {
+      title: "浏览器环境",
+      rows: [
+        ["浏览器", deviceFamilyLabel(fp)],
+        ["TLS 指纹", fp.impersonate],
+        ["User-Agent", fp.user_agent],
+        ["Vendor", fp.navigator_vendor],
+        ["Sec-CH-UA", fp.sec_ch_ua],
+      ],
+    },
+    {
+      title: "屏幕与硬件",
+      rows: [
+        ["分辨率", fp.screen],
+        ["像素比", fp.device_pixel_ratio],
+        ["CPU 线程", fp.hardware_concurrency],
+        ["内存", mem],
+        ["色深", fp.color_depth ? `${fp.color_depth} bit` : ""],
+        ["触点", fp.max_touch_points],
+        ["平台", fp.platform ? `${fp.platform} · Win ${fp.platform_version || "10"}` : ""],
+      ],
+    },
+    {
+      title: "图形 (WebGL)",
+      rows: [
+        ["Vendor", fp.webgl_vendor],
+        ["Renderer", fp.webgl_renderer],
+      ],
+    },
+    {
+      title: "地区环境",
+      rows: [
+        ["时区", deviceTzLabel(fp)],
+        ["Locale", fp.locale],
+        ["语言", fp.accept_language],
+      ],
+    },
+    {
+      title: "注册上下文",
+      rows: [
+        ["注册方式", d.registration_method === "protocol" ? "协议注册" : d.registration_method || ""],
+        ["代理", d.proxy],
+        ["Device ID", d.device_id || fp.device_id],
+        ["Profile ID", fp.profile_id],
+        ["Sentinel SID", fp.sentinel_sid],
+        ["注册时间", d.registered_at ? new Date(d.registered_at).toLocaleString("zh-CN", { hour12: false }) : ""],
+      ],
+    },
+  ].map((group) => ({ ...group, rows: group.rows.filter((row) => String(row[1] || "").trim()) }));
+});
 
 function fmtTime(value) {
   if (!value) return "-";
@@ -948,6 +1054,16 @@ function moveSelected() {
                     <button
                       class="btn secondary row-icon-btn"
                       type="button"
+                      :disabled="busy || !item.delete_key"
+                      title="查看设备信息（注册环境 / 指纹）"
+                      aria-label="查看设备信息"
+                      @click="openDeviceInfo(item)"
+                    >
+                      <Monitor :size="13" aria-hidden="true" />
+                    </button>
+                    <button
+                      class="btn secondary row-icon-btn"
+                      type="button"
                       :disabled="busy || reauthProgress.running || !item.delete_key || item.password_confirmed === false || !item.has_password || !item.has_totp || item.is_deactivated || (item.password_confirmed === undefined && item.security_repair_available && item.has_totp)"
                       title="修改密码"
                       aria-label="修改密码"
@@ -975,6 +1091,42 @@ function moveSelected() {
         <AppPager v-model:page="page" :pages="pages" :total="filtered.length" />
       </div>
     </div>
+
+    <Teleport to="body">
+      <Transition name="dialog-fade">
+        <div v-if="deviceDialog.open" class="app-dialog-mask" @click.self="closeDeviceInfo">
+          <section class="app-dialog device-info-dialog" role="dialog" aria-modal="true" aria-label="设备信息">
+            <div class="app-dialog-head">
+              <div>
+                <span class="app-dialog-kicker"><Monitor :size="12" aria-hidden="true" />设备信息</span>
+                <h2>{{ deviceDialog.email }}</h2>
+                <small>注册环境 · 当时使用的指纹快照</small>
+              </div>
+              <button class="app-dialog-close" type="button" title="关闭" aria-label="关闭" @click="closeDeviceInfo"><X :size="16" aria-hidden="true" /></button>
+            </div>
+            <div class="device-info-body">
+              <div v-if="deviceDialog.loading" class="empty-card">加载注册环境中…</div>
+              <div v-else-if="deviceDialog.error" class="empty-card">加载失败：{{ deviceDialog.error }}</div>
+              <div v-else-if="!deviceGroups.some((g) => g.rows.length)" class="empty-card">该账号没有注册环境记录（可能为浏览器注册或历史导入账号）</div>
+              <template v-else>
+                <p v-if="!deviceDialog.has_snapshot" class="device-info-note">该账号注册较早，以下信息由历史字段还原；新注册账号将保存完整指纹快照</p>
+                <div class="device-info-grid">
+                  <div v-for="group in deviceGroups" v-show="group.rows.length" :key="group.title" class="device-info-group">
+                    <h3>{{ group.title }}</h3>
+                    <div v-for="row in group.rows" :key="row[0]" class="device-kv">
+                      <em>{{ row[0] }}</em>
+                      <span :title="String(row[1])">{{ row[1] }}</span>
+                    </div>
+                  </div>
+                </div>
+              </template>
+            </div>
+            <div class="app-dialog-actions">
+              <button class="btn secondary" type="button" @click="closeDeviceInfo">关闭</button>
+            </div>
+          </section>
+        </div>
+      </Transition>
+    </Teleport>
   </section>
 </template>
-onBeforeUnmount(() => { if (totpTickTimer) clearInterval(totpTickTimer); });

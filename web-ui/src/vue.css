@@ -2395,6 +2395,17 @@ table.acct .col-actions { text-align: right; white-space: nowrap; }
 .codex-hint { display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--ink-600); margin-bottom: 12px; }
 .codex-history-list { display: flex; flex-direction: column; gap: 8px; max-height: 46vh; overflow-y: auto; }
 .codex-history-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg-inset); }
+
+/* 设备信息（注册环境）弹窗 */
+.device-info-dialog { width: min(760px, calc(100vw - 32px)); }
+.device-info-body { display: flex; flex-direction: column; gap: 12px; max-height: min(66vh, 640px); overflow-y: auto; }
+.device-info-note { margin: 0; padding: 8px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg-inset); color: var(--muted); font-size: 12px; }
+.device-info-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
+.device-info-group { border: 1px solid var(--line); border-radius: 12px; background: var(--bg-inset); padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+.device-info-group h3 { margin: 0; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+.device-kv { display: flex; align-items: baseline; gap: 10px; font-size: 12.5px; line-height: 1.5; }
+.device-kv em { flex: 0 0 92px; font-style: normal; color: var(--muted); }
+.device-kv span { min-width: 0; word-break: break-all; font-variant-numeric: tabular-nums; }
 .codex-history-row.success { border-left: 3px solid #10b981; }
 .codex-history-row.failed { border-left: 3px solid #ef4444; }
 .codex-history-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }

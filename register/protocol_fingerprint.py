@@ -14,28 +14,62 @@ from register.protocol_context import auth_base
 
 
 REGISTER_BROWSER_PROFILES: tuple[dict[str, str], ...] = (
+    # --- Firefox（与历史注册环境保持连续） ---
     {
         "impersonate": "firefox147",
+        "browser_family": "firefox",
         "major": "147",
         "full_version": "147.0",
         "weight": "6",
     },
     {
         "impersonate": "firefox144",
+        "browser_family": "firefox",
         "major": "144",
         "full_version": "144.0",
         "weight": "4",
     },
     {
         "impersonate": "firefox135",
+        "browser_family": "firefox",
         "major": "135",
         "full_version": "135.0",
         "weight": "2",
     },
     {
         "impersonate": "firefox133",
+        "browser_family": "firefox",
         "major": "133",
         "full_version": "133.0",
+        "weight": "1",
+    },
+    # --- Chrome（贴近真实市占的稳定版分布） ---
+    {
+        "impersonate": "chrome142",
+        "browser_family": "chrome",
+        "major": "142",
+        "full_version": "142.0.0.0",
+        "weight": "5",
+    },
+    {
+        "impersonate": "chrome136",
+        "browser_family": "chrome",
+        "major": "136",
+        "full_version": "136.0.0.0",
+        "weight": "4",
+    },
+    {
+        "impersonate": "chrome131",
+        "browser_family": "chrome",
+        "major": "131",
+        "full_version": "131.0.0.0",
+        "weight": "3",
+    },
+    {
+        "impersonate": "chrome124",
+        "browser_family": "chrome",
+        "major": "124",
+        "full_version": "124.0.0.0",
         "weight": "1",
     },
 )
@@ -73,16 +107,32 @@ _validate_browser_profiles()
 
 
 REGISTER_DEVICE_TRAITS: tuple[dict[str, str], ...] = (
+    # 主流桌面组合（1080p 办公机到高端游戏机）
     {"screen": "1920x1080", "hardware_concurrency": "8", "device_memory": "8", "device_pixel_ratio": "1", "platform_version": "10.0.0"},
+    {"screen": "1920x1080", "hardware_concurrency": "6", "device_memory": "8", "device_pixel_ratio": "1", "platform_version": "10.0.0"},
+    {"screen": "1920x1080", "hardware_concurrency": "12", "device_memory": "16", "device_pixel_ratio": "1", "platform_version": "10.0.0"},
+    {"screen": "1920x1080", "hardware_concurrency": "16", "device_memory": "32", "device_pixel_ratio": "1", "platform_version": "10.0.0"},
+    {"screen": "1920x1080", "hardware_concurrency": "4", "device_memory": "8", "device_pixel_ratio": "1", "platform_version": "10.0.0"},
+    # 笔记本（含 Windows 推荐缩放）
     {"screen": "1536x864", "hardware_concurrency": "8", "device_memory": "8", "device_pixel_ratio": "1.25", "platform_version": "10.0.0"},
+    {"screen": "1536x864", "hardware_concurrency": "12", "device_memory": "16", "device_pixel_ratio": "1.25", "platform_version": "10.0.0"},
     {"screen": "1366x768", "hardware_concurrency": "4", "device_memory": "8", "device_pixel_ratio": "1", "platform_version": "10.0.0"},
-    {"screen": "1600x900", "hardware_concurrency": "8", "device_memory": "16", "device_pixel_ratio": "1.2", "platform_version": "10.0.0"},
-    {"screen": "2560x1440", "hardware_concurrency": "16", "device_memory": "16", "device_pixel_ratio": "1", "platform_version": "10.0.0"},
-    {"screen": "1920x1200", "hardware_concurrency": "12", "device_memory": "16", "device_pixel_ratio": "1", "platform_version": "10.0.0"},
+    {"screen": "1366x768", "hardware_concurrency": "8", "device_memory": "4", "device_pixel_ratio": "1", "platform_version": "10.0.0"},
+    {"screen": "1707x960", "hardware_concurrency": "8", "device_memory": "16", "device_pixel_ratio": "1.125", "platform_version": "10.0.0"},
     {"screen": "1280x720", "hardware_concurrency": "4", "device_memory": "8", "device_pixel_ratio": "1.5", "platform_version": "10.0.0"},
+    # 高分辨率 / 高刷新率
+    {"screen": "2560x1440", "hardware_concurrency": "16", "device_memory": "16", "device_pixel_ratio": "1", "platform_version": "10.0.0"},
+    {"screen": "2560x1440", "hardware_concurrency": "12", "device_memory": "32", "device_pixel_ratio": "1", "platform_version": "10.0.0"},
+    {"screen": "2560x1440", "hardware_concurrency": "8", "device_memory": "16", "device_pixel_ratio": "1", "platform_version": "10.0.0"},
+    {"screen": "2560x1600", "hardware_concurrency": "16", "device_memory": "16", "device_pixel_ratio": "1", "platform_version": "10.0.0"},
+    {"screen": "3840x2160", "hardware_concurrency": "16", "device_memory": "16", "device_pixel_ratio": "1.5", "platform_version": "10.0.0"},
+    {"screen": "3840x2160", "hardware_concurrency": "20", "device_memory": "32", "device_pixel_ratio": "2", "platform_version": "10.0.0"},
+    # 16:10 / 商务本
+    {"screen": "1920x1200", "hardware_concurrency": "12", "device_memory": "16", "device_pixel_ratio": "1", "platform_version": "10.0.0"},
+    {"screen": "1600x900", "hardware_concurrency": "8", "device_memory": "16", "device_pixel_ratio": "1.2", "platform_version": "10.0.0"},
+    {"screen": "1600x900", "hardware_concurrency": "6", "device_memory": "8", "device_pixel_ratio": "1", "platform_version": "10.0.0"},
     {"screen": "1440x900", "hardware_concurrency": "8", "device_memory": "8", "device_pixel_ratio": "1", "platform_version": "10.0.0"},
     {"screen": "1680x1050", "hardware_concurrency": "8", "device_memory": "16", "device_pixel_ratio": "1", "platform_version": "10.0.0"},
-    {"screen": "2560x1600", "hardware_concurrency": "16", "device_memory": "16", "device_pixel_ratio": "1", "platform_version": "10.0.0"},
 )
 
 
@@ -227,24 +277,90 @@ def _firefox_sec_ch_ua_full_version_list(major: str, full_version: str) -> str:
     return ""
 
 
+# Chrome GREASE 品牌顺序与 Not-A-Brand 变体随大版本漂移；值取自真实浏览器抓包。
+_CHROME_SEC_CH_UA: dict[str, str] = {
+    "124": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "131": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+    "136": '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+    "142": '"Google Chrome";v="142", "Chromium";v="142", "Not:A-Brand";v="99"',
+    "146": '"Chromium";v="146", "Google Chrome";v="146", "Not?A_Brand";v="99"',
+}
+
+
+def _chrome_user_agent(major: str, full_version: str) -> str:
+    # Chrome 121+ 从 UA 中移除次版本号，固定四段 0 填充（如 131.0.0.0）。
+    version = full_version if full_version.count(".") == 3 else f"{major}.0.0.0"
+    return (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{version} Safari/537.36"
+    )
+
+
+def _chrome_sec_ch_ua(major: str) -> str:
+    return _CHROME_SEC_CH_UA.get(major) or f'"Google Chrome";v="{major}", "Chromium";v="{major}", "Not_A Brand";v="24"'
+
+
+def _chrome_sec_ch_ua_full_version_list(major: str, full_version: str) -> str:
+    version = full_version if full_version.count(".") == 3 else f"{major}.0.0.0"
+    grease_major = "24" if major in {"131", "146"} else "99"
+    if _CHROME_SEC_CH_UA.get(major, "").startswith('"Chromium"'):
+        return (
+            f'"Google Chrome";v="{version}", "Chromium";v="{version}", '
+            f'"Not_A Brand";v="{grease_major}.0.0.0"'
+        )
+    return (
+        f'"Chromium";v="{version}", "Google Chrome";v="{version}", '
+        f'"Not_A Brand";v="{grease_major}.0.0.0"'
+    )
+
+
 
 
 def _complete_browser_fingerprint(profile: dict[str, str]) -> dict[str, str]:
     major = str(profile.get("major") or "147").strip()
+    family = str(profile.get("browser_family") or "firefox").strip().lower()
+    if family not in {"firefox", "chrome"}:
+        family = "firefox"
+    if family == "chrome":
+        default_ua = _chrome_user_agent(major, str(profile.get("full_version") or ""))
+        default_sec_ch_ua = _chrome_sec_ch_ua(major)
+        default_version_list = _chrome_sec_ch_ua_full_version_list(
+            major, str(profile.get("full_version") or "")
+        )
+        default_vendor = "Google Inc."
+    else:
+        default_ua = _firefox_user_agent(major, str(profile.get("full_version") or f"{major}.0"))
+        default_sec_ch_ua = _firefox_sec_ch_ua(major)
+        default_version_list = _firefox_sec_ch_ua_full_version_list(major, str(profile.get("full_version") or ""))
+        default_vendor = ""
     full_version = str(profile.get("full_version") or f"{major}.0.0.0").strip()
-    return {
+    completed = {
         **profile,
+        "browser_family": family,
         "major": major,
         "full_version": full_version,
-        "user_agent": str(profile.get("user_agent") or _firefox_user_agent(major, full_version)),
-        "sec_ch_ua": str(profile.get("sec_ch_ua") or _firefox_sec_ch_ua(major)),
+        "user_agent": str(profile.get("user_agent") or default_ua),
+        "sec_ch_ua": str(profile.get("sec_ch_ua") or default_sec_ch_ua),
         "sec_ch_ua_full_version_list": str(
-            profile.get("sec_ch_ua_full_version_list") or _firefox_sec_ch_ua_full_version_list(major, full_version)
+            profile.get("sec_ch_ua_full_version_list") or default_version_list
         ),
+        "navigator_vendor": str(profile.get("navigator_vendor") or default_vendor),
         "accept_language": str(profile.get("accept_language") or "en-US,en;q=0.9"),
         "platform_version": str(profile.get("platform_version") or "10.0.0"),
         "impersonate": str(profile.get("impersonate") or "firefox147"),
+        # 补充的真实环境参数（sentinel payload 与设备信息存档共用）
+        "platform": str(profile.get("platform") or "Win32"),
+        "max_touch_points": str(profile.get("max_touch_points") or "0"),
+        "color_depth": str(profile.get("color_depth") or "24"),
+        "audio_sample_rate": str(profile.get("audio_sample_rate") or "48000"),
+        "audio_channel_count": str(profile.get("audio_channel_count") or "2"),
+        "do_not_track": str(profile.get("do_not_track") or "1"),
     }
+    if family == "chrome":
+        # 真实 Chrome 报告 navigator.plugins（内置 PDF 查看器三件套）
+        completed["pdf_viewer_enabled"] = str(profile.get("pdf_viewer_enabled") or "true")
+        completed["plugin_count"] = "5"
+    return completed
 
 
 
@@ -359,6 +475,18 @@ def _extract_firefox_version_from_user_agent(value: str) -> tuple[str, str]:
     return "", ""
 
 
+def _extract_chrome_version_from_user_agent(value: str) -> tuple[str, str]:
+    ua = str(value or "")
+    if "Firefox/" in ua or "Chrome/" not in ua:
+        return "", ""
+    tail = ua.split("Chrome/", 1)[1]
+    version = tail.split(" ", 1)[0].strip()
+    major = version.split(".", 1)[0].strip()
+    if major.isdigit():
+        return major, version or f"{major}.0.0.0"
+    return "", ""
+
+
 
 
 def _fingerprint_with_user_agent(fingerprint: dict[str, str] | None, value: str) -> dict[str, str]:
@@ -366,22 +494,42 @@ def _fingerprint_with_user_agent(fingerprint: dict[str, str] | None, value: str)
     if not ua:
         return _browser_fingerprint(fingerprint)
     fp = _browser_fingerprint(fingerprint)
-    major, full_version = _extract_firefox_version_from_user_agent(ua)
     impersonate_by_major = {
-        str(item.get("major") or ""): str(item.get("impersonate") or "")
+        str(item.get("major") or ""): item
         for item in REGISTER_BROWSER_PROFILES
     }
-    # Clearance endpoints occasionally report a Chromium UA.  Keep the
-    # protocol session's Firefox identity instead of mixing TLS and HTTP
-    # fingerprints, and reject Firefox versions absent from curl_cffi.
+    # Clearance endpoints occasionally report a UA from a different engine.
+    # Keep the protocol session's own family instead of mixing TLS and HTTP
+    # fingerprints, and reject versions absent from curl_cffi.
+    if fp.get("browser_family") == "chrome":
+        major, full_version = _extract_chrome_version_from_user_agent(ua)
+        if not major or major not in impersonate_by_major:
+            return fp
+        profile = impersonate_by_major[major]
+        if str(profile.get("browser_family")) != "chrome":
+            return fp
+        full_version = full_version or f"{major}.0.0.0"
+        return {
+            **fp,
+            "major": major,
+            "full_version": full_version,
+            "impersonate": str(profile.get("impersonate") or fp["impersonate"]),
+            "user_agent": ua,
+            "sec_ch_ua": _chrome_sec_ch_ua(major),
+            "sec_ch_ua_full_version_list": _chrome_sec_ch_ua_full_version_list(major, full_version),
+        }
+    major, full_version = _extract_firefox_version_from_user_agent(ua)
     if not major or major not in impersonate_by_major:
+        return fp
+    profile = impersonate_by_major[major]
+    if str(profile.get("browser_family") or "firefox") != "firefox":
         return fp
     full_version = full_version or f"{major}.0"
     return {
         **fp,
         "major": major,
         "full_version": full_version,
-        "impersonate": impersonate_by_major.get(major) or fp["impersonate"],
+        "impersonate": str(profile.get("impersonate") or fp["impersonate"]),
         "user_agent": ua,
         "sec_ch_ua": _firefox_sec_ch_ua(major),
         "sec_ch_ua_full_version_list": _firefox_sec_ch_ua_full_version_list(major, full_version),
@@ -433,9 +581,6 @@ def _country_fingerprint_traits(proxy: str = "") -> dict[str, str]:
             "locale": "ja-JP",
             "timezone": "Asia/Tokyo",
             "timezone_offset_min": "-540",
-            "platform": "Win32",
-            "navigator_vendor": "",
-            "max_touch_points": "0",
             "webgl_vendor": webgl["vendor"],
             "webgl_renderer": webgl["renderer"],
         }
@@ -447,9 +592,6 @@ def _country_fingerprint_traits(proxy: str = "") -> dict[str, str]:
             "timezone_offset_min": str(
                 _timezone_offset_for_timezone("America/New_York", fallback=300)
             ),
-            "platform": "Win32",
-            "navigator_vendor": "",
-            "max_touch_points": "0",
             "webgl_vendor": webgl["vendor"],
             "webgl_renderer": webgl["renderer"],
         }
@@ -467,9 +609,6 @@ def _country_fingerprint_traits(proxy: str = "") -> dict[str, str]:
                     fallback=(identity.timezone_offsets[0] if identity else 0),
                 )
             ),
-            "platform": "Win32",
-            "navigator_vendor": "",
-            "max_touch_points": "0",
             "webgl_vendor": webgl["vendor"],
             "webgl_renderer": webgl["renderer"],
         }
@@ -492,9 +631,6 @@ def _country_fingerprint_traits(proxy: str = "") -> dict[str, str]:
                 fallback=(identity.timezone_offsets[0] if identity else 0),
             )
         ),
-        "platform": "Win32",
-        "navigator_vendor": "",
-        "max_touch_points": "0",
         "webgl_vendor": webgl["vendor"],
         "webgl_renderer": webgl["renderer"],
     }

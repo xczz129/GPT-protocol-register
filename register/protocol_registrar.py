@@ -2544,6 +2544,13 @@ class PlatformRegistrar:
     ) -> dict[str, Any]:
         now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         fp = _browser_fingerprint(self.fingerprint)
+        # 完整注册环境存档：面板"设备信息"弹窗直接渲染该 JSON。
+        register_fingerprint = {
+            key: value
+            for key, value in fp.items()
+            if key not in {"sec_ch_ua", "sec_ch_ua_full_version_list"} or value
+        }
+        register_fingerprint["device_id"] = self.device_id
         return {
             "email": email,
             "password": password,
@@ -2571,6 +2578,8 @@ class PlatformRegistrar:
             "proxy": self.proxy,
             "registration_method": "protocol",
             "browser_type": f"curl_cffi/{fp['impersonate']}",
+            "browser_family": str(fp.get("browser_family") or "firefox"),
+            "register_fingerprint": json.dumps(register_fingerprint, ensure_ascii=False, sort_keys=True),
             "tls_impersonate": fp["impersonate"],
             "user_agent": fp["user_agent"],
             "sec_ch_ua": fp["sec_ch_ua"],
@@ -2588,6 +2597,12 @@ class PlatformRegistrar:
             "protocol_platform": str(fp.get("platform") or "Win32"),
             "protocol_webgl_vendor": str(fp.get("webgl_vendor") or ""),
             "protocol_webgl_renderer": str(fp.get("webgl_renderer") or ""),
+            "protocol_device_pixel_ratio": str(fp.get("device_pixel_ratio") or "1"),
+            "protocol_navigator_vendor": str(fp.get("navigator_vendor") or ""),
+            "protocol_max_touch_points": str(fp.get("max_touch_points") or "0"),
+            "protocol_audio_sample_rate": str(fp.get("audio_sample_rate") or "48000"),
+            "protocol_color_depth": str(fp.get("color_depth") or "24"),
+            "protocol_sentinel_sid": str(fp.get("sentinel_sid") or ""),
             "provider_type": str(mailbox.get("provider") or ""),
             "mailbox_provider_ref": str(mailbox.get("provider_ref") or ""),
         }
