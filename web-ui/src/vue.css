@@ -935,6 +935,7 @@ table.acct .col-actions { text-align: right; white-space: nowrap; }
   font-weight: 600;
   color: var(--ink-700);
 }
+.acct-group-name.has-trial { color: var(--ok); }
 .acct-reg-source { font-size: 11px; color: var(--ink-500); font-family: var(--sans); }
 
 .acct-plan { font-size: 10px; padding: 1px 8px; }

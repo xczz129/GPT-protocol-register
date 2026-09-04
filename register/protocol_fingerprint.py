@@ -191,6 +191,14 @@ REGISTER_COUNTRY_DEVICE_TRAITS: dict[str, tuple[dict[str, str], ...]] = {
         {"screen": "1920x1200", "hardware_concurrency": "12", "device_memory": "16", "device_pixel_ratio": "1", "platform_version": "10.0.0"},
         {"screen": "2560x1440", "hardware_concurrency": "16", "device_memory": "16", "device_pixel_ratio": "1", "platform_version": "10.0.0"},
     ),
+    "IN": (
+        {"screen": "1366x768", "hardware_concurrency": "4", "device_memory": "8", "device_pixel_ratio": "1", "platform_version": "10.0.0"},
+        {"screen": "1366x768", "hardware_concurrency": "8", "device_memory": "8", "device_pixel_ratio": "1", "platform_version": "10.0.0"},
+        {"screen": "1920x1080", "hardware_concurrency": "8", "device_memory": "8", "device_pixel_ratio": "1", "platform_version": "10.0.0"},
+        {"screen": "1536x864", "hardware_concurrency": "8", "device_memory": "8", "device_pixel_ratio": "1.25", "platform_version": "10.0.0"},
+        {"screen": "1600x900", "hardware_concurrency": "8", "device_memory": "16", "device_pixel_ratio": "1.2", "platform_version": "10.0.0"},
+        {"screen": "1920x1080", "hardware_concurrency": "12", "device_memory": "16", "device_pixel_ratio": "1", "platform_version": "10.0.0"},
+    ),
 }
 
 
@@ -232,6 +240,14 @@ REGISTER_COUNTRY_WEBGL_TRAITS: dict[str, tuple[dict[str, str], ...]] = {
         {"vendor": "NVIDIA Corporation", "renderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)"},
         {"vendor": "NVIDIA Corporation", "renderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 2060 Direct3D11 vs_5_0 ps_5_0, D3D11)"},
         {"vendor": "AMD", "renderer": "ANGLE (AMD, AMD Radeon RX 6600 Direct3D11 vs_5_0 ps_5_0, D3D11)"},
+    ),
+    "IN": (
+        {"vendor": "Intel Inc.", "renderer": "ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)"},
+        {"vendor": "Intel Inc.", "renderer": "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)"},
+        {"vendor": "Intel Inc.", "renderer": "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)"},
+        {"vendor": "NVIDIA Corporation", "renderer": "ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)"},
+        {"vendor": "NVIDIA Corporation", "renderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3050 Direct3D11 vs_5_0 ps_5_0, D3D11)"},
+        {"vendor": "AMD", "renderer": "ANGLE (AMD, AMD Radeon(TM) Vega 8 Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)"},
     ),
 }
 

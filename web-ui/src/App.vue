@@ -2545,7 +2545,7 @@ function closeAccountLogs() {
 
 async function copyValue(payload) {
   try {
-    await copyOrReveal(payload?.value, { title: "复制内容", successMessage: payload?.message || "已复制" });
+    await copyOrReveal(payload?.value ?? payload?.text, { title: "复制内容", successMessage: payload?.message || payload?.successMessage || "已复制" });
   } catch {
     notify("复制失败，请重试", "err");
   }
@@ -2559,65 +2559,6 @@ async function createAccountGroup(name, selectForTask = false) {
   groups.value = [...groups.value, { ...result.group, account_count: 0 }];
   syncGroupSelections();
   if (selectForTask) taskForm.groupId = result.group.id;
-}
-async function renameAccountGroup(groupId, currentName) {
-  const name = await promptInside("输入新的分组名称。", currentName, { title: "重命名分组", confirmText: "保存", maxlength: 48 });
-  const clean = typeof name === "string" ? name.trim() : "";
-  if (!clean) return;
-  const result = await run(() => api(`/api/account-groups/${encodeURIComponent(groupId)}`, { method: "PUT", body: jsonBody({ name: clean }) }), "分组已重命名");
-  if (!result?.group) return;
-  groups.value = groups.value.map((group) => group.id === groupId ? { ...group, ...result.group } : group);
-  accounts.value = accounts.value.map((account) => account.group_id === groupId ? { ...account, group_name: result.group.name } : account);
-}
-async function deleteAccountGroup(groupId, groupName) {
-  if (!await confirmInside(`删除分组“${groupName || "未命名分组"}”？该组账号会迁移到保留分组。`, { title: "删除分组", confirmText: "删除", danger: true })) return;
-  const previousAccounts = accounts.value;
-  const previousGroups = groups.value;
-  const previousTaskGroup = taskForm.groupId;
-  const previousIntegrationGroup = integrationForm.groupId;
-  const removed = groups.value.find((group) => group.id === groupId);
-  const fallback = groups.value.find((group) => group.id !== groupId);
-  if (!removed || !fallback) return;
-  groups.value = groups.value
-    .filter((group) => group.id !== groupId)
-    .map((group) => group.id === fallback.id
-      ? { ...group, account_count: Number(group.account_count || 0) + Number(removed.account_count || 0) }
-      : group);
-  accounts.value = accounts.value.map((account) => account.group_id === groupId
-    ? { ...account, group_id: fallback.id, group_name: fallback.name }
-    : account);
-  syncGroupSelections();
-  notify("正在删除分组并迁移账号");
-  const result = await run(() => api(`/api/account-groups/${encodeURIComponent(groupId)}`, { method: "DELETE" }), (value) => `分组已删除，迁移 ${value.moved || 0} 个账号`);
-  if (result?.ok) return refreshAccountCollectionsQuietly();
-  accounts.value = previousAccounts;
-  groups.value = previousGroups;
-  taskForm.groupId = previousTaskGroup;
-  integrationForm.groupId = previousIntegrationGroup;
-}
-async function moveAccountsToGroup(keys, groupId) {
-  const target = groups.value.find((group) => group.id === groupId);
-  if (!target || !keys?.length) return;
-  const previousAccounts = accounts.value;
-  const previousGroups = groups.value;
-  const wanted = new Set(keys);
-  const deltas = new Map();
-  const now = new Date().toISOString();
-  accounts.value = accounts.value.map((account) => {
-    if (!wanted.has(account.delete_key) || account.group_id === groupId) return account;
-    deltas.set(account.group_id || "", Number(deltas.get(account.group_id || "") || 0) - 1);
-    deltas.set(groupId, Number(deltas.get(groupId) || 0) + 1);
-    return { ...account, group_id: groupId, group_name: target.name, updated_at: now };
-  });
-  applyGroupCountDeltas(deltas);
-  notify("正在保存分组变更");
-  const result = await run(() => api("/api/accounts/group", { method: "POST", body: jsonBody({ keys, delete_all: false, group_id: groupId }) }), (value) => `已移动 ${value.changed || 0} 个账号`);
-  if (result?.ok) return refreshAccountCollectionsQuietly();
-  accounts.value = previousAccounts;
-  groups.value = previousGroups;
-}
-function exportGroupCredentials(groupId) {
-  if (groupId) location.href = apiUrl(`/api/account-groups/${encodeURIComponent(groupId)}/export-credentials`);
 }
 function downloadLogs() { location.href = apiUrl("/api/logs/download"); }
 async function saveMaintenance() { await run(() => api("/api/maintenance", { method: "PUT", body: jsonBody({ enabled: maintenanceForm.enabled, interval_hours: maintenanceForm.intervalHours, workers: maintenanceForm.workers, auto_delete_invalid: maintenanceForm.autoDeleteInvalid, webhook_url: maintenanceForm.webhookUrl, notify_on_complete: maintenanceForm.notifyOnComplete, notify_on_pool_low: maintenanceForm.notifyOnPoolLow, pool_low_threshold: maintenanceForm.poolLowThreshold }) }), "维护设置已保存", [loadOperations]); }
@@ -2868,7 +2809,7 @@ onBeforeUnmount(() => {
         </template>
         <IntegrationView v-else-if="active === 'chatgpt2api'" :form="integrationForm" :groups="groups" :progress="progress" :busy="busy" @save="saveIntegration" @test="testIntegration" @upload="uploadIntegration" />
         <LogsView v-else-if="active === 'logs'" :logs="logs" :connected="connected" @refresh="loadLogs" @download="downloadLogs" @clear="logs = []" />
-        <AccountsView v-else-if="active === 'accounts'" :accounts="accounts" :accounts-loading="accountsLoading" :account-load-progress="accountLoadProgress" :account-load-error="accountLoadError" :groups="groups" :proxy-countries="proxyForm.countries" :busy="busy" :copying-at="copyingAccessToken" :health-progress="healthProgress" :reauth-progress="reauthProgress" :trial-progress="trialProgress" :refresh-at-progress="refreshAtProgress" @refresh="loadAccounts" @health="healthAccounts" @trial-check="trialEligibilityAccounts" @refresh-at="refreshAtAccounts" @reauth="reauthAccounts" @security-repair="repairSecurityAccounts" @password-change="changeAccountPasswords" @totp-change="changeAccountTotp" @account-logs="openAccountLogs" @stop-reauth="stopReauth" @delete="deleteAccounts" @delete-invalid="deleteInvalidAccounts" @download="downloadAccounts" @copy-selected-at="copySelectedAccessTokens" @export-selected-at="exportSelectedAccessTokens" @export-security="exportSecurityCredentials" @create-group="createAccountGroup" @rename-group="renameAccountGroup" @delete-group="deleteAccountGroup" @move-group="moveAccountsToGroup" @export-group="exportGroupCredentials" @copy-at="copyAccessToken" @copy-session="copySessionToken" @copy-credential="copyAccountCredential" @copy-value="copyValue" @codex-oauth="runCodexOauth" @import-accounts="importAccountsDialog.open = true" :codex-oauth-running="codexOauthRunning" />
+        <AccountsView v-else-if="active === 'accounts'" :accounts="accounts" :accounts-loading="accountsLoading" :account-load-progress="accountLoadProgress" :account-load-error="accountLoadError" :proxy-countries="proxyForm.countries" :busy="busy" :copying-at="copyingAccessToken" :health-progress="healthProgress" :reauth-progress="reauthProgress" :trial-progress="trialProgress" :refresh-at-progress="refreshAtProgress" @refresh="loadAccounts" @health="healthAccounts" @trial-check="trialEligibilityAccounts" @refresh-at="refreshAtAccounts" @reauth="reauthAccounts" @security-repair="repairSecurityAccounts" @password-change="changeAccountPasswords" @totp-change="changeAccountTotp" @account-logs="openAccountLogs" @stop-reauth="stopReauth" @delete="deleteAccounts" @delete-invalid="deleteInvalidAccounts" @download="downloadAccounts" @copy-selected-at="copySelectedAccessTokens" @export-selected-at="exportSelectedAccessTokens" @export-security="exportSecurityCredentials" @copy-at="copyAccessToken" @copy-session="copySessionToken" @copy-credential="copyAccountCredential" @copy-value="copyValue" @codex-oauth="runCodexOauth" @import-accounts="importAccountsDialog.open = true" :codex-oauth-running="codexOauthRunning" />
         <RebindView v-else-if="active === 'rebind'" :progress="rebindProgress" :preflight="rebindPreflight" :busy="busy || rebindRequestBusy" :checking="rebindChecking" @preflight="preflightRebind" @start="startRebind" @stop="stopRebind" @reset="resetRebindForInput" @input-change="resetRebindForInput" />
         <CredentialExportView v-else-if="active === 'credential-export'" :accounts="accounts" :busy="busy" @export="exportSecurityByEmail" />
         <ProtocolLoginView v-else-if="active === 'protocol-login'" :accounts="accounts" :progress="reauthProgress" :health-progress="healthProgress" :preflight="protocolLoginPreflight" :busy="busy" @start="startProtocolLoginByEmail" @stop="stopReauth" @health="healthProtocolLoginEmails" @input-change="resetProtocolLoginResultsForInput" />

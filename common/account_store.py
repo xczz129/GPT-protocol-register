@@ -1481,6 +1481,20 @@ def account_is_usable(record: dict[str, Any]) -> bool:
     }
 
 
+def account_access_token_expired(record: dict[str, Any]) -> bool:
+    """Return True when the stored AT parses and its exp has already passed."""
+    token = _s(record.get("access_token"))
+    if not token:
+        return False
+    try:
+        segment = token.split(".")[1]
+        segment += "=" * (-len(segment) % 4)
+        expires_at = int(json.loads(base64.urlsafe_b64decode(segment)).get("exp") or 0)
+    except Exception:
+        return False
+    return expires_at > 0 and expires_at <= int(time.time())
+
+
 def account_public_view(record: dict[str, Any]) -> dict[str, Any]:
     """Return a panel-safe account row without raw tokens or raw password."""
     password = _s(record.get("password"))
@@ -1565,6 +1579,7 @@ def account_public_view(record: dict[str, Any]) -> dict[str, Any]:
         "updated_at": record.get("updated_at"),
         "last_invalid_at": record.get("last_invalid_at"),
         "has_access_token": has_access_token,
+        "at_expired": account_access_token_expired(record),
         "has_refresh_token": bool(record.get("refresh_token")),
         "has_session_token": bool(record.get("session_token")),
         "source_type": record.get("source_type"),

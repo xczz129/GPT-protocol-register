@@ -30,6 +30,7 @@ COUNTRY_IDENTITIES: dict[str, CountryIdentity] = {
     "FR": CountryIdentity("fr-FR", "fr-FR,fr;q=0.9,en-US;q=0.7,en;q=0.6", "Europe/Paris", (-60, -120)),
     "CA": CountryIdentity("en-CA", "en-CA,en;q=0.9,fr-CA;q=0.7", "America/Toronto", (240, 300, 360, 420)),
     "VN": CountryIdentity("vi-VN", "vi-VN,vi;q=0.9,en-US;q=0.7,en;q=0.6", "Asia/Ho_Chi_Minh", (-420,)),
+    "IN": CountryIdentity("en-IN", "en-IN,en;q=0.9,hi-IN;q=0.8,hi;q=0.7", "Asia/Kolkata", (-330,)),
 }
 
 

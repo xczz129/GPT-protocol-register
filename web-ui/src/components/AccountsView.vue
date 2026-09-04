@@ -1,18 +1,15 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { 
-  Check, 
-  CheckSquare, 
-  Clipboard, 
-  ClipboardList, 
-  Copy, 
-  Download, 
-  Eye, 
-  EyeOff, 
-  KeyRound, 
-  Monitor, 
-  Pencil, 
-  Plus, 
+import {
+  Check,
+  Clipboard,
+  ClipboardList,
+  Copy,
+  Download,
+  Eye,
+  EyeOff,
+  KeyRound,
+  Monitor,
   RefreshCw, 
   ShieldCheck, 
   Trash2, 
@@ -28,8 +25,7 @@ const props = defineProps({
   accounts: { type: Array, default: () => [] }, 
   accountsLoading: Boolean, 
   accountLoadProgress: { type: Object, default: () => ({ loaded: 0, total: 0 }) }, 
-  accountLoadError: { type: String, default: "" }, 
-  groups: { type: Array, default: () => [] }, 
+  accountLoadError: { type: String, default: "" },
   proxyCountries: { type: Array, default: () => [] }, 
   busy: Boolean, 
   copyingAt: Boolean,
@@ -43,8 +39,7 @@ const props = defineProps({
 const emit = defineEmits([
   "refresh", "health", "reauth", "security-repair", "password-change", "totp-change", 
   "account-logs", "stop-reauth", "delete", "delete-invalid", "download", "copy-selected-at", "codex-oauth", "import-accounts", 
-  "export-selected-at", "export-security", "create-group", "rename-group", "delete-group", 
-  "move-group", "export-group", "copy-at", "copy-credential", "copy-value", "trial-check",
+  "export-selected-at", "export-security", "copy-at", "copy-credential", "copy-value", "trial-check",
   "copy-session", "refresh-at"
 ]);
 
@@ -54,9 +49,6 @@ const statusFilter = ref("all");
 const planFilter = ref("all");
 const offerFilter = ref("all");
 const groupFilter = ref("all");
-const groupQuery = ref("");
-const moveTarget = ref("");
-const newGroupName = ref("");
 const pageSize = ref(20);
 const page = ref(1);
 const selected = ref([]);
@@ -109,6 +101,7 @@ const accountIndex = computed(() => {
   let usable = 0;
   let deactivated = 0;
   let checked = 0;
+  let expiredAt = 0;
   for (const item of rows) {
     const key = item?.delete_key;
     const health = String(item.health_status || "unknown").toLowerCase();
@@ -116,6 +109,7 @@ const accountIndex = computed(() => {
     if (!isDeactivated && ["alive", "limited"].includes(health)) usable += 1;
     if (isDeactivated) deactivated += 1;
     if (health !== "unknown") checked += 1;
+    if (!isDeactivated && item.at_expired) expiredAt += 1;
     if (!isDeactivated && health === "invalid" && key) invalidKeys.push(key);
     if (item.reauth_available && key) {
       reauthKeys.push(key);
@@ -132,7 +126,7 @@ const accountIndex = computed(() => {
     if (!isDeactivated && item.has_session_token && key) refreshAtKeys.add(key);
   }
   return {
-    stats: { total: rows.length, usable, deactivated, checked },
+    stats: { total: rows.length, usable, deactivated, checked, expiredAt },
     invalidKeys,
     reauthKeys,
     protocolReauthKeys,
@@ -144,6 +138,8 @@ const accountIndex = computed(() => {
 });
 
 const accountStats = computed(() => accountIndex.value.stats);
+const expiredAtCount = computed(() => accountIndex.value.stats.expiredAt || 0);
+const trialCategoryCount = computed(() => (props.accounts || []).filter((item) => item.trial_eligibility_status === "eligible").length);
 const accountLoadPercent = computed(() => {
   const total = Number(props.accountLoadProgress?.total || 0);
   const loaded = Number(props.accountLoadProgress?.loaded || props.accounts.length || 0);
@@ -251,24 +247,6 @@ const totpNow = ref(Date.now());
 let totpTickTimer = null;
 onMounted(() => { totpTickTimer = setInterval(() => { totpNow.value = Date.now(); autoRefreshTotps(); }, 1000); });
 onBeforeUnmount(() => { if (totpTickTimer) clearInterval(totpTickTimer); });
-const visibleGroups = computed(() => {
-  const needle = groupQuery.value.trim().toLowerCase();
-  return needle
-    ? props.groups.filter((item) => String(item.name || "").toLowerCase().includes(needle))
-    : props.groups;
-});
-const activeGroup = computed(() => props.groups.find((item) => item.id === groupFilter.value) || null);
-
-const filteredGroupKeys = computed(() => {
-  if (!activeGroup.value) return [];
-  return filtered.value.filter((item) => (item.group_id || "default") === activeGroup.value.id).map((item) => item.delete_key).filter(Boolean);
-});
-const filteredGroupAllSelected = computed(() => {
-  if (!filteredGroupKeys.value.length) return false;
-  const current = new Set(selected.value);
-  return filteredGroupKeys.value.every((key) => current.has(key));
-});
-
 const filtered = computed(() => {
   const needle = searchNeedle.value;
   const status = statusFilter.value;
@@ -278,7 +256,8 @@ const filtered = computed(() => {
   const textIndex = searchTextByItem.value;
 
   return (props.accounts || []).filter((item) => {
-    if (group !== "all" && (item.group_id || "default") !== group) return false;
+    if (group === "trial" && item.trial_eligibility_status !== "eligible") return false;
+    if (group === "no-trial" && item.trial_eligibility_status === "eligible") return false;
     if (status !== "all") {
       const isDeactivated = !!item.is_deactivated;
       const normalizedStatus = isDeactivated ? "deactivated" : (item.health_status || item.status || "unknown").toLowerCase();
@@ -619,35 +598,6 @@ function proxyDisplay(value) {
   }
   return { country, label: label || country };
 }
-function createGroup() {
-  const name = newGroupName.value.trim();
-  if (!name) return;
-  emit("create-group", name);
-  newGroupName.value = "";
-}
-function renameGroup(group) {
-  if (!group) return;
-  emit("rename-group", group.id, group.name);
-}
-function deleteGroup(group) {
-  if (!group) return;
-  emit("delete-group", group.id, group.name);
-}
-function toggleActiveGroupSelection() {
-  if (!filteredGroupKeys.value.length) return;
-  const next = new Set(selected.value);
-  const shouldSelect = !filteredGroupAllSelected.value;
-  for (const key of filteredGroupKeys.value) {
-    if (shouldSelect) next.add(key);
-    else next.delete(key);
-  }
-  selected.value = [...next];
-}
-function moveSelected() {
-  if (!selected.value.length || !moveTarget.value) return;
-  emit("move-group", [...selected.value], moveTarget.value);
-  selected.value = [];
-}
 </script>
 
 <template>
@@ -666,51 +616,33 @@ function moveSelected() {
     </div>
 
     <div class="accounts-workspace">
-      <!-- 账号分组管理侧边栏 -->
-      <aside class="account-group-sidebar" aria-label="账号分组">
+      <!-- 账号分类侧边栏：全部 / 有试用 / 无试用 -->
+      <aside class="account-group-sidebar" aria-label="账号分类">
         <div class="account-group-sidebar-head">
-          <div><strong>账号分组</strong><span>{{ groups.length }} 个分组</span></div>
-        </div>
-        <label class="account-group-search">
-          <span aria-hidden="true">⌕</span>
-          <input v-model="groupQuery" type="search" placeholder="搜索分组" />
-        </label>
-        <button
-          :class="['account-group-select-all', { active: filteredGroupAllSelected }]"
-          type="button"
-          :disabled="!activeGroup || !filteredGroupKeys.length || busy"
-          :title="activeGroup ? `${filteredGroupAllSelected ? '取消选择' : '选中'}“${activeGroup.name}”内符合当前套餐、状态和搜索条件的全部账号` : '请先选择一个账号分组'"
-          @click="toggleActiveGroupSelection"
-        >
-          <CheckSquare :size="14" aria-hidden="true" />
-          <span>{{ filteredGroupAllSelected ? "取消筛选全选" : "全选筛选结果" }}</span>
-          <em>{{ filteredGroupKeys.length }}</em>
-        </button>
-        <div class="account-group-actions">
-          <button type="button" title="导出该组邮箱凭证" aria-label="导出该组邮箱凭证" :disabled="!activeGroup || busy" @click="activeGroup && emit('export-group', activeGroup.id)"><Download :size="14" aria-hidden="true" /></button>
-          <button type="button" title="重命名分组" aria-label="重命名分组" :disabled="!activeGroup || busy" @click="renameGroup(activeGroup)"><Pencil :size="14" aria-hidden="true" /></button>
-          <button class="danger" type="button" title="删除分组" aria-label="删除分组" :disabled="!activeGroup || groups.length <= 1 || busy" @click="deleteGroup(activeGroup)"><Trash2 :size="14" aria-hidden="true" /></button>
-        </div>
-        <div class="account-group-create">
-          <input v-model.trim="newGroupName" maxlength="48" placeholder="新分组名称" @keyup.enter="createGroup" />
-          <button type="button" title="新建分组" aria-label="新建分组" :disabled="!newGroupName.trim() || busy" @click="createGroup"><Plus :size="16" aria-hidden="true" /></button>
+          <div><strong>账号分类</strong><span>按试用资格划分</span></div>
         </div>
         <div class="account-group-list">
           <div :class="['account-group-row', { active: groupFilter === 'all' }]">
             <button class="account-group-main" type="button" @click="groupFilter = 'all'">
               <span class="account-group-icon"><Users :size="14" aria-hidden="true" /></span>
-              <span class="account-group-copy"><b>全部账号</b><small>所有分组</small></span>
+              <span class="account-group-copy"><b>全部</b><small>所有账号</small></span>
               <em>{{ accountsLoading ? (accountLoadProgress.total || accounts.length) : accounts.length }}</em>
             </button>
           </div>
-          <div v-for="group in visibleGroups" :key="group.id" :class="['account-group-row', { active: groupFilter === group.id }]">
-            <button class="account-group-main" type="button" @click="groupFilter = group.id">
-              <span class="account-group-icon"><Users :size="14" aria-hidden="true" /></span>
-              <span class="account-group-copy"><b>{{ group.name }}</b><small>{{ groupFilter === group.id ? '当前分组' : '账号分组' }}</small></span>
-              <em>{{ group.account_count || 0 }}</em>
+          <div :class="['account-group-row', { active: groupFilter === 'trial' }]">
+            <button class="account-group-main" type="button" @click="groupFilter = 'trial'">
+              <span class="account-group-icon"><Check :size="14" aria-hidden="true" /></span>
+              <span class="account-group-copy"><b>有试用</b><small>符合 0 元资格</small></span>
+              <em>{{ trialCategoryCount }}</em>
             </button>
           </div>
-          <div v-if="!visibleGroups.length" class="account-group-empty">没有匹配的分组</div>
+          <div :class="['account-group-row', { active: groupFilter === 'no-trial' }]">
+            <button class="account-group-main" type="button" @click="groupFilter = 'no-trial'">
+              <span class="account-group-icon"><X :size="14" aria-hidden="true" /></span>
+              <span class="account-group-copy"><b>无试用</b><small>其余全部账号</small></span>
+              <em>{{ accounts.length - trialCategoryCount }}</em>
+            </button>
+          </div>
         </div>
       </aside>
 
@@ -831,7 +763,7 @@ function moveSelected() {
           <button class="btn secondary" type="button" :disabled="!selected.length || busy" title="取消所有分页中已选择的账号" @click="clearAllSelected"><X :size="14" aria-hidden="true" />取消（{{ selected.length }}）</button>
           <button class="btn primary" :disabled="!accounts.length || busy" :title="selected.length ? '下载选中的账号' : '下载全部账号'" @click="emit('download', selected.length ? selected : null)"><Download :size="14" aria-hidden="true" />{{ selected.length ? `下载选中(${selected.length})` : "下载全部" }}</button>
           <button class="btn secondary" :disabled="!selectedAccessTokenKeys.length || busy || copyingAt" title="复制选中账号的完整 Access Token" @click="emit('copy-selected-at', selected)"><Copy :size="14" aria-hidden="true" />{{ copyingAt ? "读取AT中" : "复制选中AT" }}</button><button class="btn secondary" type="button" :disabled="!selected.length || busy || codexOauthRunning" title="对选中账号接码" @click="emit('codex-oauth', selected)"><Smartphone :size="14" aria-hidden="true" />接码</button><button class="btn secondary" type="button" :disabled="busy || codexOauthRunning" title="粘贴 邮箱----密码----2FA 导入新账号" @click="emit('import-accounts')"><Upload :size="14" aria-hidden="true" />导入账号</button>
-          <button class="btn secondary" :disabled="(!selectedRefreshAtKeys.length && !accounts.length) || busy || refreshAtProgress.running" :title="selectedRefreshAtKeys.length ? `刷新选中 ${selectedRefreshAtKeys.length} 个账号的 AT（需有 Session）` : '刷新全部临期/过期账号的 AT（需有 Session，自动跳过已封号）'" @click="emit('refresh-at', selectedRefreshAtKeys.length ? { keys: selectedRefreshAtKeys } : { all_accounts: true })">{{ refreshAtProgress.running ? "刷新AT中…" : (selectedRefreshAtKeys.length ? `刷新AT选中(${selectedRefreshAtKeys.length})` : "刷新AT") }}</button>
+          <button class="btn secondary" :disabled="(!selectedRefreshAtKeys.length && !accounts.length) || busy || refreshAtProgress.running" :title="selectedRefreshAtKeys.length ? `刷新选中 ${selectedRefreshAtKeys.length} 个账号的 AT（需有 Session）` : `刷新全部临期/过期账号的 AT（已过期 ${expiredAtCount} 个，需有 Session，自动跳过已封号）`" @click="emit('refresh-at', selectedRefreshAtKeys.length ? { keys: selectedRefreshAtKeys } : { all_accounts: true })">{{ refreshAtProgress.running ? "刷新AT中…" : (selectedRefreshAtKeys.length ? `刷新AT选中(${selectedRefreshAtKeys.length})` : `刷新AT(${expiredAtCount})`) }}</button>
           <button class="btn secondary" :disabled="!selectedAccessTokenKeys.length || busy" title="导出选中账号的完整 Access Token" @click="emit('export-selected-at', selected)">导出选中AT</button>
           <button class="btn secondary" :disabled="!selected.length || busy" title="导出选中账号、密码和完整 TOTP 密钥" @click="emit('export-security', selected)">导出账号+密码+2FA</button>
           <button class="btn secondary" :disabled="!accounts.length || busy || accountLoadBlocked || healthProgress.running" :title="selected.length ? '测活选中的账号' : '测活全部账号(跳过已封号)'" @click="emit('health', selected.length ? selected : null)">{{ healthProgress.running ? "测活中…" : (selected.length ? `测活选中(${selected.length})` : "测活全部") }}</button>
@@ -844,8 +776,6 @@ function moveSelected() {
           <button class="btn secondary" :disabled="!selectedSecurityOperationKeys.length || busy || reauthProgress.running" @click="emit('totp-change', { keys: selectedSecurityOperationKeys })">修改 2FA（{{ selectedSecurityOperationKeys.length }}）</button>
           
           <button class="btn danger" :disabled="!invalidCount || busy" @click="emit('delete-invalid', invalidKeys)"><Trash2 :size="14" aria-hidden="true" />删除失效（{{ invalidCount }}）</button>
-          <select v-model="moveTarget" aria-label="移动目标分组"><option v-for="group in groups" :key="group.id" :value="group.id">移至：{{ group.name }}</option></select>
-          <button class="btn secondary" :disabled="!selected.length || !moveTarget || busy" @click="moveSelected">移动选中</button>
           <button class="btn danger" :disabled="!selected.length || busy" @click="emit('delete', selected)">删除选中</button>
           <button class="btn danger" :disabled="!accounts.length || busy" @click="emit('delete', null)">全部删除</button>
         </div>
@@ -902,10 +832,10 @@ function moveSelected() {
                   </div>
                 </td>
 
-                <!-- 分组 / 注册方式 -->
+                <!-- 分类 / 注册方式 -->
                 <td class="col-group" data-label="分组 / 方式">
                   <div class="acct-cell-stack">
-                    <span class="acct-group-name" :title="item.group_name || '默认分组'">{{ item.group_name || "默认分组" }}</span>
+                    <span :class="['acct-group-name', { 'has-trial': item.trial_eligibility_status === 'eligible' }]" :title="item.trial_eligibility_status === 'eligible' ? '符合 0 元试用资格' : '不符合 0 元试用资格（含未检测）'">{{ item.trial_eligibility_status === "eligible" ? "有试用" : "无试用" }}</span>
                     <span class="acct-reg-source">{{ registrationText(item) }}</span>
                   </div>
                 </td>

@@ -48,6 +48,7 @@ _WINDOWS_TZ_STANDARD = {
     "Europe/Berlin": "W. Europe Standard Time",
     "Europe/Paris": "Romance Standard Time",
     "Europe/Istanbul": "Turkey Time",
+    "Asia/Kolkata": "India Standard Time",
 }
 _WINDOWS_TZ_DAYLIGHT = {
     "Australia/Sydney": "AUS Eastern Daylight Time",
