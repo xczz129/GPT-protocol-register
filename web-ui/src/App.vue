@@ -27,7 +27,6 @@ import PlusEligibilityView from "./components/PlusEligibilityView.vue";
 import RebindView from "./components/RebindView.vue";
 import TrialProxyView from "./components/TrialProxyView.vue";
 import TaskView from "./components/TaskView.vue";
-import VersionHistoryView from "./components/VersionHistoryView.vue";
 
 const views = {
   task: ["注册任务", "创建、调度并观察账号注册任务"],
@@ -42,7 +41,6 @@ const views = {
   "credential-export": ["凭据导出", "按邮箱筛选并导出账号、密码和 2FA"],
   "protocol-login": ["协议登录", "按邮箱批量重新登录并查看账号状态"],
   operations: ["运维中心", "统计、自动维护、备份恢复与面板安全"],
-  versions: ["版本历史", "查看面板代码的版本提交记录与远程同步状态"],
 };
 
 const onLoginPage = location.pathname === "/login";
@@ -922,7 +920,6 @@ async function loadActiveView() {
   if (active.value === "chatgpt2api") return Promise.all([loadGroups(), loadAccounts()]);
   if (active.value === "logs") return loadLogs();
   if (active.value === "operations") return Promise.all([loadOperations(), loadTrash()]);
-  if (active.value === "versions") return loadVersionHistory();
 }
 
 async function initialize() {
@@ -2681,8 +2678,6 @@ function stopCodexOauthPolling() { if (codexOauthTimer) { clearInterval(codexOau
 async function loadSmsConfig() { try { const value = await api("/api/sms-config"); smsConfig.value = value || {}; Object.assign(smsForm, { enabled: !!value.enabled, provider: value.provider || "smsbower", apiKey: "", service: value.service || "dr", countryOrder: value.country_order || "6, 4, 151", timeoutSeconds: Number(value.timeout_seconds || 180), maxPhoneAttempts: Number(value.max_phone_attempts || 5), firefoxApiName: value.firefox_api_name || "", firefoxToken: "", firefoxDockingCode: value.firefox_docking_code || "", firefoxCountryOrder: value.firefox_country_order || "usa, chl, eng" }); } catch {} }
 async function saveSmsConfig() { await run(() => api("/api/sms-config", { method: "PUT", body: jsonBody({ enabled: smsForm.enabled, provider: smsForm.provider, api_key: smsForm.apiKey, service: smsForm.service, country_order: smsForm.countryOrder, poll_interval_ms: 5000, timeout_seconds: smsForm.timeoutSeconds, max_phone_attempts: smsForm.maxPhoneAttempts, firefox_api_name: smsForm.firefoxApiName, firefox_api_token: smsForm.firefoxToken, firefox_docking_code: smsForm.firefoxDockingCode, firefox_country_order: smsForm.firefoxCountryOrder }) }), "接码设置已保存", [loadSmsConfig]); }
 async function testSmsConfig() { await run(() => api("/api/sms-config/test", { method: "POST", body: "{}" }), (r) => r.message || "测试完成"); }
-const versionHistory = ref({ commits: [], remote: "", uncommitted_changes: false });
-async function loadVersionHistory() { try { versionHistory.value = await api("/api/version-history"); } catch { versionHistory.value = { commits: [], remote: "", uncommitted_changes: false }; } }
 const codexHistoryDialog = reactive({ open: false, loading: false, email: "", key: "", hasRt: false, rows: [] });
 const codexHistoryEmailKey = computed(() => codexHistoryDialog.key || "");
 async function openCodexHistory(account) {
@@ -2730,7 +2725,6 @@ async function copyHistoryRt(row) {
   if (!value) return;
   await copyOrReveal(value, { title: `复制 ${codexHistoryDialog.email || "账号"} 的 RT`, successMessage: "RT 已复制" });
 }
-async function pushVersionToGitHub() { await run(() => api("/api/version-push", { method: "POST", body: "{}" }), (r) => r.message || "已推送", [loadVersionHistory]); }
 async function stopCodexOauth() { await run(() => api("/api/codex-oauth/stop", { method: "POST", body: "{}" }), "已请求停止"); }
 function closeCodexOauth() { codexOauthDialog.open = false; stopCodexOauthPolling(); }
 async function codexCopyRt(payload) { if (payload?.fallback) { Object.assign(clipboardDialog, { open: true, title: `复制 ${payload.email || "账号"} 的 RT`, value: payload.text, successMessage: "RT 已复制" }); return; } notify(payload?.successMessage || "已复制", "ok"); }
@@ -2854,7 +2848,7 @@ onBeforeUnmount(() => {
         <button class="header-menu-button" type="button" aria-label="打开导航" :aria-expanded="sidebarOpen" @click="openSidebar"><Menu :size="19" aria-hidden="true" /></button>
         <div class="page-heading"><div class="eyebrow">GPT REGISTER FP · CONSOLE</div><h1>{{ title }}</h1><p>{{ subtitle }}</p></div>
       </div>
-      <div class="hero-actions"><span :class="['badge', status.job?.running ? 'run' : 'idle']"><i></i>{{ status.job?.running ? "运行中" : "空闲" }}</span><span v-if="username" class="tag account-tag">{{ username }}</span><button class="btn secondary icon-command refresh-command" type="button" title="刷新数据" aria-label="刷新数据" @click="initialize"><RefreshCw :size="15" aria-hidden="true" /></button><button class="btn secondary icon-command logout-command" type="button" title="退出登录" aria-label="退出登录" @click="logout"><LogOut :size="15" aria-hidden="true" /></button></div>
+      <div class="hero-actions"><span :class="['badge', status.job?.running ? 'run' : 'idle']"><i></i>{{ status.job?.running ? "运行中" : "空闲" }}</span><span v-if="username" class="tag account-tag">{{ username }}</span><button class="btn secondary icon-command refresh-command" type="button" title="刷新数据" aria-label="刷新数据" @click="initialize"><RefreshCw :size="15" aria-hidden="true" /><span>刷新</span></button><button class="btn secondary icon-command logout-command" type="button" title="退出登录" aria-label="退出登录" @click="logout"><LogOut :size="15" aria-hidden="true" /><span>退出</span></button></div>
     </header>
     <main class="content">
       <!-- Account pages can render their first page while the remaining
@@ -2878,7 +2872,6 @@ onBeforeUnmount(() => {
         <RebindView v-else-if="active === 'rebind'" :progress="rebindProgress" :preflight="rebindPreflight" :busy="busy || rebindRequestBusy" :checking="rebindChecking" @preflight="preflightRebind" @start="startRebind" @stop="stopRebind" @reset="resetRebindForInput" @input-change="resetRebindForInput" />
         <CredentialExportView v-else-if="active === 'credential-export'" :accounts="accounts" :busy="busy" @export="exportSecurityByEmail" />
         <ProtocolLoginView v-else-if="active === 'protocol-login'" :accounts="accounts" :progress="reauthProgress" :health-progress="healthProgress" :preflight="protocolLoginPreflight" :busy="busy" @start="startProtocolLoginByEmail" @stop="stopReauth" @health="healthProtocolLoginEmails" @input-change="resetProtocolLoginResultsForInput" />
-        <VersionHistoryView v-else-if="active === 'versions'" :history="versionHistory" :busy="busy" @refresh="loadVersionHistory" @push="pushVersionToGitHub" />
         <OperationsView v-else-if="active === 'operations'" :operations="operations" :trash="trash" :form="maintenanceForm" :maddy-auto-form="maddyAutoForm" :backup-schedule-form="backupScheduleForm" :sms-form="smsForm" :sms-config="smsConfig" :groups="groups" :security="securityForm" :busy="busy" :maintenance-running="maintenanceActive" :maddy-auto-running="maddyAutoActive" @refresh="() => Promise.all([loadOperations(), loadTrash()])" @save="saveMaintenance" @run="runMaintenance" @save-maddy-auto="saveMaddyAutoRegister" @run-maddy-auto="runMaddyAutoRegister" @test-webhook="testWebhook" @backup="createBackupNow" @save-backup-schedule="saveBackupSchedule" @save-sms-config="saveSmsConfig" @test-sms="testSmsConfig" @pick-countries="openSmsCountryPicker" :sms-countries="smsCountries" @restore-backup="restoreBackupNow" @restore-trash="restoreTrash" @change-password="changePassword" @revoke-sessions="revokeSessions" />
       </template>
     </main>
@@ -2891,31 +2884,42 @@ onBeforeUnmount(() => {
     <SmsCountryPicker :open="smsCountryDialog.open" :provider="smsForm.provider" :items="smsCountryDialog.items" :selected="smsCountryDialog.selected" :loading="smsCountryDialog.loading" :error="smsCountryDialog.error" :prices="smsCountryPrices" :providers="smsCountryProviders" @close="smsCountryDialog.open = false" @toggle="toggleSmsCountry" @set-price="setSmsCountryPrice" @set-provider="setSmsCountryProvider" />
     <ImportAccountsDialog :open="importAccountsDialog.open" :busy="busy" @close="importAccountsDialog.open = false" @submit="submitImportAccounts" />
     <CodexOauthDialog :open="codexOauthDialog.open" :status="codexOauthStatus" @close="closeCodexOauth" @stop="stopCodexOauth" @copy="codexCopyRt" />
-    <div v-if="codexHistoryDialog.open" class="modal-backdrop" @click.self="closeCodexHistory">
-      <div class="modal codex-history-modal">
-        <div class="modal-h"><h3>接码历史 · {{ codexHistoryDialog.email }}</h3><button class="icon-btn" type="button" @click="closeCodexHistory"><X :size="16" aria-hidden="true" /></button></div>
-        <div class="modal-body">
-          <p class="codex-hint"><Smartphone :size="14" aria-hidden="true" /> {{ codexHistoryDialog.hasRt ? "该账号已有 RT(可直接复制或重新接码)" : "该账号尚无 RT" }}</p>
-          <div v-if="codexHistoryDialog.loading" class="empty-card">加载历史中…</div>
-          <div v-else-if="!codexHistoryDialog.rows.length" class="empty-card">暂无接码历史记录</div>
-          <div v-else class="codex-history-list">
-            <div v-for="(row, index) in codexHistoryDialog.rows" :key="index" class="codex-history-row" :class="row.status">
-              <div class="codex-history-main">
-                <b>{{ row.status === "success" ? "接码成功" : "接码失败" }}<span v-if="row.phone" class="codex-phone"> · {{ row.phone }}</span></b>
-                <small>{{ row.at }}<template v-if="row.error"> · {{ row.error }}</template></small>
-                <small v-if="row.rt" class="codex-rt">RT: {{ row.rt.slice(0, 36) }}…</small>
+    <Teleport to="body">
+      <Transition name="dialog-fade">
+        <div v-if="codexHistoryDialog.open" class="app-dialog-mask" @click.self="closeCodexHistory">
+          <section class="app-dialog codex-history-dialog" role="dialog" aria-modal="true" aria-label="接码历史">
+            <div class="app-dialog-head">
+              <div>
+                <span class="app-dialog-kicker"><Smartphone :size="12" aria-hidden="true" />接码历史</span>
+                <h2>{{ codexHistoryDialog.email }}</h2>
+                <small>历史接码记录 · 可复制 RT 或重新接码</small>
               </div>
-              <button v-if="row.rt" class="btn secondary sm" type="button" @click="copyHistoryRt(row)">复制RT</button>
+              <button class="app-dialog-close" type="button" title="关闭" aria-label="关闭" @click="closeCodexHistory"><X :size="16" aria-hidden="true" /></button>
+            </div>
+          <p class="codex-hint"><Smartphone :size="14" aria-hidden="true" /> {{ codexHistoryDialog.hasRt ? "该账号已有 RT(可直接复制或重新接码)" : "该账号尚无 RT" }}</p>
+          <div class="codex-history-list-wrap">
+            <div v-if="codexHistoryDialog.loading" class="empty-card">加载历史中…</div>
+            <div v-else-if="!codexHistoryDialog.rows.length" class="empty-card">暂无接码历史记录</div>
+            <div v-else class="codex-history-list">
+              <div v-for="(row, index) in codexHistoryDialog.rows" :key="index" class="codex-history-row" :class="row.status">
+                <div class="codex-history-main">
+                  <b>{{ row.status === "success" ? "接码成功" : "接码失败" }}<span v-if="row.phone" class="codex-phone"> · {{ row.phone }}</span></b>
+                  <small>{{ row.at }}<template v-if="row.error"> · {{ row.error }}</template></small>
+                  <small v-if="row.rt" class="codex-rt">RT: {{ row.rt.slice(0, 36) }}…</small>
+                </div>
+                <button v-if="row.rt" class="btn secondary sm" type="button" @click="copyHistoryRt(row)">复制RT</button>
+              </div>
             </div>
           </div>
-        </div>
-        <div class="modal-actions">
-          <button class="btn secondary" type="button" @click="closeCodexHistory">关闭</button>
-          <button class="btn secondary" type="button" :disabled="!codexHistoryDialog.hasRt" @click="copyRefreshToken({ delete_key: codexHistoryDialog.key, has_refresh_token: codexHistoryDialog.hasRt, email: codexHistoryDialog.email })">复制当前RT</button>
-          <button class="btn primary" type="button" @click="rerunCodexOauthFromHistory">重新接码</button>
-        </div>
+          <div class="app-dialog-actions">
+            <button class="btn secondary" type="button" @click="closeCodexHistory">关闭</button>
+            <button class="btn secondary" type="button" :disabled="!codexHistoryDialog.hasRt" @click="copyRefreshToken({ delete_key: codexHistoryDialog.key, has_refresh_token: codexHistoryDialog.hasRt, email: codexHistoryDialog.email })">复制当前RT</button>
+            <button class="btn primary" type="button" @click="rerunCodexOauthFromHistory">重新接码</button>
+          </div>
+        </section>
       </div>
-    </div>
+      </Transition>
+    </Teleport>
     <AccountLogDialog :open="accountLogDialog.open" :account="accountLogDialog.account" :logs="accountLogDialog.logs" :total="accountLogDialog.total" :loading="accountLogDialog.loading" :error="accountLogDialog.error" @close="closeAccountLogs" @refresh="loadAccountLogs()" />
   </div>
 </template>

@@ -470,9 +470,12 @@ button.danger:disabled { opacity: 0.45; cursor: not-allowed; }
 .btn.compact, .compact { padding: 4px 10px; font-size: 11.5px; }
 .btn-pill { border-radius: 999px; }
 .icon-command {
-  width: 34px; height: 34px;
-  padding: 0;
+  height: 34px;
+  padding: 0 12px;
   flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 .row-btns { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -2388,7 +2391,7 @@ table.acct .col-actions { text-align: right; white-space: nowrap; }
 .dock-hint { display: block; margin-top: 4px; font-size: 11px; color: var(--ink-400); }
 
 /* ---- 接码历史对话框 ---- */
-.codex-history-modal { max-width: 560px; }
+.codex-history-dialog { width: min(560px, 100%); }
 .codex-hint { display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--ink-600); margin-bottom: 12px; }
 .codex-history-list { display: flex; flex-direction: column; gap: 8px; max-height: 46vh; overflow-y: auto; }
 .codex-history-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg-inset); }
