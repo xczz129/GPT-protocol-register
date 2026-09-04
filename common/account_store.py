@@ -772,7 +772,12 @@ def load_accounts(path: Path = ACCOUNTS_FILE) -> list[dict[str, Any]]:
     return records
 
 
-def upsert_account_record(record: dict[str, Any], path: Path = ACCOUNTS_FILE) -> dict[str, Any]:
+def upsert_account_record(
+    record: dict[str, Any],
+    path: Path = ACCOUNTS_FILE,
+    *,
+    create: bool = True,
+) -> dict[str, Any]:
     if not isinstance(record, dict):
         raise TypeError("account record must be a dict")
     prepared = _ordered_record(dict(record))
@@ -783,6 +788,11 @@ def upsert_account_record(record: dict[str, Any], path: Path = ACCOUNTS_FILE) ->
         _, connection = sqlite_store
         try:
             connection.execute("BEGIN IMMEDIATE")
+            if not create and not _matching_sqlite_rows(connection, prepared):
+                # Worker write-back for an account deleted mid-batch: drop
+                # the write instead of resurrecting the row.
+                connection.rollback()
+                return prepared
             saved = _upsert_sqlite_record(connection, prepared)
             _bump_revision(connection)
             connection.commit()
@@ -795,6 +805,8 @@ def upsert_account_record(record: dict[str, Any], path: Path = ACCOUNTS_FILE) ->
 
     with _file_lock(path):
         records = _canonical_snapshot(path)
+        if not create and not _record_matches_existing(records, prepared):
+            return prepared
         records.append(prepared)
         normalized = normalize_accounts(records)
         _write_unlocked(path, normalized)
@@ -808,6 +820,8 @@ def upsert_account_record(record: dict[str, Any], path: Path = ACCOUNTS_FILE) ->
 def upsert_account_records(
     records: Iterable[dict[str, Any]],
     path: Path = ACCOUNTS_FILE,
+    *,
+    create: bool = True,
 ) -> list[dict[str, Any]]:
     """Merge a batch with one locked read/normalize/write cycle.
 
@@ -833,8 +847,11 @@ def upsert_account_records(
             connection.execute("BEGIN IMMEDIATE")
             saved: list[dict[str, Any]] = []
             for item in prepared:
+                if not create and not _matching_sqlite_rows(connection, item):
+                    continue
                 saved.append(_upsert_sqlite_record(connection, item))
-            _bump_revision(connection)
+            if saved:
+                _bump_revision(connection)
             connection.commit()
             return saved
         except Exception:
@@ -846,7 +863,14 @@ def upsert_account_records(
     # Large account records include nested session payloads. A batch rewrite can
     # legitimately take longer than the short timeout used by interactive writes.
     with _file_lock(path, timeout=30.0):
-        normalized = normalize_accounts([*_canonical_snapshot(path), *prepared])
+        snapshot = _canonical_snapshot(path)
+        merged = [*snapshot, *prepared]
+        if not create:
+            merged = [
+                *snapshot,
+                *[item for item in prepared if _record_matches_existing(snapshot, item)],
+            ]
+        normalized = normalize_accounts(merged)
         _write_unlocked(path, normalized)
         by_key = {account_delete_key(item): item for item in normalized}
         by_email = {
@@ -1059,6 +1083,60 @@ def load_account_records_by_keys(
         for record in load_accounts(path)
         if (key := account_delete_key(record)) in wanted_set
     }
+
+
+def _record_matches_existing(
+    records: list[dict[str, Any]],
+    prepared: dict[str, Any],
+) -> bool:
+    """Whether ``prepared`` matches a stored row by identity, email or id."""
+    identity = _record_identity(prepared)
+    email = _norm_email(prepared.get("email"))
+    account_id = _s(prepared.get("account_id")).lower()
+    for item in records:
+        if _record_identity(item) == identity:
+            return True
+        if email and _norm_email(item.get("email")) == email:
+            return True
+        if account_id and _s(item.get("account_id")).lower() == account_id:
+            return True
+    return False
+
+
+def account_record_exists(
+    record: dict[str, Any],
+    path: Path = ACCOUNTS_FILE,
+) -> bool:
+    """Whether a row matching this record's identity still exists.
+
+    Long-running workers (reauth / health-check batches) hold in-memory
+    snapshots; write-backs consult this so accounts deleted mid-batch are
+    skipped instead of being resurrected by the next upsert.
+    """
+    if not isinstance(record, dict):
+        return False
+    clauses: list[str] = ["canonical_key = ?"]
+    params: list[Any] = [account_delete_key(record)]
+    email = _norm_email(record.get("email"))
+    account_id = _s(record.get("account_id")).lower()
+    if email:
+        clauses.append("(email <> '' AND email = ?)")
+        params.append(email)
+    if account_id:
+        clauses.append("(account_id <> '' AND account_id = ?)")
+        params.append(account_id)
+    sqlite_store = _ensure_sqlite(Path(path))
+    if sqlite_store is not None:
+        _, connection = sqlite_store
+        try:
+            row = connection.execute(
+                f"SELECT 1 FROM accounts WHERE {' OR '.join(clauses)} LIMIT 1",
+                params,
+            ).fetchone()
+            return row is not None
+        finally:
+            connection.close()
+    return _record_matches_existing(_canonical_snapshot(path), record)
 
 
 def load_account_record_by_identity(

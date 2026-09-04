@@ -400,7 +400,7 @@ def _process_one(rec: dict, sms_cfg: dict) -> dict:
             "last_token_refresh_at": _state()._now_iso(),
             "last_token_refresh_error": "",
         }
-        _state().upsert_account_record(updates, _state().ACCOUNTS_FILE)
+        _state().upsert_account_record(updates, _state().ACCOUNTS_FILE, create=False)
         log("RT 已写回账号库", "ok")
         return {
             "email": email,

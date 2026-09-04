@@ -329,6 +329,17 @@ const allPageSelected = computed({
   },
 });
 
+// 列表刷新完成后剔除已删除账号的选中项，避免删除后再选中时计数残留。
+watch(
+  () => [props.accounts, props.accountsLoading],
+  ([rows, loading]) => {
+    if (loading || !selected.value.length) return;
+    const alive = new Set((rows || []).map((item) => item?.delete_key).filter(Boolean));
+    const next = selected.value.filter((key) => alive.has(key));
+    if (next.length !== selected.value.length) selected.value = [...next];
+  }
+);
+
 function clearAllSelected() {
   selected.value = [];
 }

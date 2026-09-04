@@ -5177,7 +5177,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
             "mfa_enabled": True,
         }
 
-        def save(record, _path):
+        def save(record, _path, **_kwargs):
             return dict(record)
 
         with (
@@ -5734,7 +5734,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
             ),
             patch(
                 "web_app.upsert_account_record",
-                side_effect=lambda record, _path: dict(record),
+                side_effect=lambda record, _path, **_kwargs: dict(record),
             ) as save,
         ):
             with self.assertRaisesRegex(RuntimeError, "invalid_auth_step"):
@@ -5758,7 +5758,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
         detail = "Failed to perform, curl: (35) TLS connect error"
         with patch(
             "web_app.upsert_account_record",
-            side_effect=lambda record, _path: dict(record),
+            side_effect=lambda record, _path, **_kwargs: dict(record),
         ):
             saved = web_app._persist_reauthentication_failure(
                 account,
@@ -5793,7 +5793,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
             patch("common.account_health.check_account", side_effect=healthy),
             patch(
                 "common.account_store.upsert_account_record",
-                side_effect=lambda record, _path: dict(record),
+                side_effect=lambda record, _path, **_kwargs: dict(record),
             ),
         ):
             saved = web_app._persist_reauthenticated_account(
@@ -5995,15 +5995,16 @@ class ProtocolAndHealthTests(unittest.TestCase):
             "email": "expired@example.com",
             "access_token": _jwt({"exp": 1}),
         }
-        with (
-            patch("common.account_health.refresh_oauth_tokens", return_value=dict(source)),
-            patch(
-                "common.account_health.fetch_remote_account_info",
-                side_effect=InvalidAccessTokenError("token invalidated (/backend-api/me)"),
-            ),
-            patch("common.account_health.upsert_account_record"),
-        ):
-            result = check_account(source)
+        with tempfile.TemporaryDirectory() as td:
+            with (
+                patch("common.account_health.refresh_oauth_tokens", return_value=dict(source)),
+                patch(
+                    "common.account_health.fetch_remote_account_info",
+                    side_effect=InvalidAccessTokenError("token invalidated (/backend-api/me)"),
+                ),
+                patch("common.account_health.upsert_account_record"),
+            ):
+                result = check_account(source, path=Path(td) / "accounts.json")
 
         self.assertEqual(result["health_status"], "reauth_required")
 
@@ -10358,7 +10359,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
                 patch("common.account_health.check_account", side_effect=checked) as probe,
                 patch(
                     "common.account_health.upsert_account_records",
-                    side_effect=lambda batch, _path: [dict(item) for item in batch],
+                    side_effect=lambda batch, _path, **_kwargs: [dict(item) for item in batch],
                 ),
             ):
                 result = check_accounts(records=records, workers=2, path=path)
@@ -10416,7 +10417,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
             path = Path(td) / "accounts.json"
             persisted = []
 
-            def persist_batch(batch, _path):
+            def persist_batch(batch, _path, **_kwargs):
                 persisted.extend(record["email"] for record in batch)
                 return [dict(record) for record in batch]
 
@@ -10606,6 +10607,12 @@ class ProtocolAndHealthTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "accounts.json"
+            # 批次回写只更新已存在的账号（防止删除后复活），先落库再测并发。
+            for index in range(2):
+                upsert_account_record(
+                    {"email": f"batch-{index}@example.com", "health_status": "alive"},
+                    path=path,
+                )
             with patch("common.account_health.check_account", side_effect=checked):
                 with ThreadPoolExecutor(max_workers=2) as executor:
                     futures = [

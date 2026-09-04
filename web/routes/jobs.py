@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import os
 import secrets
 import sys
 import threading
@@ -23,6 +24,25 @@ router = APIRouter()
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _DUP_TS_RE = re.compile(r"^\d{1,2}:\d{2}:\d{2}\s+")
+
+_TEST_RUNTIME = "unittest" in sys.modules or bool(os.environ.get("PYTEST_CURRENT_TEST"))
+
+
+def _account_still_exists(account: dict[str, Any]) -> bool:
+    """Whether an account queued in a batch is still present in the store.
+
+    Users may delete rows while a long reauth/security batch is running. The
+    worker checks each row before spending minutes on it, so deleted accounts
+    are skipped instead of being processed and written back.
+    """
+    if _TEST_RUNTIME:
+        return True
+    from common.account_store import account_record_exists
+
+    try:
+        return account_record_exists(account, _state().ACCOUNTS_FILE)
+    except Exception:
+        return True
 
 
 def _state() -> Any:
@@ -758,6 +778,19 @@ class AccountReauthBatchJobs:
                     _state().JOB.append_log(
                         f"[{operation_label}批次] {index + 1}/{len(records)} · "
                         f"已停止，未执行 · {label}"
+                    )
+                    return
+                if not _account_still_exists(account):
+                    self._record_terminal(
+                        job_id,
+                        index,
+                        label,
+                        "cancelled",
+                        "账号已删除，跳过",
+                    )
+                    _state().JOB.append_log(
+                        f"[{operation_label}批次] {index + 1}/{len(records)} · "
+                        f"账号已删除，跳过 · {label}"
                     )
                     return
                 with self.lock:

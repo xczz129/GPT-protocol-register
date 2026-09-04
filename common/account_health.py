@@ -917,7 +917,7 @@ def check_accounts(
             return
         batch = list(pending)
         pending.clear()
-        stored = upsert_account_records(batch, path)
+        stored = upsert_account_records(batch, path, create=False)
         by_key = {account_delete_key(item): item for item in stored}
         by_account_id = {
             str(item.get("account_id") or "").strip().lower(): item

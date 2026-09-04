@@ -72,7 +72,7 @@ def _persist_reauthenticated_account(
     if _state().normalized_health_status(checked) not in {"alive", "limited"}:
         detail = str(checked.get("health_error") or "重新登录后的凭证测活失败")
         raise RuntimeError(detail[:400])
-    return upsert_account_record(checked, _state().ACCOUNTS_FILE)
+    return upsert_account_record(checked, _state().ACCOUNTS_FILE, create=False)
 
 
 def _persist_reauthentication_failure(
@@ -124,7 +124,7 @@ def _persist_reauthentication_failure(
     }
     if deactivated and previous_health != "invalid":
         failed["last_invalid_at"] = now
-    return _state().upsert_account_record(failed, _state().ACCOUNTS_FILE)
+    return _state().upsert_account_record(failed, _state().ACCOUNTS_FILE, create=False)
 
 
 def _reauth_proxy(account: dict[str, Any], cfg: dict[str, Any]) -> str:
@@ -541,7 +541,7 @@ def _repair_account_security_sync(
         def persist_partial(fields: dict[str, Any]) -> None:
             current.update(fields)
             current["updated_at"] = _state()._now_iso()
-            _state().upsert_account_record(current, _state().ACCOUNTS_FILE)
+            _state().upsert_account_record(current, _state().ACCOUNTS_FILE, create=False)
 
         update_mailbox_states(
             [email],
@@ -604,7 +604,7 @@ def _repair_account_security_sync(
             current["proxy"] = successful_proxy
         current["registration_state"] = "complete"
         current["updated_at"] = _state()._now_iso()
-        saved = _state().upsert_account_record(current, _state().ACCOUNTS_FILE)
+        saved = _state().upsert_account_record(current, _state().ACCOUNTS_FILE, create=False)
         _state().JOB.append_log(f"[安全字段补全] 成功 · {email}")
         _state().record_operation_event(
             saved,
@@ -810,7 +810,7 @@ def _persist_security_operation_failure(
         "last_security_failed_at": now,
         "updated_at": now,
     }
-    return _state().upsert_account_record(failed, _state().ACCOUNTS_FILE)
+    return _state().upsert_account_record(failed, _state().ACCOUNTS_FILE, create=False)
 
 
 def _redact_security_detail(detail: Any, account: dict[str, Any], new_password: str = "") -> str:
@@ -1135,7 +1135,7 @@ def _run_security_protocol_operation(
             ),
             health_error="",
         )
-        persisted = _state().upsert_account_record(saved, _state().ACCOUNTS_FILE)
+        persisted = _state().upsert_account_record(saved, _state().ACCOUNTS_FILE, create=False)
         _state().JOB.append_log(f"[{_account_security_operation_label(operation)}] 成功 · {email}")
         _state().record_operation_event(
             persisted,
