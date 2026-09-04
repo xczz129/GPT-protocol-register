@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onBeforeUnmount, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { 
   Check, 
   CheckSquare, 
@@ -246,6 +246,9 @@ const reauthOperationLabel = computed(() => ({
 
 const totpCodes = ref({});
 const totpLoading = ref({});
+const totpNow = ref(Date.now());
+let totpTickTimer = null;
+onMounted(() => { totpTickTimer = setInterval(() => { totpNow.value = Date.now(); }, 1000); });
 const visibleGroups = computed(() => {
   const needle = groupQuery.value.trim().toLowerCase();
   return needle
@@ -380,11 +383,19 @@ function mfaText(item) {
 }
 
 function totpEntry(item) {
-  return totpCodes.value[item.delete_key] || null;
+  const entry = totpCodes.value[item.delete_key];
+  // Codes live for ~30s; a cached entry older than its window must never be
+  // re-copied, otherwise the user pastes a stale (rejected) 2FA code.
+  if (!entry) return null;
+  if (entry.expiresAt && Date.now() >= entry.expiresAt - 1200) return null;
+  return entry;
 }
 function totpDisplay(item) {
   const entry = totpEntry(item);
-  if (entry?.code) return entry.code;
+  if (entry?.code) {
+    const left = Math.max(0, Math.ceil(((entry.expiresAt || 0) - totpNow.value) / 1000));
+    return left > 0 ? `${entry.code} (${left}s)` : "获取验证码";
+  }
   if (entry?.error) return "获取失败";
   return totpLoading.value[item.delete_key] ? "获取中…" : "获取验证码";
 }
@@ -398,7 +409,7 @@ async function handleTotpClick(item) {
   try {
     const res = await api("/api/accounts/credentials", { method: "POST", body: jsonBody({ key: item.delete_key, field: "totp_code" }) });
     if (res.code) {
-      totpCodes.value[item.delete_key] = { code: res.code, expires_in: res.remaining ?? 30 };
+      totpCodes.value[item.delete_key] = { code: res.code, expiresAt: Date.now() + Math.max(3, res.remaining ?? 30) * 1000 };
       copyTextDirect(res.code, `totp_code_${item.delete_key}`);
     } else {
       totpCodes.value[item.delete_key] = { error: res.message || "解码失败" };
@@ -952,3 +963,4 @@ function moveSelected() {
     </div>
   </section>
 </template>
+onBeforeUnmount(() => { if (totpTickTimer) clearInterval(totpTickTimer); });

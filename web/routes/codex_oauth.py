@@ -1157,7 +1157,12 @@ async def codex_oauth_status():
 
 @router.get("/api/codex-oauth/history")
 async def codex_oauth_history(emails: str = ""):
-    """Return persisted RT-reissue history rows for the requested accounts."""
+    """Return persisted RT-reissue history rows for the requested accounts.
+
+    Accounts that obtained their RT before this log existed still have a
+    usable RT, so synthesize one row from the stored token instead of
+    showing an empty list the operator cannot act on.
+    """
 
     def _do():
         wanted = {e.strip().lower() for e in str(emails or "").split(",") if e.strip()}
@@ -1169,6 +1174,34 @@ async def codex_oauth_history(emails: str = ""):
             data = {}
         if wanted:
             data = {k: v for k, v in data.items() if k in wanted}
+            # Backfill: no recorded rows but the account owns an RT.
+            missing = [e for e in wanted if e not in data or not data.get(e)]
+            if missing:
+                try:
+                    accounts = _state()._load_accounts() if hasattr(_state(), "_load_accounts") else []
+                except Exception:
+                    accounts = []
+                by_email = {}
+                for acc in accounts or []:
+                    mail = str(acc.get("email") or "").strip().lower()
+                    if mail:
+                        by_email[mail] = acc
+                for mail in missing:
+                    acc = by_email.get(mail)
+                    if not acc:
+                        continue
+                    rt = str(acc.get("refresh_token") or "").strip()
+                    if not rt:
+                        continue
+                    data[mail] = [
+                        {
+                            "status": "success",
+                            "at": "早于日志功能(时间未记录)",
+                            "phone": "",
+                            "rt": rt,
+                            "note": "该 RT 来自历史接码，当时未记录日志",
+                        }
+                    ]
         return {"ok": True, "history": data}
 
     return await asyncio.to_thread(_do)
