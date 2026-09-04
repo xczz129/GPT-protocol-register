@@ -2607,6 +2607,11 @@ async def account_credentials(body: AccountCredentialsRequest):
         if not value:
             raise HTTPException(409, "该账号没有已保存的 Session Token")
         payload = {"ok": True, "field": field, "value": value}
+    elif field == "refresh_token":
+        value = str(account.get("refresh_token") or "").strip()
+        if not value:
+            raise HTTPException(409, "该账号没有已保存的 RT(未接码或未导入)")
+        payload = {"ok": True, "field": field, "value": value}
     else:
         secret = str(account.get("totp_secret") or "").strip()
         if not secret:

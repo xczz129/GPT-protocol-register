@@ -81,6 +81,36 @@ def _log(message: str, level: str = "info") -> None:
             del _STATE["logs"][:overflow]
 
 
+_RT_HISTORY_PATH = Path("/root/full/gpt-register-fp/data/codex_rt_history.json")
+_RT_HISTORY_LOCK = threading.Lock()
+
+
+def _append_rt_history(email: str, entry: dict) -> None:
+    """Persist the latest RT-reissue outcome per account (newest first)."""
+    email = str(email or "").strip().lower()
+    if not email:
+        return
+    with _RT_HISTORY_LOCK:
+        data = {}
+        try:
+            if _RT_HISTORY_PATH.is_file():
+                data = json.loads(_RT_HISTORY_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        rows = [row for row in (data.get(email) or []) if isinstance(row, dict)]
+        rows.insert(0, entry)
+        data[email] = rows[:10]
+        try:
+            _RT_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _RT_HISTORY_PATH.write_text(
+                json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8"
+            )
+        except Exception:
+            pass
+
+
 def _phone_requirement(data: Any) -> tuple:
     # Detect the add-phone requirement from an MFA response.
     if not isinstance(data, dict):
@@ -286,7 +316,7 @@ def _auto_phone(client, sms, log) -> None:
             client.submit_phone_otp(code)
             sms.finish(activation)
             log("手机验证通过")
-            return
+            return activation.phone
         except Exception as exc:
             last_error = str(exc)
             try:
@@ -334,12 +364,13 @@ def _process_one(rec: dict, sms_cfg: dict) -> dict:
             mfa_data = {}
         if not isinstance(mfa_data, dict):
             mfa_data = {}
+        phone_used = ""
         phone_required, reason = _phone_requirement(mfa_data)
         if phone_required is True:
             log(f"服务端要求手机验证({reason or 'add-phone'})")
             if sms is None:
                 raise RuntimeError("需要手机验证,但接码未启用或未配置")
-            _auto_phone(client, sms, log)
+            phone_used = _auto_phone(client, sms, log) or ""
         else:
             log("无需手机验证,直接进入 workspace")
         try:
@@ -377,6 +408,7 @@ def _process_one(rec: dict, sms_cfg: dict) -> dict:
             "refresh_token": refresh,
             "expires_in": token.get("expires_in"),
             "error": "",
+            "phone": phone_used,
         }
     finally:
         try:
@@ -396,6 +428,16 @@ def _run_batch(records: list, sms_cfg: dict) -> None:
                 with _LOCK:
                     _STATE["success"] += 1
                     _STATE["results"].append(result)
+                _append_rt_history(
+                    result.get("email") or rec.get("email"),
+                    {
+                        "at": datetime.now().isoformat(timespec="seconds"),
+                        "status": "success",
+                        "rt": str(result.get("refresh_token") or "")[:600],
+                        "phone": str(result.get("phone") or ""),
+                        "error": "",
+                    },
+                )
             except Exception as exc:
                 with _LOCK:
                     _STATE["failed"] += 1
@@ -408,6 +450,16 @@ def _run_batch(records: list, sms_cfg: dict) -> None:
                             "error": str(exc)[:260],
                         }
                     )
+                _append_rt_history(
+                    rec.get("email"),
+                    {
+                        "at": datetime.now().isoformat(timespec="seconds"),
+                        "status": "failed",
+                        "rt": "",
+                        "phone": "",
+                        "error": str(exc)[:300],
+                    },
+                )
                 _log(f"{rec.get('email')} | 失败: {exc}", "error")
             finally:
                 with _LOCK:
@@ -478,6 +530,11 @@ def _sms_config_section(cfg: dict) -> dict:
         "firefox_did": str(raw.get("firefox_did") or ""),
         "firefox_item_id": str(raw.get("firefox_item_id") or "1096"),
         "firefox_country_order": str(ff_countries),
+        "firefox_docking_code_history": [
+            str(item).strip()
+            for item in raw.get("firefox_docking_code_history") or []
+            if str(item).strip()
+        ],
     }
 
 # SMSBower country id -> (english name, chinese name, calling code).
@@ -827,6 +884,11 @@ async def sms_config_get():
         )
         public["provider_label"] = settings.provider_label
         public["configured"] = settings.credentials_configured
+        public["firefox_docking_code_history"] = [
+            str(item).strip()
+            for item in section.get("firefox_docking_code_history") or []
+            if str(item).strip()
+        ]
         return public
 
     return await asyncio.to_thread(_do)
@@ -846,6 +908,19 @@ async def sms_config_update(body: SmsConfigUpdate):
                 current["firefox_api_password"] = firefox_password
             if firefox_token:
                 current["firefox_api_token"] = firefox_token
+            new_docking_code = str(body.firefox_docking_code or "").strip()
+            if new_docking_code:
+                # Keep a recency-ordered history of docking codes so the
+                # operator can switch back to a previously used country+item
+                # pair without digging through the provider console again.
+                history = [
+                    str(item).strip()
+                    for item in current.get("firefox_docking_code_history") or []
+                    if str(item).strip()
+                ]
+                history = [item for item in history if item != new_docking_code]
+                history.insert(0, new_docking_code)
+                current["firefox_docking_code_history"] = history[:20]
             current.update(
                 {
                     "enabled": bool(body.enabled),
@@ -1078,6 +1153,25 @@ async def codex_oauth_status():
             for key, value in _STATE.items()
         }
     return {"ok": True, **payload}
+
+
+@router.get("/api/codex-oauth/history")
+async def codex_oauth_history(emails: str = ""):
+    """Return persisted RT-reissue history rows for the requested accounts."""
+
+    def _do():
+        wanted = {e.strip().lower() for e in str(emails or "").split(",") if e.strip()}
+        try:
+            data = json.loads(_RT_HISTORY_PATH.read_text(encoding="utf-8")) if _RT_HISTORY_PATH.is_file() else {}
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        if wanted:
+            data = {k: v for k, v in data.items() if k in wanted}
+        return {"ok": True, "history": data}
+
+    return await asyncio.to_thread(_do)
 
 
 @router.post("/api/codex-oauth/stop")

@@ -8,6 +8,7 @@ import {
   CloudCog,
   Contact,
   FileDown,
+  GitCommitHorizontal,
   LogIn,
   Mail,
   Moon,
@@ -55,6 +56,7 @@ const sections = [
       ["credential-export", FileDown, "凭据导出"],
       ["protocol-login", LogIn, "协议登录"],
       ["operations", CloudCog, "运维"],
+      ["versions", GitCommitHorizontal, "版本历史"],
     ],
   },
 ];

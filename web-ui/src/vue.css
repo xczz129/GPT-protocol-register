@@ -2366,3 +2366,36 @@ table.acct .col-actions { text-align: right; white-space: nowrap; }
 .sms-tier-row small { color: var(--ink-400); font-size: 11px; flex: 1; }
 .btn.ghost { border: none; background: none; color: var(--ink-500); cursor: pointer; font-size: 12px; padding: 4px 8px; border-radius: 6px; }
 .btn.ghost:hover { color: var(--err, #e11d48); background: color-mix(in srgb, var(--err, #e11d48) 8%, transparent); }
+
+
+/* ---- 版本历史(GitHub) ---- */
+.version-list { display: flex; flex-direction: column; gap: 2px; }
+.version-row { align-items: flex-start; gap: 12px; padding: 10px 12px; border-radius: 10px; transition: background 0.15s; }
+.version-row:hover { background: var(--bg-inset); }
+.version-dot { flex: none; width: 9px; height: 9px; margin-top: 7px; border-radius: 50%; background: var(--line); box-shadow: 0 0 0 3px var(--bg-inset); }
+.version-dot.latest { background: var(--primary-600); box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary-600) 18%, transparent); }
+.version-body { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.version-msg { font-size: 13px; font-weight: 600; color: var(--ink-700); overflow-wrap: anywhere; }
+.version-meta { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; color: var(--ink-500); flex-wrap: wrap; }
+.version-hash { font-family: var(--mono); font-size: 11px; padding: 1px 7px; border-radius: 6px; background: var(--bg-inset); border: 1px solid var(--line); color: var(--ink-600); }
+.version-tag { font-size: 11px; font-weight: 600; padding: 1px 8px; border-radius: 999px; background: color-mix(in srgb, var(--primary-600) 14%, transparent); color: var(--primary-600); }
+.version-tag.push-pending { background: color-mix(in srgb, #f59e0b 16%, transparent); color: #d97706; }
+
+/* ---- 对接码历史 chips ---- */
+.dock-chip { cursor: pointer; border: 1px solid var(--line); font-family: var(--mono); font-size: 12px; transition: border-color 0.15s, background 0.15s, color 0.15s; }
+.dock-chip:hover { border-color: var(--primary-600); color: var(--primary-600); }
+.dock-chip.active { background: var(--primary-600); border-color: var(--primary-600); color: #fff; }
+.dock-hint { display: block; margin-top: 4px; font-size: 11px; color: var(--ink-400); }
+
+/* ---- 接码历史对话框 ---- */
+.codex-history-modal { max-width: 560px; }
+.codex-hint { display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--ink-600); margin-bottom: 12px; }
+.codex-history-list { display: flex; flex-direction: column; gap: 8px; max-height: 46vh; overflow-y: auto; }
+.codex-history-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg-inset); }
+.codex-history-row.success { border-left: 3px solid #10b981; }
+.codex-history-row.failed { border-left: 3px solid #ef4444; }
+.codex-history-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.codex-history-main b { font-size: 13px; color: var(--ink-700); }
+.codex-history-main small { font-size: 12px; color: var(--ink-500); overflow-wrap: anywhere; }
+.codex-phone { color: var(--ink-500); font-weight: 500; }
+.codex-rt { font-family: var(--mono); color: var(--ink-600); }
