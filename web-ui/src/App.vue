@@ -2675,6 +2675,19 @@ const codexOauthStatus = ref({ running: false, total: 0, done: 0, success: 0, fa
 let codexOauthTimer = null;
 const codexOauthRunning = computed(() => codexOauthDialog.open && !!codexOauthStatus.value.running);
 function stopCodexOauthPolling() { if (codexOauthTimer) { clearInterval(codexOauthTimer); codexOauthTimer = null; } }
+async function resumeCodexOauthIfRunning() {
+  try {
+    const st = await api("/api/codex-oauth/status");
+    if (st && st.running) {
+      codexOauthStatus.value = st;
+      codexOauthDialog.open = true;
+      stopCodexOauthPolling();
+      codexOauthTimer = setInterval(async () => { try { codexOauthStatus.value = await api("/api/codex-oauth/status"); if (!codexOauthStatus.value.running) stopCodexOauthPolling(); } catch { stopCodexOauthPolling(); } }, 2000);
+      return true;
+    }
+  } catch {}
+  return false;
+}
 async function loadSmsConfig() { try { const value = await api("/api/sms-config"); smsConfig.value = value || {}; Object.assign(smsForm, { enabled: !!value.enabled, provider: value.provider || "smsbower", apiKey: "", service: value.service || "dr", countryOrder: value.country_order || "6, 4, 151", timeoutSeconds: Number(value.timeout_seconds || 180), maxPhoneAttempts: Number(value.max_phone_attempts || 5), firefoxApiName: value.firefox_api_name || "", firefoxToken: "", firefoxDockingCode: value.firefox_docking_code || "", firefoxCountryOrder: value.firefox_country_order || "usa, chl, eng" }); } catch {} }
 async function saveSmsConfig() { await run(() => api("/api/sms-config", { method: "PUT", body: jsonBody({ enabled: smsForm.enabled, provider: smsForm.provider, api_key: smsForm.apiKey, service: smsForm.service, country_order: smsForm.countryOrder, poll_interval_ms: 5000, timeout_seconds: smsForm.timeoutSeconds, max_phone_attempts: smsForm.maxPhoneAttempts, firefox_api_name: smsForm.firefoxApiName, firefox_api_token: smsForm.firefoxToken, firefox_docking_code: smsForm.firefoxDockingCode, firefox_country_order: smsForm.firefoxCountryOrder }) }), "接码设置已保存", [loadSmsConfig]); }
 async function testSmsConfig() { await run(() => api("/api/sms-config/test", { method: "POST", body: "{}" }), (r) => r.message || "测试完成"); }
@@ -2698,12 +2711,14 @@ async function rerunCodexOauthFromHistory() {
 async function startCodexOauth(emails, skipConfirm = false) {
   if (!emails.length) return;
   if (!skipConfirm && !await confirmInside(`对选中 ${emails.length} 个账号接码?`, { title: "接码", confirmText: "开始" })) return;
+  if (await resumeCodexOauthIfRunning()) return;
   await run(() => api("/api/codex-oauth/run", { method: "POST", body: jsonBody({ emails }) }), "接码任务已启动");
   codexOauthDialog.open = true; stopCodexOauthPolling(); codexOauthTimer = setInterval(async () => { try { codexOauthStatus.value = await api("/api/codex-oauth/status"); if (!codexOauthStatus.value.running) stopCodexOauthPolling(); } catch { stopCodexOauthPolling(); } }, 2000);
 }
 async function runCodexOauth(selected) {
   const emails = (selected || []).map((item) => item.email).filter(Boolean);
   if (!emails.length) return;
+  if (await resumeCodexOauthIfRunning()) return;
   const rows = selected || [];
   const withRt = rows.filter((item) => item.has_refresh_token);
   if (withRt.length === 1 && rows.length === 1) { await openCodexHistory(rows[0]); return; }
