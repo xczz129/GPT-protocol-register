@@ -164,36 +164,74 @@ def _phone_requirement(data: Any) -> tuple:
     return None, step
 
 
+def _known_sms_country(value: str) -> bool:
+    """Whether a numeric id is a real SMSBower country id (not a provider id).
+
+    The panel's country picker emits provider tier ids (``6=1170|3237``).
+    Tier ids live in a disjoint numeric range, so the static country tables
+    are enough to tell a bare tier id from a country id.
+    """
+    text = str(value or "").strip()
+    if not text.isdigit():
+        return False
+    cid = int(text)
+    return cid in SMSBOWER_COUNTRY_INFO or cid in SMSBOWER_EXTRA_CALLING
+
+
 def _country_specs(sms_cfg: dict) -> list:
     """Parse country order entries.
 
-    Supported syntax per comma-separated entry:
+    Supported syntax per entry (entries separated by commas):
       country            -> provider choice left to the market
-      country:maxPrice   -> numeric price ceiling, e.g. 4:0.2
-      country@providerId -> specific provider tier, e.g. 73@3237
+      country:price      -> numeric price ceiling, e.g. 4:0.2
+      country=t1|t2     -> provider tier priority, e.g. 6=1170|3237
+    Older UI builds wrote the tier list with commas (``6=1170, 3237``).
+    A bare number that is not a known country id is folded back into the
+    preceding ``=`` token so those configs keep working.
+    Returns (country, tier_ids, max_price) triples.
     """
     provider = str(sms_cfg.get("provider") or "").strip().lower()
     key = "firefox_country_order" if provider == "firefox" else "country_order"
-    specs: list = []
+    tokens: list[dict] = []
     for raw in str(sms_cfg.get(key) or "").replace("，", ",").split(","):
         item = raw.strip()
         if not item:
             continue
-        country, _, tail = item.partition(":")
-        country = country.strip()
-        tail = tail.strip()
+        if "=" in item:
+            country, _, tail = item.partition("=")
+            tiers = [p.strip() for p in tail.replace("｜", "|").split("|") if p.strip()]
+            tokens.append({"country": country.strip(), "tiers": tiers, "price": ""})
+        elif ":" in item:
+            country, _, tail = item.partition(":")
+            tokens.append({"country": country.strip(), "tiers": [], "price": tail.strip()})
+        elif (
+            tokens
+            and tokens[-1]["tiers"]
+            and item.isdigit()
+            and not _known_sms_country(item)
+        ):
+            # Legacy comma tier list: ``6=1170, 3237`` -> tiers [1170, 3237].
+            tokens[-1]["tiers"].append(item)
+        else:
+            tokens.append({"country": item, "tiers": [], "price": ""})
+    specs: list = []
+    for token in tokens:
+        country = token["country"]
         if not country:
             continue
-        max_price = ""
-        if tail:
+        price = token["price"]
+        if price:
             try:
-                float(tail)
-                max_price = tail
+                float(price)
             except ValueError:
-                max_price = ""
-        specs.append((country, max_price or None))
+                price = ""
+        specs.append((country, list(token["tiers"]), price or None))
     if provider != "firefox":
-        specs = [(c, p) for c, p in specs if str(c).isdigit()]
+        specs = [
+            (c, tiers, price)
+            for c, tiers, price in specs
+            if str(c).isdigit() and all(str(t).isdigit() for t in tiers)
+        ]
     return specs
 
 
@@ -216,42 +254,57 @@ def _provider_specs(sms_cfg: dict) -> dict:
 
 
 class _PanelSmsBowerClient(SmsBowerClient):
-    """SMSBower client with per-country provider/maxPrice support."""
+    """SMSBower client with per-country provider tiers and maxPrice support."""
+
+    @staticmethod
+    def _normalize_specs(country_specs: list) -> list:
+        specs: list = []
+        for spec in country_specs or []:
+            if isinstance(spec, tuple) and len(spec) == 3:
+                country, tiers, price = spec
+                specs.append((str(country), list(tiers or []), str(price or "").strip()))
+            elif isinstance(spec, tuple) and len(spec) == 2:
+                country, price = spec
+                specs.append((str(country), [], str(price or "").strip()))
+        return specs
 
     def __init__(self, settings: SmsSettings, country_specs: list, *, timeout: float = 30.0):
         super().__init__(settings, timeout=timeout)
-        self.country_specs = country_specs or [(str(c), None) for c in settings.country_order]
+        self.country_specs = self._normalize_specs(country_specs) or [
+            (str(c), [], "") for c in settings.country_order
+        ]
 
     def acquire(self) -> SmsActivation:
         last_error = "没有可用号码"
-        for country, extra in self.country_specs:
-            provider_ids = ""
-            max_price = ""
-            if isinstance(extra, dict):
-                provider_ids = str(extra.get("provider_id") or "").strip()
-                max_price = str(extra.get("max_price") or "").strip()
-            params = {
-                "service": self.settings.service,
-                "country": country,
-            }
-            if provider_ids:
-                params["providerIds"] = provider_ids
-            price = max_price or self.settings.max_price
-            if price:
-                params["maxPrice"] = price
-            try:
-                body = self._request("getNumber", **params)
-            except SmsError as exc:
-                last_error = str(exc)
-                continue
-            if not body.startswith("ACCESS_NUMBER:"):
-                last_error = f"SMSBower 未分配号码: {body[:120]}"
-                continue
-            parts = body.split(":", 2)
-            if len(parts) != 3 or not parts[1] or not parts[2]:
-                last_error = f"SMSBower 响应格式异常: {body[:120]}"
-                continue
-            return SmsActivation(parts[1], parts[2], int(country), self.settings.api_key)
+        for country, tiers, max_price in self.country_specs:
+            # 档位按操作者选择顺序依次尝试:先选的先试。
+            attempts = [str(tier).strip() for tier in tiers if str(tier).strip()] or [""]
+            for tier in attempts:
+                params = {
+                    "service": self.settings.service,
+                    "country": country,
+                }
+                if tier:
+                    params["providerIds"] = tier
+                price = max_price or self.settings.max_price
+                if price:
+                    params["maxPrice"] = price
+                try:
+                    body = self._request("getNumber", **params)
+                except SmsError as exc:
+                    last_error = f"{exc} (country={country} tier={tier or 'any'})"
+                    continue
+                if not body.startswith("ACCESS_NUMBER:"):
+                    last_error = (
+                        f"SMSBower 未分配号码: {body[:120]} "
+                        f"(country={country} tier={tier or 'any'})"
+                    )
+                    continue
+                parts = body.split(":", 2)
+                if len(parts) != 3 or not parts[1] or not parts[2]:
+                    last_error = f"SMSBower 响应格式异常: {body[:120]}"
+                    continue
+                return SmsActivation(parts[1], parts[2], int(country), self.settings.api_key)
         raise SmsError(last_error)
 
 
@@ -260,7 +313,16 @@ class _PanelFirefoxSmsClient(FirefoxSmsClient):
 
     def __init__(self, settings: SmsSettings, country_specs: list, *, timeout: float = 30.0):
         super().__init__(settings, timeout=timeout)
-        self.country_specs = country_specs or [(str(c), None) for c in settings.firefox_country_order]
+        specs: list = []
+        for spec in country_specs or []:
+            # Spec triples carry (country, tiers, max_price); tiers are a
+            # SMSBower-only concept and are ignored here.
+            if isinstance(spec, tuple) and len(spec) == 3:
+                country, _tiers, price = spec
+                specs.append((country, str(price or "").strip()))
+            else:
+                specs.append((spec[0], str(spec[1] or "").strip()))
+        self.country_specs = specs or [(str(c), "") for c in settings.firefox_country_order]
 
     def acquire(self) -> SmsActivation:
         last_error = "没有可用号码"
@@ -370,9 +432,17 @@ def _process_one(rec: dict, sms_cfg: dict, steps: list | None = None) -> dict:
     settings = SmsSettings.from_mapping(sms_cfg)
     provider_map = _provider_specs(sms_cfg)
     specs = []
-    for country, max_price in _country_specs(sms_cfg):
-        pid = provider_map.get(str(country))
-        specs.append((country, {"provider_id": pid, "max_price": max_price} if pid else max_price))
+    for country, tier_ids, max_price in _country_specs(sms_cfg):
+        extra_ids = [
+            pid.strip()
+            for pid in str(provider_map.get(str(country)) or "").split(",")
+            if pid.strip()
+        ]
+        merged = [str(t) for t in tier_ids]
+        for pid in extra_ids:
+            if pid not in merged:
+                merged.append(pid)
+        specs.append((country, merged, max_price))
     sms = _sms_client(settings, specs)
 
     client = ProtocolClient(email, timeout=30)
@@ -394,6 +464,10 @@ def _process_one(rec: dict, sms_cfg: dict, steps: list | None = None) -> dict:
         if not isinstance(mfa_data, dict):
             mfa_data = {}
         phone_used = ""
+        # Team 账号按导入时指定的工作区名选择;个人账号为空,默认第一个。
+        workspace_name = str(rec.get("workspace_name") or "").strip()
+        if workspace_name:
+            log(f"使用工作区「{workspace_name}」")
         phone_required, reason = _phone_requirement(mfa_data)
         if phone_required is True:
             log(f"服务端要求手机验证({reason or 'add-phone'})")
@@ -403,12 +477,12 @@ def _process_one(rec: dict, sms_cfg: dict, steps: list | None = None) -> dict:
         else:
             log("无需手机验证,直接进入 workspace")
         try:
-            callback = client.select_workspace()
+            callback = client.select_workspace(workspace_name)
         except Exception as exc:
             if sms is not None and "phone" in str(exc).lower():
                 log("workspace 返回手机号步骤,切换到接码流程")
                 _auto_phone(client, sms, log)
-                callback = client.select_workspace()
+                callback = client.select_workspace(workspace_name)
             else:
                 raise
         query = parse_qs(urlparse(callback).query)
@@ -1162,6 +1236,8 @@ def _import_one(
         # team 标记仅作测活失败时的套餐兜底
         if account_type == "team":
             account["plan_type"] = "team"
+            # 记录导入时选择的工作区名,接码/重登时按此工作区选择。
+            account["workspace_name"] = str(workspace or "").strip()
         saved = _persist_imported_account(account, tokens, log)
         at = str(saved.get("access_token") or tokens.get("access_token") or "")
         log("协议登录成功,账号已写入账号库", "ok")
