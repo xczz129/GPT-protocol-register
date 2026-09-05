@@ -254,7 +254,12 @@ def _provider_specs(sms_cfg: dict) -> dict:
 
 
 class _PanelSmsBowerClient(SmsBowerClient):
-    """SMSBower client with per-country provider tiers and maxPrice support."""
+    """SMSBower client with per-country provider tiers and maxPrice support.
+
+    取号组合(国家×档位)带轮转游标:上一次分配到的组合,下一次 acquire 从其
+    后继组合开始,依次循环。这样 OpenAI 拒掉某个组合的号码后(如 VoIP 号),
+    换号重试会切到下一个价位,价位用完切下一个国家,全部轮完再从头来。
+    """
 
     @staticmethod
     def _normalize_specs(country_specs: list) -> list:
@@ -273,43 +278,63 @@ class _PanelSmsBowerClient(SmsBowerClient):
         self.country_specs = self._normalize_specs(country_specs) or [
             (str(c), [], "") for c in settings.country_order
         ]
+        # 轮转游标:指向下一次 acquire 的起始组合下标。
+        self._cursor = 0
+
+    def _combinations(self) -> list:
+        """展平国家×档位组合,保持操作者配置的优先顺序。"""
+        combos: list = []
+        for country, tiers, max_price in self.country_specs:
+            tier_list = [str(tier).strip() for tier in tiers if str(tier).strip()] or [""]
+            for tier in tier_list:
+                combos.append((country, tier, max_price))
+        return combos
 
     def acquire(self) -> SmsActivation:
+        combos = self._combinations()
+        if not combos:
+            raise SmsError("没有配置任何国家/档位")
         last_error = "没有可用号码"
-        for country, tiers, max_price in self.country_specs:
-            # 档位按操作者选择顺序依次尝试:先选的先试。
-            attempts = [str(tier).strip() for tier in tiers if str(tier).strip()] or [""]
-            for tier in attempts:
-                params = {
-                    "service": self.settings.service,
-                    "country": country,
-                }
-                if tier:
-                    params["providerIds"] = tier
-                price = max_price or self.settings.max_price
-                if price:
-                    params["maxPrice"] = price
-                try:
-                    body = self._request("getNumber", **params)
-                except SmsError as exc:
-                    last_error = f"{exc} (country={country} tier={tier or 'any'})"
-                    continue
-                if not body.startswith("ACCESS_NUMBER:"):
-                    last_error = (
-                        f"SMSBower 未分配号码: {body[:120]} "
-                        f"(country={country} tier={tier or 'any'})"
-                    )
-                    continue
-                parts = body.split(":", 2)
-                if len(parts) != 3 or not parts[1] or not parts[2]:
-                    last_error = f"SMSBower 响应格式异常: {body[:120]}"
-                    continue
-                return SmsActivation(parts[1], parts[2], int(country), self.settings.api_key)
+        total = len(combos)
+        for offset in range(total):
+            index = (self._cursor + offset) % total
+            country, tier, max_price = combos[index]
+            params = {
+                "service": self.settings.service,
+                "country": country,
+            }
+            if tier:
+                params["providerIds"] = tier
+            price = max_price or self.settings.max_price
+            if price:
+                params["maxPrice"] = price
+            try:
+                body = self._request("getNumber", **params)
+            except SmsError as exc:
+                last_error = f"{exc} (country={country} tier={tier or 'any'})"
+                continue
+            if not body.startswith("ACCESS_NUMBER:"):
+                last_error = (
+                    f"SMSBower 未分配号码: {body[:120]} "
+                    f"(country={country} tier={tier or 'any'})"
+                )
+                continue
+            parts = body.split(":", 2)
+            if len(parts) != 3 or not parts[1] or not parts[2]:
+                last_error = f"SMSBower 响应格式异常: {body[:120]}"
+                continue
+            # 号码来自当前组合;游标推进到后继组合,失败换号时不再重复它。
+            self._cursor = (index + 1) % total
+            return SmsActivation(parts[1], parts[2], int(country), self.settings.api_key)
         raise SmsError(last_error)
 
 
 class _PanelFirefoxSmsClient(FirefoxSmsClient):
-    """Firefox client honouring per-country maxPrice specs."""
+    """Firefox client honouring per-country maxPrice specs.
+
+    国家顺序同样带轮转游标:OpenAI 拒掉某国的号码后,换号重试切到下一个
+    国家,轮完一圈再从头来(与 SMSBower 客户端的档位轮转语义一致)。
+    """
 
     def __init__(self, settings: SmsSettings, country_specs: list, *, timeout: float = 30.0):
         super().__init__(settings, timeout=timeout)
@@ -323,6 +348,8 @@ class _PanelFirefoxSmsClient(FirefoxSmsClient):
             else:
                 specs.append((spec[0], str(spec[1] or "").strip()))
         self.country_specs = specs or [(str(c), "") for c in settings.firefox_country_order]
+        # 轮转游标:指向下一次 acquire 的起始国家下标。
+        self._cursor = 0
 
     def acquire(self) -> SmsActivation:
         last_error = "没有可用号码"
@@ -336,7 +363,12 @@ class _PanelFirefoxSmsClient(FirefoxSmsClient):
             item_id = self.settings.firefox_item_id
             did = self.settings.firefox_did
         self._login()
-        for country, max_price in specs:
+        if not specs:
+            raise SmsError(last_error)
+        total = len(specs)
+        for offset in range(total):
+            index = (self._cursor + offset) % total
+            country, max_price = specs[index]
             country = normalize_firefox_country(country)
             params = {
                 "iid": item_id,
@@ -364,6 +396,8 @@ class _PanelFirefoxSmsClient(FirefoxSmsClient):
             returned_country = normalize_firefox_country(parts[3] if len(parts) > 3 else "") or country
             returned_prefix = parts[4] if len(parts) > 4 else ""
             phone = self._normalize_phone(parts[7], returned_prefix, returned_country)
+            # 号码来自当前国家;游标推进到后继国家,失败换号时不再重复它。
+            self._cursor = (index + 1) % total
             return SmsActivation(
                 activation_id=parts[1].strip(),
                 phone=phone,
