@@ -122,7 +122,10 @@ function clearTiers(id) {
                 :class="['sms-country-row', selected.includes(item.id) ? 'on' : '']"
                 role="button"
                 tabindex="0"
+                :aria-pressed="selected.includes(item.id)"
                 @click="emit('toggle', item.id)"
+                @keydown.enter.prevent="emit('toggle', item.id)"
+                @keydown.space.prevent="emit('toggle', item.id)"
               >
                 <span class="sms-country-order">{{ selected.includes(item.id) ? selected.indexOf(item.id) + 1 : "" }}</span>
                 <span class="sms-country-name">{{ item.name }}</span>

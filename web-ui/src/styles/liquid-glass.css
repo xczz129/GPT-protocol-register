@@ -1,0 +1,300 @@
+/* GPT Register FP — readable liquid-glass layer
+ *
+ * The original stylesheet remains the compatibility/base layer.  This file is
+ * intentionally imported last so the visual system can evolve independently
+ * from component markup and legacy selectors.
+ */
+:root {
+  --primary-300: #9abfff;
+  --primary-400: #6ea8ff;
+  --primary-500: #4f8df7;
+  --primary-600: #3475df;
+  --primary-700: #255bb9;
+  --primary-800: #1d458e;
+  --primary-900: #15356f;
+
+  --bg-0: #080b10;
+  --bg-1: rgba(14, 20, 30, 0.86);
+  --bg-2: rgba(19, 28, 41, 0.82);
+  --bg-3: rgba(31, 44, 63, 0.86);
+  --bg-inset: rgba(8, 12, 18, 0.74);
+  --line: rgba(142, 174, 222, 0.18);
+  --line-2: rgba(142, 174, 222, 0.34);
+  --line-hover: #46638e;
+
+  --ink-900: #f7faff;
+  --ink-800: #e6edf8;
+  --ink-700: #c9d5e7;
+  --ink-600: #adbed5;
+  --ink-500: #91a6c3;
+  --ink-400: #7890af;
+  --ink-300: #5d7392;
+
+  --card: rgba(19, 28, 41, 0.82);
+  --soft: rgba(31, 44, 63, 0.86);
+  --soft2: rgba(37, 53, 77, 0.88);
+  --brand: #4f8df7;
+  --brand2: #9abfff;
+  --blue: #4f8df7;
+  --field-inset: inset 0 1px 2px rgba(0, 0, 0, 0.34);
+  --field-inset-soft: inset 0 1px 2px rgba(0, 0, 0, 0.2);
+  --focus-ring: 0 0 0 3px rgba(79, 141, 247, 0.38);
+  --glass-card: rgba(19, 28, 41, 0.78);
+  --glass-panel: rgba(9, 14, 22, 0.62);
+  --glass-border: rgba(142, 174, 222, 0.24);
+  --glass-blur: 18px;
+}
+
+html[data-theme="light"] {
+  --primary-300: #3f78d9;
+  --primary-400: #2868cc;
+  --primary-500: #1e5fca;
+  --primary-600: #174fae;
+  --primary-700: #123f8b;
+  --primary-800: #10356f;
+  --primary-900: #0d2a59;
+
+  --bg-0: #f2f6fc;
+  --bg-1: rgba(255, 255, 255, 0.76);
+  --bg-2: rgba(255, 255, 255, 0.82);
+  --bg-3: rgba(232, 240, 251, 0.9);
+  --bg-inset: rgba(246, 249, 253, 0.82);
+  --line: rgba(93, 126, 171, 0.22);
+  --line-2: rgba(77, 113, 164, 0.36);
+  --line-hover: #8ba8cf;
+
+  --ink-900: #0b1729;
+  --ink-800: #172944;
+  --ink-700: #29415f;
+  --ink-600: #3d5878;
+  --ink-500: #526d8e;
+  --ink-400: #6c86a5;
+  --ink-300: #91a5bf;
+
+  --card: rgba(255, 255, 255, 0.82);
+  --soft: rgba(232, 240, 251, 0.9);
+  --soft2: rgba(222, 234, 249, 0.94);
+  --brand: #1e5fca;
+  --brand2: #3f78d9;
+  --blue: #1e5fca;
+  --field-inset: inset 0 1px 2px rgba(32, 67, 112, 0.08);
+  --field-inset-soft: inset 0 1px 2px rgba(32, 67, 112, 0.04);
+  --focus-ring: 0 0 0 3px rgba(30, 95, 202, 0.22);
+  --glass-card: rgba(255, 255, 255, 0.74);
+  --glass-panel: rgba(248, 251, 255, 0.66);
+  --glass-border: rgba(77, 113, 164, 0.24);
+}
+
+body {
+  font-size: 14px;
+  background:
+    radial-gradient(900px 520px at 88% -12%, rgba(79, 141, 247, 0.16), transparent 62%),
+    radial-gradient(740px 460px at -12% 28%, rgba(34, 211, 238, 0.08), transparent 62%),
+    var(--bg-0);
+}
+
+html[data-theme="light"] body {
+  background:
+    radial-gradient(900px 520px at 88% -12%, rgba(30, 95, 202, 0.11), transparent 62%),
+    radial-gradient(740px 460px at -12% 28%, rgba(8, 145, 178, 0.07), transparent 62%),
+    var(--bg-0);
+}
+
+.side,
+.hero,
+.card,
+.metric,
+.account-group-sidebar,
+.bulkbar,
+.panel-soft,
+.health-progress,
+.rebind-endpoint,
+.rebind-target-box,
+.rebind-auto-target,
+.protocol-login-panel,
+.mailbox-card,
+.cdk-generator,
+.cdk-eligibility {
+  background: var(--glass-card);
+  border-color: var(--glass-border);
+  backdrop-filter: blur(var(--glass-blur)) saturate(125%);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(125%);
+}
+
+.side {
+  box-shadow: 18px 0 54px rgba(4, 14, 30, 0.18);
+}
+
+.hero {
+  background: var(--glass-panel);
+  box-shadow: 0 10px 30px rgba(18, 43, 76, 0.08);
+}
+
+.card,
+.metric {
+  box-shadow: 0 14px 34px rgba(21, 55, 99, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+html[data-theme="light"] .card,
+html[data-theme="light"] .metric {
+  box-shadow: 0 14px 34px rgba(46, 84, 132, 0.1), inset 0 1px 0 rgba(255, 255, 255, 0.8);
+}
+
+.hero h1 { font-size: 21px; }
+.hero p { font-size: 13px; color: var(--ink-600); }
+.subtle { font-size: 13px; color: var(--ink-600); }
+.hint, .field-help { font-size: 12px; color: var(--ink-500); }
+.form label, .field-label-row, .label-line { font-size: 12.5px; color: var(--ink-600); }
+.metric-name { font-size: 12px; color: var(--ink-600); }
+.metric-value { font-size: 25px; }
+
+.btn, button.primary, button.secondary, button.danger {
+  min-height: 42px;
+  font-size: 13px;
+}
+
+.btn.primary,
+button.primary {
+  background: linear-gradient(135deg, var(--primary-500), var(--primary-700));
+  border-color: rgba(133, 183, 255, 0.42);
+}
+
+.btn.secondary,
+button.secondary {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: var(--line-2);
+}
+
+html[data-theme="light"] .btn.secondary,
+html[data-theme="light"] button.secondary {
+  background: rgba(255, 255, 255, 0.58);
+}
+
+input[type="text"],
+input[type="search"],
+input[type="password"],
+input[type="number"],
+input[type="email"],
+input[type="url"],
+select,
+textarea {
+  min-height: 42px;
+  font-size: 13.5px;
+  background: var(--glass-panel);
+  border-color: var(--line-2);
+}
+
+input[type="checkbox"], input[type="radio"] {
+  width: 18px;
+  height: 18px;
+}
+
+.table-wrap,
+.cdk-table-wrap,
+.protocol-login-table-wrap,
+.credential-export-table-wrap {
+  background: var(--glass-panel);
+  border-color: var(--glass-border);
+}
+
+table { font-size: 13px; }
+thead th { font-size: 11px; color: var(--ink-500); }
+tbody td { color: var(--ink-700); }
+tbody tr:hover { background: rgba(79, 141, 247, 0.08); }
+
+.header-menu-button,
+.sidebar-close,
+.icon-command,
+.app-dialog-close {
+  min-width: 44px;
+  min-height: 44px;
+}
+
+.search-field input::placeholder,
+input::placeholder,
+textarea::placeholder { color: var(--ink-500); opacity: 1; }
+
+/* Mobile account rows become readable cards instead of a 1000px canvas. */
+@media (max-width: 640px) {
+  body { font-size: 14px; }
+  .content { padding: 12px; }
+  .hero { padding: 10px 12px; gap: 8px; }
+  .hero h1 { font-size: 18px; }
+  .hero p { font-size: 12.5px; max-width: 46vw; }
+  .hero-actions { gap: 6px; }
+  .hero-actions .tag { display: none; }
+  .icon-command { width: 44px; height: 44px; padding: 0; }
+  .icon-command span { display: none; }
+  .header-menu-button { width: 44px; height: 44px; }
+  .card { padding: 16px; border-radius: 14px; }
+  .btn, button.primary, button.secondary, button.danger { min-height: 44px; }
+  .account-filters { gap: 8px; }
+  .account-filters select { flex: 1 1 calc(50% - 8px); min-height: 44px; }
+  .bulkbar { grid-template-columns: repeat(2, minmax(0, 1fr)); display: grid; gap: 8px; }
+  .bulkbar > label, .bulkbar > select { grid-column: 1 / -1; }
+  .bulkbar > .btn { width: 100%; }
+
+  .acct-wrap { overflow: visible; border: 0; background: transparent; }
+  table.acct { min-width: 0; display: block; }
+  table.acct thead { display: none; }
+  table.acct tbody { display: grid; gap: 12px; }
+  table.acct tbody tr {
+    display: grid;
+    grid-template-columns: 24px minmax(0, 1fr);
+    gap: 10px 12px;
+    padding: 14px;
+    border: 1px solid var(--glass-border);
+    border-radius: 14px;
+    background: var(--glass-card);
+    box-shadow: 0 10px 24px rgba(25, 59, 102, 0.08);
+  }
+  table.acct tbody td { display: none; padding: 0; border: 0; min-width: 0; }
+  table.acct tbody td.col-check { display: flex; grid-column: 1; grid-row: 1; align-items: flex-start; padding-top: 4px; }
+  table.acct tbody td.col-account { display: block; grid-column: 2; grid-row: 1; }
+  table.acct tbody td.col-status { display: flex; grid-column: 2; grid-row: 2; padding-top: 4px; }
+  table.acct tbody td.col-group,
+  table.acct tbody td.col-cred,
+  table.acct tbody td.col-totp,
+  table.acct tbody td.col-meta {
+    display: grid;
+    grid-template-columns: 76px minmax(0, 1fr);
+    grid-column: 1 / -1;
+    gap: 8px;
+    padding-top: 10px;
+    border-top: 1px solid var(--line);
+  }
+  table.acct tbody td[data-label]::before {
+    content: attr(data-label);
+    color: var(--ink-500);
+    font-size: 11px;
+    font-weight: 700;
+  }
+  table.acct tbody td.col-check::before { display: none; }
+  table.acct tbody td.col-actions {
+    display: flex;
+    grid-column: 1 / -1;
+    padding-top: 12px;
+    border-top: 1px solid var(--line);
+  }
+  .account-row-actions {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(44px, 1fr));
+    gap: 6px;
+    width: 100%;
+  }
+  .account-row-actions .row-icon-btn {
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0;
+  }
+  .acct-proxy { max-width: 100%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+}

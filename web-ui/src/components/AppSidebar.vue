@@ -1,6 +1,6 @@
 <script setup>
 import { nextTick, ref, watch } from "vue";
-import { Activity, ArrowLeftRight, Cable, ClipboardList, CloudCog, Contact, FileDown, LogIn, Mail, Moon, Network, Route, ShieldCheck, SquareTerminal, Sun, X } from "@lucide/vue";
+import { Activity, ArrowLeftRight, Cable, ClipboardList, CloudCog, Contact, FileDown, LogIn, Mail, Moon, Network, ShieldCheck, SquareTerminal, Sun, X } from "@lucide/vue";
 
 const props = defineProps({ active: String, accountCount: [Number, String], open: Boolean });
 const emit = defineEmits(["navigate", "close"]);
@@ -28,6 +28,7 @@ const sections = [
     items: [
       ["plus-eligibility", ShieldCheck, "Plus 免费试用"],
       ["chatgpt2api", Cable, "chatgpt2api"],
+      ["cliproxy", Cable, "中转管理"],
       ["logs", ClipboardList, "日志"],
     ],
   },
@@ -38,7 +39,6 @@ const sections = [
       ["rebind", ArrowLeftRight, "换绑"],
       ["credential-export", FileDown, "凭据导出"],
       ["protocol-login", LogIn, "协议登录"],
-      ["cliproxy", Route, "中转"],
       ["operations", CloudCog, "运维"],
     ],
   },
@@ -74,6 +74,7 @@ watch(() => props.active, async (value) => {
           :href="`#${item[0]}`"
           :data-view="item[0]"
           :class="{ active: active === item[0] }"
+          :aria-current="active === item[0] ? 'page' : undefined"
           @click.prevent="select(item)"
         >
           <span class="nav-icon" aria-hidden="true"><component :is="item[1]" :size="16" /></span>
@@ -84,10 +85,10 @@ watch(() => props.active, async (value) => {
     </nav>
     <div class="side-theme">
       <div class="side-theme-options" role="group" aria-label="界面风格">
-        <button type="button" :class="{ active: theme === 'dark' }" @click="setTheme('dark')">
+        <button type="button" :class="{ active: theme === 'dark' }" :aria-pressed="theme === 'dark'" @click="setTheme('dark')">
           <Moon :size="13" aria-hidden="true" /><span>黑色</span>
         </button>
-        <button type="button" :class="{ active: theme === 'light' }" @click="setTheme('light')">
+        <button type="button" :class="{ active: theme === 'light' }" :aria-pressed="theme === 'light'" @click="setTheme('light')">
           <Sun :size="13" aria-hidden="true" /><span>白色</span>
         </button>
       </div>

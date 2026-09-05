@@ -821,7 +821,7 @@ function moveSelected() {
         <div class="account-filters">
           <label class="search-field">
             <span aria-hidden="true">⌕</span>
-            <input v-model="query" type="search" placeholder="搜索邮箱、注册方式、状态、ID或代理" />
+            <input v-model="query" type="search" aria-label="搜索账号" placeholder="搜索邮箱、注册方式、状态、ID或代理" />
           </label>
           <select v-model="statusFilter" aria-label="账号状态筛选">
             <option value="all">全部状态</option>
@@ -906,7 +906,7 @@ function moveSelected() {
               <tr v-for="item in pageItems" :key="item.delete_key">
                 <!-- 选择框 -->
                 <td data-label="选择">
-                  <input v-model="selected" type="checkbox" :value="item.delete_key" />
+                    <input v-model="selected" type="checkbox" :value="item.delete_key" :aria-label="`选择账号 ${item.email || item.account_id || ''}`" />
                 </td>
 
                 <!-- 账号：邮箱 + ID -->

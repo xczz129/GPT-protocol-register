@@ -1,6 +1,6 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from "vue";
-import { Smartphone, X, LogOut, Menu, RefreshCw } from "@lucide/vue";
+import { Smartphone, X } from "@lucide/vue";
 import { api, apiUrl, downloadPost, jsonBody } from "./api.js";
 import AccountsView from "./components/AccountsView.vue";
 import AccountLogDialog from "./components/AccountLogDialog.vue";
@@ -10,6 +10,7 @@ import SmsCountryPicker from "./components/SmsCountryPicker.vue";
 import ConcurrencyDialog from "./components/ConcurrencyDialog.vue";
 import AppDialog from "./components/AppDialog.vue";
 import AppSidebar from "./components/AppSidebar.vue";
+import AppTopbar from "./components/AppTopbar.vue";
 import BrowserView from "./components/BrowserView.vue";
 import CliproxyView from "./components/CliproxyView.vue";
 import LoginView from "./components/LoginView.vue";
@@ -76,6 +77,8 @@ const trash = ref([]);
 const cliproxyAccounts = ref({ configured: false, auths_dir: "", items: [] });
 const cliproxyLoading = ref(false);
 const cliproxyRefreshing = ref(false);
+const cliproxyImporting = ref(false);
+const cliproxyResettingFile = ref("");
 const progress = ref({ running: 0, items: [] });
 const maintenanceRunning = ref(false);
 const maddyAutoRunning = ref(false);
@@ -914,6 +917,130 @@ async function refreshCliproxyQuota(rows) {
   } finally {
     cliproxyRefreshing.value = false;
   }
+}
+async function importCliproxySub2(payload) {
+  const content = String(payload?.content || "");
+  if (payload?.error) {
+    notify(String(payload.error), "err");
+    return;
+  }
+  if (!content.trim()) {
+    notify("请选择有效的 SUB2 JSON 文件", "err");
+    return;
+  }
+  cliproxyImporting.value = true;
+  try {
+    const result = await api("/api/cliproxy/import-sub2", {
+      method: "POST",
+      body: jsonBody({ filename: String(payload.filename || "sub2.json"), content }),
+    });
+    notify(`SUB2 导入完成：新增 ${result.imported || 0} 个，跳过 ${result.skipped || 0} 个`, result.imported ? "ok" : "warn");
+    await loadCliproxyAccounts();
+    if (result.imported) void refreshCliproxyQuota((result.files || []).map((file) => ({ file })));
+  } catch (error) {
+    notify(error?.message || "SUB2 JSON 导入失败", "err");
+  } finally {
+    cliproxyImporting.value = false;
+  }
+}
+async function importCliproxyCpa(payload) {
+  const content = String(payload?.content || "");
+  if (payload?.error) {
+    notify(String(payload.error), "err");
+    return;
+  }
+  if (!content.trim()) {
+    notify("请选择有效的 CPA JSON 文件", "err");
+    return;
+  }
+  cliproxyImporting.value = true;
+  try {
+    const result = await api("/api/cliproxy/import-cpa", {
+      method: "POST",
+      body: jsonBody({ filename: String(payload.filename || "cpa.json"), content }),
+    });
+    notify(`CPA 导入完成：新增 ${result.imported || 0} 个，跳过 ${result.skipped || 0} 个`, result.imported ? "ok" : "warn");
+    await loadCliproxyAccounts();
+    if (result.imported) void refreshCliproxyQuota((result.files || []).map((file) => ({ file })));
+  } catch (error) {
+    notify(error?.message || "CPA JSON 导入失败", "err");
+  } finally {
+    cliproxyImporting.value = false;
+  }
+}
+async function exportCliproxySub2(files) {
+  const names = Array.isArray(files) ? files.filter(Boolean) : [];
+  const query = names.length ? `?files=${encodeURIComponent(names.join(","))}` : "";
+  try {
+    const response = await fetch(apiUrl(`/api/cliproxy/export-sub2${query}`), {
+      credentials: "include",
+      cache: "no-store",
+    });
+    if (!response.ok) {
+      let detail = response.statusText;
+      try { detail = (await response.json())?.detail || detail; } catch {}
+      throw new Error(detail);
+    }
+    const url = URL.createObjectURL(await response.blob());
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = names.length ? "cliproxy-sub2-selected.json" : "cliproxy-sub2-all.json";
+    anchor.click();
+    URL.revokeObjectURL(url);
+    notify(`SUB2 JSON 已导出 ${names.length ? names.length : itemsCount(cliproxyAccounts.value)} 个账号`, "ok");
+  } catch (error) {
+    notify(error?.message || "SUB2 JSON 导出失败", "err");
+  }
+}
+async function exportCliproxyCpa(files) {
+  const names = Array.isArray(files) ? files.filter(Boolean) : [];
+  const query = names.length ? `?files=${encodeURIComponent(names.join(","))}` : "";
+  try {
+    const response = await fetch(apiUrl(`/api/cliproxy/export-cpa${query}`), { credentials: "include", cache: "no-store" });
+    if (!response.ok) {
+      let detail = response.statusText;
+      try { detail = (await response.json())?.detail || detail; } catch {}
+      throw new Error(detail);
+    }
+    const url = URL.createObjectURL(await response.blob());
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = names.length ? "cliproxy-cpa-selected.json" : "cliproxy-cpa-all.json";
+    anchor.click();
+    URL.revokeObjectURL(url);
+    notify(`CPA JSON 已导出 ${names.length ? names.length : itemsCount(cliproxyAccounts.value)} 个账号`, "ok");
+  } catch (error) {
+    notify(error?.message || "CPA JSON 导出失败", "err");
+  }
+}
+async function consumeCliproxyReset(payload) {
+  const file = String(payload?.file || "").trim();
+  if (!file) return;
+  cliproxyResettingFile.value = file;
+  try {
+    const result = await api("/api/cliproxy/reset-credits/consume", {
+      method: "POST",
+      body: jsonBody({ file }),
+    });
+    if (result.quota) {
+      const items = (cliproxyAccounts.value.items || []).map((item) => (
+        item.file === file
+          ? { ...item, quota: result.quota, quota_error: result.quota_error || "", status: result.quota.status || item.status }
+          : item
+      ));
+      cliproxyAccounts.value = { ...cliproxyAccounts.value, items };
+    } else {
+      await refreshCliproxyQuota([{ file }]);
+    }
+    notify("重置卡已消耗，额度窗口正在刷新", "ok");
+  } catch (error) {
+    notify(error?.message || "重置卡消耗失败", "err");
+  } finally {
+    cliproxyResettingFile.value = "";
+  }
+}
+function itemsCount(value) {
+  return Array.isArray(value?.items) ? value.items.length : 0;
 }
 async function loadProgress() {
   const next = await api("/api/progress");
@@ -3033,13 +3160,16 @@ onBeforeUnmount(() => {
   <div v-else class="shell vue-shell">
     <button v-if="sidebarOpen" class="sidebar-scrim" type="button" aria-label="关闭导航" @click="closeSidebar"></button>
     <AppSidebar :active="active" :account-count="status.accounts_count" :open="sidebarOpen" @navigate="navigate" @close="closeSidebar" />
-    <header class="hero">
-      <div class="hero-title-row">
-        <button class="header-menu-button" type="button" aria-label="打开导航" :aria-expanded="sidebarOpen" @click="openSidebar"><Menu :size="19" aria-hidden="true" /></button>
-        <div class="page-heading"><div class="eyebrow">GPT REGISTER FP · CONSOLE</div><h1>{{ title }}</h1><p>{{ subtitle }}</p></div>
-      </div>
-      <div class="hero-actions"><span :class="['badge', status.job?.running ? 'run' : 'idle']"><i></i>{{ status.job?.running ? "运行中" : "空闲" }}</span><span v-if="username" class="tag account-tag">{{ username }}</span><button class="btn secondary icon-command refresh-command" type="button" title="刷新数据" aria-label="刷新数据" @click="initialize"><RefreshCw :size="15" aria-hidden="true" /><span>刷新</span></button><button class="btn secondary icon-command logout-command" type="button" title="退出登录" aria-label="退出登录" @click="logout"><LogOut :size="15" aria-hidden="true" /><span>退出</span></button></div>
-    </header>
+    <AppTopbar
+      :title="title"
+      :subtitle="subtitle"
+      :username="username"
+      :running="!!status.job?.running"
+      :sidebar-open="sidebarOpen"
+      @open-sidebar="openSidebar"
+      @refresh="initialize"
+      @logout="logout"
+    />
     <main class="content">
       <!-- Account pages can render their first page while the remaining
            pages continue loading in the background. Keep the full-screen
@@ -3063,7 +3193,7 @@ onBeforeUnmount(() => {
         <CredentialExportView v-else-if="active === 'credential-export'" :accounts="accounts" :busy="busy" @export="exportSecurityByEmail" />
         <ProtocolLoginView v-else-if="active === 'protocol-login'" :accounts="accounts" :progress="reauthProgress" :health-progress="healthProgress" :preflight="protocolLoginPreflight" :busy="busy" @start="startProtocolLoginByEmail" @stop="stopReauth" @health="healthProtocolLoginEmails" @input-change="resetProtocolLoginResultsForInput" />
         <OperationsView v-else-if="active === 'operations'" :operations="operations" :trash="trash" :form="maintenanceForm" :maddy-auto-form="maddyAutoForm" :backup-schedule-form="backupScheduleForm" :sms-form="smsForm" :sms-config="smsConfig" :groups="groups" :security="securityForm" :busy="busy" :maintenance-running="maintenanceActive" :maddy-auto-running="maddyAutoActive" @refresh="() => Promise.all([loadOperations(), loadTrash()])" @save="saveMaintenance" @run="runMaintenance" @save-maddy-auto="saveMaddyAutoRegister" @run-maddy-auto="runMaddyAutoRegister" @test-webhook="testWebhook" @backup="createBackupNow" @save-backup-schedule="saveBackupSchedule" @save-sms-config="saveSmsConfig" @test-sms="testSmsConfig" @pick-countries="openSmsCountryPicker" @clear-docking-history="clearDockingHistory" :sms-countries="smsCountries" @restore-backup="restoreBackupNow" @restore-trash="restoreTrash" @change-password="changePassword" @revoke-sessions="revokeSessions" />
-        <CliproxyView v-else-if="active === 'cliproxy'" :accounts="cliproxyAccounts" :loading="cliproxyLoading" :refreshing="cliproxyRefreshing" @refresh="loadCliproxyAccounts" @refresh-quota="refreshCliproxyQuota" />
+          <CliproxyView v-else-if="active === 'cliproxy'" :accounts="cliproxyAccounts" :loading="cliproxyLoading" :refreshing="cliproxyRefreshing" :importing="cliproxyImporting" :resetting-file="cliproxyResettingFile" @refresh="loadCliproxyAccounts" @refresh-quota="refreshCliproxyQuota" @import-cpa="importCliproxyCpa" @import-sub2="importCliproxySub2" @export-cpa="exportCliproxyCpa" @export-sub2="exportCliproxySub2" @consume-reset="consumeCliproxyReset" />
       </template>
     </main>
     <footer class="foot"><span>gpt-register-fp · Vue 3</span></footer>

@@ -248,8 +248,13 @@ onBeforeUnmount(() => clearInterval(clockTimer));
                 <span
                   v-if="task.email"
                   class="interactive-email"
+                  role="button"
+                  tabindex="0"
+                  :aria-label="`复制邮箱 ${task.email}`"
                   :title="`点击复制邮箱: ${task.email}`"
                   @click="copyTextDirect(task.email, `task_email_${task.card_id || task.index}`)"
+                  @keydown.enter.prevent="copyTextDirect(task.email, `task_email_${task.card_id || task.index}`)"
+                  @keydown.space.prevent="copyTextDirect(task.email, `task_email_${task.card_id || task.index}`)"
                 >
                   <b>{{ task.email }}</b>
                   <component :is="copiedFeedback[`task_email_${task.card_id || task.index}`] ? Check : Copy" :size="11" />
