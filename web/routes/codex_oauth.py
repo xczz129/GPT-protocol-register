@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 # Codex OAuth RT issuance: batch protocol login with SMS phone verification.
 #
-# Bridges the standalone codex-oauth-project into the panel so selected
-# accounts can mint a real refresh_token (offline_access scope) through the
-# Codex PKCE client, with SMSBower / Firefox.fun SMS providers for the
-# add-phone step when OpenAI requires it.
+# Codex OAuth integration for the panel: selected accounts can mint a real
+# refresh_token (offline_access scope) through the local Codex PKCE client,
+# with SMSBower / Firefox.fun SMS providers for the add-phone step when needed.
 
 from __future__ import annotations
 
@@ -25,9 +24,13 @@ from pydantic import BaseModel, Field
 
 router = APIRouter()
 
-_CODEX_SRC = Path("/root/codex-oauth-project/src")
-if _CODEX_SRC.is_dir() and str(_CODEX_SRC) not in sys.path:
-    sys.path.insert(0, str(_CODEX_SRC))
+# Keep the Codex OAuth implementation inside this project so the panel can be
+# deployed and exported as one self-contained source tree.  The project root is
+# already on sys.path when cli.py/web_app.py starts; this guard also covers
+# direct imports from tests and tooling.
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 from codex_oauth.oauth import (  # noqa: E402
     ProtocolClient,
