@@ -294,6 +294,30 @@ def validate_otp(
         return resp, error
     if resp is not None and resp.status_code == 200:
         return resp, ""
+    # 仅在 sentinel 准备阶段失败（或服务端明确拒绝 sentinel token）时才重放，
+    # 避免对错误验证码等确定性失败做二次提交、加倍消耗 OTP 尝试次数触发风控
+    resp_error = ""
+    if resp is not None:
+        try:
+            err_obj = resp.json()
+        except Exception:
+            err_obj = {}
+        if isinstance(err_obj, dict):
+            raw_err = err_obj.get("error")
+            if isinstance(raw_err, str):
+                resp_error = raw_err
+            elif isinstance(raw_err, dict):
+                resp_error = str(raw_err.get("code") or "")
+    deterministic_otp_failure = bool(
+        resp is not None
+        and resp.status_code in {400, 403}
+        and any(
+            marker in resp_error.lower()
+            for marker in ("otp", "code", "rate_limit", "invalid")
+        )
+    )
+    if deterministic_otp_failure and not sentinel_error:
+        return resp, error or resp_error
     try:
         headers.update(
             _build_sentinel_headers(

@@ -214,10 +214,11 @@ def headers_with_clearance(
 ) -> dict[str, str]:
     output = {str(key): str(value) for key, value in headers.items()}
     bundle = cached_clearance(proxy_config, target_url, request_proxy)
-    user_agent = user_agent_override or (bundle.user_agent if bundle else "")
-    if user_agent:
+    # 仅在调用方显式提供当前会话 UA 时才覆盖；不回退 bundle 的 FlareSolverr UA，
+    # 否则 Firefox TLS 会话会配上 Chrome UA，形成 UA/TLS 指纹矛盾
+    if user_agent_override:
         key = next((key for key in output if key.lower() == "user-agent"), "user-agent")
-        output[key] = user_agent
+        output[key] = user_agent_override
     if bundle and bundle.cookies:
         key = next((key for key in output if key.lower() == "cookie"), "cookie")
         existing = str(output.get(key) or "").strip().rstrip(";")
