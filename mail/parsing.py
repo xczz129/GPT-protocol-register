@@ -166,21 +166,23 @@ def extract_code(message: dict[str, Any]) -> str | None:
     ).strip()
     if not content:
         return None
+    # 所有分支统一加 (?<!\d)...(?!\d) 数字边界：订单号/时间戳等 7 位以上
+    # 数字串的前 6 位不能被截断成"验证码"；"177010" 是模板噪音码需跳过
     match = re.search(
-        r"background-color:\s*#F3F3F3[^>]*>[\s\S]*?(\d{6})[\s\S]*?</p>",
-        content,
-        re.I,
-    )
-    if match:
-        return match.group(1)
-    match = re.search(
-        r"(?:Verification code|code is|代码为|验证码)[:\s]*(\d{6})",
+        r"background-color:\s*#F3F3F3[^>]*>[^<]*?((?<!\d)\d{6}(?!\d))",
         content,
         re.I,
     )
     if match and match.group(1) != "177010":
         return match.group(1)
-    for code in re.findall(r">\s*(\d{6})\s*<|(?<![#&])\b(\d{6})\b", content):
+    match = re.search(
+        r"(?:Verification code|code is|代码为|验证码)[:\s]*((?<!\d)\d{6}(?!\d))",
+        content,
+        re.I,
+    )
+    if match and match.group(1) != "177010":
+        return match.group(1)
+    for code in re.findall(r">\s*((?<!\d)\d{6}(?!\d))\s*<|(?<![#&])\b((?<!\d)\d{6}(?!\d))\b", content):
         value = code[0] or code[1]
         if value and value != "177010":
             return value

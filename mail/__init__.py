@@ -172,6 +172,16 @@ OTP_CODE_GRACE_SECONDS = 5.0
 # External APIs: prefer direct (no system proxy)
 _NO_PROXY = {"http": None, "https": None}
 
+# 抹掉异常文本中 URL 查询串里的密钥参数（requests 的 ConnectionError 会
+# 带完整 URL，key=xxx 会随之进入异常消息和日志）
+_SECRET_PARAM_RE = re.compile(
+    r"(?i)\b(key|token|secret|password|apikey|api_key)=[^&\s'\"]+")
+
+
+def _redact_secrets(value: object) -> str:
+    text = str(value or "")
+    return _SECRET_PARAM_RE.sub(r"\1=***", text)
+
 # The panel asks for mailbox capacity from several endpoints.  The source
 # files are large enough that reparsing them for every request is noticeable,
 # so keep one immutable-by-convention snapshot and invalidate it from the
@@ -235,7 +245,20 @@ def _load_state_unlocked() -> dict[str, dict[str, Any]]:
         if not STATE_FILE.exists():
             return {}
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as error:
+        # JSON 损坏时先把坏文件隔离存档再返回空：直接当空状态继续写会
+        # 让全部 used/failed 历史丢失，已注册邮箱重新回池造成重复注册
+        try:
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            STATE_FILE.rename(
+                STATE_FILE.with_name(f"{STATE_FILE.name}.corrupt-{stamp}")
+            )
+            logger.error(
+                "mailbox state file corrupt, archived and reset: %s (%s)",
+                STATE_FILE, error,
+            )
+        except Exception:
+            logger.exception("failed to archive corrupt mailbox state file")
         return {}
     return _parse_state_payload(data)
 
@@ -344,7 +367,7 @@ def _set_state(address: str, state: str, reason: str = "") -> None:
             metadata = {
                 key: value
                 for key, value in previous.items()
-                if key not in {"state", "reason", "updated_at"}
+                if key not in {"state", "reason", "updated_at", "_prev_state"}
             }
             store[target] = {
                 **metadata,
@@ -371,7 +394,21 @@ def _release_state(address: str, *, any_state: bool = False) -> None:
             if not isinstance(entry, dict):
                 return
             st = str(entry.get("state") or "")
-            if any_state or st == "in_use":
+            if st == "in_use":
+                # 预约前是 used（allow_used 复用）的邮箱，释放时恢复 used 而不是
+                # 直接变回 available，否则会被当作全新邮箱重复注册
+                prev = str(entry.get("_prev_state") or "")
+                if prev in UNAVAILABLE_STATES:
+                    entry.pop("_prev_state", None)
+                    entry["state"] = prev
+                    entry["reason"] = (
+                        "restored after transient failure; original state kept"
+                    )
+                    _save_state_unlocked(store)
+                else:
+                    store.pop(target, None)
+                    _save_state_unlocked(store)
+            elif any_state:
                 store.pop(target, None)
                 _save_state_unlocked(store)
 
@@ -753,9 +790,12 @@ class OutlookTokenProvider:
                         )
                     email_lower = credential["email"].strip().lower()
                     slot_address = _requested_mailbox_slot(requested_email, email_lower)
+                    prev_entry = store.get(slot_address) if isinstance(store.get(slot_address), dict) else {}
                     store[slot_address] = {
                         "state": "in_use",
                         "reason": "",
+                        # 记录预约前状态：释放时恢复 used 等终态，避免重复注册
+                        "_prev_state": str(prev_entry.get("state") or ""),
                         "updated_at": datetime.now(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S%z"),
                     }
                     _save_state_unlocked(store)
@@ -801,7 +841,12 @@ class OutlookTokenProvider:
                 }
 
             state = "token_invalid" if "token_invalid" in reason else "failed"
-            _set_state(credential["email"], state, reason[:300])
+            # 预约写入的是 slot_address（可能是 split 别名槽），释放/标记也必须
+            # 作用于同一 key，否则 slot 永远 in_use 锁 15 分钟、基础邮箱被误标
+            if slot_address and slot_address != email_lower:
+                _set_state(slot_address, state, reason[:300])
+            else:
+                _set_state(credential["email"], state, reason[:300])
             logger.warning("[%s] skipping %s: %s", self.name, credential["email"], reason)
 
     def _read_graph(self, access_token: str) -> list[dict[str, Any]]:
@@ -980,12 +1025,12 @@ class OutlookTokenProvider:
                 )
                 return self._graph_messages(mailbox, access_token)
             except Exception as error:
-                errors.append(f"graph: {error}")
+                errors.append(f"graph: {_redact_secrets(error)}")
                 if self.mode == "graph":
                     logger.warning(
                         "[%s] Graph 失败，改用 IMAP: %s",
                         self.name,
-                        str(error)[:200],
+                        _redact_secrets(str(error)[:200]),
                     )
         if try_imap:
             try:
@@ -994,7 +1039,7 @@ class OutlookTokenProvider:
                 )
                 return self._imap_messages(mailbox, access_token)
             except Exception as error:
-                errors.append(f"imap: {error}")
+                errors.append(f"imap: {_redact_secrets(error)}")
                 if self.mode == "imap":
                     raise
         if errors:
@@ -1146,9 +1191,12 @@ class ICloudApiProvider:
                         )
                     email_lower = credential["email"].strip().lower()
                     slot_address = _requested_mailbox_slot(requested_email, email_lower)
+                    prev_entry = store.get(slot_address) if isinstance(store.get(slot_address), dict) else {}
                     store[slot_address] = {
                         "state": "in_use",
                         "reason": "",
+                        # 记录预约前状态：释放时恢复 used 等终态，避免重复注册
+                        "_prev_state": str(prev_entry.get("state") or ""),
                         "updated_at": datetime.now(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S%z"),
                     }
                     _save_state_unlocked(store)
@@ -1270,7 +1318,7 @@ class ICloudApiProvider:
                 time.sleep(0.75 * (request_attempt + 1))
         if resp is None:
             raise ICloudApiError(
-                f"iCloud wait API request failed: {last_error or 'empty response'}"
+                f"iCloud wait API request failed: {_redact_secrets(last_error or 'empty response')}"
             )
 
         try:
@@ -1330,7 +1378,7 @@ class ICloudApiProvider:
                 timeout=min(10.0, float(self.conf["request_timeout"])),
             )
         except Exception as error:
-            raise ICloudApiError(f"iCloud messages request failed: {error}") from error
+            raise ICloudApiError(f"iCloud messages request failed: {_redact_secrets(error)}") from error
         try:
             data = resp.json()
         except Exception:
@@ -1853,6 +1901,8 @@ class MaddyWebuiProvider:
                 store[target] = {
                     "state": "in_use",
                     "reason": "",
+                    # 记录预约前状态：释放时恢复 used 等终态，避免重复注册
+                    "_prev_state": str((entry or {}).get("state") or ""),
                     "updated_at": datetime.now(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S%z"),
                     "provider": self.name,
                     "provider_ref": self.provider_ref,
@@ -2204,7 +2254,7 @@ class FastmailApiProvider:
                 **kwargs,
             )
         except Exception as error:
-            raise FastmailApiError(f"Fastmail {action} request failed: {error}") from error
+            raise FastmailApiError(f"Fastmail {action} request failed: {_redact_secrets(error)}") from error
         try:
             data = resp.json()
         except Exception:
@@ -2380,6 +2430,8 @@ class FastmailApiProvider:
                 store[target] = {
                     "state": "in_use",
                     "reason": "",
+                    # 记录预约前状态：释放时恢复 used 等终态，避免重复注册
+                    "_prev_state": str((entry or {}).get("state") or ""),
                     "updated_at": datetime.now(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S%z"),
                     "provider": self.name,
                     "provider_ref": self.provider_ref,
@@ -2497,7 +2549,7 @@ class FastmailApiProvider:
                 timeout=http_timeout,
             )
         except Exception as error:
-            raise FastmailApiError(f"Fastmail code API request failed: {error}") from error
+            raise FastmailApiError(f"Fastmail code API request failed: {_redact_secrets(error)}") from error
         try:
             data = resp.json()
         except Exception:
@@ -2652,7 +2704,7 @@ class FastmailApiProvider:
                 timeout=max(5.0, min(float(self.conf["request_timeout"]), 20.0)),
             )
         except Exception as error:
-            raise FastmailApiError(f"Fastmail messages request failed: {error}") from error
+            raise FastmailApiError(f"Fastmail messages request failed: {_redact_secrets(error)}") from error
         try:
             data = resp.json()
         except Exception:
@@ -3323,12 +3375,22 @@ def create_mailbox(
         ordered = matched if matched else others
 
     for entry in ordered:
-        provider = _build_provider(entry, conf)
+        try:
+            provider = _build_provider(entry, conf)
+        except Exception as error:
+            # 配置类型错误（如 message_limit 非数字）不应中断整个 provider 轮换
+            last_error = f"build provider failed: {error}"
+            continue
         try:
             mailbox = provider.create_mailbox(username, allow_used=allow_used)
             mark_mailbox_code_boundary(mailbox, grace_seconds=0)
             return mailbox
         except RuntimeError as error:
+            last_error = str(error)
+            continue
+        except Exception as error:
+            # 网络层等非 RuntimeError 异常同样换下一个 provider，
+            # 避免单个 provider 内部状态（已写 in_use）外泄成未释放预约
             last_error = str(error)
             continue
         finally:
@@ -3370,11 +3432,12 @@ def wait_for_code(mail_config: dict, mailbox: dict, stop_check=None) -> str | No
             ),
             None,
         )
-    if entry is None and entries:
-        entry = entries[0]
     if entry is None:
+        # mailbox 有明确 provider 归属；匹配不到说明配置已删除该 provider，
+        # 静默换成第一个 provider 会用错误的池白等到超时
         raise RuntimeError(
-            f"No mail provider found (ref={provider_ref}, type={provider_type})"
+            f"Mailbox provider missing from config (ref={provider_ref}, "
+            f"type={provider_type})"
         )
 
     conf = _make_config(mail_config)
