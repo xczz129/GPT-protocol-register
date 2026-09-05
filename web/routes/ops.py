@@ -527,6 +527,7 @@ async def logs_stream(request: Request, events: str = "status,log,tasks"):
         while idle_ticks < max_ticks and not _state()._SERVER_SHUTDOWN_EVENT.is_set():
             if await request.is_disconnected():
                 break
+            sent_any = False
             if "log" in requested_events:
                 with _state().JOB.lock:
                     lines = list(_state().JOB.logs)
@@ -535,6 +536,7 @@ async def logs_stream(request: Request, events: str = "status,log,tasks"):
                 if chunk:
                     payload = json.dumps({"lines": chunk}, ensure_ascii=False)
                     yield f"event: log\ndata: {payload}\n\n"
+                    sent_any = True
 
             if "tasks" in requested_events:
                 task_revision, task_items = _state().JOB.task_stream_snapshot()
@@ -545,6 +547,7 @@ async def logs_stream(request: Request, events: str = "status,log,tasks"):
                     )
                     yield f"event: tasks\ndata: {payload}\n\n"
                     previous_task_revision = task_revision
+                    sent_any = True
 
             if "status" in requested_events:
                 snap = _state().JOB.snapshot()
@@ -552,12 +555,18 @@ async def logs_stream(request: Request, events: str = "status,log,tasks"):
                 if status_payload != previous_status:
                     yield f"event: status\ndata: {status_payload}\n\n"
                     previous_status = status_payload
+                    sent_any = True
 
             now = time.monotonic()
             if now - last_heartbeat >= 5.0:
                 yield "event: heartbeat\ndata: {}\n\n"
                 last_heartbeat = now
-            idle_ticks += 1
+            # Only count genuinely idle ticks so active streams are not cut
+            # off by the lifetime cap.
+            if sent_any:
+                idle_ticks = 0
+            else:
+                idle_ticks += 1
             await asyncio.sleep(1.0)
 
     return StreamingResponse(
