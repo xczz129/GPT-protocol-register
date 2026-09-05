@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import random
 import secrets
@@ -752,12 +753,102 @@ class PlatformRegistrar:
         factor_type = str((factor or {}).get("factor_type") or "").strip().lower()
         return factor_id, factor_type
 
+    def _auth_session_workspaces(self) -> list[dict[str, Any]]:
+        """Decode workspace entries from the oai-client-auth-session cookie."""
+        raw = (
+            self.session.cookies.get(
+                "oai-client-auth-session", domain=".auth.openai.com"
+            )
+            or self.session.cookies.get("oai-client-auth-session")
+            or ""
+        )
+        if not raw:
+            return []
+        try:
+            from urllib.parse import unquote
+
+            first = unquote(str(raw)).split(".", 1)[0]
+            pad = 4 - len(first) % 4
+            if pad != 4:
+                first += "=" * pad
+            payload = json.loads(base64.urlsafe_b64decode(first))
+            items = payload.get("workspaces") or []
+        except Exception:
+            items = []
+        if not isinstance(items, list):
+            return []
+        return [item for item in items if isinstance(item, dict) and item.get("id")]
+
+    def _select_workspace(
+        self, index: int, workspace_name: str, referer: str
+    ) -> str:
+        """Team 账号工作区选择：按名称匹配（无匹配取第一个）并返回 callback URL。"""
+        workspaces = self._auth_session_workspaces()
+        if not workspaces:
+            raise RuntimeError("workspace_page_without_workspaces")
+        wanted = str(workspace_name or "").strip().lower()
+        selected = None
+        if wanted:
+            for item in workspaces:
+                label = str(
+                    item.get("name")
+                    or item.get("title")
+                    or item.get("label")
+                    or ""
+                ).strip().lower()
+                if label == wanted:
+                    selected = item
+                    break
+            if selected is None:
+                available = "、".join(
+                    str(
+                        item.get("name")
+                        or item.get("title")
+                        or item.get("label")
+                        or item.get("id")
+                    )
+                    for item in workspaces
+                )
+                raise RuntimeError(
+                    "workspace_name_not_found: "
+                    f"未找到工作区「{workspace_name}」，可用工作区: {available[:200]}"
+                )
+        if selected is None:
+            selected = workspaces[0]
+        workspace_id = str(selected.get("id"))
+        label = str(
+            selected.get("name") or selected.get("title") or selected.get("label") or workspace_id
+        )
+        step(index, f"检测到工作区选择页(Team)，选择工作区: {label}", "yellow")
+        url = f"{auth_base}/api/accounts/workspace/select"
+        data = self._post_auth_json(
+            url,
+            referer,
+            {"workspace_id": workspace_id},
+            index,
+            "workspace_select",
+        )
+        continue_url = str(data.get("continue_url") or "").strip()
+        if not continue_url:
+            page = data.get("page") if isinstance(data.get("page"), dict) else {}
+            payload = page.get("payload") if isinstance(page, dict) else {}
+            continue_url = str((payload or {}).get("url") or "").strip()
+        if not continue_url:
+            raise RuntimeError(
+                "workspace_select_missing_continue: "
+                f"page={str(data.get('page') or '?')[:160]}"
+            )
+        # 抓包确认: workspace/select 的 continue_url 直接就是 chatgpt.com 的
+        # OAuth callback URL，返回给调用方统一跟随（与个人账号 MFA 后流程一致）
+        return continue_url
+
     def login_with_password_totp(
         self,
         email: str,
         password: str,
         totp_secret: str,
         index: int,
+        workspace_name: str = "",
     ) -> dict[str, Any]:
         """Complete the HAR-observed password plus TOTP login transaction."""
         email = str(email or "").strip()
@@ -849,10 +940,20 @@ class PlatformRegistrar:
         step(index, "协议凭据登录[6/6] MFA 校验通过，准备跟随 OAuth callback")
         callback_url, callback_page = _auth_step_details(verified)
         if not _is_chatgpt_callback_url(callback_url):
-            raise RuntimeError(
-                "mfa_verify_missing_callback: "
-                f"page={callback_page or '?'} continue={_safe_url_for_log(callback_url)}"
-            )
+            # Team 账号 MFA 后会进入工作区选择页：选择目标工作区后拿新 callback
+            # 抓包确认: select 请求的 Referer 必须是 workspace 页面本身
+            if "workspace" in f"{callback_page or ''} {callback_url or ''}".lower():
+                workspace_referer = (
+                    _absolute_auth_url(callback_url) or mfa_referer
+                )
+                callback_url = self._select_workspace(
+                    index, workspace_name, workspace_referer
+                )
+            if not _is_chatgpt_callback_url(callback_url):
+                raise RuntimeError(
+                    "mfa_verify_missing_callback: "
+                    f"page={callback_page or '?'} continue={_safe_url_for_log(callback_url)}"
+                )
         callback_response = self._navigate_auth_step(
             callback_url,
             mfa_referer,
