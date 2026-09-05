@@ -1,4 +1,4 @@
-﻿<script setup>
+<script setup>
 import { computed, ref } from "vue";
 import { Globe, RotateCcw, Search, X } from "@lucide/vue";
 
@@ -60,7 +60,9 @@ function toggleExpand(item) {
 
 function providerList(id) {
   const raw = String(props.providers[id] || "").trim();
-  return raw ? raw.split(",").map((pid) => pid.trim()).filter(Boolean) : [];
+  // "|" is the tier separator inside one token; "," stays accepted for
+  // configs written by older builds.
+  return raw ? raw.split(/[|,]/).map((pid) => pid.trim()).filter(Boolean) : [];
 }
 
 function providerRank(id, pid) {
@@ -77,7 +79,7 @@ function toggleTier(id, pid) {
   } else {
     list.push(String(pid));
   }
-  emit("set-provider", { id, providerId: list.join(",") });
+  emit("set-provider", { id, providerId: list.join("|") });
 }
 
 function clearTiers(id) {
