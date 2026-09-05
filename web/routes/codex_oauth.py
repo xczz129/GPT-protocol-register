@@ -1012,7 +1012,73 @@ def _parse_credential_lines(text: str) -> list:
     return creds
 
 
-def _import_one(index: int, email: str, password: str, totp: str, workspace: str = "") -> dict:
+def _persist_imported_account(
+    account: dict, tokens: dict, log
+) -> dict:
+    """导入账号专用持久化：新账号创建，已有账号更新。
+
+    与重新认证(reauth)的 create=False 不同，导入是新写入，
+    必须允许创建记录，否则账号登录成功却不会进库。
+    """
+    from common.account_health import check_account
+    from common.account_store import upsert_account_record
+
+    access_token = str(tokens.get("access_token") or "").strip()
+    if not access_token:
+        raise RuntimeError("协议登录未返回 AT")
+    refreshed = {
+        **account,
+        "access_token": access_token,
+        "refresh_token": str(tokens.get("refresh_token") or "").strip()
+        or str(account.get("refresh_token") or ""),
+        "id_token": str(tokens.get("id_token") or "").strip(),
+        "session_token": str(tokens.get("session_token") or "").strip(),
+        "session": tokens.get("session") or account.get("session"),
+    }
+    for key in (
+        "plan_type",
+        "type",
+        "browser_type",
+        "tls_impersonate",
+        "user_agent",
+        "sec_ch_ua",
+        "sec_ch_ua_full_version_list",
+        "platform_version",
+        "accept_language",
+        "locale",
+        "timezone",
+        "timezone_offset_min",
+        "protocol_screen",
+        "protocol_hardware_concurrency",
+        "protocol_device_memory",
+        "protocol_platform",
+        "protocol_webgl_vendor",
+        "protocol_webgl_renderer",
+        "device_id",
+        "protocol_profile_id",
+    ):
+        if key in tokens:
+            refreshed[key] = tokens[key]
+    try:
+        checked = check_account(refreshed, persist=False, path=_state().ACCOUNTS_FILE)
+    except Exception as exc:
+        log(f"导入后测活失败,账号仅入库标记待续期: {exc}", "warning")
+        checked = {**refreshed, "health_status": "unknown", "health_error": ""}
+    else:
+        if _state().normalized_health_status(checked) not in {"alive", "limited"}:
+            detail = str(checked.get("health_error") or "导入后测活失败")
+            raise RuntimeError(detail[:400])
+    return upsert_account_record(checked, _state().ACCOUNTS_FILE, create=True)
+
+
+def _import_one(
+    index: int,
+    email: str,
+    password: str,
+    totp: str,
+    workspace: str = "",
+    account_type: str = "personal",
+) -> dict:
     # Import uses the panel's own protocol login (email -> password -> TOTP ->
     # chatgpt.com session), the same engine as the protocol-reauth page.  No
     # SMS and no Codex OAuth PKCE flow are involved.
@@ -1020,7 +1086,6 @@ def _import_one(index: int, email: str, password: str, totp: str, workspace: str
     # concurrent batch runner can keep going.
     from register.protocol import login_with_password_totp_one
     from register.sessions import JobCancelled
-    from web.routes.security_ops import _persist_reauthenticated_account
 
     result: dict[str, Any] = {
         "email": email,
@@ -1089,11 +1154,14 @@ def _import_one(index: int, email: str, password: str, totp: str, workspace: str
             "mfa_enabled": True,
             "mfa_factor_type": "totp",
             "registration_method": "protocol",
-            "source_type": "import",
-            "registration_state": "imported",
+            "source_type": "imported",
+            "registration_state": "complete",
             "proxy": "",
         }
-        saved = _persist_reauthenticated_account(account, tokens)
+        # 账号类型作为套餐初始标记(team/pro)；测活会用真实 planType 覆盖
+        if account_type in {"team", "pro"}:
+            account["plan_type"] = account_type
+        saved = _persist_imported_account(account, tokens, log)
         at = str(saved.get("access_token") or tokens.get("access_token") or "")
         log("协议登录成功,账号已写入账号库", "ok")
         result.update(
@@ -1116,7 +1184,10 @@ def _import_one(index: int, email: str, password: str, totp: str, workspace: str
 
 
 def _run_import_batch(
-    creds: list, workspace: str = "", concurrency: int = 1
+    creds: list,
+    workspace: str = "",
+    concurrency: int = 1,
+    account_type: str = "personal",
 ) -> None:
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -1126,7 +1197,15 @@ def _run_import_batch(
             max_workers=workers, thread_name_prefix="import"
         ) as pool:
             futures = [
-                pool.submit(_import_one, index, email, password, totp, workspace)
+                pool.submit(
+                    _import_one,
+                    index,
+                    email,
+                    password,
+                    totp,
+                    workspace,
+                    account_type,
+                )
                 for index, (email, password, totp) in enumerate(creds, start=1)
             ]
             for future in as_completed(futures):
@@ -1165,6 +1244,8 @@ async def codex_oauth_import(body: CodexOauthImportRequest):
         if not creds:
             raise HTTPException(400, "未识别到有效账号行(格式:邮箱----密码----2FA)")
         account_type = str(body.account_type or "personal").strip().lower()
+        if account_type not in {"personal", "team", "pro"}:
+            account_type = "personal"
         workspace = str(body.workspace or "").strip()
         if account_type == "team" and not workspace:
             raise HTTPException(400, "Team 账号请填写工作区名称")
@@ -1189,11 +1270,12 @@ async def codex_oauth_import(body: CodexOauthImportRequest):
         _STOP.clear()
         threading.Thread(
             target=_run_import_batch,
-            args=(creds, workspace, concurrency),
+            args=(creds, workspace, concurrency, account_type),
             name="codex-oauth-import",
             daemon=True,
         ).start()
-        plan = f"Team 工作区「{workspace}」" if workspace else "个人账号"
+        type_label = {"team": "Team", "pro": "Pro"}.get(account_type, "个人")
+        plan = f"Team 工作区「{workspace}」" if workspace else type_label
         _log(
             f"导入任务启动:{len(creds)} 个账号 · 协议登录(密码+TOTP) · {plan} · 并发 {min(concurrency, len(creds))}"
         )

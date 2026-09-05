@@ -1,6 +1,6 @@
 <script setup>
 import { computed, ref, watch } from "vue";
-import { Upload, Users, Zap, X } from "@lucide/vue";
+import { Upload, Sparkles, Users, Zap, X } from "@lucide/vue";
 
 const props = defineProps({
   open: Boolean,
@@ -57,6 +57,7 @@ function submit() {
               <div class="segmented" role="group" aria-label="账号类型">
                 <button type="button" :class="{ active: accountType === 'personal' }" @click="setType('personal')">个人 / Plus</button>
                 <button type="button" :class="{ active: accountType === 'team' }" @click="setType('team')"><Users :size="12" aria-hidden="true" />Team</button>
+                <button type="button" :class="{ active: accountType === 'pro' }" @click="setType('pro')"><Sparkles :size="12" aria-hidden="true" />Pro</button>
               </div>
             </div>
             <div class="import-accounts-field">

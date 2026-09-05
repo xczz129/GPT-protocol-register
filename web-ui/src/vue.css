@@ -859,6 +859,11 @@ tr.selectable, .selectable { cursor: pointer; }
   background: var(--accent-cyan-light);
   border-color: rgba(34, 211, 238, 0.3);
 }
+.capsule-badge.pro {
+  color: var(--primary-300);
+  background: var(--primary-50);
+  border-color: rgba(129, 140, 248, 0.35);
+}
 
 .copy-pill-btn {
   display: inline-flex;

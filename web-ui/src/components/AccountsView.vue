@@ -354,12 +354,17 @@ function clearAllSelected() {
 
 function planType(item) {
   const plan = String(item.plan_type || "free").toLowerCase();
-  return plan.includes("plus") ? "plus" : (plan.includes("team") ? "team" : "free");
+  // Team 套餐的 plan_type 可能是 self_serve_business_prolite 等,含 business/team
+  if (plan.includes("team") || plan.includes("business")) return "team";
+  if (plan.includes("pro")) return "pro";
+  if (plan.includes("plus")) return "plus";
+  return "free";
 }
 function planName(item) {
   const plan = String(item.plan_type || "Free").toLowerCase();
+  if (plan.includes("team") || plan.includes("business")) return "Team";
+  if (plan.includes("pro")) return "Pro";
   if (plan.includes("plus")) return "Plus";
-  if (plan.includes("team")) return "Team";
   return "Free";
 }
 function statusName(item) {
@@ -832,6 +837,8 @@ function moveSelected() {
             <option value="all">全部套餐</option>
             <option value="free">Free</option>
             <option value="plus">Plus</option>
+            <option value="pro">Pro</option>
+            <option value="team">Team</option>
           </select>
           <select v-model="offerFilter" aria-label="优惠筛选">
             <option value="all">全部</option>
