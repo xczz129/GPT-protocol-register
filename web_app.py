@@ -1929,7 +1929,16 @@ async def _app_lifespan(_app: FastAPI):
         web_executor.shutdown(wait=True, cancel_futures=True)
 
 
-app = FastAPI(title="GPT Register FP", version="1.0.0", lifespan=_app_lifespan)
+# 关闭内置文档路由：/docs /redoc /openapi.json 未在认证中间件保护范围内，
+# 暴露完整 API schema 会显著降低攻击成本
+app = FastAPI(
+    title="GPT Register FP",
+    version="1.0.0",
+    lifespan=_app_lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
 app.include_router(auth_router)
 
