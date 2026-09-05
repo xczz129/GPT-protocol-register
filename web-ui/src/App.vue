@@ -11,6 +11,7 @@ import ConcurrencyDialog from "./components/ConcurrencyDialog.vue";
 import AppDialog from "./components/AppDialog.vue";
 import AppSidebar from "./components/AppSidebar.vue";
 import BrowserView from "./components/BrowserView.vue";
+import CliproxyView from "./components/CliproxyView.vue";
 import LoginView from "./components/LoginView.vue";
 import ClipboardDialog from "./components/ClipboardDialog.vue";
 import CredentialExportView from "./components/CredentialExportView.vue";
@@ -40,6 +41,7 @@ const views = {
   rebind: ["邮箱换绑", "将现有账号换绑到邮箱池中的未占用地址并刷新凭据"],
   "credential-export": ["凭据导出", "按邮箱筛选并导出账号、密码和 2FA"],
   "protocol-login": ["协议登录", "按邮箱批量重新登录并查看账号状态"],
+  cliproxy: ["中转管理", "查看 cliproxy 中转账号额度并下载凭据"],
   operations: ["运维中心", "统计、自动维护、备份恢复与面板安全"],
 };
 
@@ -71,6 +73,9 @@ const capabilities = ref({ items: [] });
 const proxyDiagnostics = ref({ items: [] });
 const operations = ref({ metrics: {}, maintenance: {}, maddy_auto_register: {}, state: {}, backups: [] });
 const trash = ref([]);
+const cliproxyAccounts = ref({ configured: false, auths_dir: "", items: [] });
+const cliproxyLoading = ref(false);
+const cliproxyRefreshing = ref(false);
 const progress = ref({ running: 0, items: [] });
 const maintenanceRunning = ref(false);
 const maddyAutoRunning = ref(false);
@@ -886,6 +891,30 @@ async function loadOperations() {
   Object.assign(backupScheduleForm, { enabled: !!backupSchedule.enabled, time: backupSchedule.time || "04:00", retentionDays: Number(backupSchedule.retention_days ?? 7) });
 }
 async function loadTrash() { trash.value = (await api("/api/accounts/trash")).items || []; }
+async function loadCliproxyAccounts() {
+  cliproxyLoading.value = true;
+  try {
+    cliproxyAccounts.value = await api("/api/cliproxy/accounts");
+  } finally {
+    cliproxyLoading.value = false;
+  }
+}
+async function refreshCliproxyQuota(rows) {
+  // rows 为空数组 = 刷新全部;传入行对象时按文件名单个刷新
+  const files = Array.isArray(rows) && rows.length ? rows.map((row) => row.file).filter(Boolean) : [];
+  cliproxyRefreshing.value = true;
+  try {
+    const response = await api("/api/cliproxy/refresh-quota", { method: "POST", body: jsonBody({ files }) });
+    const byFile = response.items || {};
+    const items = (cliproxyAccounts.value.items || []).map((item) => {
+      const updated = byFile[item.file];
+      return updated ? { ...item, quota: updated.quota, quota_error: updated.error || "" } : item;
+    });
+    cliproxyAccounts.value = { ...cliproxyAccounts.value, items };
+  } finally {
+    cliproxyRefreshing.value = false;
+  }
+}
 async function loadProgress() {
   const next = await api("/api/progress");
   progress.value = next;
@@ -919,6 +948,11 @@ async function loadActiveView() {
   if (active.value === "rebind") return resumeRebindProgress();
   if (active.value === "chatgpt2api") return Promise.all([loadGroups(), loadAccounts()]);
   if (active.value === "logs") return loadLogs();
+  if (active.value === "cliproxy") {
+    await loadCliproxyAccounts();
+    if (cliproxyAccounts.value.items?.length) void refreshCliproxyQuota([]);
+    return;
+  }
   if (active.value === "operations") return Promise.all([loadOperations(), loadTrash()]);
 }
 
@@ -3027,6 +3061,7 @@ onBeforeUnmount(() => {
         <CredentialExportView v-else-if="active === 'credential-export'" :accounts="accounts" :busy="busy" @export="exportSecurityByEmail" />
         <ProtocolLoginView v-else-if="active === 'protocol-login'" :accounts="accounts" :progress="reauthProgress" :health-progress="healthProgress" :preflight="protocolLoginPreflight" :busy="busy" @start="startProtocolLoginByEmail" @stop="stopReauth" @health="healthProtocolLoginEmails" @input-change="resetProtocolLoginResultsForInput" />
         <OperationsView v-else-if="active === 'operations'" :operations="operations" :trash="trash" :form="maintenanceForm" :maddy-auto-form="maddyAutoForm" :backup-schedule-form="backupScheduleForm" :sms-form="smsForm" :sms-config="smsConfig" :groups="groups" :security="securityForm" :busy="busy" :maintenance-running="maintenanceActive" :maddy-auto-running="maddyAutoActive" @refresh="() => Promise.all([loadOperations(), loadTrash()])" @save="saveMaintenance" @run="runMaintenance" @save-maddy-auto="saveMaddyAutoRegister" @run-maddy-auto="runMaddyAutoRegister" @test-webhook="testWebhook" @backup="createBackupNow" @save-backup-schedule="saveBackupSchedule" @save-sms-config="saveSmsConfig" @test-sms="testSmsConfig" @pick-countries="openSmsCountryPicker" @clear-docking-history="clearDockingHistory" :sms-countries="smsCountries" @restore-backup="restoreBackupNow" @restore-trash="restoreTrash" @change-password="changePassword" @revoke-sessions="revokeSessions" />
+        <CliproxyView v-else-if="active === 'cliproxy'" :accounts="cliproxyAccounts" :loading="cliproxyLoading" :refreshing="cliproxyRefreshing" @refresh="loadCliproxyAccounts" @refresh-quota="refreshCliproxyQuota" />
       </template>
     </main>
     <footer class="foot"><span>gpt-register-fp · Vue 3</span></footer>

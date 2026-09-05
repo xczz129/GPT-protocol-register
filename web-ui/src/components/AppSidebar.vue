@@ -1,6 +1,6 @@
 <script setup>
 import { nextTick, ref, watch } from "vue";
-import { Activity, ArrowLeftRight, Cable, ClipboardList, CloudCog, Contact, FileDown, LogIn, Mail, Moon, Network, ShieldCheck, SquareTerminal, Sun, X } from "@lucide/vue";
+import { Activity, ArrowLeftRight, Cable, ClipboardList, CloudCog, Contact, FileDown, LogIn, Mail, Moon, Network, Route, ShieldCheck, SquareTerminal, Sun, X } from "@lucide/vue";
 
 const props = defineProps({ active: String, accountCount: [Number, String], open: Boolean });
 const emit = defineEmits(["navigate", "close"]);
@@ -38,6 +38,7 @@ const sections = [
       ["rebind", ArrowLeftRight, "换绑"],
       ["credential-export", FileDown, "凭据导出"],
       ["protocol-login", LogIn, "协议登录"],
+      ["cliproxy", Route, "中转"],
       ["operations", CloudCog, "运维"],
     ],
   },

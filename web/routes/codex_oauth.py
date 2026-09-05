@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import sys
@@ -30,7 +31,9 @@ if _CODEX_SRC.is_dir() and str(_CODEX_SRC) not in sys.path:
 
 from codex_oauth.oauth import (  # noqa: E402
     ProtocolClient,
+    decode_jwt_payload,
     exchange_code,
+    save_auth_record,
     totp_from_secret,
 )
 from codex_oauth.sms import (  # noqa: E402
@@ -46,6 +49,47 @@ from codex_oauth.sms import (  # noqa: E402
 )
 
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+
+# cli-proxy-api 容器挂载的 auths 目录;接码成功后自动写入,账号即可被中转使用
+CLIPROXY_AUTHS_DIR = Path("/opt/codex-services/data/cliproxy/auths")
+
+
+def _cliproxy_auth_filename(email: str, account_id: str, plan_type: str) -> str:
+    digest = hashlib.sha256(str(account_id).encode("utf-8")).hexdigest()[:8]
+    plan_norm = re.sub(r"[^a-z0-9]+", "-", str(plan_type or "").lower()).strip("-")
+    base = f"codex-{digest}-{email}"
+    return f"{base}-{plan_norm}.json" if plan_norm else f"{base}.json"
+
+
+def _sync_cliproxy_auth(email: str, token: dict, log) -> str:
+    """把接码成功的凭据写成 cliproxy auth 文件(已存在则跳过),返回文件名。"""
+    if not CLIPROXY_AUTHS_DIR.is_dir():
+        log("未检测到中转目录(/opt/codex-services/data/cliproxy/auths),跳过同步", "warning")
+        return ""
+    claims = decode_jwt_payload(str(token.get("id_token") or "")) or decode_jwt_payload(str(token.get("access_token") or ""))
+    auth = claims.get("https://api.openai.com/auth") if isinstance(claims, dict) else {}
+    account_id = str(
+        (auth or {}).get("chatgpt_account_id")
+        or claims.get("chatgpt_account_id")
+        or claims.get("account_id")
+        or ""
+    ).strip()
+    if not account_id:
+        log("token 中缺少 chatgpt_account_id,跳过中转同步", "warning")
+        return ""
+    plan_type = str(
+        (auth or {}).get("chatgpt_plan_type")
+        or claims.get("chatgpt_plan_type")
+        or ""
+    ).strip()
+    filename = _cliproxy_auth_filename(email, account_id, plan_type)
+    target = CLIPROXY_AUTHS_DIR / filename
+    if target.exists():
+        log(f"中转已存在 {filename}", "ok")
+        return filename
+    save_auth_record(token, email, target)
+    log(f"已同步到中转 {filename}", "ok")
+    return filename
 
 
 def _state() -> Any:
@@ -564,6 +608,10 @@ def _process_one(rec: dict, sms_cfg: dict, steps: list | None = None) -> dict:
             }
             _state().upsert_account_record(updates, _state().ACCOUNTS_FILE, create=False)
             log("RT 已写回账号库", "ok")
+            try:
+                _sync_cliproxy_auth(email, token, log)
+            except Exception as exc:
+                log(f"同步中转失败: {exc}", "warning")
             return {
                 "email": email,
                 "status": "success",
