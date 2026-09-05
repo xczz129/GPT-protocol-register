@@ -259,12 +259,19 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
     """
     cfg = copy.deepcopy(DEFAULT_CONFIG)
     candidates: list[Path] = []
+    explicit_missing: list[Path] = []
     if path:
-        candidates.append(Path(path))
+        p = Path(path)
+        candidates.append(p)
+        if not p.is_file():
+            explicit_missing.append(p)
     else:
         env_path = os.environ.get("GPT_REGISTER_CONFIG", "").strip()
         if env_path:
-            candidates.append(Path(env_path))
+            p = Path(env_path)
+            candidates.append(p)
+            if not p.is_file():
+                explicit_missing.append(p)
         candidates.extend(
             [
                 ROOT / "config.yaml",
@@ -272,6 +279,11 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
                 ROOT / "config.json",
             ]
         )
+    # 显式指定的配置路径（-c 参数 / 环境变量）不存在时直接报错：
+    # 静默回退默认配置（空邮箱池、禁代理）会把故障延迟暴露且极难排查
+    if explicit_missing:
+        missing_list = "、".join(str(p) for p in explicit_missing)
+        raise FileNotFoundError(f"指定的配置文件不存在: {missing_list}")
 
     loaded_from: Path | None = None
     for p in candidates:
