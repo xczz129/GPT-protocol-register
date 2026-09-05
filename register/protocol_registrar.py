@@ -252,8 +252,13 @@ class PlatformRegistrar:
             if _is_cloudflare_challenge(resp):
                 raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 重试仍被拦截"))
         if resp is None or resp.status_code != 200:
-            err = _response_json(resp).get("error", {}) if resp is not None else {}
-            detail = f": {err.get('code', '')} - {err.get('message', '')}".strip(" -") if err else ""
+            err = _response_json(resp).get("error") if resp is not None else None
+            # Auth0 的 error 字段可能是字符串（如 "access_denied"）而非对象，
+            # 直接 .get 会在错误路径上再抛 AttributeError 掩盖真实 HTTP 错误
+            if isinstance(err, dict):
+                detail = f": {err.get('code', '')} - {err.get('message', '')}".strip(" -")
+            else:
+                detail = f": {err}".strip(" -") if err else ""
             debug = _response_debug_detail(resp)
             status = getattr(resp, "status_code", "unknown")
             raise RuntimeError(error or f"platform_authorize_http_{status}{detail}, {debug}")
