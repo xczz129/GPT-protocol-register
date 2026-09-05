@@ -60,6 +60,8 @@ _LOCK = threading.Lock()
 _STOP = threading.Event()
 _STATE: dict[str, Any] = {
     "running": False,
+    # mode 区分两类共享此状态的批任务：codex=接码(短信验证), import=导入(协议登录)
+    "mode": "codex",
     "total": 0,
     "done": 0,
     "success": 0,
@@ -1100,6 +1102,7 @@ async def codex_oauth_import(body: CodexOauthImportRequest):
             _STATE.update(
                 {
                     "running": True,
+                    "mode": "import",
                     "total": len(creds),
                     "done": 0,
                     "success": 0,
@@ -1146,6 +1149,7 @@ def _start_sms_batch(wanted: set[str]) -> dict:
         _STATE.update(
             {
                 "running": True,
+                "mode": "codex",
                 "total": len(picked),
                 "done": 0,
                 "success": 0,
