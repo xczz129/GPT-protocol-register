@@ -256,8 +256,13 @@ def _get_persistent_worker() -> _PersistentSentinelWorker:
         if len(_PERSISTENT_WORKERS) > size:
             extra = _PERSISTENT_WORKERS[size:]
             del _PERSISTENT_WORKERS[size:]
+            # 缩容时持 worker 自身锁再关闭，避免 terminate 正被其它线程使用的进程
             for worker in extra:
-                worker.close()
+                try:
+                    with worker._lock:
+                        worker.close()
+                except Exception:
+                    worker.close()
         worker = _PERSISTENT_WORKERS[_PERSISTENT_WORKER_CURSOR % len(_PERSISTENT_WORKERS)]
         _PERSISTENT_WORKER_CURSOR += 1
         return worker
@@ -326,9 +331,17 @@ class SentinelTokenGenerator:
             str(self.device_profile.get("timezone") or ""),
             offset_minutes=offset_minutes,
         )
-        local_stamp = time.strftime(
-            f"%a %b %d %Y %H:%M:%S GMT{sign}{hours:02d}{minutes:02d} ({zone_name})",
-            time.gmtime(time.time() - offset_minutes * 60),
+        # JS Date.toString() 恒为英文；time.strftime("%a %b") 受进程 locale 影响，手动映射
+        _EN_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+        _EN_MONTHS = (
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        )
+        gm = time.gmtime(time.time() - offset_minutes * 60)
+        local_stamp = (
+            f"{_EN_WEEKDAYS[gm.tm_wday]} {_EN_MONTHS[gm.tm_mon - 1]} "
+            f"{gm.tm_mday:02d} {gm.tm_year} {gm.tm_hour:02d}:{gm.tm_min:02d}:{gm.tm_sec:02d} "
+            f"GMT{sign}{hours:02d}{minutes:02d} ({zone_name})"
         )
         try:
             hardware_concurrency = max(
@@ -641,15 +654,26 @@ def _sentinel_version(url: str) -> str:
 
 def _cookie_header(session: Any, device_id: str) -> str:
     values: dict[str, str] = {}
+    # 真实浏览器中 sentinel iframe 只能看到 openai.com 域的 cookie，
+    # 混入 chatgpt.com 等其它域 cookie 是强检测信号，按域过滤
+    allowed_domains = (".openai.com", "openai.com", ".auth0.openai.com")
+
+    def _cookie_allowed(cookie: Any) -> bool:
+        domain = str(getattr(cookie, "domain", "") or "").lower()
+        if not domain:
+            return True
+        return any(domain == d.lstrip(".") or domain.endswith(d) for d in allowed_domains)
+
     try:
         jar = getattr(session.cookies, "jar", session.cookies)
         for cookie in list(jar):
             name = str(getattr(cookie, "name", "") or "")
             value = str(getattr(cookie, "value", "") or "")
-            if name:
+            if name and _cookie_allowed(cookie):
                 values[name] = value
     except Exception:
         try:
+            # get_dict() 无域信息，仅在 jar 遍历失败时兜底（OpenAI 流程 cookie 均在 openai.com 域）
             values.update(
                 {
                     str(name): str(value)
@@ -1007,6 +1031,11 @@ def _flow_page(flow: str) -> tuple[str, str]:
         return (
             "https://auth.openai.com/email-verification",
             "https://auth.openai.com/email-verification",
+        )
+    if flow == "password_verify":
+        return (
+            "https://auth.openai.com/log-in/password",
+            "https://auth.openai.com/log-in",
         )
     if flow == "password_reset":
         return (
