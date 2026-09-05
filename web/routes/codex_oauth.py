@@ -1069,6 +1069,26 @@ async def sms_config_test():
     return await asyncio.to_thread(_do)
 
 
+@router.delete("/api/sms-config/docking-history")
+async def sms_config_clear_docking_history():
+    """清空火狐狸历史对接码(演示/过期条目会一直挂在选择列表里)。"""
+
+    def _do():
+        with _state()._edit_config() as cfg:
+            section = cfg.setdefault("sms_code", {})
+            removed = len(
+                [
+                    item
+                    for item in section.get("firefox_docking_code_history") or []
+                    if str(item).strip()
+                ]
+            )
+            section["firefox_docking_code_history"] = []
+        return {"ok": True, "removed": removed}
+
+    return await asyncio.to_thread(_do)
+
+
 # ---------------------------------------------------------------------------
 # Batch run endpoints
 

@@ -17,7 +17,7 @@ const props = defineProps({
   maintenanceRunning: Boolean,
   maddyAutoRunning: Boolean,
 });
-const emit = defineEmits(["refresh", "save", "run", "save-maddy-auto", "run-maddy-auto", "test-webhook", "backup", "save-backup-schedule", "save-sms-config", "test-sms", "pick-countries", "restore-backup", "restore-trash", "change-password", "revoke-sessions"]);
+const emit = defineEmits(["refresh", "save", "run", "save-maddy-auto", "run-maddy-auto", "test-webhook", "backup", "save-backup-schedule", "save-sms-config", "test-sms", "pick-countries", "clear-docking-history", "restore-backup", "restore-trash", "change-password", "revoke-sessions"]);
 const dockingHistory = computed(() => {
   const list = (props.smsConfig && props.smsConfig.firefox_docking_code_history) || [];
   const cur = String(props.smsForm?.firefoxDockingCode || "").trim();
@@ -120,7 +120,7 @@ function formatTime(value) { if (!value) return "-"; try { const date = new Date
           <label class="full">火狐狸用户名(ApiName)<input v-model="smsForm.firefoxApiName" type="text" placeholder="ApiName" autocomplete="off" /></label>
           <label class="full">火狐狸 Token(我的密钥)<input v-model="smsForm.firefoxToken" type="password" :placeholder="smsConfig.has_firefox_token ? `已保存 ${smsConfig.firefox_api_token_masked}` : 'firefox token'" autocomplete="off" /></label>
           <label class="full">对接码(一次锁定国家+项目)<input v-model="smsForm.firefoxDockingCode" type="text" placeholder="格式: eng-1096-DEMO01(在火狐狸接码页复制)" autocomplete="off" />
-            <div v-if="dockingHistory.length" class="sms-country-field"><div class="sms-country-chips"><button v-for="code in dockingHistory" :key="code" type="button" class="sms-country-chip dock-chip" :class="{ active: code === smsForm.firefoxDockingCode }" :title="'使用 ' + code" @click="smsForm.firefoxDockingCode = code">{{ code }}</button></div><small class="dock-hint">点击历史对接码快速填入</small></div>
+            <div v-if="dockingHistory.length" class="sms-country-field"><div class="sms-country-chips"><button v-for="code in dockingHistory" :key="code" type="button" class="sms-country-chip dock-chip" :class="{ active: code === smsForm.firefoxDockingCode }" :title="'使用 ' + code" @click="smsForm.firefoxDockingCode = code">{{ code }}</button></div><div class="dock-actions"><small class="dock-hint">点击历史对接码快速填入</small><button class="btn secondary sm" type="button" :disabled="busy" @click="emit('clear-docking-history')">清空历史</button></div></div>
           </label>
         </template>
         <label v-if="smsForm.provider !== 'firefox'" class="full">国家顺序(按顺序取号)<div class="sms-country-field"><div v-if="smsCountries.length" class="sms-country-chips"><span v-for="(name, index) in smsCountries" :key="name + index" class="sms-country-chip">{{ index + 1 }}. {{ name }}</span></div><span v-else class="sms-country-none">未选择</span><button class="btn secondary sm" type="button" @click="emit('pick-countries')">选择国家</button></div></label>

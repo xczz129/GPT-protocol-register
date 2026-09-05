@@ -2420,6 +2420,8 @@ table.acct .col-actions { text-align: right; white-space: nowrap; }
 .dock-chip:hover { border-color: var(--primary-600); color: var(--primary-600); }
 .dock-chip.active { background: var(--primary-600); border-color: var(--primary-600); color: #fff; }
 .dock-hint { display: block; margin-top: 4px; font-size: 11px; color: var(--ink-400); }
+.dock-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.dock-actions .dock-hint { margin-top: 0; }
 
 /* ---- 接码历史对话框 ---- */
 .codex-history-dialog { width: min(720px, 100%); }
