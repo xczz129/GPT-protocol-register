@@ -84,7 +84,11 @@ def _is_login_url(url: str) -> bool:
 def login_email_query(url: str) -> str | None:
     """Return the login route's email query, preserving an explicit blank."""
     try:
-        query = parse_qs(urlparse(str(url or "")).query, keep_blank_values=True)
+        raw_query = urlparse(str(url or "")).query
+        # parse_qs 会把 "+" 解码成空格，别名邮箱（base+split@domain）会匹配失败，
+        # 先把 "+" 保护为 %2B 再解码
+        safe_query = raw_query.replace("+", "%2B")
+        query = parse_qs(safe_query, keep_blank_values=True)
         if "email" not in query:
             return None
         return str((query.get("email") or [""])[0]).strip()

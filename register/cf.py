@@ -4,10 +4,14 @@
 from __future__ import annotations
 
 import os
+import threading
 
 from config import CHATGPT_CF_NODES, CLASH_API, CLASH_GROUP, CLASH_SECRET
 from register.log import _log
 from register.util import _cf_node_idx
+
+# 节点轮转计数是全局 read-modify-write；切换经 asyncio.to_thread 并发执行时必须持锁
+_CF_NODE_LOCK = threading.Lock()
 
 
 def _switch_cf_node() -> str | None:
@@ -22,8 +26,9 @@ def _switch_cf_node() -> str | None:
 
         secret = CLASH_SECRET or os.environ.get("CLASH_SECRET") or ""
         group = CLASH_GROUP or os.environ.get("CLASH_GROUP") or "GLOBAL"
-        node = nodes[_cf_node_idx[0] % len(nodes)]
-        _cf_node_idx[0] += 1
+        with _CF_NODE_LOCK:
+            node = nodes[_cf_node_idx[0] % len(nodes)]
+            _cf_node_idx[0] += 1
         headers = {"Authorization": f"Bearer {secret}"} if secret else {}
         requests.put(
             f"{api.rstrip('/')}/proxies/{group}",

@@ -394,6 +394,7 @@ async def register_one(
     bb = pid = None
     browser = ctx = page = None
     success = False
+    otp_accepted_by_server = False
     diagnostic_written = False
     last_error = ""
     _stop = stop_check if callable(stop_check) else _default_stop_check
@@ -561,7 +562,9 @@ async def register_one(
             else:
                 passed = False
                 for cf_try in range(max(1, len(CHATGPT_CF_NODES) or 1)):
-                    node = _switch_cf_node()
+                    # 同步 requests 会阻塞事件循环最长 13s（8s PUT + 5s DELETE），
+                    # 期间所有并发任务的 OTP 临界区全部停摆，必须下放线程
+                    node = await asyncio.to_thread(_switch_cf_node)
                     if not node:
                         break
                     _log(f"[CF] 切换节点 -> {node} ({cf_try + 1})")
@@ -1228,9 +1231,11 @@ async def register_one(
                         timeout=15,
                     )
                     cur_after_password = await _page_url(page)
+                # 以“密码输入框已消失”判定提交成功：表单被服务端接受后跳转，
+                # 密码框不再渲染；不能看 URL 子串（query 参数带 password 字样会误判，
+                # 导致落库空密码、服务端真实密码永久丢失）
                 password_submitted = (
-                    "password" not in cur_after_password.lower()
-                    and await safe_count(
+                    await safe_count(
                         page,
                         'input[type="password"], input[name="password"], '
                         'input[name="new-password"]',
@@ -1329,6 +1334,8 @@ async def register_one(
                 _log("[4] 未确认首次发送请求，继续轮询并在下一轮重发")
                 emit("running", step="验证码发送未确认")
             for code_try in range(3) if not code else ():
+                # OTP 等待链路最长可达数分钟，必须受注册总超时约束
+                check_timeout()
                 try:
                     if page.is_closed():
                         _log("[4] 页面已关闭，停止等待验证码")
@@ -1380,7 +1387,16 @@ async def register_one(
                                 timeout=12,
                             )
                             pw = page.locator('input[type="password"]')
-                            if await pw.count() > 0:
+                            recovery_url = await _page_url(page)
+                            if await pw.count() > 0 and _is_existing_account_password_url(
+                                (recovery_url or "").lower()
+                            ):
+                                # 落到已有账号的登录密码页：不能填本轮注册密码
+                                # （错误密码提交会触发账号锁定/风控），直接放弃恢复
+                                _log(
+                                    "[4] 恢复流程落到已有账号密码页，跳过填码避免误提交"
+                                )
+                            elif await pw.count() > 0:
                                 await react_fill(
                                     page,
                                     'input[type="password"]',
@@ -1404,9 +1420,9 @@ async def register_one(
                                     timeout=10,
                                 )
                                 recovery_password_url = await _page_url(page)
+                                # 与主流程一致：仅以密码框消失判定提交成功
                                 password_submitted = (
-                                    "password" not in recovery_password_url.lower()
-                                    and await safe_count(
+                                    await safe_count(
                                         page,
                                         'input[type="password"], input[name="password"], '
                                         'input[name="new-password"]',
@@ -1450,7 +1466,8 @@ async def register_one(
                     break
 
             if code:
-                _log(f"已拿到验证码: {code}")
+                # 验证码脱敏：聚合日志可能被用于撞库窗口内重放，只显示前 2 位
+                _log(f"已拿到验证码: {str(code)[:2]}****")
                 emit("running", step="已拿到验证码")
                 if hybrid_mode:
                     # Keep the SPA in control of the OTP response. The same
@@ -1467,6 +1484,10 @@ async def register_one(
                         page, code, timeout=12
                     )
                 advanced = otp_result.advanced
+                if otp_result.accepted:
+                    # OTP 被服务端接受 = 账号已在服务端创建；后续任何失败都不能
+                    # 把邮箱释放回池（回池会触发重复注册、密码状态错乱）
+                    otp_accepted_by_server = True
                 await dump_state(page, "填验证码后", verbose=not advanced)
                 if not advanced:
                     check_stop()
@@ -1554,7 +1575,7 @@ async def register_one(
                             fresh_code = None
                         check_stop()
                         if fresh_code and fresh_code != code:
-                            _log(f"[4] 已收到重发验证码: {fresh_code}")
+                            _log(f"[4] 已收到重发验证码: {str(fresh_code)[:2]}****")
                             emit("running", step="已收到重发验证码")
                             await _submit_verification_code(
                                 page,
@@ -1594,7 +1615,7 @@ async def register_one(
         ) > 0:
             _log("[5] 完善资料 / 引导页…")
             emit("running", step="完善资料 / onboarding")
-            ob_ok = await handle_onboarding(page, index)
+            ob_ok = await handle_onboarding(page, index, stop_check=_stop)
             if not ob_ok and not await is_chatgpt_main(page):
                 identity_gate = await is_identity_verification_page(page)
                 last_error = (
@@ -1628,7 +1649,7 @@ async def register_one(
         else:
             _log(f"[5] 尝试引导 · url={cur_pre_ob[:80]}")
             emit("running", step="完善资料 / onboarding")
-            ob_ok = await handle_onboarding(page, index)
+            ob_ok = await handle_onboarding(page, index, stop_check=_stop)
             if not ob_ok and not await is_chatgpt_main(page):
                 identity_gate = await is_identity_verification_page(page)
                 last_error = (
@@ -1943,6 +1964,14 @@ async def register_one(
             try:
                 if success:
                     mark_mailbox_result(mailbox, success=True)
+                elif otp_accepted_by_server:
+                    # OTP 已被服务端接受（账号已创建）但流程未走完：
+                    # 标记 used 防止邮箱回池后被当作新邮箱重复注册
+                    mark_mailbox_result(mailbox, success=True)
+                    _log(
+                        f"[邮箱] OTP 已接受但流程未完成，标记 used 不回池: "
+                        f"{_mask_email(mailbox.get('address', ''))}"
+                    )
                 elif last_error in {"cancelled", "stop requested"}:
                     release_mailbox(mailbox)
                     _log(f"[mail] released (stop): {mailbox.get('address')}")
@@ -1961,11 +1990,15 @@ async def register_one(
             if keep:
                 try:
                     await teardown(bb, pid, delete=False)
-                    _log(f"[调试] 已保留浏览器窗口: id={pid}；停止任务后关闭")
-                    while not _stop():
+                    _log(f"[调试] 已保留浏览器窗口: id={pid}；停止任务或 10 分钟后关闭")
+                    # 等待上限 10 分钟：无超时的死循环会挂死整批 asyncio.gather，
+                    # 且吞掉 CancelledError 会破坏取消语义
+                    keep_deadline = time.monotonic() + 600
+                    while not _stop() and time.monotonic() < keep_deadline:
                         await asyncio.sleep(0.25)
                 except asyncio.CancelledError:
-                    pass
+                    # 取消信号不能吞：让外层 finally 完成清理后正常传播
+                    _log("[调试] 保留等待被取消，继续清理浏览器")
                 except Exception as e:
                     _log(f"[调试] 保留浏览器失败: {str(e)[:80]}")
             _unregister_session(bb, pid)

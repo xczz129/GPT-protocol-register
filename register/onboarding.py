@@ -14,9 +14,11 @@ if str(ROOT) not in sys.path:
 
 from common.browser import react_fill
 from register.log import _log
+from register.sessions import JobCancelled
 from register.util import rand_name
 from register.page import (
     dump_state,
+    safe_body_text,
     safe_count,
     wait_for_any,
     is_chatgpt_main,
@@ -48,9 +50,10 @@ async def is_identity_verification_page(page) -> bool:
     if "verify-your-identity" in url or "identity-verification" in url:
         return True
     try:
+        # Playwright inner_text 在 Obscura 引擎上会挂起（page.py 注释明确记录），
+        # 用 evaluate 实现的 safe_body_text 替代
         body = str(
-            await page.locator("body").inner_text(timeout=1200)
-            or ""
+            await safe_body_text(page, limit=1600, timeout=1.2) or ""
         ).lower()
     except Exception:
         body = ""
@@ -61,7 +64,9 @@ async def is_identity_verification_page(page) -> bool:
     )
 
 
-async def handle_onboarding(page, index: int, max_rounds: int = 6) -> bool:
+async def handle_onboarding(
+    page, index: int, max_rounds: int = 6, stop_check=None
+) -> bool:
     # Already on main app — skip entire onboarding loop
     if await is_chatgpt_main(page):
         _log("  [资料] 已在 ChatGPT 主界面，跳过引导")
@@ -75,6 +80,9 @@ async def handle_onboarding(page, index: int, max_rounds: int = 6) -> bool:
     age_done = False
     bday_done = False
     for r in range(max_rounds):
+        # 引导全程响应停止请求：否则用户点停止后整批还要空转数分钟
+        if callable(stop_check) and stop_check():
+            raise JobCancelled("stop requested")
         if await is_chatgpt_main(page):
             _log("  [资料] 已进入 ChatGPT 主界面")
             return True
