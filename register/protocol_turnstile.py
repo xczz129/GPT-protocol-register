@@ -148,9 +148,11 @@ def solve_turnstile_token(dx: str, p: str) -> Optional[str]:
     def func_2(e: float, t: Any) -> None:
         process_map[e] = t
 
-    def func_3(e: str) -> None:
+    def func_3(e: Any) -> None:
         nonlocal result
-        result = base64.b64encode(e.encode()).decode()
+        # VM 队列元素不保证是 str；直接 .encode() 抛 AttributeError 会被
+        # run_queue 吞掉，最终静默返回 None。按 JS 语义先转字符串再编码。
+        result = base64.b64encode(_turnstile_to_str(e).encode()).decode()
 
     def func_5(e: float, t: float) -> None:
         current = get_value(e)
