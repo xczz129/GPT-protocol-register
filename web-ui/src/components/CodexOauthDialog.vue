@@ -1,15 +1,23 @@
 <script setup>
-import { nextTick, ref, watch } from "vue";
-import { Copy, Smartphone, X } from "@lucide/vue";
+import { computed, nextTick, ref, watch } from "vue";
+import { Copy, RefreshCw, Smartphone, Upload, X } from "@lucide/vue";
 
 const props = defineProps({
   open: Boolean,
   status: { type: Object, default: () => ({}) },
 });
-const emit = defineEmits(["close", "stop", "copy"]);
+const emit = defineEmits(["close", "stop", "copy", "retry", "retry-all"]);
 
 const logsEl = ref(null);
 const copiedKey = ref("");
+
+const isImport = computed(() => props.status?.mode === "import");
+const dialogTitle = computed(() => (isImport.value ? "协议登录进度" : "接码进度"));
+const dialogHint = computed(() =>
+  isImport.value ? "协议登录(密码 + TOTP) · 完成后可复制 AT 并写入账号库" : "自动接码 · 完成后可复制 RT",
+);
+const failedCount = computed(() => Number(props.status?.failed || 0));
+const canRetry = computed(() => !props.status?.running && failedCount.value > 0);
 
 watch(() => props.status?.logs?.length, async () => {
   await nextTick();
@@ -63,18 +71,23 @@ async function copyRt(rt, email) {
   <Teleport to="body">
     <Transition name="dialog-fade">
       <div v-if="open" class="app-dialog-mask" role="presentation" @click.self="emit('close')">
-        <section class="app-dialog codex-oauth-dialog" role="dialog" aria-modal="true" aria-label="接码" @keyup.esc="emit('close')">
+        <section class="app-dialog codex-oauth-dialog" role="dialog" aria-modal="true" :aria-label="isImport ? '导入账号' : '接码'" @keyup.esc="emit('close')">
           <div class="app-dialog-head">
             <div>
-              <span class="app-dialog-kicker"><Smartphone :size="12" aria-hidden="true" />接码</span>
-              <h2>接码进度</h2>
-              <small>自动接码 · 完成后可复制 RT</small>
+              <span class="app-dialog-kicker">
+                <Upload v-if="isImport" :size="12" aria-hidden="true" />
+                <Smartphone v-else :size="12" aria-hidden="true" />
+                {{ isImport ? "导入账号" : "接码" }}
+              </span>
+              <h2>{{ dialogTitle }}</h2>
+              <small>{{ dialogHint }}</small>
             </div>
             <button class="app-dialog-close" type="button" title="关闭" aria-label="关闭" @click="emit('close')"><X :size="16" aria-hidden="true" /></button>
           </div>
           <div class="codex-oauth-toolbar">
             <span>{{ status.done || 0 }} / {{ status.total || 0 }} · 成功 {{ status.success || 0 }} · 失败 {{ status.failed || 0 }}<template v-if="status.running"> · 运行中…</template><template v-else> · 已结束</template></span>
             <div class="row-btns">
+              <button v-if="canRetry" class="btn secondary sm" type="button" @click="emit('retry-all')"><RefreshCw :size="12" aria-hidden="true" />重试失败项 ({{ failedCount }})</button>
               <button v-if="status.running" class="btn danger sm" type="button" @click="emit('stop')">停止</button>
               <button class="btn secondary sm" type="button" @click="emit('close')">关闭</button>
             </div>
@@ -88,7 +101,10 @@ async function copyRt(rt, email) {
                   <small v-if="item.status === 'success'">RT {{ shortRt(item.refresh_token) }}<template v-if="rtDays(item.expires_in)"> · 约 {{ rtDays(item.expires_in) }} 天</template></small>
                   <small v-else>{{ item.error }}</small>
                 </div>
-                <button v-if="item.status === 'success'" class="btn secondary sm" type="button" title="复制完整 refresh_token" @click="copyRt(item.refresh_token, item.email)"><Copy :size="12" aria-hidden="true" />{{ copiedKey === item.email ? "已复制" : (item.token_kind === "at" ? "复制 AT" : "复制 RT") }}</button>
+                <div class="row-btns">
+                  <button v-if="item.status !== 'success' && !status.running" class="btn secondary sm" type="button" title="重新尝试该账号" @click="emit('retry', item)"><RefreshCw :size="12" aria-hidden="true" />重试</button>
+                  <button v-if="item.status === 'success'" class="btn secondary sm" type="button" title="复制完整 refresh_token" @click="copyRt(item.refresh_token, item.email)"><Copy :size="12" aria-hidden="true" />{{ copiedKey === item.email ? "已复制" : (item.token_kind === "at" ? "复制 AT" : "复制 RT") }}</button>
+                </div>
               </div>
             </div>
             <div ref="logsEl" class="codex-oauth-logs">

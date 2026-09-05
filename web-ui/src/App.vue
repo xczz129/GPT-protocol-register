@@ -1603,7 +1603,6 @@ function resetProtocolLoginResultsForInput(emails = []) {
 
 function scheduleReauthProgressPoll(delay = 700, announce = true) {
   clearTimeout(reauthProgressTimer);
-  clearTimeout(trialProgressTimer);
   reauthProgressTimer = setTimeout(() => pollReauthProgress(announce), delay);
 }
 
@@ -2149,7 +2148,11 @@ async function pollTrialProgress() {
     if (trialProgress.running) { trialProgressTimer = setTimeout(pollTrialProgress, 900); return; }
     await loadAccounts();
     notify(`0元资格检测完成：符合 ${trialProgress.eligible}，不符合 ${trialProgress.ineligible}，失败 ${trialProgress.failed}`, trialProgress.failed ? "err" : "ok");
-  } catch (error) { trialProgressTimer = setTimeout(pollTrialProgress, 1800); }
+  } catch (error) {
+    // 任务已被清理(如服务重启)时停止轮询,避免无限重试
+    if (String(error?.message || "").includes("不存在或已清理")) { trialProgressTimer = null; return; }
+    trialProgressTimer = setTimeout(pollTrialProgress, 1800);
+  }
 }
 async function refreshAtAccounts(payload = {}) {
   if (accountLoadError.value) {
@@ -2884,7 +2887,43 @@ async function saveConcurrencyDefault(pick) {
   try { await api("/api/ui-settings", { method: "PUT", body: jsonBody(payload) }); uiSettings.value = payload; notify("默认值已保存", "ok"); } catch (error) { notify(error?.message || "保存失败", "err"); }
 }
 const importAccountsDialog = reactive({ open: false });
-async function submitImportAccounts(text) { const value = String(text || "").trim(); if (!value) return; await run(() => api("/api/codex-oauth/import", { method: "POST", body: jsonBody({ text: value }) }), "导入任务已启动"); importAccountsDialog.open = false; codexOauthDialog.open = true; stopCodexOauthPolling(); codexOauthTimer = setInterval(async () => { try { codexOauthStatus.value = await api("/api/codex-oauth/status"); if (!codexOauthStatus.value.running) stopCodexOauthPolling(); } catch { stopCodexOauthPolling(); } }, 2000); }
+// 导入任务的 email -> 原始凭据行缓存：失败重试时无需重新粘贴全部内容
+const lastImportLines = ref(new Map());
+async function submitImportAccounts(text) {
+  const value = String(text || "").trim();
+  if (!value) return;
+  const rows = new Map();
+  for (const line of value.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const [email] = trimmed.split("----");
+    if (email && email.trim()) rows.set(email.trim().toLowerCase(), trimmed);
+  }
+  lastImportLines.value = rows;
+  await run(() => api("/api/codex-oauth/import", { method: "POST", body: jsonBody({ text: value }) }), "导入任务已启动");
+  importAccountsDialog.open = false; codexOauthDialog.open = true; stopCodexOauthPolling(); codexOauthTimer = setInterval(async () => { try { codexOauthStatus.value = await api("/api/codex-oauth/status"); if (!codexOauthStatus.value.running) { stopCodexOauthPolling(); loadAccounts(); } } catch { stopCodexOauthPolling(); } }, 2000); }
+async function retryCodexOauthFailed(item) {
+  const email = String(item?.email || "").trim();
+  if (!email) return;
+  if (codexOauthStatus.value?.mode === "import") {
+    const line = lastImportLines.value.get(email.toLowerCase());
+    if (!line) { notify("该账号的原始导入行已丢失,请重新粘贴导入", "err"); return; }
+    await submitImportAccounts(line);
+    return;
+  }
+  await startCodexOauth([email], true);
+}
+async function retryAllCodexOauthFailed() {
+  const failed = (codexOauthStatus.value?.results || []).filter((item) => item?.status === "failed");
+  if (!failed.length) return;
+  if (codexOauthStatus.value?.mode === "import") {
+    const lines = failed.map((item) => lastImportLines.value.get(String(item.email || "").trim().toLowerCase())).filter(Boolean);
+    if (!lines.length) { notify("失败账号的原始导入行已丢失,请重新粘贴导入", "err"); return; }
+    await submitImportAccounts(lines.join("\n"));
+    return;
+  }
+  await startCodexOauth(failed.map((item) => item.email).filter(Boolean), true);
+}
 
 async function saveBackupSchedule() { await run(() => api("/api/backup-schedule", { method: "PUT", body: jsonBody({ enabled: backupScheduleForm.enabled, time: backupScheduleForm.time, retention_days: backupScheduleForm.retentionDays }) }), "定时备份设置已保存", [loadOperations]); }
 async function restoreBackupNow(name) { if (!await confirmInside(`恢复备份 ${name}？当前配置和数据会被覆盖。`, { title: "恢复备份", confirmText: "恢复", danger: true })) return; await run(() => api("/api/backups/restore", { method: "POST", body: jsonBody({ name }) }), "备份已恢复", [initialize]); }
@@ -2989,7 +3028,7 @@ onBeforeUnmount(() => {
     <ConcurrencyDialog :open="concurrencyDialog.open" :title="concurrencyDialog.title" :message="concurrencyDialog.message" :value="concurrencyDialog.value" :max="concurrencyDialog.max" :mode="concurrencyDialog.mode" :mode-options="concurrencyDialog.modeOptions" :mode-messages="concurrencyDialog.modeMessages" @confirm="closeConcurrencyDialog" @cancel="closeConcurrencyDialog(null)" @save="saveConcurrencyDefault" />
     <SmsCountryPicker :open="smsCountryDialog.open" :provider="smsForm.provider" :items="smsCountryDialog.items" :selected="smsCountryDialog.selected" :loading="smsCountryDialog.loading" :error="smsCountryDialog.error" :prices="smsCountryPrices" :providers="smsCountryProviders" @close="smsCountryDialog.open = false" @toggle="toggleSmsCountry" @set-price="setSmsCountryPrice" @set-provider="setSmsCountryProvider" />
     <ImportAccountsDialog :open="importAccountsDialog.open" :busy="busy" @close="importAccountsDialog.open = false" @submit="submitImportAccounts" />
-    <CodexOauthDialog :open="codexOauthDialog.open" :status="codexOauthStatus" @close="closeCodexOauth" @stop="stopCodexOauth" @copy="codexCopyRt" />
+    <CodexOauthDialog :open="codexOauthDialog.open" :status="codexOauthStatus" @close="closeCodexOauth" @stop="stopCodexOauth" @copy="codexCopyRt" @retry="retryCodexOauthFailed" @retry-all="retryAllCodexOauthFailed" />
     <Teleport to="body">
       <Transition name="dialog-fade">
         <div v-if="codexHistoryDialog.open" class="app-dialog-mask" @click.self="closeCodexHistory">
