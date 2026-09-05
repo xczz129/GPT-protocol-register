@@ -132,9 +132,22 @@ async def save_platform_cookies(
 
     print(f"  [{platform}] {len(cookies)} 个 cookie，关键 cookie: {found_names}")
 
+    # 会话 cookie 属敏感凭据：原子写入 + 0600 权限，避免半写文件和同机其它用户可读
     full_path = os.path.join(pdir, f"full_{profile_id}_{ts}.json")
-    with open(full_path, "w", encoding="utf-8") as f:
-        json.dump(cookies, f, indent=2, ensure_ascii=False)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=pdir, prefix=".full_cookies_", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(cookies, f, indent=2, ensure_ascii=False)
+        os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, full_path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
     print(f"  [{platform}] 完整 cookie 已保存: {full_path}")
 
     if key_val and email:
