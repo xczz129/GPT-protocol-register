@@ -29,7 +29,6 @@ CODEX_USAGE_URL = "https://chatgpt.com/backend-api/codex/usage"
 TOKEN_URL = "https://auth.openai.com/oauth/token"
 OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 IMPERSONATE = "firefox147"
-QUOTA_TTL = 120
 QUOTA_WORKERS = 6
 
 _QUOTA_CACHE: dict[str, dict] = {}
@@ -194,6 +193,12 @@ def _parse_usage(data: dict) -> dict:
 
     credits = data.get("credits") if isinstance(data.get("credits"), dict) else {}
     reset_credits = data.get("rate_limit_reset_credits") if isinstance(data.get("rate_limit_reset_credits"), dict) else {}
+    if rate_limit.get("limit_reached"):
+        status = "limit_reached"
+    elif rate_limit.get("allowed") is False:
+        status = "blocked"
+    else:
+        status = "ok"
     return {
         "plan_type": str(data.get("plan_type") or ""),
         "allowed": rate_limit.get("allowed"),
@@ -208,8 +213,23 @@ def _parse_usage(data: dict) -> dict:
             "available": reset_credits.get("available_count"),
             "applicable": reset_credits.get("applicable_available_count"),
         },
+        "status": status,
         "fetched_at": _now_iso(),
     }
+
+
+def _classify_quota_error(error: str) -> str:
+    """把额度查询失败归类为账号健康状态。"""
+    text = str(error)
+    if "usage HTTP 401" in text:
+        return "unauthorized"
+    if "usage HTTP 403" in text:
+        return "forbidden"
+    if "usage HTTP 429" in text:
+        return "rate_limited"
+    if "token refresh HTTP" in text:
+        return "refresh_failed"
+    return "error"
 
 
 def _quota_for_file(path: Path) -> dict:
@@ -237,7 +257,6 @@ class QuotaRefreshRequest(BaseModel):
 
 @router.get("/api/cliproxy/accounts")
 async def list_accounts() -> dict:
-    now = time.time()
     with _QUOTA_LOCK:
         cache = {k: dict(v) for k, v in _QUOTA_CACHE.items()}
     items: list[dict] = []
@@ -249,20 +268,15 @@ async def list_accounts() -> dict:
             "email": str(record.get("email") or ""),
             "account_id": str(record.get("account_id") or ""),
             "plan_type": _plan_from_record(record) or _plan_from_filename(path.name),
-            "disabled": bool(record.get("disabled")),
             "expired": str(record.get("expired") or ""),
             "last_refresh": str(record.get("last_refresh") or ""),
-            "proxy_url": str(record.get("proxy_url") or ""),
             "size_bytes": stat.st_size,
             "mtime": int(stat.st_mtime),
         }
-        cached = cache.get(path.name)
-        if cached and now - cached.get("fetched_ts", 0) < QUOTA_TTL:
-            item["quota"] = cached.get("quota")
-            item["quota_error"] = str(cached.get("error") or "")
-        else:
-            item["quota"] = None
-            item["quota_error"] = str(cached.get("error") or "") if cached else ""
+        cached = cache.get(path.name) or {}
+        item["quota"] = cached.get("quota")
+        item["quota_error"] = str(cached.get("error") or "")
+        item["status"] = str(cached.get("status") or "")
         items.append(item)
     return {
         "auths_dir": str(AUTHS_DIR),
@@ -282,9 +296,11 @@ async def refresh_quota(body: QuotaRefreshRequest) -> dict:
 
     def work(path: Path) -> tuple[str, dict]:
         try:
-            return path.name, {"quota": _quota_for_file(path), "error": ""}
+            quota = _quota_for_file(path)
+            return path.name, {"quota": quota, "error": "", "status": str(quota.get("status") or "ok")}
         except Exception as exc:
-            return path.name, {"quota": None, "error": str(exc)[:200]}
+            message = str(exc)[:200]
+            return path.name, {"quota": None, "error": message, "status": _classify_quota_error(message)}
 
     results: dict[str, dict] = {}
     with ThreadPoolExecutor(max_workers=min(QUOTA_WORKERS, len(paths))) as pool:
@@ -299,6 +315,7 @@ async def refresh_quota(body: QuotaRefreshRequest) -> dict:
             _QUOTA_CACHE[name] = {
                 "quota": payload.get("quota"),
                 "error": payload.get("error") or "",
+                "status": payload.get("status") or "",
                 "fetched_ts": now,
             }
     return {"items": results}

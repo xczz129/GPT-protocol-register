@@ -908,7 +908,7 @@ async function refreshCliproxyQuota(rows) {
     const byFile = response.items || {};
     const items = (cliproxyAccounts.value.items || []).map((item) => {
       const updated = byFile[item.file];
-      return updated ? { ...item, quota: updated.quota, quota_error: updated.error || "" } : item;
+      return updated ? { ...item, quota: updated.quota, quota_error: updated.error || "", status: updated.status || "" } : item;
     });
     cliproxyAccounts.value = { ...cliproxyAccounts.value, items };
   } finally {
@@ -950,7 +950,9 @@ async function loadActiveView() {
   if (active.value === "logs") return loadLogs();
   if (active.value === "cliproxy") {
     await loadCliproxyAccounts();
-    if (cliproxyAccounts.value.items?.length) void refreshCliproxyQuota([]);
+    // 只补查从未检测过的账号;已有状态(含 401/429)等手动点刷新
+    const missing = (cliproxyAccounts.value.items || []).filter((item) => !item.status);
+    if (missing.length) void refreshCliproxyQuota(missing);
     return;
   }
   if (active.value === "operations") return Promise.all([loadOperations(), loadTrash()]);
