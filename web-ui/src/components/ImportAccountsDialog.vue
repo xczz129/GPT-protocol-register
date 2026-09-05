@@ -1,6 +1,6 @@
 <script setup>
 import { computed, ref, watch } from "vue";
-import { Upload, Sparkles, Users, Zap, X } from "@lucide/vue";
+import { Upload, Users, Zap, X } from "@lucide/vue";
 
 const props = defineProps({
   open: Boolean,
@@ -45,7 +45,7 @@ function submit() {
             <div>
               <span class="app-dialog-kicker"><Upload :size="12" aria-hidden="true" />导入账号</span>
               <h2>邮箱----密码----2FA 协议登录</h2>
-              <small>自动识别并协议登录(密码 + TOTP),获取 AT 会话凭证后写入账号库</small>
+              <small>协议登录(密码 + TOTP)写入账号库,套餐由登录后自动识别</small>
             </div>
             <button class="app-dialog-close" type="button" title="关闭" aria-label="关闭" @click="emit('close')"><X :size="16" aria-hidden="true" /></button>
           </div>
@@ -55,9 +55,8 @@ function submit() {
             <div class="import-accounts-field">
               <span class="import-accounts-label">账号类型</span>
               <div class="segmented" role="group" aria-label="账号类型">
-                <button type="button" :class="{ active: accountType === 'personal' }" @click="setType('personal')">个人 / Plus</button>
+                <button type="button" :class="{ active: accountType === 'personal' }" @click="setType('personal')">个人</button>
                 <button type="button" :class="{ active: accountType === 'team' }" @click="setType('team')"><Users :size="12" aria-hidden="true" />Team</button>
-                <button type="button" :class="{ active: accountType === 'pro' }" @click="setType('pro')"><Sparkles :size="12" aria-hidden="true" />Pro</button>
               </div>
             </div>
             <div class="import-accounts-field">

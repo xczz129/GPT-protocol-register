@@ -1158,9 +1158,10 @@ def _import_one(
             "registration_state": "complete",
             "proxy": "",
         }
-        # 账号类型作为套餐初始标记(team/pro)；测活会用真实 planType 覆盖
-        if account_type in {"team", "pro"}:
-            account["plan_type"] = account_type
+        # 账号类型只有 personal/team；套餐由登录后测活自动识别，
+        # team 标记仅作测活失败时的套餐兜底
+        if account_type == "team":
+            account["plan_type"] = "team"
         saved = _persist_imported_account(account, tokens, log)
         at = str(saved.get("access_token") or tokens.get("access_token") or "")
         log("协议登录成功,账号已写入账号库", "ok")
@@ -1227,7 +1228,8 @@ def _run_import_batch(
 
 class CodexOauthImportRequest(BaseModel):
     text: str = Field(default="", max_length=200000)
-    # team 账号 MFA 后会进入工作区选择页，需要指定工作区名；个人账号留空
+    # team 账号 MFA 后会进入工作区选择页，需要指定工作区名；个人账号留空。
+    # 套餐(free/plus/pro/team)由登录后测活自动识别，不由导入时指定。
     account_type: str = Field(default="personal", max_length=16)
     workspace: str = Field(default="", max_length=128)
     # 同时进行协议登录的账号数(1-8)
@@ -1243,8 +1245,9 @@ async def codex_oauth_import(body: CodexOauthImportRequest):
         creds = _parse_credential_lines(body.text)
         if not creds:
             raise HTTPException(400, "未识别到有效账号行(格式:邮箱----密码----2FA)")
+        # 账号类型只支持 personal/team；套餐由登录后测活识别
         account_type = str(body.account_type or "personal").strip().lower()
-        if account_type not in {"personal", "team", "pro"}:
+        if account_type != "team":
             account_type = "personal"
         workspace = str(body.workspace or "").strip()
         if account_type == "team" and not workspace:
@@ -1274,7 +1277,7 @@ async def codex_oauth_import(body: CodexOauthImportRequest):
             name="codex-oauth-import",
             daemon=True,
         ).start()
-        type_label = {"team": "Team", "pro": "Pro"}.get(account_type, "个人")
+        type_label = "Team" if account_type == "team" else "个人"
         plan = f"Team 工作区「{workspace}」" if workspace else type_label
         _log(
             f"导入任务启动:{len(creds)} 个账号 · 协议登录(密码+TOTP) · {plan} · 并发 {min(concurrency, len(creds))}"

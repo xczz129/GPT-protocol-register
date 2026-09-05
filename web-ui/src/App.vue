@@ -2889,7 +2889,7 @@ async function saveConcurrencyDefault(pick) {
 const importAccountsDialog = reactive({ open: false });
 // 导入任务的 email -> 原始凭据行缓存：失败重试时无需重新粘贴全部内容
 const lastImportLines = ref(new Map());
-// 最近一次导入的套餐/工作区/并发设置，重试失败项时沿用
+// 最近一次导入的账号类型/工作区/并发设置，重试失败项时沿用
 const lastImportOptions = reactive({ accountType: "personal", workspace: "", concurrency: 1 });
 async function submitImportAccounts(payload) {
   const value = String(payload?.text || "").trim();
