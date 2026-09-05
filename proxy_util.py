@@ -39,10 +39,17 @@ def normalize_proxy_url(url: str | None) -> str:
         elif "@" in url:
             left, right = url.split("@", 1)
             if ":" in left and ":" in right:
-                host, port = left.rsplit(":", 1)
-                username, password = right.split(":", 1)
-                if port.isdigit():
-                    url = f"http://{_encode_proxy_credential(username)}:{_encode_proxy_credential(password)}@{host}:{port}"
+                # 标准格式 user:pass@host:port 时右侧必须是合法 host:port；
+                # 先按标准顺序解释，避免纯数字密码（如 user:123456@host:8080）
+                # 被反向重组为 host:port@user:pass
+                right_host, _, right_port = right.rpartition(":")
+                if right_host and right_port.isdigit() and ":" not in right_host:
+                    url = f"http://{left}@{right}"
+                else:
+                    host, port = left.rsplit(":", 1)
+                    username, password = right.split(":", 1)
+                    if port.isdigit():
+                        url = f"http://{_encode_proxy_credential(username)}:{_encode_proxy_credential(password)}@{host}:{port}"
             if "://" not in url:
                 url = "http://" + url
         else:
