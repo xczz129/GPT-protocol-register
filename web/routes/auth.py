@@ -89,14 +89,28 @@ async def auth_login(body: LoginRequest, response: Response, request: Request):
     password = str(body.password or "")
     from common.web_auth import verify_password
 
-    ok_user = secrets.compare_digest(username, creds["username"])
+    # compare_digest 的 str 参数必须 ASCII-only，非 ASCII 输入会抛 TypeError 变 500；
+    # 统一按 utf-8 bytes 比较
+    ok_user = secrets.compare_digest(
+        username.encode("utf-8"), str(creds["username"]).encode("utf-8")
+    )
     stored_pass = str(creds["password"] or "")
     if stored_pass.startswith("pbkdf2_sha256$"):
         ok_pass = verify_password(password, stored_pass)
     else:
-        ok_pass = secrets.compare_digest(password, stored_pass)
+        ok_pass = secrets.compare_digest(
+            password.encode("utf-8"), stored_pass.encode("utf-8")
+        )
     if not (ok_user and ok_pass):
         with state._LOGIN_ATTEMPTS_LOCK:
+            # 顺带清理长期未访问 IP 的历史条目，防止字典无界增长
+            stale_ips = [
+                ip
+                for ip, stamps in state._LOGIN_ATTEMPTS.items()
+                if not stamps or now - max(stamps) > 600
+            ]
+            for ip in stale_ips:
+                state._LOGIN_ATTEMPTS.pop(ip, None)
             state._LOGIN_ATTEMPTS.setdefault(client_ip, []).append(now)
         raise HTTPException(401, "用户名或密码错误")
     with state._LOGIN_ATTEMPTS_LOCK:
@@ -145,7 +159,11 @@ async def auth_change_password(
         if current.startswith("pbkdf2_sha256$"):
             ok_current = verify_password(str(body.current_password or ""), current)
         else:
-            ok_current = secrets.compare_digest(str(body.current_password or ""), current)
+            # 非 ASCII 输入走 bytes 比较，避免 compare_digest 抛 TypeError
+            ok_current = secrets.compare_digest(
+                str(body.current_password or "").encode("utf-8"),
+                current.encode("utf-8"),
+            )
         if not ok_current:
             raise HTTPException(400, "当前密码不正确")
         web["password"] = hash_password(body.new_password)
