@@ -1271,9 +1271,11 @@ async def _run_maddy_auto_register_once(*, force: bool = False) -> dict[str, Any
             ok = int(job_snapshot.get("success_count") or 0)
             fail = int(job_snapshot.get("fail_count") or 0)
             skipped = int(job_snapshot.get("skipped_count") or 0)
+            # 服务关闭导致等待提前返回时任务可能仍在跑，此时不能计为成功
+            stopped_by_shutdown = bool(_state()._SERVER_SHUTDOWN_EVENT.is_set())
             result = {
                 "domain": domain,
-                "ok": True,
+                "ok": (not stopped_by_shutdown) and fail == 0 and ok > 0,
                 "success": ok,
                 "failed": fail,
                 "skipped": skipped,
