@@ -650,7 +650,7 @@ class SmsConfigUpdate(BaseModel):
     poll_interval_ms: int = Field(default=5000, ge=1000, le=60000)
     timeout_seconds: int = Field(default=180, ge=30, le=1800)
     max_price: str = Field(default="", max_length=20)
-    max_phone_attempts: int = Field(default=5, ge=1, le=20)
+    max_phone_attempts: int = Field(default=5, ge=1)
     firefox_api_name: str = Field(default="", max_length=120)
     firefox_api_password: str = Field(default="", max_length=120)
     firefox_api_token: str = Field(default="", max_length=200)
