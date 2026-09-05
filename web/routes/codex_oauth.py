@@ -637,7 +637,30 @@ def _run_batch(records: list, sms_cfg: dict) -> None:
                 break
             steps: list = []
             try:
-                result = _process_one(rec, sms_cfg, steps)
+                # 账号库已有 RT = 之前已接码成功,直接跳过,不重跑登录流程
+                existing_rt = str(rec.get("refresh_token") or "").strip()
+                if existing_rt:
+                    email = str(rec.get("email") or "").strip()
+                    _log(f"{email} | 已有 RT,按已接码处理")
+                    steps.append(
+                        {
+                            "t": datetime.now().strftime("%H:%M:%S"),
+                            "level": "ok",
+                            "m": "账号库已有 RT,无需重新接码",
+                        }
+                    )
+                    result = {
+                        "email": email,
+                        "status": "success",
+                        "skipped": True,
+                        "refresh_token": existing_rt,
+                        "expires_in": None,
+                        "error": "",
+                        "phone": "",
+                        "logs": list(steps),
+                    }
+                else:
+                    result = _process_one(rec, sms_cfg, steps)
                 with _LOCK:
                     _STATE["success"] += 1
                     _STATE["results"].append(result)

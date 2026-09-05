@@ -18,6 +18,7 @@ const dialogHint = computed(() =>
   isImport.value ? "协议登录(密码 + TOTP) · 失败项可展开查看该账号的完整登录日志" : "自动接码 · 完成后可复制 RT",
 );
 const failedCount = computed(() => Number(props.status?.failed || 0));
+const skippedCount = computed(() => (props.status?.results || []).filter((item) => item.skipped).length);
 const canRetry = computed(() => !props.status?.running && failedCount.value > 0);
 
 watch(() => props.status?.logs?.length, async () => {
@@ -101,7 +102,7 @@ async function copyRt(rt, email) {
             <button class="app-dialog-close" type="button" title="关闭" aria-label="关闭" @click="emit('close')"><X :size="16" aria-hidden="true" /></button>
           </div>
           <div class="codex-oauth-toolbar">
-            <span>{{ status.done || 0 }} / {{ status.total || 0 }} · 成功 {{ status.success || 0 }} · 失败 {{ status.failed || 0 }}<template v-if="status.running"> · 运行中…</template><template v-else> · 已结束</template></span>
+            <span>{{ status.done || 0 }} / {{ status.total || 0 }} · 成功 {{ status.success || 0 }}<template v-if="skippedCount"> · 已接码 {{ skippedCount }}</template> · 失败 {{ status.failed || 0 }}<template v-if="status.running"> · 运行中…</template><template v-else> · 已结束</template></span>
             <div class="row-btns">
               <button v-if="canRetry" class="btn secondary sm" type="button" @click="emit('retry-all')"><RefreshCw :size="12" aria-hidden="true" />重试失败项 ({{ failedCount }})</button>
               <button v-if="status.running" class="btn danger sm" type="button" @click="emit('stop')">停止</button>
@@ -113,8 +114,8 @@ async function copyRt(rt, email) {
             <div v-if="(status.results || []).length" class="codex-oauth-results">
               <div v-for="(item, index) in status.results" :key="`${item.email}-${index}`" :class="['codex-result-row', item.status === 'success' ? 'ok' : 'bad', { expanded: isExpanded(item, index) }]">
                 <div class="codex-result-main">
-                  <b>{{ item.email }}</b>
-                  <small v-if="item.status === 'success'">RT {{ shortRt(item.refresh_token) }}<template v-if="rtDays(item.expires_in)"> · 约 {{ rtDays(item.expires_in) }} 天</template></small>
+                  <b>{{ item.email }}<em v-if="item.skipped" class="codex-skip-tag">已接码</em></b>
+                  <small v-if="item.status === 'success'">RT {{ shortRt(item.refresh_token) }}<template v-if="item.skipped"> · 沿用已有</template><template v-else-if="rtDays(item.expires_in)"> · 约 {{ rtDays(item.expires_in) }} 天</template></small>
                   <small v-else>{{ item.error }}</small>
                 </div>
                 <div class="row-btns">
