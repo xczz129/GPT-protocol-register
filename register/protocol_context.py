@@ -10,7 +10,6 @@ import secrets
 import string
 import threading
 import time
-import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable
 from common.registration_trace import RegistrationTrace
@@ -198,15 +197,17 @@ def step(index: int, text: str, color: str = "") -> None:
 
 
 def _make_trace_headers() -> dict[str, str]:
-    trace_id = str(random.getrandbits(64))
-    parent_id = str(random.getrandbits(64))
+    # trace-id / parent-id 各只生成一次：x-datadog-* 头用十进制、traceparent 用
+    # 对应的小写十六进制，保证两者描述的是同一条 trace（真实 RUM 上报行为）
+    trace_id = random.getrandbits(64)
+    parent_id = random.getrandbits(64)
     return {
-        "traceparent": f"00-{uuid.uuid4().hex}-{format(int(parent_id), '016x')}-01",
+        "traceparent": f"00-{format(trace_id, '032x')}-{format(parent_id, '016x')}-01",
         "tracestate": "dd=s:1;o:rum",
         "x-datadog-origin": "rum",
-        "x-datadog-parent-id": parent_id,
+        "x-datadog-parent-id": str(parent_id),
         "x-datadog-sampling-priority": "1",
-        "x-datadog-trace-id": trace_id,
+        "x-datadog-trace-id": str(trace_id),
     }
 
 
