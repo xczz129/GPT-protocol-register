@@ -1012,7 +1012,7 @@ def _parse_credential_lines(text: str) -> list:
     return creds
 
 
-def _import_one(email: str, password: str, totp: str) -> dict:
+def _import_one(email: str, password: str, totp: str, workspace: str = "") -> dict:
     # Import uses the panel's own protocol login (email -> password -> TOTP ->
     # chatgpt.com session), the same engine as the protocol-reauth page.  No
     # SMS and no Codex OAuth PKCE flow are involved.
@@ -1029,6 +1029,7 @@ def _import_one(email: str, password: str, totp: str) -> dict:
         password=password,
         totp_secret=totp,
         proxy="",
+        workspace_name=str(workspace or "").strip(),
         stop_check=lambda: _STOP.is_set(),
     )
     if not tokens or not str(tokens.get("access_token") or "").strip():
@@ -1058,14 +1059,14 @@ def _import_one(email: str, password: str, totp: str) -> dict:
     }
 
 
-def _run_import_batch(creds: list) -> None:
+def _run_import_batch(creds: list, workspace: str = "") -> None:
     try:
         for email, password, totp in creds:
             if _STOP.is_set():
                 _log("任务已停止(剩余账号跳过)", "warning")
                 break
             try:
-                result = _import_one(email, password, totp)
+                result = _import_one(email, password, totp, workspace)
                 with _LOCK:
                     _STATE["success"] += 1
                     _STATE["results"].append(result)
@@ -1087,6 +1088,9 @@ def _run_import_batch(creds: list) -> None:
 
 class CodexOauthImportRequest(BaseModel):
     text: str = Field(default="", max_length=200000)
+    # team 账号 MFA 后会进入工作区选择页，需要指定工作区名；个人账号留空
+    account_type: str = Field(default="personal", max_length=16)
+    workspace: str = Field(default="", max_length=128)
 
 
 @router.post("/api/codex-oauth/import")
@@ -1098,6 +1102,12 @@ async def codex_oauth_import(body: CodexOauthImportRequest):
         creds = _parse_credential_lines(body.text)
         if not creds:
             raise HTTPException(400, "未识别到有效账号行(格式:邮箱----密码----2FA)")
+        account_type = str(body.account_type or "personal").strip().lower()
+        workspace = str(body.workspace or "").strip()
+        if account_type == "team" and not workspace:
+            raise HTTPException(400, "Team 账号请填写工作区名称")
+        if account_type != "team":
+            workspace = ""
         with _LOCK:
             _STATE.update(
                 {
@@ -1116,11 +1126,12 @@ async def codex_oauth_import(body: CodexOauthImportRequest):
         _STOP.clear()
         threading.Thread(
             target=_run_import_batch,
-            args=(creds,),
+            args=(creds, workspace),
             name="codex-oauth-import",
             daemon=True,
         ).start()
-        _log(f"导入任务启动:{len(creds)} 个账号 · 协议登录(密码+TOTP)")
+        plan = f"Team 工作区「{workspace}」" if workspace else "个人账号"
+        _log(f"导入任务启动:{len(creds)} 个账号 · 协议登录(密码+TOTP) · {plan}")
         return {"ok": True, "total": len(creds)}
 
     return await asyncio.to_thread(_do)

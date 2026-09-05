@@ -707,6 +707,7 @@ def login_with_password_totp_one(
     password: str,
     totp_secret: str,
     proxy: str = "",
+    workspace_name: str = "",
     stop_check: Callable[[], bool] | None = None,
     task_event=None,
     error_sink: Callable[[str], None] | None = None,
@@ -752,6 +753,7 @@ def login_with_password_totp_one(
             password,
             totp_secret,
             index,
+            workspace_name=workspace_name,
         )
         # Return the exact identity used for this session so reauthentication
         # can replace stale browser metadata from an older Chrome account.
