@@ -1335,74 +1335,80 @@ class _LogStream(io.TextIOBase):
         self._job = job
         self._buf = ""
         self._in_transport_cleanup_trace = False
+        # 任务线程与维护线程都会 print，write 必须可重入
+        self._lock = threading.Lock()
 
     def write(self, s):
         if not isinstance(s, str):
             s = str(s)
+        original_input = s
         try:
             self._original.write(s)
         except Exception:
             pass
-        self._buf += s
-        while "\n" in self._buf:
-            line, self._buf = self._buf.split("\n", 1)
-            s = line.strip()
-            if not s:
-                continue
-            if s.startswith(
-                "Exception ignored in: <function BaseSubprocessTransport.__del__"
-            ):
-                self._in_transport_cleanup_trace = True
-                continue
-            if self._in_transport_cleanup_trace:
-                transport_trace_line = (
-                    s == "Traceback (most recent call last):"
-                    or "asyncio/base_subprocess.py" in s
-                    or "asyncio/unix_events.py" in s
-                    or "asyncio/base_events.py" in s
-                    or s in {
-                        "self.close()",
-                        "proto.pipe.close()",
-                        "self.write_eof()",
-                        "self._loop.call_soon(self._call_connection_lost, None)",
-                        "self._check_closed()",
-                        "raise RuntimeError('Event loop is closed')",
-                        "RuntimeError: Event loop is closed",
-                    }
-                )
-                if transport_trace_line:
-                    if s == "RuntimeError: Event loop is closed":
-                        self._in_transport_cleanup_trace = False
+        with self._lock:
+            self._buf += s
+            while "\n" in self._buf:
+                line, self._buf = self._buf.split("\n", 1)
+                s = line.strip()
+                if not s:
                     continue
-            if "Future exception was never retrieved" in s:
-                continue
-            if "Execution context was destroyed" in s:
-                continue
-            if "Cannot find context with specified id" in s:
-                continue
-            if "Inspected target navigated or closed" in s:
-                continue
-            if "TargetClosedError" in s or "Target page, context or browser has been closed" in s:
-                continue
-            if "LeakWarning: Disabling Cross-Origin-Opener-Policy" in s:
-                continue
-            if "LeakWarning: When using a proxy" in s:
-                continue
-            if "i_know_what_im_doing=True" in s:
-                continue
-            if s.startswith("result = self.fn("):
-                continue
-            self._job.append_log(line)
-        return len(s)
+                if s.startswith(
+                    "Exception ignored in: <function BaseSubprocessTransport.__del__"
+                ):
+                    self._in_transport_cleanup_trace = True
+                    continue
+                if self._in_transport_cleanup_trace:
+                    transport_trace_line = (
+                        s == "Traceback (most recent call last):"
+                        or "asyncio/base_subprocess.py" in s
+                        or "asyncio/unix_events.py" in s
+                        or "asyncio/base_events.py" in s
+                        or s in {
+                            "self.close()",
+                            "proto.pipe.close()",
+                            "self.write_eof()",
+                            "self._loop.call_soon(self._call_connection_lost, None)",
+                            "self._check_closed()",
+                            "raise RuntimeError('Event loop is closed')",
+                            "RuntimeError: Event loop is closed",
+                        }
+                    )
+                    if transport_trace_line:
+                        if s == "RuntimeError: Event loop is closed":
+                            self._in_transport_cleanup_trace = False
+                        continue
+                if "Future exception was never retrieved" in s:
+                    continue
+                if "Execution context was destroyed" in s:
+                    continue
+                if "Cannot find context with specified id" in s:
+                    continue
+                if "Inspected target navigated or closed" in s:
+                    continue
+                if "TargetClosedError" in s or "Target page, context or browser has been closed" in s:
+                    continue
+                if "LeakWarning: Disabling Cross-Origin-Opener-Policy" in s:
+                    continue
+                if "LeakWarning: When using a proxy" in s:
+                    continue
+                if "i_know_what_im_doing=True" in s:
+                    continue
+                if s.startswith("result = self.fn("):
+                    continue
+                self._job.append_log(line)
+        # 返回值必须是本次写入的完整长度（io 契约），不是最后一行 strip 后的长度
+        return len(original_input)
 
     def flush(self):
         try:
             self._original.flush()
         except Exception:
             pass
-        if self._buf.strip():
-            self._job.append_log(self._buf)
-            self._buf = ""
+        with self._lock:
+            if self._buf.strip():
+                self._job.append_log(self._buf)
+                self._buf = ""
 
 
 
