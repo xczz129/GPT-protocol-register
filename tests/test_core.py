@@ -1181,15 +1181,18 @@ class ProxyFormatTests(unittest.TestCase):
             path = Path(directory) / "proxy_pool.txt"
             lines = [f"http://proxy-{index}.example:8080" for index in range(25)]
             path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            result = web_app._proxy_pool_preview(
-                {
-                    "proxy": {
-                        "enabled": True,
-                        "mode": "pool",
-                        "pool_file": str(path),
+            # 预览只允许读取 DATA_DIR 内的池文件（防任意文件读取），
+            # 测试时把 DATA_DIR 指向临时目录
+            with patch.object(web_app, "DATA_DIR", Path(directory)):
+                result = web_app._proxy_pool_preview(
+                    {
+                        "proxy": {
+                            "enabled": True,
+                            "mode": "pool",
+                            "pool_file": str(path),
+                        }
                     }
-                }
-            )
+                )
 
         self.assertEqual(result["pool_count"], 25)
         self.assertEqual(result["pool_unique_count"], 25)
