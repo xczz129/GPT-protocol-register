@@ -40,6 +40,23 @@ class ProxyTestRequest(BaseModel):
     proxies: list[str] = Field(default_factory=list)
 
 
+def _resolve_pool_path(pool_file: str) -> Path:
+    """解析代理池文件路径，并强制限制在项目 data 目录内。
+
+    防止通过配置任意路径读取服务器上的敏感文件（如 config.yaml）。
+    """
+    path = Path(pool_file).expanduser()
+    if not path.is_absolute():
+        path = (_state().ROOT / path).resolve()
+    else:
+        path = path.resolve()
+    try:
+        path.relative_to(_state().DATA_DIR.resolve())
+    except ValueError:
+        raise HTTPException(400, "代理池文件必须位于项目 data 目录")
+    return path
+
+
 def _proxy_pool_preview(cfg: dict[str, Any]) -> dict[str, Any]:
     proxy = cfg.get("proxy") if isinstance(cfg.get("proxy"), dict) else {}
     pool_file = str(proxy.get("pool_file") or "").strip()
@@ -48,6 +65,11 @@ def _proxy_pool_preview(cfg: dict[str, Any]) -> dict[str, Any]:
         path = Path(pool_file).expanduser()
         if not path.is_absolute():
             path = (_state().ROOT / path).resolve()
+        try:
+            # 读取前强制校验路径仍位于 data 目录，防止历史配置残留任意路径
+            path.relative_to(_state().DATA_DIR.resolve())
+        except ValueError:
+            path = Path("")
         if path.is_file():
             try:
                 lines = [
@@ -136,18 +158,13 @@ async def put_proxy(body: ProxyUpdate):
                 "refresh_interval": max(0, int(raw.get("refresh_interval") or 3600)),
             }
         pool_file = (body.pool_file or "").strip()
+        # 无论是否提交 pool_text，pool_file 本身都必须位于 data 目录内
+        if pool_file:
+            _resolve_pool_path(pool_file)
         if body.pool_text is not None:
             if not pool_file:
                 pool_file = str(_state().DATA_DIR / "proxy_pool.txt")
-            path = Path(pool_file).expanduser()
-            if not path.is_absolute():
-                path = (_state().ROOT / path).resolve()
-            else:
-                path = path.resolve()
-            try:
-                path.relative_to(_state().DATA_DIR.resolve())
-            except ValueError:
-                raise HTTPException(400, "代理池文件必须位于项目 data 目录")
+            path = _resolve_pool_path(pool_file)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(body.pool_text.rstrip() + "\n", encoding="utf-8")
             try:
