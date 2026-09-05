@@ -77,3 +77,4 @@ audit-workspace/
 notes/
 data/registration_logs/
 data/proxy_pool*
+data/codex_rt_history.json
