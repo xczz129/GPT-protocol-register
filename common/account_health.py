@@ -635,7 +635,28 @@ def fetch_remote_account_info(record: dict[str, Any]) -> dict[str, Any]:
         accounts = payloads.get("accounts") or {}
         account_entries = accounts.get("accounts") or {}
         account_entries = account_entries if isinstance(account_entries, dict) else {}
-        default = account_entries.get("default") or next(
+        # 多工作区账号(Team): AT 的 chatgpt_account_id 指向本次会话实际
+        # 登录的工作区, 优先取它的套餐/账号ID; 否则退回 default(个人)工作区,
+        # 避免 Team 账号被 default 个人工作区覆盖成 free。
+        token_account_id = ""
+        try:
+            auth_claims = _jwt_payload(token).get("https://api.openai.com/auth")
+            token_account_id = str(
+                (auth_claims if isinstance(auth_claims, dict) else {}).get(
+                    "chatgpt_account_id"
+                )
+                or ""
+            ).strip()
+        except Exception:
+            token_account_id = ""
+        selected = (
+            account_entries.get(token_account_id)
+            if token_account_id and isinstance(
+                account_entries.get(token_account_id), dict
+            )
+            else None
+        )
+        default = selected or account_entries.get("default") or next(
             (item for item in account_entries.values() if isinstance(item, dict)),
             {},
         )
