@@ -34,6 +34,7 @@ from codex_oauth.oauth import (  # noqa: E402
     totp_from_secret,
 )
 from codex_oauth.sms import (  # noqa: E402
+    FIREFOX_COUNTRY_NAMES,
     FirefoxSmsClient,
     SmsActivation,
     SmsBowerClient,
@@ -253,6 +254,39 @@ def _provider_specs(sms_cfg: dict) -> dict:
     return out
 
 
+_SMSBOWER_PRICE_CACHE: dict = {"at": 0.0, "map": {}}
+
+
+def _smsbower_tier_prices(api_key: str, service: str) -> dict:
+    """getPricesV3 的 ``{country: {tier: price}}``,缓存 5 分钟。
+
+    只用于日志展示(已分配号码时带出档位价格);查询失败时返回上一次
+    的结果,接码流程不因价格展示失败而中断。
+    """
+    import time as _time
+
+    now = _time.time()
+    if _SMSBOWER_PRICE_CACHE["map"] and now - _SMSBOWER_PRICE_CACHE["at"] < 300:
+        return _SMSBOWER_PRICE_CACHE["map"]
+    try:
+        raw = _smsbower_request(api_key, "getPricesV3", service=service)
+        doc = json.loads(raw) if raw.startswith("{") else {}
+    except Exception:
+        return _SMSBOWER_PRICE_CACHE["map"]
+    out: dict = {}
+    for country_id, services in (doc or {}).items():
+        rows = services.get(service) if isinstance(services, dict) else None
+        if not isinstance(rows, dict):
+            continue
+        tiers = {}
+        for pid, info in rows.items():
+            if isinstance(info, dict) and info.get("price") is not None:
+                tiers[str(pid)] = str(info.get("price"))
+        out[str(country_id)] = tiers
+    _SMSBOWER_PRICE_CACHE.update(at=now, map=out)
+    return out
+
+
 class _PanelSmsBowerClient(SmsBowerClient):
     """SMSBower client with per-country provider tiers and maxPrice support.
 
@@ -295,6 +329,7 @@ class _PanelSmsBowerClient(SmsBowerClient):
         if not combos:
             raise SmsError("没有配置任何国家/档位")
         last_error = "没有可用号码"
+        prices = _smsbower_tier_prices(self.settings.api_key, self.settings.service)
         total = len(combos)
         for offset in range(total):
             index = (self._cursor + offset) % total
@@ -325,86 +360,68 @@ class _PanelSmsBowerClient(SmsBowerClient):
                 continue
             # 号码来自当前组合;游标推进到后继组合,失败换号时不再重复它。
             self._cursor = (index + 1) % total
-            return SmsActivation(parts[1], parts[2], int(country), self.settings.api_key)
+            label = self._country_label(country, tier, prices)
+            return SmsActivation(parts[1], parts[2], int(country), self.settings.api_key, label=label)
         raise SmsError(last_error)
+
+    @staticmethod
+    def _country_label(country: str, tier: str, prices: dict) -> str:
+        """国家中文名 + 档位/价格,如 ``印度尼西亚 #1170 $0.107``。"""
+        try:
+            meta = SMSBOWER_COUNTRY_INFO.get(int(country))
+        except (TypeError, ValueError):
+            meta = None
+        label = meta[1] if meta else str(country)
+        if tier:
+            label += f" #{tier}"
+            tier_price = prices.get(str(country), {}).get(str(tier))
+            if tier_price:
+                label += f" ${tier_price}"
+        return label
 
 
 class _PanelFirefoxSmsClient(FirefoxSmsClient):
-    """Firefox client honouring per-country maxPrice specs.
+    """Firefox client:对接码锁定国家+项目,取号只认对接码。
 
-    国家顺序同样带轮转游标:OpenAI 拒掉某国的号码后,换号重试切到下一个
-    国家,轮完一圈再从头来(与 SMSBower 客户端的档位轮转语义一致)。
+    对接码一次锁定国家与项目(如 ``eng-1096-DEMO01``),不再回退国家
+    列表;未配置对接码直接报错,提示去火狐狸接码页复制。
     """
 
     def __init__(self, settings: SmsSettings, country_specs: list, *, timeout: float = 30.0):
         super().__init__(settings, timeout=timeout)
-        specs: list = []
-        for spec in country_specs or []:
-            # Spec triples carry (country, tiers, max_price); tiers are a
-            # SMSBower-only concept and are ignored here.
-            if isinstance(spec, tuple) and len(spec) == 3:
-                country, _tiers, price = spec
-                specs.append((country, str(price or "").strip()))
-            else:
-                specs.append((spec[0], str(spec[1] or "").strip()))
-        self.country_specs = specs or [(str(c), "") for c in settings.firefox_country_order]
-        # 轮转游标:指向下一次 acquire 的起始国家下标。
-        self._cursor = 0
+        # country_specs 仅 SMSBower 使用;火狐狸忽略。
 
     def acquire(self) -> SmsActivation:
-        last_error = "没有可用号码"
-        dock_country, dock_item_id, dock_did = parse_firefox_docking_code(self.settings.firefox_docking_code)
-        if dock_country and dock_item_id and dock_did:
-            specs = [(dock_country, None)]
-            item_id = dock_item_id
-            did = dock_did
-        else:
-            specs = self.country_specs
-            item_id = self.settings.firefox_item_id
-            did = self.settings.firefox_did
+        dock_country, item_id, did = parse_firefox_docking_code(self.settings.firefox_docking_code)
+        if not (dock_country and item_id and did):
+            raise SmsError("火狐狸需要配置对接码(格式: eng-1096-DEMO01,在火狐狸接码页复制)")
         self._login()
-        if not specs:
-            raise SmsError(last_error)
-        total = len(specs)
-        for offset in range(total):
-            index = (self._cursor + offset) % total
-            country, max_price = specs[index]
-            country = normalize_firefox_country(country)
-            params = {
-                "iid": item_id,
-                "country": country,
-                "dock": "0",
-                "otpmode": "sms",
-            }
-            if did:
-                params["did"] = did
-            price = max_price or self.settings.max_price
-            if price:
-                params["maxPrice"] = price
-            try:
-                body = self._authorized_request("getPhone", **params)
-            except SmsError as exc:
-                last_error = str(exc)
-                continue
-            if not body.startswith("1|"):
-                last_error = f"火狐狸未分配号码：{self._failure(body)[:120]}"
-                continue
-            parts = body.split("|")
-            if len(parts) < 8 or not parts[1].strip() or not parts[7].strip():
-                last_error = f"火狐狸响应格式异常：{body[:160]}"
-                continue
-            returned_country = normalize_firefox_country(parts[3] if len(parts) > 3 else "") or country
-            returned_prefix = parts[4] if len(parts) > 4 else ""
-            phone = self._normalize_phone(parts[7], returned_prefix, returned_country)
-            # 号码来自当前国家;游标推进到后继国家,失败换号时不再重复它。
-            self._cursor = (index + 1) % total
-            return SmsActivation(
-                activation_id=parts[1].strip(),
-                phone=phone,
-                country=returned_country,
-                api_key=self._token,
-            )
-        raise SmsError(last_error)
+        params = {
+            "iid": item_id,
+            "country": dock_country,
+            "dock": "0",
+            "otpmode": "sms",
+            "did": did,
+        }
+        if self.settings.max_price:
+            params["maxPrice"] = self.settings.max_price
+        body = self._authorized_request("getPhone", **params)
+        if not body.startswith("1|"):
+            raise SmsError(f"火狐狸未分配号码：{self._failure(body)[:120]}")
+        parts = body.split("|")
+        if len(parts) < 8 or not parts[1].strip() or not parts[7].strip():
+            raise SmsError(f"火狐狸响应格式异常：{body[:160]}")
+        returned_country = normalize_firefox_country(parts[3] if len(parts) > 3 else "") or dock_country
+        returned_prefix = parts[4] if len(parts) > 4 else ""
+        phone = self._normalize_phone(parts[7], returned_prefix, returned_country)
+        label = FIREFOX_COUNTRY_NAMES.get(returned_country, returned_country)
+        return SmsActivation(
+            activation_id=parts[1].strip(),
+            phone=phone,
+            country=returned_country,
+            api_key=self._token,
+            label=label,
+        )
 
 
 def _sms_client(settings: SmsSettings, country_specs: list | None = None):
@@ -414,34 +431,6 @@ def _sms_client(settings: SmsSettings, country_specs: list | None = None):
     if settings.provider == "firefox":
         return _PanelFirefoxSmsClient(settings, specs, timeout=30.0)
     return _PanelSmsBowerClient(settings, specs, timeout=30.0)
-
-
-def _auto_phone(client, sms, log) -> None:
-    attempts_max = int(sms.settings.max_phone_attempts or 5)
-    last_error = ""
-    for attempt in range(1, attempts_max + 1):
-        if _STOP.is_set():
-            raise RuntimeError("任务已停止")
-        log(f"接码获取号码(第 {attempt} 次)")
-        activation = sms.acquire()
-        try:
-            log(f"已分配 {activation.phone}(国家 {activation.country})")
-            client.send_phone(activation.phone)
-            log("手机号已提交,等待短信验证码")
-            code = sms.wait_code(activation, cancel_event=_STOP)
-            log("收到验证码,提交验证")
-            client.submit_phone_otp(code)
-            sms.finish(activation)
-            log("手机验证通过")
-            return activation.phone
-        except Exception as exc:
-            last_error = str(exc)
-            try:
-                sms.cancel(activation)
-            except Exception:
-                pass
-            log(f"号码 {activation.phone} 失败: {last_error}", "warning")
-    raise RuntimeError(f"接码 {attempts_max} 次均失败: {last_error[:160]}")
 
 
 def _process_one(rec: dict, sms_cfg: dict, steps: list | None = None) -> dict:
@@ -479,80 +468,117 @@ def _process_one(rec: dict, sms_cfg: dict, steps: list | None = None) -> dict:
         specs.append((country, merged, max_price))
     sms = _sms_client(settings, specs)
 
-    client = ProtocolClient(email, timeout=30)
-    try:
-        log("初始化会话与 PKCE")
-        client.bootstrap()
-        client.submit_email()
-        log("邮箱已提交")
-        client.verify_password(password)
-        log("密码验证通过")
-        mfa_id = client.mfa_id()
-        client.issue_mfa_challenge(mfa_id)
-        mfa_response = client.verify_mfa(mfa_id, totp_from_secret(totp))
-        log("2FA 验证通过")
+    # Team 账号按导入时指定的工作区名选择;个人账号为空,默认第一个。
+    workspace_name = str(rec.get("workspace_name") or "").strip()
+    if workspace_name:
+        log(f"使用工作区「{workspace_name}」")
+
+    # OpenAI 的 add-phone 会话没有换号接口:提交过一个号码后,同一会话再
+    # 提交新号码会得到 invalid_auth_step。因此每个号码配一整轮完整登录
+    # (新会话 bootstrap → 邮箱 → 密码 → 2FA → 接码),号码失败取消后
+    # 重新登录走下一轮。
+    rounds = int(settings.max_phone_attempts or 5) if sms is not None else 1
+    last_error = ""
+    for attempt in range(1, rounds + 1):
+        if _STOP.is_set():
+            raise RuntimeError("任务已停止")
+        client = ProtocolClient(email, timeout=30)
         try:
-            mfa_data = mfa_response.json()
-        except Exception:
-            mfa_data = {}
-        if not isinstance(mfa_data, dict):
-            mfa_data = {}
-        phone_used = ""
-        # Team 账号按导入时指定的工作区名选择;个人账号为空,默认第一个。
-        workspace_name = str(rec.get("workspace_name") or "").strip()
-        if workspace_name:
-            log(f"使用工作区「{workspace_name}」")
-        phone_required, reason = _phone_requirement(mfa_data)
-        if phone_required is True:
-            log(f"服务端要求手机验证({reason or 'add-phone'})")
-            if sms is None:
-                raise RuntimeError("需要手机验证,但接码未启用或未配置")
-            phone_used = _auto_phone(client, sms, log) or ""
-        else:
-            log("无需手机验证,直接进入 workspace")
-        try:
-            callback = client.select_workspace(workspace_name)
-        except Exception as exc:
-            if sms is not None and "phone" in str(exc).lower():
-                log("workspace 返回手机号步骤,切换到接码流程")
-                _auto_phone(client, sms, log)
-                callback = client.select_workspace(workspace_name)
+            log("初始化会话与 PKCE" + (f"(第 {attempt} 轮)" if attempt > 1 else ""))
+            client.bootstrap()
+            client.submit_email()
+            log("邮箱已提交")
+            client.verify_password(password)
+            log("密码验证通过")
+            mfa_id = client.mfa_id()
+            client.issue_mfa_challenge(mfa_id)
+            mfa_response = client.verify_mfa(mfa_id, totp_from_secret(totp))
+            log("2FA 验证通过")
+            try:
+                mfa_data = mfa_response.json()
+            except Exception:
+                mfa_data = {}
+            if not isinstance(mfa_data, dict):
+                mfa_data = {}
+            phone_used = ""
+            phone_required, reason = _phone_requirement(mfa_data)
+            if phone_required is True:
+                log(f"服务端要求手机验证({reason or 'add-phone'})")
+                if sms is None:
+                    raise RuntimeError("需要手机验证,但接码未启用或未配置")
+                log(f"接码获取号码(第 {attempt} 次)")
+                activation = sms.acquire()
+                try:
+                    desc = activation.label or f"国家 {activation.country}"
+                    log(f"已分配 {activation.phone}({desc})")
+                    client.send_phone(activation.phone)
+                    log("手机号已提交,等待短信验证码")
+                    code = sms.wait_code(activation, cancel_event=_STOP)
+                    log("收到验证码,提交验证")
+                    client.submit_phone_otp(code)
+                    sms.finish(activation)
+                    log("手机验证通过")
+                    phone_used = activation.phone
+                except Exception as exc:
+                    last_error = str(exc)
+                    # 号码不可用:取消激活,会话作废,由外层重新登录换号。
+                    try:
+                        sms.cancel(activation)
+                        log("号码已取消,重新登录换号", "warning")
+                    except Exception:
+                        log("号码取消失败(继续换号)", "warning")
+                    log(f"号码 {activation.phone} 失败: {last_error[:200]}", "warning")
+                    continue
             else:
+                log("无需手机验证,直接进入 workspace")
+            try:
+                callback = client.select_workspace(workspace_name)
+            except Exception as exc:
+                if (
+                    sms is not None
+                    and attempt < rounds
+                    and "phone" in str(exc).lower()
+                ):
+                    # workspace 步骤回退到手机验证:同样作废会话重登。
+                    last_error = str(exc)
+                    log("workspace 返回手机号步骤,重新登录进入接码", "warning")
+                    continue
                 raise
-        query = parse_qs(urlparse(callback).query)
-        code = query.get("code", [""])[0]
-        if not code:
-            raise RuntimeError("回调缺少授权 code")
-        log("交换 OAuth Token")
-        token = exchange_code(code, client.verifier)
-        refresh = str(token.get("refresh_token") or "")
-        if not refresh:
-            raise RuntimeError("响应缺少 refresh_token(scope 未含 offline_access?)")
-        updates = {
-            **rec,
-            "refresh_token": refresh,
-            "id_token": str(token.get("id_token") or ""),
-            "access_token": str(token.get("access_token") or ""),
-            "oauth_client_id": CODEX_CLIENT_ID,
-            "last_token_refresh_at": _state()._now_iso(),
-            "last_token_refresh_error": "",
-        }
-        _state().upsert_account_record(updates, _state().ACCOUNTS_FILE, create=False)
-        log("RT 已写回账号库", "ok")
-        return {
-            "email": email,
-            "status": "success",
-            "refresh_token": refresh,
-            "expires_in": token.get("expires_in"),
-            "error": "",
-            "phone": phone_used,
-            "logs": list(steps or []),
-        }
-    finally:
-        try:
-            client.session.close()
-        except Exception:
-            pass
+            query = parse_qs(urlparse(callback).query)
+            code = query.get("code", [""])[0]
+            if not code:
+                raise RuntimeError("回调缺少授权 code")
+            log("交换 OAuth Token")
+            token = exchange_code(code, client.verifier)
+            refresh = str(token.get("refresh_token") or "")
+            if not refresh:
+                raise RuntimeError("响应缺少 refresh_token(scope 未含 offline_access?)")
+            updates = {
+                **rec,
+                "refresh_token": refresh,
+                "id_token": str(token.get("id_token") or ""),
+                "access_token": str(token.get("access_token") or ""),
+                "oauth_client_id": CODEX_CLIENT_ID,
+                "last_token_refresh_at": _state()._now_iso(),
+                "last_token_refresh_error": "",
+            }
+            _state().upsert_account_record(updates, _state().ACCOUNTS_FILE, create=False)
+            log("RT 已写回账号库", "ok")
+            return {
+                "email": email,
+                "status": "success",
+                "refresh_token": refresh,
+                "expires_in": token.get("expires_in"),
+                "error": "",
+                "phone": phone_used,
+                "logs": list(steps or []),
+            }
+        finally:
+            try:
+                client.session.close()
+            except Exception:
+                pass
+    raise RuntimeError(f"接码 {rounds} 次均失败: {last_error[:160]}")
 
 
 def _run_batch(records: list, sms_cfg: dict) -> None:
@@ -1435,6 +1461,8 @@ def _start_sms_batch(wanted: set[str]) -> dict:
     sms_cfg = _sms_config_section(cfg)
     settings = SmsSettings.from_mapping(sms_cfg)
     if not settings.enabled or not settings.credentials_configured:
+        if settings.provider == "firefox":
+            raise HTTPException(400, "火狐狸接码需要先配置对接码(运维 → 接码设置 → 对接码)")
         raise HTTPException(400, f"接码未启用或未配置凭证({settings.provider_label})")
     with _LOCK:
         _STATE.update(
