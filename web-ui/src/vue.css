@@ -2260,6 +2260,26 @@ table.acct .col-actions { text-align: right; white-space: nowrap; }
 .import-accounts-dialog { width: min(680px, 100%); }
 .import-accounts-textarea { width: 100%; min-height: 190px; resize: vertical; padding: 10px 12px; border: 1px solid var(--bg-3); border-radius: 10px; background: var(--bg-1); color: var(--ink-800); font-family: var(--mono, ui-monospace, monospace); font-size: 12px; line-height: 1.7; }
 .import-accounts-textarea:focus { outline: none; border-color: var(--acc, #6366f1); }
+.import-accounts-plan { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 14px; }
+.import-accounts-field { display: grid; gap: 7px; }
+.import-accounts-field-grow { flex: 1; min-width: 200px; }
+.import-accounts-label { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: var(--ink-400); }
+.import-accounts-workspace { width: 100%; padding: 8px 12px; border: 1px solid var(--bg-3); border-radius: 8px; background: var(--bg-1); color: var(--ink-800); font-size: 13px; transition: border-color .15s ease, box-shadow .15s ease; }
+.import-accounts-workspace:focus { outline: none; border-color: var(--acc, #6366f1); box-shadow: 0 0 0 3px color-mix(in srgb, var(--acc, #6366f1) 18%, transparent); }
+.import-accounts-warn { font-size: 12px; color: var(--warn, #d97706); }
+.segmented { display: inline-flex; padding: 3px; gap: 2px; background: var(--bg-inset); border: 1px solid var(--bg-3); border-radius: 10px; }
+.segmented button { display: inline-flex; align-items: center; justify-content: center; gap: 5px; padding: 6px 13px; border: none; border-radius: 7px; background: transparent; color: var(--ink-500); font-size: 12px; font-weight: 500; font-family: inherit; cursor: pointer; transition: color .15s ease, background .15s ease, box-shadow .15s ease; }
+.segmented button:hover { color: var(--ink-800); background: var(--bg-3); }
+.segmented button.active { color: #fff; background: var(--acc, #6366f1); box-shadow: 0 1px 6px color-mix(in srgb, var(--acc, #6366f1) 40%, transparent); }
+.segmented button:focus-visible { outline: 2px solid color-mix(in srgb, var(--acc, #6366f1) 60%, transparent); outline-offset: 1px; }
+
+/* per-account logs inside codex/oauth import results */
+.codex-result-row.expanded { border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
+.codex-result-logs { display: grid; gap: 6px; }
+.codex-result-log-block { border: 1px solid var(--bg-3); border-top: none; border-radius: 0 0 10px 10px; background: var(--bg-inset); padding: 8px 12px; font-family: var(--mono, ui-monospace, monospace); font-size: 12px; line-height: 1.7; max-height: 240px; overflow: auto; }
+.codex-result-log-block + .codex-result-row { margin-top: 6px; }
+.codex-result-log-title { font-size: 11px; font-weight: 600; color: var(--ink-400); margin-bottom: 4px; font-family: inherit; }
+.codex-result-log-block p { margin: 0; color: var(--ink-700); word-break: break-all; }
 
 /* sms country picker */
 .sms-country-dialog { width: min(620px, 100%); }

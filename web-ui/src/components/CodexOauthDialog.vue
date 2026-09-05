@@ -1,6 +1,6 @@
 <script setup>
 import { computed, nextTick, ref, watch } from "vue";
-import { Copy, RefreshCw, Smartphone, Upload, X } from "@lucide/vue";
+import { Copy, RefreshCw, Smartphone, ScrollText, Upload, X } from "@lucide/vue";
 
 const props = defineProps({
   open: Boolean,
@@ -10,11 +10,12 @@ const emit = defineEmits(["close", "stop", "copy", "retry", "retry-all"]);
 
 const logsEl = ref(null);
 const copiedKey = ref("");
+const expandedLogs = ref({});
 
 const isImport = computed(() => props.status?.mode === "import");
 const dialogTitle = computed(() => (isImport.value ? "协议登录进度" : "接码进度"));
 const dialogHint = computed(() =>
-  isImport.value ? "协议登录(密码 + TOTP) · 完成后可复制 AT 并写入账号库" : "自动接码 · 完成后可复制 RT",
+  isImport.value ? "协议登录(密码 + TOTP) · 失败项可展开查看该账号的完整登录日志" : "自动接码 · 完成后可复制 RT",
 );
 const failedCount = computed(() => Number(props.status?.failed || 0));
 const canRetry = computed(() => !props.status?.running && failedCount.value > 0);
@@ -24,12 +25,27 @@ watch(() => props.status?.logs?.length, async () => {
   if (logsEl.value) logsEl.value.scrollTop = logsEl.value.scrollHeight;
 });
 
+watch(() => props.open, (value) => {
+  if (!value) expandedLogs.value = {};
+});
+
 function logClass(level) {
   if (level === "error") return "codex-log-error";
   if (level === "warning") return "codex-log-warning";
   if (level === "ok") return "codex-log-ok";
   return "";
 }
+
+function toggleLogs(item, index) {
+  const key = `${item.email}-${index}`;
+  expandedLogs.value = { ...expandedLogs.value, [key]: !expandedLogs.value[key] };
+}
+
+function isExpanded(item, index) {
+  return Boolean(expandedLogs.value[`${item.email}-${index}`]);
+}
+
+const expandedCount = computed(() => Object.values(expandedLogs.value).filter(Boolean).length);
 
 function shortRt(rt) {
   const text = String(rt || "");
@@ -95,15 +111,23 @@ async function copyRt(rt, email) {
           <p v-if="!status.running && (status.logs || []).length && (status.logs || []).some((line) => line.level === 'warning')" class="codex-hint"><Smartphone :size="14" aria-hidden="true" /> {{ (status.logs || []).filter((line) => line.level === 'warning').slice(-1)[0]?.m || "" }}</p>
           <div class="codex-oauth-body">
             <div v-if="(status.results || []).length" class="codex-oauth-results">
-              <div v-for="(item, index) in status.results" :key="`${item.email}-${index}`" :class="['codex-result-row', item.status === 'success' ? 'ok' : 'bad']">
+              <div v-for="(item, index) in status.results" :key="`${item.email}-${index}`" :class="['codex-result-row', item.status === 'success' ? 'ok' : 'bad', { expanded: isExpanded(item, index) }]">
                 <div class="codex-result-main">
                   <b>{{ item.email }}</b>
                   <small v-if="item.status === 'success'">RT {{ shortRt(item.refresh_token) }}<template v-if="rtDays(item.expires_in)"> · 约 {{ rtDays(item.expires_in) }} 天</template></small>
                   <small v-else>{{ item.error }}</small>
                 </div>
                 <div class="row-btns">
+                  <button v-if="(item.logs || []).length" class="btn secondary sm" type="button" :title="isExpanded(item, index) ? '收起该账号日志' : '展开该账号日志'" @click="toggleLogs(item, index)"><ScrollText :size="12" aria-hidden="true" />{{ isExpanded(item, index) ? "收起日志" : "日志" }}</button>
                   <button v-if="item.status !== 'success' && !status.running" class="btn secondary sm" type="button" title="重新尝试该账号" @click="emit('retry', item)"><RefreshCw :size="12" aria-hidden="true" />重试</button>
                   <button v-if="item.status === 'success'" class="btn secondary sm" type="button" title="复制完整 refresh_token" @click="copyRt(item.refresh_token, item.email)"><Copy :size="12" aria-hidden="true" />{{ copiedKey === item.email ? "已复制" : (item.token_kind === "at" ? "复制 AT" : "复制 RT") }}</button>
+                </div>
+              </div>
+              <div v-if="expandedCount" class="codex-result-logs">
+                <div v-for="(item, index) in status.results" v-show="isExpanded(item, index)" :key="`logs-${item.email}-${index}`" class="codex-result-log-block">
+                  <div class="codex-result-log-title">{{ item.email }} · {{ (item.logs || []).length }} 条</div>
+                  <p v-for="(line, lineIndex) in item.logs || []" :key="lineIndex" :class="logClass(line.level)"><span class="codex-log-time">{{ line.t }}</span>{{ line.m }}</p>
+                  <p v-if="!(item.logs || []).length" class="codex-log-empty">该账号无日志</p>
                 </div>
               </div>
             </div>

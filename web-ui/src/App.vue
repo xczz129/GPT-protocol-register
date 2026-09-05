@@ -2889,13 +2889,14 @@ async function saveConcurrencyDefault(pick) {
 const importAccountsDialog = reactive({ open: false });
 // 导入任务的 email -> 原始凭据行缓存：失败重试时无需重新粘贴全部内容
 const lastImportLines = ref(new Map());
-// 最近一次导入的套餐/工作区设置，重试失败项时沿用
-const lastImportOptions = reactive({ accountType: "personal", workspace: "" });
+// 最近一次导入的套餐/工作区/并发设置，重试失败项时沿用
+const lastImportOptions = reactive({ accountType: "personal", workspace: "", concurrency: 1 });
 async function submitImportAccounts(payload) {
   const value = String(payload?.text || "").trim();
   if (!value) return;
   const accountType = String(payload?.accountType || "personal").trim() || "personal";
   const workspace = String(payload?.workspace || "").trim();
+  const concurrency = Math.min(Math.max(Number(payload?.concurrency) || 1, 1), 8);
   const rows = new Map();
   for (const line of value.split(/\r?\n/)) {
     const trimmed = line.trim();
@@ -2906,7 +2907,8 @@ async function submitImportAccounts(payload) {
   lastImportLines.value = rows;
   lastImportOptions.accountType = accountType;
   lastImportOptions.workspace = workspace;
-  await run(() => api("/api/codex-oauth/import", { method: "POST", body: jsonBody({ text: value, account_type: accountType, workspace }) }), "导入任务已启动");
+  lastImportOptions.concurrency = concurrency;
+  await run(() => api("/api/codex-oauth/import", { method: "POST", body: jsonBody({ text: value, account_type: accountType, workspace, concurrency }) }), "导入任务已启动");
   importAccountsDialog.open = false; codexOauthDialog.open = true; stopCodexOauthPolling(); codexOauthTimer = setInterval(async () => { try { codexOauthStatus.value = await api("/api/codex-oauth/status"); if (!codexOauthStatus.value.running) { stopCodexOauthPolling(); loadAccounts(); } } catch { stopCodexOauthPolling(); } }, 2000); }
 async function retryCodexOauthFailed(item) {
   const email = String(item?.email || "").trim();
@@ -2914,7 +2916,7 @@ async function retryCodexOauthFailed(item) {
   if (codexOauthStatus.value?.mode === "import") {
     const line = lastImportLines.value.get(email.toLowerCase());
     if (!line) { notify("该账号的原始导入行已丢失,请重新粘贴导入", "err"); return; }
-    await submitImportAccounts({ text: line, accountType: lastImportOptions.accountType, workspace: lastImportOptions.workspace });
+    await submitImportAccounts({ text: line, accountType: lastImportOptions.accountType, workspace: lastImportOptions.workspace, concurrency: lastImportOptions.concurrency });
     return;
   }
   await startCodexOauth([email], true);
@@ -2925,7 +2927,7 @@ async function retryAllCodexOauthFailed() {
   if (codexOauthStatus.value?.mode === "import") {
     const lines = failed.map((item) => lastImportLines.value.get(String(item.email || "").trim().toLowerCase())).filter(Boolean);
     if (!lines.length) { notify("失败账号的原始导入行已丢失,请重新粘贴导入", "err"); return; }
-    await submitImportAccounts({ text: lines.join("\n"), accountType: lastImportOptions.accountType, workspace: lastImportOptions.workspace });
+    await submitImportAccounts({ text: lines.join("\n"), accountType: lastImportOptions.accountType, workspace: lastImportOptions.workspace, concurrency: lastImportOptions.concurrency });
     return;
   }
   await startCodexOauth(failed.map((item) => item.email).filter(Boolean), true);

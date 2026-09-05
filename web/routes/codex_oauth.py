@@ -1012,74 +1012,134 @@ def _parse_credential_lines(text: str) -> list:
     return creds
 
 
-def _import_one(email: str, password: str, totp: str, workspace: str = "") -> dict:
+def _import_one(index: int, email: str, password: str, totp: str, workspace: str = "") -> dict:
     # Import uses the panel's own protocol login (email -> password -> TOTP ->
     # chatgpt.com session), the same engine as the protocol-reauth page.  No
     # SMS and no Codex OAuth PKCE flow are involved.
+    # Returns one result row with per-account logs; never raises so the
+    # concurrent batch runner can keep going.
     from register.protocol import login_with_password_totp_one
+    from register.sessions import JobCancelled
     from web.routes.security_ops import _persist_reauthenticated_account
 
-    def log(message: str, level: str = "info") -> None:
-        _log(f"{email} | {message}", level)
-
-    log("协议登录启动(密码 + TOTP)")
-    tokens = login_with_password_totp_one(
-        1,
-        email=email,
-        password=password,
-        totp_secret=totp,
-        proxy="",
-        workspace_name=str(workspace or "").strip(),
-        stop_check=lambda: _STOP.is_set(),
-    )
-    if not tokens or not str(tokens.get("access_token") or "").strip():
-        raise RuntimeError("协议登录未取得访问凭证")
-    account = {
+    result: dict[str, Any] = {
         "email": email,
-        "password": password,
-        "password_set": True,
-        "totp_secret": totp,
-        "mfa_enabled": True,
-        "mfa_factor_type": "totp",
-        "registration_method": "protocol",
-        "source_type": "import",
-        "registration_state": "imported",
-        "proxy": "",
-    }
-    saved = _persist_reauthenticated_account(account, tokens)
-    at = str(saved.get("access_token") or tokens.get("access_token") or "")
-    log("协议登录成功,账号已写入账号库", "ok")
-    return {
-        "email": email,
-        "status": "success",
-        "refresh_token": at,
+        "status": "failed",
+        "refresh_token": "",
         "token_kind": "at",
-        "expires_in": saved.get("expires_at") or None,
+        "expires_in": None,
         "error": "",
+        "logs": [],
     }
+    account_logs: list = []
 
+    def log(message: str, level: str = "info") -> None:
+        stamp = datetime.now().strftime("%H:%M:%S")
+        account_logs.append({"t": stamp, "level": level, "m": str(message)[:300]})
+        _log(f"[{index}] {email} | {message}", level)
 
-def _run_import_batch(creds: list, workspace: str = "") -> None:
+    def account_log_sink(event: dict) -> None:
+        # Structured protocol step events -> readable per-account log lines.
+        status = str(event.get("status") or "")
+        text = str(
+            event.get("step") or event.get("message") or event.get("error") or ""
+        ).strip()
+        if not text:
+            return
+        level = (
+            "error" if status == "failed" else ("ok" if status == "success" else "info")
+        )
+        log(text, level)
+
+    captured_errors: list = []
+
+    def error_sink(message: str) -> None:
+        captured_errors.append(str(message))
+
+    if _STOP.is_set():
+        result["error"] = "任务已停止"
+        log("任务已停止，账号未执行", "warning")
+        result["logs"] = account_logs
+        return result
+
     try:
-        for email, password, totp in creds:
-            if _STOP.is_set():
-                _log("任务已停止(剩余账号跳过)", "warning")
-                break
-            try:
-                result = _import_one(email, password, totp, workspace)
-                with _LOCK:
-                    _STATE["success"] += 1
-                    _STATE["results"].append(result)
-            except Exception as exc:
-                with _LOCK:
-                    _STATE["failed"] += 1
-                    _STATE["results"].append(
-                        {"email": email, "status": "failed", "refresh_token": "", "expires_in": None, "error": str(exc)[:260]}
-                    )
-                _log(f"{email} | 失败: {exc}", "error")
-            finally:
+        log("协议登录启动(密码 + TOTP)")
+        tokens = login_with_password_totp_one(
+            index,
+            email=email,
+            password=password,
+            totp_secret=totp,
+            proxy="",
+            workspace_name=str(workspace or "").strip(),
+            stop_check=lambda: _STOP.is_set(),
+            error_sink=error_sink,
+            account_log_sink=account_log_sink,
+        )
+        if not tokens or not str(tokens.get("access_token") or "").strip():
+            # The real failure reason arrives via error_sink; keep the generic
+            # text only as a fallback.
+            raise RuntimeError(
+                captured_errors[-1] if captured_errors else "协议登录未取得访问凭证"
+            )
+        account = {
+            "email": email,
+            "password": password,
+            "password_set": True,
+            "totp_secret": totp,
+            "mfa_enabled": True,
+            "mfa_factor_type": "totp",
+            "registration_method": "protocol",
+            "source_type": "import",
+            "registration_state": "imported",
+            "proxy": "",
+        }
+        saved = _persist_reauthenticated_account(account, tokens)
+        at = str(saved.get("access_token") or tokens.get("access_token") or "")
+        log("协议登录成功,账号已写入账号库", "ok")
+        result.update(
+            {
+                "status": "success",
+                "refresh_token": at,
+                "expires_in": saved.get("expires_at") or None,
+                "error": "",
+            }
+        )
+    except JobCancelled:
+        result["error"] = "任务已停止"
+        log("任务已停止", "warning")
+    except Exception as exc:
+        message = str(exc)[:260]
+        result["error"] = message
+        log(f"失败: {message}", "error")
+    result["logs"] = account_logs[-200:]
+    return result
+
+
+def _run_import_batch(
+    creds: list, workspace: str = "", concurrency: int = 1
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    workers = max(1, min(int(concurrency or 1), 8, len(creds) or 1))
+    try:
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="import"
+        ) as pool:
+            futures = [
+                pool.submit(_import_one, index, email, password, totp, workspace)
+                for index, (email, password, totp) in enumerate(creds, start=1)
+            ]
+            for future in as_completed(futures):
+                result = future.result()
                 with _LOCK:
                     _STATE["done"] += 1
+                    _STATE["results"].append(result)
+                    if result.get("status") == "success":
+                        _STATE["success"] += 1
+                    else:
+                        _STATE["failed"] += 1
+    except Exception as exc:
+        _log(f"导入批次异常终止: {exc}", "error")
     finally:
         with _LOCK:
             _STATE["running"] = False
@@ -1091,6 +1151,8 @@ class CodexOauthImportRequest(BaseModel):
     # team 账号 MFA 后会进入工作区选择页，需要指定工作区名；个人账号留空
     account_type: str = Field(default="personal", max_length=16)
     workspace: str = Field(default="", max_length=128)
+    # 同时进行协议登录的账号数(1-8)
+    concurrency: int = Field(default=1, ge=1, le=8)
 
 
 @router.post("/api/codex-oauth/import")
@@ -1108,6 +1170,7 @@ async def codex_oauth_import(body: CodexOauthImportRequest):
             raise HTTPException(400, "Team 账号请填写工作区名称")
         if account_type != "team":
             workspace = ""
+        concurrency = int(body.concurrency or 1)
         with _LOCK:
             _STATE.update(
                 {
@@ -1126,12 +1189,14 @@ async def codex_oauth_import(body: CodexOauthImportRequest):
         _STOP.clear()
         threading.Thread(
             target=_run_import_batch,
-            args=(creds, workspace),
+            args=(creds, workspace, concurrency),
             name="codex-oauth-import",
             daemon=True,
         ).start()
         plan = f"Team 工作区「{workspace}」" if workspace else "个人账号"
-        _log(f"导入任务启动:{len(creds)} 个账号 · 协议登录(密码+TOTP) · {plan}")
+        _log(
+            f"导入任务启动:{len(creds)} 个账号 · 协议登录(密码+TOTP) · {plan} · 并发 {min(concurrency, len(creds))}"
+        )
         return {"ok": True, "total": len(creds)}
 
     return await asyncio.to_thread(_do)
