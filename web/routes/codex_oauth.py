@@ -480,10 +480,33 @@ def _sms_client(settings: SmsSettings, country_specs: list | None = None):
     return _PanelSmsBowerClient(settings, specs, timeout=30.0)
 
 
-def _process_one(rec: dict, sms_cfg: dict, steps: list | None = None) -> dict:
+def _proxy_retryable_error(error: BaseException | str) -> bool:
+    text = str(error or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "http 429", "http_429", "rate limit", "rate_limit", "proxy",
+            "connection reset", "connection closed", "timed out", "tls connect",
+            "curl: (7)", "curl: (28)", "curl: (35)", "curl: (56)",
+        )
+    )
+
+
+def _process_one(
+    rec: dict,
+    sms_cfg: dict,
+    steps: list | None = None,
+    *,
+    proxy_candidates: list[str] | None = None,
+    proxy_offset: int = 0,
+) -> dict:
     email = str(rec.get("email") or "").strip()
     password = str(rec.get("password") or "")
     totp = str(rec.get("totp_secret") or "")
+    proxies = [str(value or "").strip() for value in (proxy_candidates or []) if str(value or "").strip()]
+    if not proxies:
+        stored_proxy = str(rec.get("proxy") or "").strip()
+        proxies = [stored_proxy] if stored_proxy else [""]
 
     def log(message: str, level: str = "info") -> None:
         _log(f"{email} | {message}", level)
@@ -529,9 +552,12 @@ def _process_one(rec: dict, sms_cfg: dict, steps: list | None = None) -> dict:
     for attempt in range(1, rounds + 1):
         if _STOP.is_set():
             raise RuntimeError("任务已停止")
-        client = ProtocolClient(email, timeout=30)
+        proxy = proxies[(max(0, int(proxy_offset)) + attempt - 1) % len(proxies)]
+        client = ProtocolClient(email, timeout=30, proxy=proxy)
         try:
-            log("初始化会话与 PKCE" + (f"(第 {attempt} 轮)" if attempt > 1 else ""))
+            proxy_label = _state().proxy_brief(proxy) if proxy else "直连"
+            log(f"使用注册代理 {proxy_label}" + (f"(第 {attempt} 轮)" if attempt > 1 else ""))
+            log("初始化会话与 PKCE")
             client.bootstrap()
             client.submit_email()
             log("邮箱已提交")
@@ -596,7 +622,7 @@ def _process_one(rec: dict, sms_cfg: dict, steps: list | None = None) -> dict:
             if not code:
                 raise RuntimeError("回调缺少授权 code")
             log("交换 OAuth Token")
-            token = exchange_code(code, client.verifier)
+            token = exchange_code(code, client.verifier, proxy=proxy)
             refresh = str(token.get("refresh_token") or "")
             if not refresh:
                 raise RuntimeError("响应缺少 refresh_token(scope 未含 offline_access?)")
@@ -624,6 +650,12 @@ def _process_one(rec: dict, sms_cfg: dict, steps: list | None = None) -> dict:
                 "phone": phone_used,
                 "logs": list(steps or []),
             }
+        except Exception as exc:
+            last_error = str(exc)
+            if attempt < rounds and _proxy_retryable_error(exc):
+                log(f"当前代理请求失败({last_error[:140]})，切换下一条注册代理", "warning")
+                continue
+            raise
         finally:
             try:
                 client.session.close()
@@ -632,9 +664,9 @@ def _process_one(rec: dict, sms_cfg: dict, steps: list | None = None) -> dict:
     raise RuntimeError(f"接码 {rounds} 次均失败: {last_error[:160]}")
 
 
-def _run_batch(records: list, sms_cfg: dict) -> None:
+def _run_batch(records: list, sms_cfg: dict, proxy_candidates: list[str] | None = None) -> None:
     try:
-        for rec in records:
+        for index, rec in enumerate(records):
             if _STOP.is_set():
                 _log("任务已停止(剩余账号跳过)", "warning")
                 break
@@ -663,7 +695,13 @@ def _run_batch(records: list, sms_cfg: dict) -> None:
                         "logs": list(steps),
                     }
                 else:
-                    result = _process_one(rec, sms_cfg, steps)
+                    result = _process_one(
+                        rec,
+                        sms_cfg,
+                        steps,
+                        proxy_candidates=proxy_candidates,
+                        proxy_offset=index,
+                    )
                 with _LOCK:
                     _STATE["success"] += 1
                     _STATE["results"].append(result)
@@ -687,6 +725,7 @@ def _run_batch(records: list, sms_cfg: dict) -> None:
                             "status": "failed",
                             "refresh_token": "",
                             "expires_in": None,
+                            "logs": list(steps),
                             "error": str(exc)[:260],
                         }
                     )
@@ -1533,6 +1572,14 @@ def _start_sms_batch(wanted: set[str]) -> dict:
         raise HTTPException(404, "选中账号在库中不存在")
     cfg = _state()._read_config()
     sms_cfg = _sms_config_section(cfg)
+    proxy_cfg = cfg.get("proxy") if isinstance(cfg.get("proxy"), dict) else {}
+    proxy_candidates = (
+        _state().resolve_proxy_pool(proxy_cfg)
+        if bool(proxy_cfg.get("enabled"))
+        else []
+    )
+    if proxy_cfg.get("enabled") and not proxy_candidates:
+        raise HTTPException(400, "当前注册代理池没有可用线路，接码不会无代理直连")
     settings = SmsSettings.from_mapping(sms_cfg)
     if not settings.enabled or not settings.credentials_configured:
         if settings.provider == "firefox":
@@ -1556,12 +1603,15 @@ def _start_sms_batch(wanted: set[str]) -> dict:
     _STOP.clear()
     threading.Thread(
         target=_run_batch,
-        args=(picked, sms_cfg),
+        args=(picked, sms_cfg, proxy_candidates),
         name="codex-oauth-batch",
         daemon=True,
     ).start()
-    _log(f"任务启动:{len(picked)} 个账号 · 接码渠道 {settings.provider_label}")
-    return {"ok": True, "total": len(picked)}
+    _log(
+        f"任务启动:{len(picked)} 个账号 · 接码渠道 {settings.provider_label} · "
+        f"注册代理 {len(proxy_candidates)} 条"
+    )
+    return {"ok": True, "total": len(picked), "proxy_count": len(proxy_candidates)}
 
 
 @router.post("/api/codex-oauth/run")

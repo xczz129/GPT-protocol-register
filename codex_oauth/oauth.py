@@ -77,12 +77,19 @@ def wait_for_callback(state: str, timeout: int = 300) -> str:
     if not code: raise RuntimeError("callback did not contain an authorization code")
     return code
 
-def exchange_code(code: str, verifier: str) -> dict:
-    response = Session(impersonate="chrome").post(TOKEN_URL, data={
-        "grant_type": "authorization_code", "client_id": CLIENT_ID,
-        "code": code, "redirect_uri": REDIRECT_URI, "code_verifier": verifier,
-    }, timeout=30)
-    response.raise_for_status(); return response.json()
+def exchange_code(code: str, verifier: str, proxy: str = "") -> dict:
+    session = Session(impersonate="chrome")
+    if proxy:
+        session.proxies = {"http": proxy, "https": proxy}
+    try:
+        response = session.post(TOKEN_URL, data={
+            "grant_type": "authorization_code", "client_id": CLIENT_ID,
+            "code": code, "redirect_uri": REDIRECT_URI, "code_verifier": verifier,
+        }, timeout=30)
+        response.raise_for_status()
+        return response.json()
+    finally:
+        session.close()
 
 
 def decode_jwt_payload(value: str) -> dict:
@@ -202,9 +209,12 @@ def save_auth_record(token: dict, email: str, path: Path) -> dict:
 
 class ProtocolClient:
     """纯 HTTP OAuth 流程客户端；不依赖浏览器自动化。"""
-    def __init__(self, email: str, timeout: int = 30):
+    def __init__(self, email: str, timeout: int = 30, proxy: str = ""):
         self.email, self.timeout = email, timeout
         self.session = Session(impersonate="chrome")
+        self.proxy = str(proxy or "").strip()
+        if self.proxy:
+            self.session.proxies = {"http": self.proxy, "https": self.proxy}
         self.state = secrets.token_urlsafe(32)
         self.verifier, self.challenge = create_pkce()
         # The auth frontend uses a UUID-shaped oai-did and carries a stable
@@ -555,7 +565,7 @@ class ProtocolClient:
         self.send_phone(phone); self.submit_phone_otp(phone_code)
         callback = self.select_workspace(); query = parse_qs(urlparse(callback).query)
         if query.get("state", [""])[0] != self.state: raise RuntimeError("state mismatch")
-        return exchange_code(query["code"][0], self.verifier)
+        return exchange_code(query["code"][0], self.verifier, proxy=self.proxy)
 
 def save_token(token: dict, path: Path) -> None:
     # Keep the legacy CLI output shape, but apply the same private-file

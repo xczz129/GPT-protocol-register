@@ -2970,14 +2970,31 @@ async function startCodexOauth(emails, skipConfirm = false) {
   if (!emails.length) return;
   if (!skipConfirm && !await confirmInside(`对选中 ${emails.length} 个账号接码?`, { title: "接码", confirmText: "开始" })) return;
   if (await resumeCodexOauthIfRunning()) return;
-  await run(() => api("/api/codex-oauth/run", { method: "POST", body: jsonBody({ emails }) }), "接码任务已启动");
-  codexOauthDialog.open = true; stopCodexOauthPolling(); codexOauthTimer = setInterval(async () => { try { codexOauthStatus.value = await api("/api/codex-oauth/status"); if (!codexOauthStatus.value.running) stopCodexOauthPolling(); } catch { stopCodexOauthPolling(); } }, 2000);
+  const result = await run(() => api("/api/codex-oauth/run", { method: "POST", body: jsonBody({ emails }) }), "接码任务已启动");
+  if (!result) return;
+  codexOauthDialog.open = true;
+  stopCodexOauthPolling();
+  try { codexOauthStatus.value = await api("/api/codex-oauth/status"); } catch {}
+  codexOauthTimer = setInterval(async () => { try { codexOauthStatus.value = await api("/api/codex-oauth/status"); if (!codexOauthStatus.value.running) stopCodexOauthPolling(); } catch { stopCodexOauthPolling(); } }, 2000);
 }
 async function runCodexOauth(selected) {
-  const emails = (selected || []).map((item) => item.email).filter(Boolean);
-  if (!emails.length) return;
+  const incoming = Array.isArray(selected) ? selected : [];
+  const rows = [];
+  const emails = [];
+  const seen = new Set();
+  for (const value of incoming) {
+    const key = typeof value === "string" ? value.trim() : String(value?.delete_key || value?.email || "").trim();
+    const row = typeof value === "object" && value
+      ? value
+      : accounts.value.find((item) => item?.delete_key === key || item?.email === key || item?.account_id === key);
+    const email = String(row?.email || (key.includes("@") ? key : "")).trim().toLowerCase();
+    if (!email || seen.has(email)) continue;
+    seen.add(email);
+    rows.push(row || { email });
+    emails.push(email);
+  }
+  if (!emails.length) { notify("选中的账号没有可用邮箱，请刷新账号列表后重试", "err"); return; }
   if (await resumeCodexOauthIfRunning()) return;
-  const rows = selected || [];
   const withRt = rows.filter((item) => item.has_refresh_token);
   if (withRt.length === 1 && rows.length === 1) { await openCodexHistory(rows[0]); return; }
   if (withRt.length) {
