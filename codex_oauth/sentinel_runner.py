@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Sentinel Runner 适配层
-通过 subprocess 调用项目根目录的 sentinel-runner.js，
+通过 subprocess 调用项目内 sentinel/ 目录的 sentinel-runner.js，
 让 Node.js 在 vm 沙箱中真实运行 sdk.js，生成可通过校验的 sentinel-token。
 
 工作原理：
@@ -23,8 +23,8 @@ SEC_CH_UA_PLATFORM = "\"Windows\""
 
 logger = logging.getLogger(__name__)
 
-# 项目根目录（core 的上一级）
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+# 项目根目录：codex_oauth/ 已集成在 gpt-register-fp/ 下
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # Node 资源放在项目根的 sentinel/ 子目录下
 _SENTINEL_DIR = _PROJECT_ROOT / "sentinel"
 _RUNNER_PATH = _SENTINEL_DIR / "sentinel-runner.js"
