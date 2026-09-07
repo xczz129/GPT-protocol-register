@@ -811,7 +811,9 @@ class SmsConfigUpdate(BaseModel):
     provider: str = Field(default="smsbower", max_length=20)
     api_key: str = Field(default="", max_length=200)
     service: str = Field(default="dr", max_length=30)
-    country_order: str = Field(default="6, 4, 151", max_length=120)
+    # 国家×档位组合串(国家=档位|档位, 多国逗号分隔)远超百字符,
+    # 上限放宽到 4000 以容纳大规模取号顺序
+    country_order: str = Field(default="6, 4, 151", max_length=4000)
     poll_interval_ms: int = Field(default=5000, ge=1000, le=60000)
     timeout_seconds: int = Field(default=180, ge=30, le=1800)
     max_price: str = Field(default="", max_length=20)
@@ -822,7 +824,7 @@ class SmsConfigUpdate(BaseModel):
     firefox_docking_code: str = Field(default="", max_length=120)
     firefox_did: str = Field(default="", max_length=60)
     firefox_item_id: str = Field(default="1096", max_length=20)
-    firefox_country_order: str = Field(default="usa, chl, eng", max_length=160)
+    firefox_country_order: str = Field(default="usa, chl, eng", max_length=2000)
 
 
 def _sms_config_section(cfg: dict) -> dict:
