@@ -45,11 +45,12 @@ _ACCOUNT_HEALTH_SUMMARY_CACHE_MAX_ENTRIES = 16
 # every payload row, which dominates panel memory on large stores.  Cache the
 # decoded list keyed by the SQLite revision — the same cheap invalidation
 # signal the health summary uses — so repeat reads between writes reuse one
-# decode instead of rebuilding a full snapshot per request.  Entries are
-# trimmed FIFO; in practice one production store keeps a single live entry.
+# decode instead of rebuilding a full snapshot per request.  A decoded
+# snapshot of a large store costs hundreds of MB, so keep exactly one live
+# entry per store and drop the stale one before decoding a replacement.
 _ACCOUNT_ROWS_CACHE_LOCK = RLock()
 _ACCOUNT_ROWS_CACHE: dict[tuple[str, int], list[dict[str, Any]]] = {}
-_ACCOUNT_ROWS_CACHE_MAX_ENTRIES = 4
+_ACCOUNT_ROWS_CACHE_MAX_ENTRIES = 1
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 _FIELD_ORDER = (
     "email",
@@ -777,10 +778,18 @@ def load_accounts(path: Path = ACCOUNTS_FILE) -> list[dict[str, Any]]:
             if cache_key is not None:
                 with _ACCOUNT_ROWS_CACHE_LOCK:
                     cached = _ACCOUNT_ROWS_CACHE.get(cache_key)
-                if cached is not None:
-                    # Callers may mutate the returned records; hand out
-                    # shallow copies like the JSON snapshot cache does.
-                    return [dict(item) for item in cached]
+                    if cached is not None:
+                        # Callers may mutate the returned records; hand out
+                        # shallow copies like the JSON snapshot cache does.
+                        return [dict(item) for item in cached]
+                    # Miss: drop the stale snapshot for this store before
+                    # decoding a fresh one.  Holding both versions at once
+                    # would roughly double the resident footprint.
+                    store_key = cache_key[0]
+                    for existing in [
+                        key for key in _ACCOUNT_ROWS_CACHE if key[0] == store_key
+                    ]:
+                        _ACCOUNT_ROWS_CACHE.pop(existing, None)
             records = _sqlite_rows(connection)
             if cache_key is not None:
                 # Re-read while the connection is open.  If a writer bumped
