@@ -64,6 +64,7 @@ from common.account_store import (
     count_accounts,
     delete_account_records,
     load_account_record_by_identity,
+    load_account_records_by_emails,
     load_account_records_by_keys,
     load_account_public_views,
     load_accounts,

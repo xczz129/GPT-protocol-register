@@ -41,6 +41,15 @@ _ACCOUNT_SNAPSHOT_CACHE: dict[Path, tuple[tuple[int, int, int], list[dict[str, A
 _ACCOUNT_HEALTH_SUMMARY_CACHE_LOCK = RLock()
 _ACCOUNT_HEALTH_SUMMARY_CACHE: dict[tuple[str, int], dict[str, int]] = {}
 _ACCOUNT_HEALTH_SUMMARY_CACHE_MAX_ENTRIES = 16
+# Full-snapshot readers (health checks, chatgpt2api sync, import jobs) decode
+# every payload row, which dominates panel memory on large stores.  Cache the
+# decoded list keyed by the SQLite revision — the same cheap invalidation
+# signal the health summary uses — so repeat reads between writes reuse one
+# decode instead of rebuilding a full snapshot per request.  Entries are
+# trimmed FIFO; in practice one production store keeps a single live entry.
+_ACCOUNT_ROWS_CACHE_LOCK = RLock()
+_ACCOUNT_ROWS_CACHE: dict[tuple[str, int], list[dict[str, Any]]] = {}
+_ACCOUNT_ROWS_CACHE_MAX_ENTRIES = 4
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 _FIELD_ORDER = (
     "email",
@@ -753,9 +762,40 @@ def _upsert_sqlite_record(
 def load_accounts(path: Path = ACCOUNTS_FILE) -> list[dict[str, Any]]:
     sqlite_store = _ensure_sqlite(Path(path))
     if sqlite_store is not None:
-        _, connection = sqlite_store
+        db_path, connection = sqlite_store
         try:
-            return _sqlite_rows(connection)
+            revision = 0
+            try:
+                revision = int(_meta_value(connection, "revision") or 0)
+            except (TypeError, ValueError, sqlite3.Error):
+                revision = 0
+            cache_key: tuple[str, int] | None = None
+            try:
+                cache_key = (str(Path(db_path).resolve()), revision)
+            except OSError:
+                cache_key = (str(db_path), revision)
+            if cache_key is not None:
+                with _ACCOUNT_ROWS_CACHE_LOCK:
+                    cached = _ACCOUNT_ROWS_CACHE.get(cache_key)
+                if cached is not None:
+                    # Callers may mutate the returned records; hand out
+                    # shallow copies like the JSON snapshot cache does.
+                    return [dict(item) for item in cached]
+            records = _sqlite_rows(connection)
+            if cache_key is not None:
+                # Re-read while the connection is open.  If a writer bumped
+                # the revision during the decode, skip publishing a snapshot
+                # under the stale key; the next read rebuilds it.
+                try:
+                    current_revision = int(_meta_value(connection, "revision") or 0)
+                except (TypeError, ValueError, sqlite3.Error):
+                    current_revision = revision
+                if current_revision == revision:
+                    with _ACCOUNT_ROWS_CACHE_LOCK:
+                        while len(_ACCOUNT_ROWS_CACHE) >= _ACCOUNT_ROWS_CACHE_MAX_ENTRIES:
+                            _ACCOUNT_ROWS_CACHE.pop(next(iter(_ACCOUNT_ROWS_CACHE)))
+                        _ACCOUNT_ROWS_CACHE[cache_key] = records
+            return [dict(item) for item in records]
         finally:
             connection.close()
     # Writers build a complete temporary file and atomically replace ``path``.
@@ -1083,6 +1123,57 @@ def load_account_records_by_keys(
         for record in load_accounts(path)
         if (key := account_delete_key(record)) in wanted_set
     }
+
+
+def load_account_records_by_emails(
+    emails: Iterable[Any],
+    path: Path = ACCOUNTS_FILE,
+) -> list[dict[str, Any]]:
+    """Load full records for the requested emails via the indexed column.
+
+    Batch endpoints (SMS docking, RT history backfill) select a handful of
+    accounts while the store can hold thousands of rows; decoding the whole
+    payload snapshot just to filter by email wastes memory and CPU.  The
+    ``email`` column stores ``_norm_email`` output, so query it directly in
+    chunks; the JSON backend keeps the full-scan fallback.
+    """
+    wanted = list(
+        dict.fromkeys(
+            _norm_email(email)
+            for email in emails
+            if _norm_email(email)
+        )
+    )
+    if not wanted:
+        return []
+
+    sqlite_store = _ensure_sqlite(Path(path))
+    if sqlite_store is not None:
+        _, connection = sqlite_store
+        try:
+            records: list[dict[str, Any]] = []
+            for start in range(0, len(wanted), 500):
+                chunk = wanted[start : start + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = connection.execute(
+                    f"SELECT payload FROM accounts "
+                    f"WHERE email <> '' AND email IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                for (payload,) in rows:
+                    record = _decode_payload(payload)
+                    if record is not None:
+                        records.append(record)
+            return records
+        finally:
+            connection.close()
+
+    wanted_set = set(wanted)
+    return [
+        record
+        for record in load_accounts(path)
+        if _norm_email(record.get("email")) in wanted_set
+    ]
 
 
 def _record_matches_existing(

@@ -1560,14 +1560,28 @@ class CodexOauthRunRequest(BaseModel):
     emails: list = Field(default_factory=list, max_length=200)
 
 
-def _start_sms_batch(wanted: set[str]) -> dict:
-    """按选中邮箱启动接码批次。"""
-    records = _state().load_accounts(_state().ACCOUNTS_FILE)
-    picked = [
+def _load_sms_batch_records(wanted: set[str]) -> list[dict[str, Any]]:
+    """Resolve the selected accounts without decoding the full account table.
+
+    Uses the indexed email loader when the state module exposes it; falls back
+    to the full snapshot for test doubles and older state modules.
+    """
+    state = _state()
+    loader = getattr(state, "load_account_records_by_emails", None)
+    if callable(loader):
+        records = loader(wanted, state.ACCOUNTS_FILE)
+    else:  # pragma: no cover - compatibility fallback for state doubles
+        records = state.load_accounts(state.ACCOUNTS_FILE)
+    return [
         dict(rec)
         for rec in records
         if str(rec.get("email") or "").strip().lower() in wanted
     ]
+
+
+def _start_sms_batch(wanted: set[str]) -> dict:
+    """按选中邮箱启动接码批次。"""
+    picked = _load_sms_batch_records(wanted)
     if not picked:
         raise HTTPException(404, "选中账号在库中不存在")
     cfg = _state()._read_config()
@@ -1660,11 +1674,21 @@ async def codex_oauth_history(emails: str = ""):
             # Backfill: no recorded rows but the account owns an RT.
             missing = [e for e in wanted if e not in data or not data.get(e)]
             if missing:
+                by_email = {}
                 try:
-                    accounts = _state()._load_accounts() if hasattr(_state(), "_load_accounts") else []
+                    state = _state()
+                    loader = getattr(state, "load_account_records_by_emails", None)
+                    if callable(loader):
+                        # Indexed lookup: only decode the requested rows.
+                        accounts = loader(missing, state.ACCOUNTS_FILE)
+                    else:  # pragma: no cover - compatibility fallback
+                        accounts = (
+                            state._load_accounts()
+                            if hasattr(state, "_load_accounts")
+                            else []
+                        )
                 except Exception:
                     accounts = []
-                by_email = {}
                 for acc in accounts or []:
                     mail = str(acc.get("email") or "").strip().lower()
                     if mail:
