@@ -1461,6 +1461,16 @@ class ImportJobManager:
         settings = self._sms_settings()
         job.sms_provider = settings.provider_label
         sms_client = _sms_client_for(settings, self.timeout)
+        # OpenAI 2026-09 起校验页面导航:先进入 add-phone 页面,
+        # 否则 add-phone/send 直接 409 session invalid
+        nav_data = getattr(client, "last_auth_response", None)
+        nav_url = str(nav_data.get("continue_url") or "").strip() if isinstance(nav_data, dict) else ""
+        if nav_url.startswith("http"):
+            try:
+                client.navigate(nav_url)
+                job.add_log("已进入手机验证页面")
+            except Exception as exc:
+                job.add_log(f"进入手机验证页面失败（{exc}）", "warning")
         if sms_client is not None:
             job.add_log(
                 f"服务端要求手机号；{settings.provider_label} 自动接码已启用，将自动申请号码并轮询短信"

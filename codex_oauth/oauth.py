@@ -241,6 +241,68 @@ class ProtocolClient:
         if value:
             self.navigation_id = str(value)
 
+    def navigate(self, url: str, referer: str = "https://auth.openai.com/") -> Any:
+        """模拟浏览器页面导航(GET)。
+
+        真实浏览器在 mfa 通过后会先导航到 continue_url(如 add-phone 页面),
+        该请求会刷新会话 cookie 与服务端状态机;2026-09 起 add-phone/send
+        会校验这一步,缺少导航直接报 409 session invalid。
+        """
+        current = str(url or "").strip()
+        if not current:
+            return None
+        for _ in range(6):
+            response = self.session.get(
+                current,
+                allow_redirects=False,
+                timeout=self.timeout,
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "zh-CN,zh;q=0.9",
+                    "Referer": referer,
+                    "Upgrade-Insecure-Requests": "1",
+                    "sec-fetch-site": "same-origin",
+                    "sec-fetch-mode": "navigate",
+                    "sec-fetch-user": "?1",
+                    "sec-fetch-dest": "document",
+                    "x-openai-document-navigation-id": self.navigation_id,
+                    "oai-device-id": self.device_id,
+                },
+            )
+            self._update_navigation(response)
+            status = int(response.status_code)
+            if 300 <= status < 400:
+                location = response.headers.get("location", "")
+                if not location:
+                    break
+                referer, current = current, urljoin(current, location)
+                continue
+            if status in (403, 503) and self._is_edge_challenge(response):
+                # 与 bootstrap 相同的 Cloudflare 兜底:按表单 POST 重放
+                form = dict(parse_qsl(urlparse(current).query, keep_blank_values=True))
+                response = self.session.post(
+                    current,
+                    data=form,
+                    allow_redirects=False,
+                    timeout=self.timeout,
+                    headers={
+                        "User-Agent": USER_AGENT,
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Origin": "https://auth.openai.com",
+                        "Referer": current,
+                        "x-openai-document-navigation-id": self.navigation_id,
+                        "oai-device-id": self.device_id,
+                    },
+                )
+                self._update_navigation(response)
+                status = int(response.status_code)
+            if status >= 400:
+                raise RuntimeError(f"HTTP {status} navigate {urlparse(current).path}: {self._response_detail(response)}")
+            break
+        return response
+
     @staticmethod
     def _response_detail(response: Any) -> str:
         try:
