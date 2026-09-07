@@ -50,6 +50,7 @@ from codex_oauth.sms import (  # noqa: E402
     normalize_firefox_country,
     parse_firefox_docking_code,
 )
+from proxy_util import proxy_brief  # noqa: E402
 
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 
@@ -65,7 +66,7 @@ def _cliproxy_auth_filename(email: str, account_id: str, plan_type: str) -> str:
 
 
 def _sync_cliproxy_auth(email: str, token: dict, log) -> str:
-    """把接码成功的凭据写成 cliproxy auth 文件(已存在则跳过),返回文件名。"""
+    """把接码成功的凭据写成 cliproxy auth 文件(存在则用新 token 覆盖)。"""
     if not CLIPROXY_AUTHS_DIR.is_dir():
         log("未检测到中转目录(/opt/codex-services/data/cliproxy/auths),跳过同步", "warning")
         return ""
@@ -87,11 +88,17 @@ def _sync_cliproxy_auth(email: str, token: dict, log) -> str:
     ).strip()
     filename = _cliproxy_auth_filename(email, account_id, plan_type)
     target = CLIPROXY_AUTHS_DIR / filename
-    if target.exists():
-        log(f"中转已存在 {filename}", "ok")
-        return filename
+    existed = target.exists()
     save_auth_record(token, email, target)
-    log(f"已同步到中转 {filename}", "ok")
+    # 覆盖/写入后清掉面板的额度缓存,下次查询会用新凭据重新拉取
+    try:
+        from web.routes.cliproxy import _QUOTA_CACHE, _QUOTA_LOCK
+
+        with _QUOTA_LOCK:
+            _QUOTA_CACHE.pop(filename, None)
+    except Exception:
+        pass
+    log(f"{'已覆盖更新中转(旧凭据失效时重新登录的常规操作)' if existed else '已同步到中转'} {filename}", "ok")
     return filename
 
 
@@ -492,6 +499,19 @@ def _proxy_retryable_error(error: BaseException | str) -> bool:
     )
 
 
+# 2FA 验证码被拒(Incorrect code)时的自动重试上限:
+# 第 1 次等下一个 30s 窗口换新码;第 2/3 次用 +1/-1 相邻窗口码,
+# 补偿本地与服务器之间的时钟偏移。
+_MFA_CODE_RETRIES = 3
+
+
+def _mfa_code_error(error: BaseException | str) -> bool:
+    lowered = str(error or "").lower()
+    return "mfa/verify" in lowered and (
+        "incorrect code" in lowered or "incorrect_code" in lowered
+    )
+
+
 def _process_one(
     rec: dict,
     sms_cfg: dict,
@@ -549,13 +569,14 @@ def _process_one(
     # 重新登录走下一轮。
     rounds = int(settings.max_phone_attempts or 5) if sms is not None else 1
     last_error = ""
-    for attempt in range(1, rounds + 1):
+    mfa_code_failures = 0
+    for attempt in range(1, rounds + 1 + _MFA_CODE_RETRIES):
         if _STOP.is_set():
             raise RuntimeError("任务已停止")
         proxy = proxies[(max(0, int(proxy_offset)) + attempt - 1) % len(proxies)]
         client = ProtocolClient(email, timeout=30, proxy=proxy)
         try:
-            proxy_label = _state().proxy_brief(proxy) if proxy else "直连"
+            proxy_label = proxy_brief(proxy) if proxy else "直连"
             log(f"使用注册代理 {proxy_label}" + (f"(第 {attempt} 轮)" if attempt > 1 else ""))
             log("初始化会话与 PKCE")
             client.bootstrap()
@@ -565,7 +586,11 @@ def _process_one(
             log("密码验证通过")
             mfa_id = client.mfa_id()
             client.issue_mfa_challenge(mfa_id)
-            mfa_response = client.verify_mfa(mfa_id, totp_from_secret(totp))
+            # 重试时换用相邻时间窗口的验证码,补偿本地与服务器时钟偏移
+            skew = {1: 0, 2: 1, 3: -1}.get(mfa_code_failures, 0)
+            mfa_response = client.verify_mfa(
+                mfa_id, totp_from_secret(totp, at=time.time() + 30 * skew)
+            )
             log("2FA 验证通过")
             try:
                 mfa_data = mfa_response.json()
@@ -579,6 +604,15 @@ def _process_one(
                 log(f"服务端要求手机验证({reason or 'add-phone'})")
                 if sms is None:
                     raise RuntimeError("需要手机验证,但接码未启用或未配置")
+                # OpenAI 2026-09 起校验页面导航:先进入 add-phone 页面,
+                # 否则 add-phone/send 直接 409 session invalid
+                nav_url = str(reason or "").strip()
+                if nav_url.startswith("http"):
+                    try:
+                        client.navigate(nav_url)
+                        log("已进入手机验证页面")
+                    except Exception as exc:
+                        log(f"进入手机验证页面失败({str(exc)[:100]})", "warning")
                 log(f"接码获取号码(第 {attempt} 次)")
                 activation = sms.acquire()
                 try:
@@ -655,13 +689,31 @@ def _process_one(
             if attempt < rounds and _proxy_retryable_error(exc):
                 log(f"当前代理请求失败({last_error[:140]})，切换下一条注册代理", "warning")
                 continue
+            if mfa_code_failures < _MFA_CODE_RETRIES and _mfa_code_error(exc):
+                mfa_code_failures += 1
+                if mfa_code_failures == 1:
+                    # 等到下一个 30s TOTP 窗口,保证取到与上次不同的新码
+                    wait = 31 - (int(time.time()) % 30)
+                    log(
+                        f"2FA 验证码被拒,等 {wait}s 换新验证码自动重试"
+                        f"({mfa_code_failures}/{_MFA_CODE_RETRIES})",
+                        "warning",
+                    )
+                    time.sleep(wait)
+                else:
+                    log(
+                        f"2FA 验证码被拒,换相邻时间窗口验证码自动重试"
+                        f"({mfa_code_failures}/{_MFA_CODE_RETRIES})",
+                        "warning",
+                    )
+                continue
             raise
         finally:
             try:
                 client.session.close()
             except Exception:
                 pass
-    raise RuntimeError(f"接码 {rounds} 次均失败: {last_error[:160]}")
+    raise RuntimeError(f"接码 {attempt} 次均失败: {last_error[:160]}")
 
 
 def _run_batch(records: list, sms_cfg: dict, proxy_candidates: list[str] | None = None) -> None:
@@ -1558,6 +1610,8 @@ async def codex_oauth_import(body: CodexOauthImportRequest):
 
 class CodexOauthRunRequest(BaseModel):
     emails: list = Field(default_factory=list, max_length=200)
+    # force=True: 忽略账号库已有 RT 全部重跑(中转凭据失效重新登录用)
+    force: bool = False
 
 
 def _load_sms_batch_records(wanted: set[str]) -> list[dict[str, Any]]:
@@ -1579,11 +1633,16 @@ def _load_sms_batch_records(wanted: set[str]) -> list[dict[str, Any]]:
     ]
 
 
-def _start_sms_batch(wanted: set[str]) -> dict:
-    """按选中邮箱启动接码批次。"""
+def _start_sms_batch(wanted: set[str], force: bool = False) -> dict:
+    """按选中邮箱启动接码批次。force 时忽略已有 RT 全部重跑。"""
     picked = _load_sms_batch_records(wanted)
     if not picked:
         raise HTTPException(404, "选中账号在库中不存在")
+    if force:
+        # 清掉内存记录里的旧 RT 标记,_run_batch 就不会按"已接码"跳过;
+        # 登录成功后新 RT 会覆盖写回账号库。
+        for rec in picked:
+            rec["refresh_token"] = ""
     cfg = _state()._read_config()
     sms_cfg = _sms_config_section(cfg)
     proxy_cfg = cfg.get("proxy") if isinstance(cfg.get("proxy"), dict) else {}
@@ -1637,7 +1696,114 @@ async def codex_oauth_run(body: CodexOauthRunRequest):
         wanted = {str(e).strip().lower() for e in body.emails if str(e).strip()}
         if not wanted:
             raise HTTPException(400, "未选择账号")
-        return _start_sms_batch(wanted)
+        return _start_sms_batch(wanted, force=bool(body.force))
+
+    return await asyncio.to_thread(_do)
+
+
+@router.get("/api/sms/stats")
+async def sms_stats():
+    """接码成功率统计:解析历史日志里的取号/失败/通过记录,
+    按国家和档位(国家x档位)聚合,展示给运维面板。"""
+
+    def _do():
+        import re
+        from collections import defaultdict
+
+        assign_re = re.compile(r"已分配\s+(\S+?)\((.+?)\s+#(\d+)\s+\$([0-9.]+)\)")
+        fail_re = re.compile(r"号码\s+(\S+?)\s+失败")
+
+        try:
+            history = json.loads(_RT_HISTORY_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            history = {}
+        if not isinstance(history, dict):
+            history = {}
+
+        numbers: dict[str, dict] = {}
+        rows = []
+        for email, records in history.items():
+            if not isinstance(records, list):
+                continue
+            for rec in records:
+                rows.append((str(rec.get("at") or ""), email, rec))
+        rows.sort(key=lambda r: r[0])
+
+        for at, email, rec in rows:
+            logs = rec.get("logs") or []
+            for line in logs:
+                text = str(line.get("m") or "")
+                m = assign_re.search(text)
+                if m:
+                    phone, country, tier, price = m.groups()
+                    numbers[phone] = {
+                        "country": country,
+                        "tier": tier,
+                        "price": float(price),
+                        "result": "unknown",
+                        "at": at,
+                    }
+                m = fail_re.search(text)
+                if m and m.group(1) in numbers:
+                    numbers[m.group(1)]["result"] = "fail"
+            if rec.get("status") == "success" and rec.get("phone"):
+                phone = str(rec["phone"])
+                if phone in numbers:
+                    numbers[phone]["result"] = "ok"
+                else:
+                    numbers[phone] = {
+                        "country": "其他",
+                        "tier": "",
+                        "price": 0.0,
+                        "result": "ok",
+                        "at": at,
+                    }
+
+        total = len(numbers)
+        ok_n = sum(1 for v in numbers.values() if v["result"] == "ok")
+        fail_n = sum(1 for v in numbers.values() if v["result"] == "fail")
+
+        countries = defaultdict(lambda: {"total": 0, "ok": 0, "fail": 0, "cost": 0.0})
+        tiers = defaultdict(lambda: {"total": 0, "ok": 0, "fail": 0, "cost": 0.0})
+        for v in numbers.values():
+            c = countries[v["country"]]
+            c["total"] += 1
+            c["cost"] += v["price"]
+            if v["result"] == "ok":
+                c["ok"] += 1
+            elif v["result"] == "fail":
+                c["fail"] += 1
+            tier_key = f'{v["country"]} #{v["tier"]}'
+            t = tiers[tier_key]
+            t["total"] += 1
+            t["cost"] += v["price"]
+            t["price"] = v["price"]
+            if v["result"] == "ok":
+                t["ok"] += 1
+            elif v["result"] == "fail":
+                t["fail"] += 1
+
+        def _with_rate(item: dict) -> dict:
+            rate = round(item["ok"] / item["total"] * 100, 1) if item["total"] else 0.0
+            return {**item, "rate": rate}
+
+        return {
+            "ok": True,
+            "summary": {
+                "total": total,
+                "success": ok_n,
+                "failed": fail_n,
+                "rate": round(ok_n / total * 100, 1) if total else 0.0,
+            },
+            "countries": [
+                {"name": name, **_with_rate(data)}
+                for name, data in sorted(countries.items(), key=lambda kv: -kv[1]["total"])
+            ],
+            "tiers": [
+                {"name": name, **_with_rate(data)}
+                for name, data in sorted(tiers.items(), key=lambda kv: -kv[1]["total"])
+            ],
+        }
 
     return await asyncio.to_thread(_do)
 

@@ -78,6 +78,7 @@ const cliproxyAccounts = ref({ configured: false, auths_dir: "", items: [] });
 const cliproxyLoading = ref(false);
 const cliproxyRefreshing = ref(false);
 const cliproxyImporting = ref(false);
+const cliproxyDeleting = ref(false);
 const cliproxyResettingFile = ref("");
 const progress = ref({ running: 0, items: [] });
 const maintenanceRunning = ref(false);
@@ -1039,6 +1040,43 @@ async function consumeCliproxyReset(payload) {
     cliproxyResettingFile.value = "";
   }
 }
+async function deleteCliproxyAccounts(files) {
+  const list = (files || []).filter(Boolean);
+  if (!list.length) return;
+  const byFile = new Map((cliproxyAccounts.value.items || []).map((item) => [item.file, item]));
+  const label = list.length === 1 ? (byFile.get(list[0])?.email || list[0]) : `选中的 ${list.length} 个账号`;
+  if (!await confirmInside(`删除中转账号 ${label}？凭据会移出中转目录，不影响账号库。`, { title: "删除中转账号", confirmText: "删除", danger: true })) return;
+  cliproxyDeleting.value = true;
+  try {
+    const result = await api("/api/cliproxy/delete", { method: "POST", body: jsonBody({ files: list }) });
+    notify(`已删除 ${result.deleted?.length || 0} 个中转账号`, "ok");
+    await loadCliproxyAccounts();
+  } catch (error) {
+    notify(error?.message || "中转账号删除失败", "err");
+  } finally {
+    cliproxyDeleting.value = false;
+  }
+}
+const cliproxyReloginLoading = ref(false);
+async function reloginCliproxyAccount(payload) {
+  const email = String(payload?.email || "").trim().toLowerCase();
+  if (!email) return;
+  // 不在前端预检账号列表(可能未加载/分页不全),由后端直接读账号库校验:
+  // 不存在返回 404,缺密码/2FA 也会给出明确错误
+  if (!await confirmInside(`对 ${email} 重新 OAuth 登录?将用账号库凭据重新走完整登录流程,成功后新 RT 会写回账号库和中转。`, { title: "重新登录", confirmText: "开始登录" })) return;
+  if (await resumeCodexOauthIfRunning()) return;
+  cliproxyReloginLoading.value = true;
+  try {
+    const result = await run(() => api("/api/codex-oauth/run", { method: "POST", body: jsonBody({ emails: [email], force: true }) }), "重新登录任务已启动");
+    if (!result) return;
+    codexOauthDialog.open = true;
+    stopCodexOauthPolling();
+    try { codexOauthStatus.value = await api("/api/codex-oauth/status"); } catch {}
+    codexOauthTimer = setInterval(async () => { try { codexOauthStatus.value = await api("/api/codex-oauth/status"); if (!codexOauthStatus.value.running) stopCodexOauthPolling(); } catch { stopCodexOauthPolling(); } }, 2000);
+  } finally {
+    cliproxyReloginLoading.value = false;
+  }
+}
 function itemsCount(value) {
   return Array.isArray(value?.items) ? value.items.length : 0;
 }
@@ -1082,7 +1120,7 @@ async function loadActiveView() {
     if (missing.length) void refreshCliproxyQuota(missing);
     return;
   }
-  if (active.value === "operations") return Promise.all([loadOperations(), loadTrash()]);
+  if (active.value === "operations") return Promise.all([loadOperations(), loadTrash(), loadSmsStats()]);
 }
 
 async function initialize() {
@@ -2918,7 +2956,14 @@ const codexOauthDialog = reactive({ open: false });
 const codexOauthStatus = ref({ running: false, total: 0, done: 0, success: 0, failed: 0, logs: [], results: [] });
 let codexOauthTimer = null;
 const codexOauthRunning = computed(() => codexOauthDialog.open && !!codexOauthStatus.value.running);
-function stopCodexOauthPolling() { if (codexOauthTimer) { clearInterval(codexOauthTimer); codexOauthTimer = null; } }
+function stopCodexOauthPolling() {
+  if (codexOauthTimer) {
+    clearInterval(codexOauthTimer);
+    codexOauthTimer = null;
+    // 接码/重新登录任务结束后刷新中转列表(新 RT 会覆盖写入 auth 文件)
+    void loadCliproxyAccounts();
+  }
+}
 async function resumeCodexOauthIfRunning() {
   try {
     const st = await api("/api/codex-oauth/status");
@@ -2927,12 +2972,19 @@ async function resumeCodexOauthIfRunning() {
       codexOauthDialog.open = true;
       stopCodexOauthPolling();
       codexOauthTimer = setInterval(async () => { try { codexOauthStatus.value = await api("/api/codex-oauth/status"); if (!codexOauthStatus.value.running) stopCodexOauthPolling(); } catch { stopCodexOauthPolling(); } }, 2000);
+      notify("检测到接码/重新登录任务进行中,已为你打开实时日志", "ok");
       return true;
     }
   } catch {}
   return false;
 }
 async function loadSmsConfig() { try { const value = await api("/api/sms-config"); smsConfig.value = value || {}; Object.assign(smsForm, { enabled: !!value.enabled, provider: value.provider || "smsbower", apiKey: "", service: value.service || "dr", countryOrder: value.country_order || "6, 4, 151", timeoutSeconds: Number(value.timeout_seconds || 180), maxPhoneAttempts: Number(value.max_phone_attempts || 5), firefoxApiName: value.firefox_api_name || "", firefoxToken: "", firefoxDockingCode: value.firefox_docking_code || "", firefoxCountryOrder: value.firefox_country_order || "usa, chl, eng" }); } catch {} }
+const smsStats = ref(null);
+const smsStatsLoading = ref(false);
+async function loadSmsStats() {
+  smsStatsLoading.value = true;
+  try { smsStats.value = await api("/api/sms/stats"); } catch { smsStats.value = null; } finally { smsStatsLoading.value = false; }
+}
 async function saveSmsConfig() { await run(() => api("/api/sms-config", { method: "PUT", body: jsonBody({ enabled: smsForm.enabled, provider: smsForm.provider, api_key: smsForm.apiKey, service: smsForm.service, country_order: smsForm.countryOrder, poll_interval_ms: 5000, timeout_seconds: smsForm.timeoutSeconds, max_phone_attempts: smsForm.maxPhoneAttempts, firefox_api_name: smsForm.firefoxApiName, firefox_api_token: smsForm.firefoxToken, firefox_docking_code: smsForm.firefoxDockingCode, firefox_country_order: smsForm.firefoxCountryOrder }) }), "接码设置已保存", [loadSmsConfig]); }
 async function testSmsConfig() { await run(() => api("/api/sms-config/test", { method: "POST", body: "{}" }), (r) => r.message || "测试完成"); }
 async function clearDockingHistory() { if (!await confirmInside("清空火狐狸历史对接码?", { title: "清空历史", confirmText: "清空" })) return; await run(() => api("/api/sms-config/docking-history", { method: "DELETE" }), "历史对接码已清空", [loadSmsConfig]); }
@@ -3016,7 +3068,30 @@ async function copyHistoryRt(row) {
   await copyOrReveal(value, { title: `复制 ${codexHistoryDialog.email || "账号"} 的 RT`, successMessage: "RT 已复制" });
 }
 async function stopCodexOauth() { await run(() => api("/api/codex-oauth/stop", { method: "POST", body: "{}" }), "已请求停止"); }
-function closeCodexOauth() { codexOauthDialog.open = false; stopCodexOauthPolling(); }
+function closeCodexOauth() {
+  codexOauthDialog.open = false;
+  // 只关弹窗不打断任务;保留静默轮询,任务结束后自动刷新中转列表
+  stopCodexOauthPolling();
+  startCodexBackgroundWatch();
+}
+let codexBackgroundWatchTimer = null;
+function startCodexBackgroundWatch() {
+  if (codexBackgroundWatchTimer) return;
+  codexBackgroundWatchTimer = setInterval(async () => {
+    try {
+      const st = await api("/api/codex-oauth/status");
+      if (!st.running) {
+        clearInterval(codexBackgroundWatchTimer);
+        codexBackgroundWatchTimer = null;
+        // 任务结束(含成功写回 RT)后刷新中转列表
+        void loadCliproxyAccounts();
+      }
+    } catch {
+      clearInterval(codexBackgroundWatchTimer);
+      codexBackgroundWatchTimer = null;
+    }
+  }, 3000);
+}
 async function codexCopyRt(payload) { if (payload?.fallback) { Object.assign(clipboardDialog, { open: true, title: `复制 ${payload.email || "账号"} 的 RT`, value: payload.text, successMessage: "RT 已复制" }); return; } notify(payload?.successMessage || "已复制", "ok"); }
 onBeforeUnmount(stopCodexOauthPolling);
 const smsCountryDialog = reactive({ open: false, loading: false, error: "", items: [], selected: [] });
@@ -3209,8 +3284,8 @@ onBeforeUnmount(() => {
         <RebindView v-else-if="active === 'rebind'" :progress="rebindProgress" :preflight="rebindPreflight" :busy="busy || rebindRequestBusy" :checking="rebindChecking" @preflight="preflightRebind" @start="startRebind" @stop="stopRebind" @reset="resetRebindForInput" @input-change="resetRebindForInput" />
         <CredentialExportView v-else-if="active === 'credential-export'" :accounts="accounts" :busy="busy" @export="exportSecurityByEmail" />
         <ProtocolLoginView v-else-if="active === 'protocol-login'" :accounts="accounts" :progress="reauthProgress" :health-progress="healthProgress" :preflight="protocolLoginPreflight" :busy="busy" @start="startProtocolLoginByEmail" @stop="stopReauth" @health="healthProtocolLoginEmails" @input-change="resetProtocolLoginResultsForInput" />
-        <OperationsView v-else-if="active === 'operations'" :operations="operations" :trash="trash" :form="maintenanceForm" :maddy-auto-form="maddyAutoForm" :backup-schedule-form="backupScheduleForm" :sms-form="smsForm" :sms-config="smsConfig" :groups="groups" :security="securityForm" :busy="busy" :maintenance-running="maintenanceActive" :maddy-auto-running="maddyAutoActive" @refresh="() => Promise.all([loadOperations(), loadTrash()])" @save="saveMaintenance" @run="runMaintenance" @save-maddy-auto="saveMaddyAutoRegister" @run-maddy-auto="runMaddyAutoRegister" @test-webhook="testWebhook" @backup="createBackupNow" @save-backup-schedule="saveBackupSchedule" @save-sms-config="saveSmsConfig" @test-sms="testSmsConfig" @pick-countries="openSmsCountryPicker" @clear-docking-history="clearDockingHistory" :sms-countries="smsCountries" @restore-backup="restoreBackupNow" @restore-trash="restoreTrash" @change-password="changePassword" @revoke-sessions="revokeSessions" />
-          <CliproxyView v-else-if="active === 'cliproxy'" :accounts="cliproxyAccounts" :loading="cliproxyLoading" :refreshing="cliproxyRefreshing" :importing="cliproxyImporting" :resetting-file="cliproxyResettingFile" @refresh="loadCliproxyAccounts" @refresh-quota="refreshCliproxyQuota" @import-cpa="importCliproxyCpa" @import-sub2="importCliproxySub2" @export-cpa="exportCliproxyCpa" @export-sub2="exportCliproxySub2" @consume-reset="consumeCliproxyReset" />
+        <OperationsView v-else-if="active === 'operations'" :operations="operations" :trash="trash" :form="maintenanceForm" :maddy-auto-form="maddyAutoForm" :backup-schedule-form="backupScheduleForm" :sms-form="smsForm" :sms-config="smsConfig" :groups="groups" :security="securityForm" :busy="busy" :maintenance-running="maintenanceActive" :maddy-auto-running="maddyAutoActive" :sms-stats="smsStats" :sms-stats-loading="smsStatsLoading" @refresh="() => Promise.all([loadOperations(), loadTrash(), loadSmsStats()])" @save="saveMaintenance" @run="runMaintenance" @save-maddy-auto="saveMaddyAutoRegister" @run-maddy-auto="runMaddyAutoRegister" @test-webhook="testWebhook" @backup="createBackupNow" @save-backup-schedule="saveBackupSchedule" @save-sms-config="saveSmsConfig" @test-sms="testSmsConfig" @pick-countries="openSmsCountryPicker" @clear-docking-history="clearDockingHistory" :sms-countries="smsCountries" @restore-backup="restoreBackupNow" @restore-trash="restoreTrash" @change-password="changePassword" @revoke-sessions="revokeSessions" @refresh-sms-stats="loadSmsStats" />
+          <CliproxyView v-else-if="active === 'cliproxy'" :accounts="cliproxyAccounts" :loading="cliproxyLoading" :refreshing="cliproxyRefreshing" :importing="cliproxyImporting" :deleting="cliproxyDeleting" :relogin-loading="cliproxyReloginLoading" :resetting-file="cliproxyResettingFile" @refresh="loadCliproxyAccounts" @refresh-quota="refreshCliproxyQuota" @import-cpa="importCliproxyCpa" @import-sub2="importCliproxySub2" @export-cpa="exportCliproxyCpa" @export-sub2="exportCliproxySub2" @consume-reset="consumeCliproxyReset" @delete-accounts="deleteCliproxyAccounts" @relogin-account="reloginCliproxyAccount" />
       </template>
     </main>
     <footer class="foot"><span>gpt-register-fp · Vue 3</span></footer>

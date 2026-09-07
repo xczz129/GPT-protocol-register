@@ -1011,6 +1011,9 @@ function moveSelected() {
                       <span>{{ !item.has_session_token ? "缺失" : copyingAt ? "读取中…" : "复制 Token" }}</span>
                       <Copy :size="11" aria-hidden="true" />
                     </button>
+                    <span :class="['sms-state-chip', item.has_refresh_token ? 'is-ok' : 'is-none']" :title="item.has_refresh_token ? '已接码：账号已持有 RT' : '未接码：账号还没有 RT，可在操作列点手机图标补发'">
+                      <Smartphone :size="11" aria-hidden="true" />{{ item.has_refresh_token ? "已接码" : "未接码" }}
+                    </span>
                     <small v-if="item.c2a_upload_status" :class="['capsule-badge', 'acct-c2a', item.c2a_upload_status === 'success' ? 'plus' : 'free']">
                       c2a {{ item.c2a_upload_status === 'success' ? '已上传' : '失败' }}
                     </small>

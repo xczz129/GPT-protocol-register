@@ -669,6 +669,31 @@ async def export_sub2(files: str = Query(default="")) -> Any:
     )
 
 
+@router.post("/api/cliproxy/delete")
+async def delete_accounts(body: QuotaRefreshRequest) -> dict[str, Any]:
+    """删除中转账号:auth 文件移出 auths 目录(cliproxy 自动卸载),
+    移入同级 auths-trash 回收目录,可手动找回。"""
+    selected = _safe_auth_paths([name for name in body.files if str(name or "").strip()])
+    if not selected:
+        raise HTTPException(status_code=404, detail="未找到指定的 auth 文件")
+    trash_dir = AUTHS_DIR.parent / "auths-trash"
+    trash_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    deleted: list[str] = []
+    failed: list[dict[str, str]] = []
+    for path in selected:
+        try:
+            path.replace(trash_dir / f"{stamp}-{path.name}")
+            deleted.append(path.name)
+        except OSError as exc:
+            failed.append({"file": path.name, "error": str(exc)[:120]})
+    if deleted:
+        with _QUOTA_LOCK:
+            for name in deleted:
+                _QUOTA_CACHE.pop(name, None)
+    return {"ok": not failed, "deleted": deleted, "failed": failed}
+
+
 @router.post("/api/cliproxy/reset-credits/consume")
 async def consume_reset_credit(body: ResetCreditConsumeRequest) -> dict[str, Any]:
     selected = _safe_auth_paths([body.file])

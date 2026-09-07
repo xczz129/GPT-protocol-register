@@ -7,11 +7,14 @@ const props = defineProps({
   loading: Boolean,
   refreshing: Boolean,
   importing: Boolean,
+  deleting: Boolean,
+  reloginLoading: Boolean,
   resettingFile: { type: String, default: "" },
 });
-const emit = defineEmits(["refresh", "refresh-quota", "import-cpa", "import-sub2", "export-cpa", "export-sub2", "consume-reset"]);
+const emit = defineEmits(["refresh", "refresh-quota", "import-cpa", "import-sub2", "export-cpa", "export-sub2", "consume-reset", "delete-accounts", "relogin-account"]);
 
 const selected = ref([]);
+const planFilter = ref("all");
 const cpaInput = ref(null);
 const sub2Input = ref(null);
 const exportDialog = ref({ open: false, files: [] });
@@ -138,6 +141,39 @@ function confirmReset() {
   emit("consume-reset", { file });
   closeResetDialog();
 }
+function requestDelete(files) {
+  const list = (files || []).filter(Boolean);
+  if (!list.length) return;
+  emit("delete-accounts", list);
+}
+// 凭据失效(401/403/刷新失败)的中转账号可走账号库重新 OAuth 登录
+function isCredentialDead(item) {
+  const status = itemStatus(item);
+  return status === "unauthorized" || status === "forbidden" || status === "refresh_failed";
+}
+function requestRelogin(item) {
+  const email = String(item?.email || "").trim();
+  if (!email) return;
+  emit("relogin-account", { email, file: item.file });
+}
+const planFilterOptions = computed(() => {
+  const counts = { all: items.value.length, free: 0, plus: 0, pro: 0, team: 0 };
+  for (const item of items.value) {
+    const key = planClass(item.plan_type);
+    if (counts[key] !== undefined) counts[key] += 1;
+  }
+  return [
+    { value: "all", label: `全部 (${counts.all})` },
+    { value: "free", label: `Free (${counts.free})` },
+    { value: "plus", label: `Plus (${counts.plus})` },
+    { value: "pro", label: `Pro (${counts.pro})` },
+    { value: "team", label: `Team (${counts.team})` },
+  ].filter((option) => option.value === "all" || Number(option.label.match(/\((\d+)\)/)?.[1] || 0) > 0);
+});
+const filteredItems = computed(() => {
+  if (planFilter.value === "all") return items.value;
+  return items.value.filter((item) => planClass(item.plan_type) === planFilter.value);
+});
 function planClass(value) {
   const plan = String(value || "").trim().toLowerCase();
   if (plan.includes("team") || plan.includes("business")) return "team";
@@ -190,6 +226,7 @@ const lastQuotaFetched = computed(() => {
           <button class="btn secondary" :disabled="loading || refreshing || importing" @click="openSub2Picker">导入 SUB2 JSON</button>
           <button class="btn primary" :disabled="loading || refreshing || importing || !items.length" @click="openExportDialog">导出 CPA JSON</button>
           <button class="btn secondary" :disabled="loading || refreshing || importing || !items.length" @click="openExportDialog('sub2')">导出 SUB2 JSON</button>
+          <button class="btn danger" :disabled="loading || refreshing || importing || deleting || !selected.length" @click="requestDelete(selected)">{{ deleting ? "删除中…" : `删除选中 (${selected.length})` }}</button>
           <input ref="cpaInput" class="cliproxy-file-input" type="file" accept="application/json,.json" @change="(event) => handleImportFile(event, 'cpa')" />
           <input ref="sub2Input" class="cliproxy-file-input" type="file" accept="application/json,.json" @change="(event) => handleImportFile(event, 'sub2')" />
         </div>
@@ -208,14 +245,19 @@ const lastQuotaFetched = computed(() => {
 
     <section v-if="items.length" class="card span-all">
       <div class="card-h">
-        <div><h2>账号明细</h2><p class="subtle">共 {{ items.length }} 个 · 已选 {{ selected.length }} 个</p></div>
-        <p class="hint">单个账号可在操作列下载；批量导出请使用上方 CPA / SUB2 导出。</p>
+        <div><h2>账号明细</h2><p class="subtle">共 {{ items.length }} 个 · 已选 {{ selected.length }} 个<template v-if="planFilter !== 'all'"> · 筛选 {{ filteredItems.length }} 个</template></p></div>
+        <div class="row-btns">
+          <select v-model="planFilter" class="cliproxy-plan-filter" aria-label="按套餐筛选">
+            <option v-for="option in planFilterOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
+          </select>
+          <p class="hint">单个账号可在操作列下载；批量导出请使用上方 CPA / SUB2 导出。</p>
+        </div>
       </div>
       <div class="table-wrap cliproxy-wrap">
         <table class="cliproxy-table">
           <thead>
             <tr>
-              <th class="col-check"><input type="checkbox" :checked="selected.length === items.length && items.length > 0" @change="toggleAll" /></th>
+              <th class="col-check"><input type="checkbox" :checked="selected.length === filteredItems.length && filteredItems.length > 0" @change="toggleAll" /></th>
               <th>账号</th>
               <th>套餐</th>
               <th>状态</th>
@@ -228,7 +270,7 @@ const lastQuotaFetched = computed(() => {
             </tr>
           </thead>
           <tbody>
-            <tr v-for="item in items" :key="item.file">
+            <tr v-for="item in filteredItems" :key="item.file">
               <td class="col-check"><input v-model="selected" type="checkbox" :value="item.file" :aria-label="`选择中转账号 ${item.email || item.file}`" /></td>
               <td>
                 <div class="cliproxy-account">
@@ -272,8 +314,10 @@ const lastQuotaFetched = computed(() => {
               <td><small class="cliproxy-sub">{{ item.expired ? formatTime(item.expired) : "-" }}</small></td>
               <td class="col-actions">
                 <div class="row-btns">
+                  <button v-if="isCredentialDead(item)" class="btn primary sm" type="button" :disabled="reloginLoading" :title="`用账号库凭据对 ${item.email || item.file} 重新 OAuth 登录并覆盖写回`" @click="requestRelogin(item)">重新登录</button>
                   <button class="btn secondary sm" :disabled="refreshing" @click="emit('refresh-quota', [item])">刷新</button>
                   <a class="btn secondary sm" :href="downloadUrl([item.file])">下载</a>
+                  <button class="btn danger sm" :disabled="deleting" @click="requestDelete([item.file])">删除</button>
                 </div>
               </td>
             </tr>
@@ -365,4 +409,6 @@ const lastQuotaFetched = computed(() => {
 .cliproxy-reset-cell strong { font-family: var(--mono); color: var(--ink-800); font-size: 13px; }
 .cliproxy-reset-btn { min-height: 30px; padding: 4px 10px; font-size: 11px; }
 .cliproxy-reset-empty { color: var(--ink-500); font-family: var(--mono); font-size: 12px; }
+.cliproxy-plan-filter { min-height: 34px; padding: 4px 10px; font-size: 12.5px; border: 1px solid var(--line-2); border-radius: 8px; background: var(--bg-2); color: var(--ink-800); cursor: pointer; }
+.cliproxy-plan-filter:focus { outline: none; border-color: var(--acc, #6366f1); }
 </style>

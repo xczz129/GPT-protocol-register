@@ -11,13 +11,15 @@ const props = defineProps({
   smsForm: { type: Object, required: true },
   smsConfig: { type: Object, default: () => ({}) },
   smsCountries: { type: Array, default: () => [] },
+  smsStats: { type: Object, default: () => null },
+  smsStatsLoading: Boolean,
   groups: { type: Array, default: () => [] },
   security: { type: Object, required: true },
   busy: Boolean,
   maintenanceRunning: Boolean,
   maddyAutoRunning: Boolean,
 });
-const emit = defineEmits(["refresh", "save", "run", "save-maddy-auto", "run-maddy-auto", "test-webhook", "backup", "save-backup-schedule", "save-sms-config", "test-sms", "pick-countries", "clear-docking-history", "restore-backup", "restore-trash", "change-password", "revoke-sessions"]);
+const emit = defineEmits(["refresh", "save", "run", "save-maddy-auto", "run-maddy-auto", "test-webhook", "backup", "save-backup-schedule", "save-sms-config", "test-sms", "pick-countries", "clear-docking-history", "restore-backup", "restore-trash", "change-password", "revoke-sessions", "refresh-sms-stats"]);
 const dockingHistory = computed(() => {
   const list = (props.smsConfig && props.smsConfig.firefox_docking_code_history) || [];
   const cur = String(props.smsForm?.firefoxDockingCode || "").trim();
@@ -40,6 +42,26 @@ const healthyAccounts = computed(() => Number(props.operations.accounts?.alive |
 const accountScope = computed(() => Math.max(0, Number(props.operations.accounts?.total || 0) - Number(props.operations.accounts?.deactivated || 0)));
 const accountRate = computed(() => accountScope.value ? Math.round(healthyAccounts.value * 100 / accountScope.value) : 0);
 const failureMax = computed(() => Math.max(1, ...(props.operations.metrics?.failure_reasons || []).map((item) => Number(item.count || 0))));
+const smsStatsView = ref("country");
+const smsStatsSummary = computed(() => props.smsStats?.summary || { total: 0, success: 0, failed: 0, rate: 0 });
+const smsStatsRows = computed(() => {
+  const source = smsStatsView.value === "tier" ? props.smsStats?.tiers : props.smsStats?.countries;
+  return (source || []).map((row) => ({
+    name: row.name,
+    total: Number(row.total || 0),
+    ok: Number(row.ok || 0),
+    fail: Number(row.fail || 0),
+    rate: Number(row.rate || 0),
+    cost: Number(row.cost || 0),
+    price: Number(row.price || 0),
+  }));
+});
+const smsStatsMaxTotal = computed(() => Math.max(1, ...smsStatsRows.value.map((row) => row.total)));
+function smsRateLevel(rate) {
+  if (rate >= 20) return "good";
+  if (rate >= 8) return "mid";
+  return "low";
+}
 const maddyAuto = computed(() => props.operations.maddy_auto_register || {});
 const maddyDomainsText = computed(() => (maddyAuto.value.domains || []).join("、") || "-");
 function formatSize(value) { const size = Number(value || 0); return size > 1048576 ? `${(size / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(size / 1024))} KB`; }
@@ -71,6 +93,36 @@ function formatTime(value) { if (!value) return "-"; try { const date = new Date
               <div class="failure-track"><i :style="{ width: `${Math.max(4, item.count * 100 / failureMax)}%` }"></i></div>
             </li>
           </ol>
+        </div>
+
+        <div class="failure-chart sms-stats-dashboard">
+          <div class="failure-chart-title">
+            <b>接码成功率</b>
+            <span class="failure-total">{{ smsStatsSummary.success }} 通过 / {{ smsStatsSummary.total }} 取号</span>
+          </div>
+          <div class="sms-stats-toolbar">
+            <div class="seg-controls sms-stats-seg">
+              <button type="button" class="seg-btn" :class="{ active: smsStatsView === 'country' }" @click="smsStatsView = 'country'">按国家</button>
+              <button type="button" class="seg-btn" :class="{ active: smsStatsView === 'tier' }" @click="smsStatsView = 'tier'">按档位</button>
+            </div>
+            <strong :class="['sms-stats-overall', `rate-${smsRateLevel(smsStatsSummary.rate)}`]">{{ smsStatsSummary.rate }}%</strong>
+            <button class="btn secondary sm" type="button" :disabled="smsStatsLoading" @click="emit('refresh-sms-stats')">{{ smsStatsLoading ? "统计中…" : "刷新" }}</button>
+          </div>
+          <div v-if="!smsStatsRows.length" class="dashboard-empty">{{ smsStatsLoading ? "统计中…" : "暂无接码记录" }}</div>
+          <div v-else class="sms-stats-list">
+            <div v-for="(row, index) in smsStatsRows" :key="row.name" class="sms-stats-row">
+              <span class="sms-stats-rank">{{ index + 1 }}</span>
+              <div class="sms-stats-main">
+                <div class="sms-stats-head">
+                  <b class="sms-stats-name" :title="row.name">{{ row.name }}</b>
+                  <span class="sms-stats-nums">{{ row.ok }}/{{ row.total }}</span>
+                  <strong :class="['sms-stats-rate', `rate-${smsRateLevel(row.rate)}`]">{{ row.rate }}%</strong>
+                </div>
+                <div class="sms-stats-track"><i :style="{ width: `${Math.max(2, row.total * 100 / smsStatsMaxTotal)}%` }"></i></div>
+                <small class="sms-stats-meta">拒 {{ row.fail }} · ${{ row.cost.toFixed(3) }}<template v-if="row.price"> · 单价 ${{ row.price.toFixed(3) }}</template></small>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </section>

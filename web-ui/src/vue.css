@@ -974,6 +974,53 @@ table.acct .col-actions { text-align: right; white-space: nowrap; }
 }
 .acct-c2a { font-size: 9px; padding: 1px 6px; }
 
+/* 接码状态芯片:绿色=已接码(RT 在手),琥珀=未接码 */
+.sms-state-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 9px;
+  font-size: 10.5px;
+  font-weight: 700;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+.sms-state-chip.is-ok {
+  color: #34d399;
+  background: rgba(52, 211, 153, 0.12);
+  border-color: rgba(52, 211, 153, 0.35);
+}
+.sms-state-chip.is-none {
+  color: #fbbf24;
+  background: rgba(251, 191, 36, 0.12);
+  border-color: rgba(251, 191, 36, 0.35);
+}
+html[data-theme="light"] .sms-state-chip.is-ok { color: #0d9668; }
+html[data-theme="light"] .sms-state-chip.is-none { color: #b45309; }
+
+/* 运维-接码成功率统计(运行统计卡片内区块) */
+.sms-stats-dashboard { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.sms-stats-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.sms-stats-seg .seg-btn { padding: 5px 14px; font-size: 12px; }
+.sms-stats-overall { margin-left: auto; font-family: var(--mono); font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.sms-stats-list { display: grid; gap: 10px; max-height: 300px; overflow: auto; padding-right: 2px; }
+.sms-stats-row { display: flex; gap: 10px; align-items: flex-start; }
+.sms-stats-rank { flex: none; width: 22px; text-align: center; font-family: var(--mono); font-size: 12px; color: var(--ink-400); padding-top: 2px; }
+.sms-stats-main { flex: 1; min-width: 0; display: grid; gap: 4px; }
+.sms-stats-head { display: flex; align-items: baseline; gap: 10px; }
+.sms-stats-name { font-size: 13px; font-weight: 600; color: var(--ink-800); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sms-stats-nums { font-size: 11.5px; color: var(--ink-500); font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.sms-stats-rate { margin-left: auto; font-family: var(--mono); font-size: 13.5px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.sms-stats-track { height: 5px; border-radius: 4px; background: var(--bg-inset, var(--bg-1)); overflow: hidden; }
+.sms-stats-track i { display: block; height: 100%; border-radius: 4px; background: var(--acc, #6366f1); transition: width 0.3s; }
+.sms-stats-meta { font-size: 10.5px; color: var(--ink-400); font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.sms-stats-rate.rate-good, .sms-stats-overall.rate-good { color: var(--ok, #22c55e); }
+.sms-stats-rate.rate-mid, .sms-stats-overall.rate-mid { color: var(--warn, #f59e0b); }
+.sms-stats-rate.rate-low, .sms-stats-overall.rate-low { color: var(--err, #ef4444); }
+
+
+
 .totp-btn strong { font-size: 12.5px; letter-spacing: 0.06em; font-weight: 700; }
 
 .acct-meta {
