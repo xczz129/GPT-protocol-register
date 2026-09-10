@@ -9,7 +9,11 @@ from common.session_export import parse_jwt_payload
 from register.sessions import JobCancelled
 from mail import mark_mailbox_code_boundary, mark_mailbox_result, release_mailbox
 from proxy_util import is_proxy_transport_error, proxy_brief
-from register.protocol_runtime import ProtocolRuntimeSettings, activate_runtime
+from register.protocol_runtime import (
+    ProtocolRuntimeSettings,
+    activate_runtime,
+    current_runtime_settings,
+)
 from register.util import _append_account
 
 from register.protocol_context import (
@@ -729,7 +733,7 @@ def login_with_password_totp_one(
     proxy_config: dict[str, Any] | None = None,
     protocol_runtime: ProtocolRuntimeSettings | None = None,
 ) -> dict[str, Any] | None:
-    """Run one re-login using the stored password and TOTP secret."""
+    """Re-login, retrying only an empty pre-selection Team auth session."""
     start = time.time()
     stop = stop_check if callable(stop_check) else (lambda: False)
     task_event = _operation_event_forwarder(
@@ -750,10 +754,15 @@ def login_with_password_totp_one(
     runtime_context.__enter__()
     registrar = None
 
+    def ensure_running() -> None:
+        if stop():
+            raise JobCancelled("stop requested")
+        if current_runtime_settings().expired():
+            raise RuntimeError("protocol_account_timeout")
+
     try:
         if not str(password or "").strip() or not str(totp_secret or "").strip():
             raise RuntimeError("协议凭据登录要求同时具备密码和 TOTP 2FA")
-        registrar = PlatformRegistrar(proxy)
         if callable(task_event):
             task_event(
                 index,
@@ -762,14 +771,52 @@ def login_with_password_totp_one(
                 email=str(email or "").strip(),
                 step="密码 + TOTP 协议登录启动",
             )
-        tokens = registrar.login_with_password_totp(
-            str(email or "").strip(),
-            password,
-            totp_secret,
-            index,
-            workspace_name=workspace_name,
-            require_team_workspace=require_team_workspace,
-        )
+        attempt_limit = 3 if require_team_workspace else 1
+        for attempt in range(1, attempt_limit + 1):
+            ensure_running()
+            registrar = PlatformRegistrar(proxy)
+            try:
+                tokens = registrar.login_with_password_totp(
+                    str(email or "").strip(),
+                    password,
+                    totp_secret,
+                    index,
+                    workspace_name=workspace_name,
+                    require_team_workspace=require_team_workspace,
+                )
+                break
+            except RuntimeError as error:
+                # This code is emitted before workspace/select or a callback
+                # is consumed. All other authentication/identity failures are
+                # final, including a real list that contains no matching Team.
+                if (
+                    not require_team_workspace
+                    or attempt >= attempt_limit
+                    or str(error).partition(":")[0] != "workspace_page_without_workspaces"
+                    or getattr(registrar, "_selected_workspace_id", "")
+                ):
+                    raise
+                failed_registrar, registrar = registrar, None
+                failed_registrar.close()
+                ensure_running()
+                step(
+                    index,
+                    "Team 工作区列表暂未返回，关闭当前认证会话；"
+                    f"准备第 {attempt + 1}/{attempt_limit} 次全新会话登录"
+                    "（workspace_page_without_workspaces）",
+                    "yellow",
+                )
+                retry_at = time.monotonic() + attempt
+                while True:
+                    ensure_running()
+                    remaining = retry_at - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    deadline = current_runtime_settings().deadline
+                    if deadline is not None:
+                        remaining = min(remaining, deadline - time.monotonic())
+                    if remaining > 0:
+                        time.sleep(min(0.1, remaining))
         # Return the exact identity used for this session so reauthentication
         # can replace stale browser metadata from an older Chrome account.
         fp = _browser_fingerprint(registrar.fingerprint)

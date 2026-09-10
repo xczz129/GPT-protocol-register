@@ -10,7 +10,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, unquote, urlencode, urldefrag, urljoin, urlsplit
 from common.proxy_clearance import clearance_error, refresh_clearance
 from common.session_export import build_account_record, parse_jwt_payload
 from common.totp import totp_code
@@ -93,6 +93,53 @@ from register.protocol_http import (
 )
 
 
+
+
+def _workspace_recovery_url(value: str, base: str) -> str:
+    """Allow only auth-site GET navigation that cannot consume an OAuth code."""
+    try:
+        target = urldefrag(urljoin(base, str(value or "").strip()))[0]
+        parsed = urlsplit(target)
+        origin = urlsplit(auth_base)
+        if (
+            parsed.scheme != "https"
+            or parsed.netloc.lower() != origin.netloc.lower()
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            return ""
+        path = unquote(parsed.path).rstrip("/").lower()
+        query_keys = {key.lower() for key, _value in parse_qsl(parsed.query, keep_blank_values=True)}
+        reauth_paths = (
+            "/log-in", "/login", "/sign-in", "/mfa", "/mfa-challenge", "/email-verification",
+            "/verify-email", "/reset-password", "/phone-verification",
+            "/api/accounts/authorize", "/authorize", "/oauth/authorize",
+        )
+        if (
+            "callback" in path
+            or query_keys.intersection({"code", "error", "access_token", "id_token", "session_token"})
+            or any(path == prefix or path.startswith(prefix + "/") for prefix in reauth_paths)
+        ):
+            return ""
+        return target
+    except (TypeError, ValueError):
+        return ""
+
+
+def _workspace_recovery_log_url(value: str, base: str = "") -> str:
+    """Never include query strings, fragments or URL userinfo in diagnostics."""
+    try:
+        parsed = urlsplit(urljoin(base, str(value or "")))
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return "invalid_url"
+        return f"{parsed.hostname}{parsed.path}"[:160]
+    except (TypeError, ValueError):
+        return "invalid_url"
+
+
+def _is_workspace_recovery_page(url: str) -> bool:
+    path = urlsplit(url).path.lower()
+    return not path.startswith("/api/") and ("workspace" in path or path.endswith("/consent"))
 
 
 class PlatformRegistrar:
@@ -707,31 +754,91 @@ class PlatformRegistrar:
             )
         return data
 
-    def _dump_client_auth_session(self, referer: str, index: int) -> dict[str, Any]:
-        """Refresh the auth-session checksum observed during the MFA page load."""
-        url = f"{auth_base}/api/accounts/client_auth_session_dump"
-        headers = _headers_with_clearance(
-            self._navigate_headers(referer),
-            url,
-            self.proxy,
-            self.clearance_user_agent,
-        )
-        response, error = request_with_local_retry(
-            self.session,
-            "get",
-            url,
-            headers=headers,
-            allow_redirects=False,
-            verify=_tls_verify(),
-        )
-        if response is None or response.status_code != 200:
-            step(
-                index,
-                f"认证会话同步跳过 · {error or getattr(response, 'status_code', 'unknown')}",
-                "yellow",
+    def _dump_client_auth_session(
+        self, referer: str, index: int, *, recover_workspaces: bool = False,
+    ) -> dict[str, Any]:
+        """Keep pre-MFA sync unchanged; recover missing post-MFA workspace state.
+
+        Recovery uses the same cookie jar and a bounded manual GET chain. It
+        never follows a callback, submits credentials, or repeats workspace/select.
+        """
+        dump_url = f"{auth_base}/api/accounts/client_auth_session_dump"
+        url = dump_url
+        request_referer = referer
+        fallback = _workspace_recovery_url(referer, auth_base)
+        fallback = fallback if fallback and _is_workspace_recovery_page(fallback) else ""
+        visited: set[str] = set()
+        resynced = False
+        if recover_workspaces:
+            self._workspace_recovery_referer = ""
+        for _hop in range(6 if recover_workspaces else 1):
+            if _STOP_CHECK.get()():
+                raise JobCancelled("stop requested")
+            visited.add(url)
+            headers = _headers_with_clearance(
+                self._navigate_headers(request_referer), url,
+                self.proxy, self.clearance_user_agent,
             )
-            return {}
-        return _response_json(response)
+            response, error = request_with_local_retry(
+                self.session, "get", url, headers=headers,
+                allow_redirects=False, verify=_tls_verify(),
+                **({"retry_attempts": 1} if recover_workspaces else {}),
+            )
+            status = int(getattr(response, "status_code", 0) or 0)
+            location = str(
+                (getattr(response, "headers", {}) or {}).get("Location")
+                or (getattr(response, "headers", {}) or {}).get("location") or ""
+            ).strip()
+            response_url = str(getattr(response, "url", "") or url)
+            if not recover_workspaces:
+                if response is None or status != 200:
+                    target = f" → {_workspace_recovery_log_url(location, response_url)}" if location else ""
+                    step(index, f"认证会话同步跳过 · {status or 'transport_error'}{target}", "yellow")
+                    return {}
+                return _response_json(response)
+
+            safe_current = _workspace_recovery_url(response_url, url)
+            target_hint = f" → {_workspace_recovery_log_url(location, response_url)}" if location else ""
+            step(index, f"工作区会话恢复[{_hop + 1}/6] · HTTP={status or 'transport_error'} "
+                 f"{_workspace_recovery_log_url(url)}{target_hint}")
+            if response is None or status >= 400 or not safe_current:
+                # Error bodies are not authenticated workspace evidence. Do not
+                # log transport-error text: it may contain cookies or URL queries.
+                if response is None:
+                    reason = "protocol_account_timeout" if error == "protocol_account_timeout" else "workspace_session_transport_error"
+                    raise RuntimeError(reason + ": 工作区会话同步请求未完成")
+                if status >= 400:
+                    raise RuntimeError(f"workspace_session_http_{status}: 工作区会话同步请求失败")
+                raise RuntimeError("workspace_session_unexpected_navigation: 认证会话跳转超出预期范围")
+            if safe_current != dump_url and _is_workspace_recovery_page(safe_current):
+                self._workspace_recovery_referer = safe_current
+            data = _response_json(response)
+            workspaces = self._auth_session_workspaces(data)
+            if workspaces:
+                step(index, f"工作区会话恢复成功 · 工作区数量={len(workspaces)}")
+                return {"workspaces": workspaces}
+
+            continuation = location
+            if not continuation and status == 200:
+                continuation, _page = _auth_step_details(data)
+            next_url = _workspace_recovery_url(continuation, response_url) if continuation else ""
+            if next_url and next_url not in visited:
+                request_referer, url = safe_current, next_url
+                continue
+            if continuation and not next_url:
+                step(index, "工作区会话恢复暂停 · 跳转需重新认证或属于回调，未继续访问", "yellow")
+            # A real workspace page supplied by MFA can set cookies omitted by
+            # the dump. Never guess a page URL or navigate the MFA callback here.
+            if fallback and fallback not in visited:
+                request_referer, url = safe_current, fallback
+                continue
+            page_referer = self._workspace_recovery_referer
+            if page_referer and not resynced and safe_current != dump_url:
+                resynced = True
+                request_referer, url = page_referer, dump_url
+                continue
+            break
+        return {}
 
     @staticmethod
     def _totp_factor(data: dict[str, Any]) -> tuple[str, str]:
@@ -783,8 +890,9 @@ class PlatformRegistrar:
         """Select the requested workspace before consuming its callback."""
         workspaces = self._auth_session_workspaces(*auth_payloads)
         if not workspaces and require_team_workspace:
-            refreshed = self._dump_client_auth_session(referer, index)
+            refreshed = self._dump_client_auth_session(referer, index, recover_workspaces=True)
             workspaces = self._auth_session_workspaces(refreshed, *auth_payloads)
+            referer = getattr(self, "_workspace_recovery_referer", "") or referer
         if not workspaces:
             raise RuntimeError("workspace_page_without_workspaces: 同步认证会话后仍无工作区，未选择个人空间")
         wanted = str(workspace_name or "").strip().lower()
@@ -860,6 +968,7 @@ class PlatformRegistrar:
         totp_secret = str(totp_secret or "").strip()
         self._selected_workspace_id = ""
         self._selected_workspace_name = ""
+        self._workspace_recovery_referer = ""
         if not email:
             raise RuntimeError("协议凭据登录缺少邮箱")
         if not password or not totp_secret:
@@ -947,6 +1056,10 @@ class PlatformRegistrar:
         callback_url, callback_page = _auth_step_details(verified)
         workspace_page = "workspace" in f"{callback_page or ''} {callback_url or ''}".lower()
         if require_team_workspace:
+            step(index, f"Team MFA 返回 · page={str(callback_page or '?')[:60]} "
+                 f"continue={_workspace_recovery_log_url(callback_url, auth_base)} "
+                 f"response_workspaces={len(workspace_entries(verified))} "
+                 f"session_workspaces={len(self._auth_session_workspaces(verified, session_dump))}")
             # An immediate callback can represent the personal workspace. Select
             # the team while the auth transaction is still live, BEFORE following
             # either callback. Never replay a consumed callback as a fallback.
