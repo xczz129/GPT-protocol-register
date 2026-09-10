@@ -20,6 +20,7 @@ from common.account_store import (
     account_is_deactivated,
     update_account_record_fields,
 )
+from common.team_workspace import requires_team_workspace, validate_session_replacement
 
 NERVER_SESSION_REFRESH_URL = os.environ.get(
     "NERVER_SESSION_REFRESH_URL",
@@ -116,6 +117,7 @@ def refresh_session_via_service(
         "account_id": str(data.get("account_id") or account.get("id") or "").strip(),
         "email": str(data.get("email") or user.get("email") or "").strip(),
         "rotated": bool(data.get("session_rotated")),
+        "session": session,
     }
 
 
@@ -217,7 +219,12 @@ class SessionRefreshJobs:
                 old_exp = int(item.get("old_expires_at") or 0)
             try:
                 result = refresh_session_via_service(str(record.get("session_token") or ""))
-            except SessionRefreshError as error:
+                # Validate the fresh response before old row metadata can mask a
+                # different user's token or a personal workspace fallback.
+                identity = validate_session_replacement(
+                    record, result, require_identity=requires_team_workspace(record),
+                )
+            except (SessionRefreshError, RuntimeError) as error:
                 message = str(error)
                 fields = {
                     "last_token_refresh_at": _now(),
@@ -237,10 +244,23 @@ class SessionRefreshJobs:
                 "health_status": "alive",
                 "health_error": "",
             }
-            if result.get("plan_type"):
-                fields["plan_type"] = result["plan_type"]
-            if result.get("account_id"):
-                fields["account_id"] = result["account_id"]
+            plan = identity["plan_type"] or result.get("plan_type")
+            if plan:
+                fields["plan_type"] = plan
+            if identity["user_id"]:
+                fields["user_id"] = identity["user_id"]
+            if isinstance(result.get("session"), dict) and result["session"]:
+                fields["session"] = result["session"]
+            current_workspace_id = identity["account_id"] or result.get("account_id")
+            if current_workspace_id:
+                # Workspace sessions flip account_id between member id and
+                # shared workspace id; never rewrite identity on refresh.
+                existing_aid = str(record.get("account_id") or "").strip()
+                refreshed_aid = str(current_workspace_id).strip()
+                if not existing_aid or refreshed_aid.lower() == existing_aid.lower():
+                    fields["account_id"] = refreshed_aid
+                else:
+                    fields["workspace_account_id"] = refreshed_aid
             if key:
                 update_account_record_fields({key: fields}, include_records=False)
             if new_exp > old_exp + REFRESH_MARGIN_SECONDS:

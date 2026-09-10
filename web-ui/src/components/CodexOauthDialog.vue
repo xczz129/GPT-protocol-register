@@ -6,7 +6,7 @@ const props = defineProps({
   open: Boolean,
   status: { type: Object, default: () => ({}) },
 });
-const emit = defineEmits(["close", "stop", "copy", "retry", "retry-all"]);
+const emit = defineEmits(["close", "stop", "copy", "retry", "retry-all", "history"]);
 
 const logsEl = ref(null);
 const copiedKey = ref("");
@@ -104,6 +104,7 @@ async function copyRt(rt, email) {
           <div class="codex-oauth-toolbar">
             <span>{{ status.done || 0 }} / {{ status.total || 0 }} · 成功 {{ status.success || 0 }}<template v-if="skippedCount"> · 已接码 {{ skippedCount }}</template> · 失败 {{ status.failed || 0 }}<template v-if="status.running"> · 运行中…</template><template v-else> · 已结束</template></span>
             <div class="row-btns">
+              <button v-if="isImport" class="btn secondary sm" type="button" title="查看每个账号的历史导入日志" @click="emit('history')"><ScrollText :size="12" aria-hidden="true" />历史日志</button>
               <button v-if="canRetry" class="btn secondary sm" type="button" @click="emit('retry-all')"><RefreshCw :size="12" aria-hidden="true" />重试失败项 ({{ failedCount }})</button>
               <button v-if="status.running" class="btn danger sm" type="button" @click="emit('stop')">停止</button>
               <button class="btn secondary sm" type="button" @click="emit('close')">关闭</button>

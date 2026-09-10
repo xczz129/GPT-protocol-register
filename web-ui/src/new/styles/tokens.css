@@ -1,0 +1,146 @@
+/* ===================================
+   GPT Register FP Console — 设计令牌
+   macOS 白蓝液态玻璃（浅色默认）
+   =================================== */
+
+/* --- 浅色主题（默认） --- */
+:root {
+  color-scheme: light;
+
+  /* 背景与氛围 */
+  --bg-base: #e8edf5;
+  --bg-gradient-1: #e0e7ff;
+  --bg-gradient-2: #dbeafe;
+  --bg-gradient-3: #e0f2fe;
+  --bg-gradient-4: #ede9fe;
+  --orb-1: rgba(147, 197, 253, 0.5);
+  --orb-2: rgba(196, 181, 253, 0.4);
+  --orb-3: rgba(165, 218, 255, 0.45);
+
+  /* 玻璃材质 */
+  --glass-bg: rgba(255, 255, 255, 0.55);
+  --glass-bg-hover: rgba(255, 255, 255, 0.72);
+  --glass-bg-strong: rgba(255, 255, 255, 0.6);
+  --glass-border: rgba(255, 255, 255, 0.65);
+  --glass-border-hover: rgba(255, 255, 255, 0.85);
+  --glass-blur: blur(28px) saturate(1.4);
+  --glass-shadow: rgba(100, 120, 180, 0.08);
+
+  /* 主色 — 蓝 */
+  --accent: #2563eb;
+  --accent-light: #3b82f6;
+  --accent-lighter: #93c5fd;
+  --accent-bg: rgba(37, 99, 235, 0.08);
+  --accent-border: rgba(37, 99, 235, 0.15);
+  --accent-glow: rgba(37, 99, 235, 0.2);
+
+  /* 辅色 — 青 */
+  --accent-2: #0ea5e9;
+  --accent-2-bg: rgba(14, 165, 233, 0.08);
+  --accent-2-glow: rgba(14, 165, 233, 0.15);
+
+  /* 文字 */
+  --text-primary: #1e293b;
+  --text-secondary: #475569;
+  --text-muted: #94a3b8;
+
+  /* 语义色 */
+  --success: #10b981;
+  --success-bg: rgba(16, 185, 129, 0.08);
+  --warning: #f59e0b;
+  --warning-bg: rgba(245, 158, 11, 0.08);
+  --error: #ef4444;
+  --error-bg: rgba(239, 68, 68, 0.08);
+  --info: #0ea5e9;
+  --info-bg: rgba(14, 165, 233, 0.08);
+
+  /* 表单与线条 */
+  --field-bg: rgba(255, 255, 255, 0.7);
+  --field-bg-focus: rgba(255, 255, 255, 0.9);
+  --field-border: rgba(0, 0, 0, 0.06);
+  --line-subtle: rgba(0, 0, 0, 0.05);
+  --focus-ring: 0 0 0 3px rgba(59, 130, 246, 0.12);
+
+  /* 圆角 */
+  --radius-sm: 10px;
+  --radius-md: 14px;
+  --radius-lg: 18px;
+
+  /* 阴影（带蓝调） */
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.04), 0 1px 2px rgba(0, 0, 0, 0.02);
+  --shadow-md: 0 4px 16px rgba(100, 120, 180, 0.1), 0 1px 4px rgba(0, 0, 0, 0.04);
+  --shadow-lg: 0 8px 32px rgba(100, 120, 180, 0.15), 0 2px 8px rgba(0, 0, 0, 0.05);
+
+  /* 动效 */
+  --transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  --transition-fast: all 0.15s cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* 字体 */
+  --sans: "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Display", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --mono: "SF Mono", ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
+
+  /* 滚动条 */
+  --scrollbar-thumb: rgba(0, 0, 0, 0.08);
+
+  /* 进度条轨道 */
+  --progress-track: rgba(0, 0, 0, 0.04);
+}
+
+/* --- 深色主题（可选，同语言深色玻璃） --- */
+html[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg-base: #0b1120;
+  --bg-gradient-1: #111c33;
+  --bg-gradient-2: #0d1b2e;
+  --bg-gradient-3: #0f1e30;
+  --bg-gradient-4: #161b33;
+  --orb-1: rgba(59, 130, 246, 0.22);
+  --orb-2: rgba(139, 92, 246, 0.18);
+  --orb-3: rgba(14, 165, 233, 0.2);
+
+  --glass-bg: rgba(17, 25, 40, 0.55);
+  --glass-bg-hover: rgba(23, 33, 52, 0.72);
+  --glass-bg-strong: rgba(17, 25, 40, 0.7);
+  --glass-border: rgba(148, 163, 184, 0.16);
+  --glass-border-hover: rgba(148, 163, 184, 0.3);
+  --glass-shadow: rgba(0, 0, 0, 0.3);
+
+  --accent: #3b82f6;
+  --accent-light: #60a5fa;
+  --accent-lighter: #1e3a5f;
+  --accent-bg: rgba(59, 130, 246, 0.14);
+  --accent-border: rgba(59, 130, 246, 0.3);
+  --accent-glow: rgba(59, 130, 246, 0.3);
+
+  --accent-2: #38bdf8;
+  --accent-2-bg: rgba(56, 189, 248, 0.12);
+  --accent-2-glow: rgba(56, 189, 248, 0.2);
+
+  --text-primary: #e8eef8;
+  --text-secondary: #a8b6cc;
+  --text-muted: #64748b;
+
+  --success: #34d399;
+  --success-bg: rgba(52, 211, 153, 0.12);
+  --warning: #fbbf24;
+  --warning-bg: rgba(251, 191, 36, 0.12);
+  --error: #f87171;
+  --error-bg: rgba(248, 113, 113, 0.12);
+  --info: #38bdf8;
+  --info-bg: rgba(56, 189, 248, 0.12);
+
+  --field-bg: rgba(15, 23, 42, 0.6);
+  --field-bg-focus: rgba(15, 23, 42, 0.85);
+  --field-border: rgba(148, 163, 184, 0.16);
+  --line-subtle: rgba(148, 163, 184, 0.1);
+  --focus-ring: 0 0 0 3px rgba(59, 130, 246, 0.25);
+
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.35);
+  --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.45);
+
+  --scrollbar-thumb: rgba(148, 163, 184, 0.2);
+
+  --progress-track: rgba(148, 163, 184, 0.12);
+}

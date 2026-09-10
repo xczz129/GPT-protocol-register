@@ -54,6 +54,11 @@ class MaintenanceUpdate(BaseModel):
     pool_low_threshold: int = Field(3, ge=0, le=10000)
 
 
+class CliproxyQuotaUpdate(BaseModel):
+    enabled: bool = True
+    interval_seconds: int = Field(60, ge=30, le=3600)
+
+
 class BackupRestoreRequest(BaseModel):
     name: str
 
@@ -600,24 +605,6 @@ async def operations():
             settings["has_webhook"] = bool(webhook)
             settings["webhook_masked"] = _state()._mask_secret(webhook) if webhook else ""
             state = _state().load_ops_state()
-            maddy_auto = _state()._maddy_auto_config(cfg)
-            try:
-                maddy_auto["domains"] = _state()._maddy_auto_domains(cfg, refresh=False)
-            except Exception:
-                maddy_auto["domains"] = []
-            maddy_auto.update(
-                {
-                    "current_domain": str(state.get("maddy_auto_current_domain") or ""),
-                    "current_started_at": str(state.get("maddy_auto_current_started_at") or ""),
-                    "last_at": str(state.get("maddy_auto_last_at") or ""),
-                    "last_domain": str(state.get("maddy_auto_last_domain") or ""),
-                    "last_result": state.get("maddy_auto_last_result") or {},
-                    "last_error": str(state.get("maddy_auto_last_error") or ""),
-                    "domain_last_epoch": state.get("maddy_auto_domain_last_epoch") or {},
-                    "running": bool(state.get("maddy_auto_current_domain")),
-                    "trigger_locked": _state()._MADDY_AUTO_RUN_LOCK.locked(),
-                }
-            )
             health_counts = _state().account_health_summary(_state().ACCOUNTS_FILE)
             account_total = health_counts["total"]
             return {
@@ -626,7 +613,7 @@ async def operations():
                 "mail": _state()._public_mail_stats(cfg),
                 "accounts": {"total": account_total, **health_counts},
                 "maintenance": settings,
-                "maddy_auto_register": maddy_auto,
+                "cliproxy_quota": _state()._cliproxy_quota_config(cfg),
                 "state": state,
                 "backups": _state().list_backups(),
                 "backup_schedule": _state()._backup_schedule_config(cfg),
@@ -667,6 +654,8 @@ class UiSettingsUpdate(BaseModel):
     reauth_workers: int = Field(default=3, ge=1, le=20)
     trial_workers: int = Field(default=20, ge=1, le=20)
     refresh_at_workers: int = Field(default=10, ge=1, le=10)
+    # 接码批量任务默认并发(保存的默认值,保存上限 64;单次任务并发不受此限制)
+    codex_sms_workers: int = Field(default=2, ge=1, le=64)
     reauth_mode: str = Field(default="protocol")
     trial_channel: str = Field(default="v4")
 
@@ -690,6 +679,7 @@ async def ui_settings_get():
             "trial_workers": max(1, min(_int(raw.get("trial_workers"), 20), 20)),
             "trial_channel": "nerver" if str(raw.get("trial_channel") or "").strip().lower() == "nerver" else "v4",
             "refresh_at_workers": max(1, min(_int(raw.get("refresh_at_workers"), 10), 10)),
+            "codex_sms_workers": max(1, min(_int(raw.get("codex_sms_workers"), 2), 64)),
             "reauth_mode": "browser" if str(raw.get("reauth_mode") or "").strip().lower() == "browser" else "protocol",
         }
 
@@ -708,6 +698,7 @@ async def ui_settings_update(body: UiSettingsUpdate):
                     "trial_workers": max(1, min(int(body.trial_workers or 20), 20)),
                     "trial_channel": "nerver" if str(body.trial_channel or "").strip().lower() == "nerver" else "v4",
                     "refresh_at_workers": max(1, min(int(body.refresh_at_workers or 10), 10)),
+                    "codex_sms_workers": max(1, min(int(body.codex_sms_workers or 2), 64)),
                     "reauth_mode": "browser" if str(body.reauth_mode or "").strip().lower() == "browser" else "protocol",
                 }
             )
@@ -740,6 +731,19 @@ async def maintenance_update(body: MaintenanceUpdate):
     public["has_webhook"] = bool(saved_webhook)
     public["webhook_masked"] = _state()._mask_secret(saved_webhook) if saved_webhook else ""
     return {"ok": True, "maintenance": public}
+
+
+@router.put("/api/cliproxy-quota")
+async def cliproxy_quota_update(body: CliproxyQuotaUpdate):
+    with _state()._edit_config() as cfg:
+        current = cfg.setdefault("cliproxy_quota", {})
+        current.update(
+            {
+                "enabled": bool(body.enabled),
+                "interval_seconds": max(30, min(int(body.interval_seconds or 60), 3600)),
+            }
+        )
+    return {"ok": True, "cliproxy_quota": _state()._cliproxy_quota_config(cfg)}
 
 
 @router.post("/api/maintenance/run")

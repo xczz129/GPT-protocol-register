@@ -78,3 +78,22 @@ notes/
 data/registration_logs/
 data/proxy_pool*
 data/codex_rt_history.json
+
+# backup variants (any suffix style) + config backups
+*.bak_*
+config.yaml.*
+
+# Runtime state and private operator notes
+/data/
+/HANDOVER.md
+
+# One-off operator scripts with account lists or deployment-specific paths
+/audit_aids.py
+/audit_imports.py
+/audit_trace.py
+/batch_plus_login.py
+/test_collapse_fix.py
+/scripts/export_rt_to_relay.py
+/scripts/import_plus_pool.py
+/scripts/plus_protocol_login.py
+/scripts/reauth_failed_plus.py

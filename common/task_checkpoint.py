@@ -18,6 +18,28 @@ from pathlib import Path
 from typing import Any, Callable
 
 _DEFAULT_DIR = Path(__file__).resolve().parent.parent / "data" / "task_checkpoints"
+_STATES_LOCK = threading.Lock()
+_STATES: dict[Path, "_CheckpointState"] = {}
+
+
+class _CheckpointState:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.lock = threading.Lock()
+        self.generation = 0
+
+
+def _checkpoint_state(task_type: str) -> _CheckpointState:
+    path = checkpoint_path(task_type).resolve()
+    with _STATES_LOCK:
+        return _STATES.setdefault(path, _CheckpointState(path))
+
+
+def _write_checkpoint(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def _checkpoint_dir() -> Path:
@@ -32,13 +54,12 @@ def checkpoint_path(task_type: str) -> Path:
 def save_checkpoint(task_type: str, payload: dict[str, Any]) -> None:
     """原子写检查点(临时文件 + rename),失败静默(进度落盘不能影响任务)。"""
     try:
-        path = checkpoint_path(task_type)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f".{path.name}.tmp")
-        tmp.write_text(
-            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
-        )
-        os.replace(tmp, path)
+        state = _checkpoint_state(task_type)
+        with state.lock:
+            # A direct save starts a new checkpoint generation. Older timers
+            # may still be evaluating their payload, but cannot replace it.
+            state.generation += 1
+            _write_checkpoint(state.path, payload)
     except Exception:
         pass
 
@@ -56,7 +77,10 @@ def load_checkpoint(task_type: str) -> dict[str, Any] | None:
 
 def clear_checkpoint(task_type: str) -> None:
     try:
-        checkpoint_path(task_type).unlink(missing_ok=True)
+        state = _checkpoint_state(task_type)
+        with state.lock:
+            state.generation += 1
+            state.path.unlink(missing_ok=True)
     except Exception:
         pass
 
@@ -64,8 +88,8 @@ def clear_checkpoint(task_type: str) -> None:
 class DebouncedCheckpointSaver:
     """高频进度更新的防抖落盘。
 
-    submit() 只安排一个延迟 timer(已有挂起则跳过),到点后调用
-    payload_fn() 取最新快照落盘——两次 flush 之间的更新自动合并。
+    submit() 合并同一轮待保存回调。清除检查点、直接保存新批次或
+    flush_now() 后，已经开始的旧 timer 也不能覆盖新的状态。
     """
 
     def __init__(self, task_type: str, interval: float = 2.0) -> None:
@@ -73,32 +97,79 @@ class DebouncedCheckpointSaver:
         self.interval = max(0.2, float(interval))
         self._lock = threading.Lock()
         self._timer: threading.Timer | None = None
+        self._payload_fn: Callable[[], dict[str, Any]] | None = None
+        self._revision = 0
+        self._pending_state: _CheckpointState | None = None
+        self._pending_generation = -1
 
     def submit(self, payload_fn: Callable[[], dict[str, Any]]) -> None:
+        state = _checkpoint_state(self.task_type)
         with self._lock:
-            if self._timer is not None:
+            with state.lock:
+                generation = state.generation
+            self._payload_fn = payload_fn
+            if (
+                self._timer is not None
+                and self._pending_state is state
+                and self._pending_generation == generation
+            ):
                 return
-            timer = threading.Timer(self.interval, self._flush)
+            if self._timer is not None:
+                self._timer.cancel()
+            self._revision += 1
+            self._pending_state = state
+            self._pending_generation = generation
+            timer = threading.Timer(self.interval, self._flush, args=(self._revision,))
             timer.daemon = True
             self._timer = timer
         timer.start()
 
-    def _flush(self) -> None:
+    def _flush(self, revision: int) -> None:
         with self._lock:
+            if revision != self._revision:
+                return
             self._timer = None
+            payload_fn = self._payload_fn
+            self._payload_fn = None
+            state = self._pending_state
+            generation = self._pending_generation
+        if payload_fn is None or state is None:
+            return
+        self._save_if_current(payload_fn, state, generation, revision)
+
+    def _save_if_current(
+        self,
+        payload_fn: Callable[[], dict[str, Any]],
+        state: _CheckpointState,
+        generation: int,
+        revision: int,
+    ) -> None:
         try:
-            save_checkpoint(self.task_type, payload_fn())
+            # Payload callbacks take task-manager locks. Never invoke them
+            # while holding the saver or file lock (submit uses the reverse
+            # call order from those managers).
+            payload = payload_fn()
+            with self._lock:
+                if revision != self._revision:
+                    return
+                with state.lock:
+                    if generation == state.generation:
+                        _write_checkpoint(state.path, payload)
         except Exception:
             pass
 
     def flush_now(self, payload_fn: Callable[[], dict[str, Any]]) -> None:
         """立即落盘(任务结束路径),取消挂起的防抖 timer。"""
+        state = _checkpoint_state(self.task_type)
         with self._lock:
             timer = self._timer
             self._timer = None
+            self._payload_fn = None
+            self._revision += 1
+            revision = self._revision
+            with state.lock:
+                state.generation += 1
+                generation = state.generation
         if timer is not None:
             timer.cancel()
-        try:
-            save_checkpoint(self.task_type, payload_fn())
-        except Exception:
-            pass
+        self._save_if_current(payload_fn, state, generation, revision)

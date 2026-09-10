@@ -1,0 +1,196 @@
+/* ===================================
+   基础样式：重置、氛围背景、玻璃面板、通用件
+   =================================== */
+
+/* --- 重置 --- */
+*, *::before, *::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html {
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  font-family: var(--sans);
+  background: var(--bg-base);
+  color: var(--text-primary);
+  min-height: 100vh;
+  overflow-x: hidden;
+  line-height: 1.6;
+}
+
+button, input, select, textarea {
+  font-family: inherit;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+::selection {
+  background: rgba(59, 130, 246, 0.18);
+}
+
+/* --- 动态氛围背景（浮动光斑） --- */
+.bg-animation {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  pointer-events: none;
+  background: linear-gradient(
+    135deg,
+    var(--bg-gradient-1) 0%,
+    var(--bg-gradient-2) 25%,
+    var(--bg-gradient-3) 50%,
+    var(--bg-gradient-4) 75%,
+    var(--bg-base) 100%
+  );
+}
+
+.bg-orb {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(100px);
+  opacity: 0.6;
+  animation: orb-float 25s ease-in-out infinite;
+}
+
+.bg-orb-1 {
+  width: 600px;
+  height: 600px;
+  background: radial-gradient(circle, var(--orb-1), transparent 70%);
+  top: -15%;
+  left: -10%;
+}
+
+.bg-orb-2 {
+  width: 500px;
+  height: 500px;
+  background: radial-gradient(circle, var(--orb-2), transparent 70%);
+  top: 40%;
+  right: -10%;
+  animation-delay: -8s;
+}
+
+.bg-orb-3 {
+  width: 450px;
+  height: 450px;
+  background: radial-gradient(circle, var(--orb-3), transparent 70%);
+  bottom: -10%;
+  left: 25%;
+  animation-delay: -16s;
+}
+
+@keyframes orb-float {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  25% { transform: translate(40px, -30px) scale(1.05); }
+  50% { transform: translate(-25px, 25px) scale(0.95); }
+  75% { transform: translate(20px, 40px) scale(1.03); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bg-orb { animation: none; }
+}
+
+/* --- 玻璃面板 --- */
+.glass-panel {
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
+}
+
+/* --- 通用文字 --- */
+.text-muted {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+
+/* --- 徽标 --- */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: var(--accent-bg);
+  color: var(--accent);
+  padding: 2px 10px;
+  border-radius: 20px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.badge.badge-success { background: var(--success-bg); color: var(--success); }
+.badge.badge-warning { background: var(--warning-bg); color: var(--warning); }
+.badge.badge-error { background: var(--error-bg); color: var(--error); }
+
+/* --- 状态点 --- */
+.status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: pulse 2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(0.8); }
+}
+
+/* --- 输入件 --- */
+.input {
+  width: 100%;
+  padding: 9px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--field-border);
+  background: var(--field-bg);
+  color: var(--text-primary);
+  font-size: 0.85rem;
+  outline: none;
+  transition: var(--transition-fast);
+}
+
+.input:focus {
+  border-color: var(--accent-light);
+  box-shadow: var(--focus-ring);
+  background: var(--field-bg-focus);
+}
+
+.input::placeholder {
+  color: var(--text-muted);
+}
+
+/* --- 滚动条 --- */
+*::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 4px;
+}
+
+/* --- 动效工具 --- */
+@keyframes fade-in-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes shimmer {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}

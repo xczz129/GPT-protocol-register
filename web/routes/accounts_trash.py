@@ -9,8 +9,10 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
+
+from common.panel_ops import restore_trash
 
 
 router = APIRouter()
@@ -55,7 +57,8 @@ async def accounts_trash_restore(body: TrashRestoreRequest):
     state = _state()
     if not any(str(value or "").strip() for value in body.ids):
         return {"ok": True, "restored": 0}
-    records = await asyncio.to_thread(state.take_trash, body.ids)
-    if records:
-        await asyncio.to_thread(state.upsert_account_records, records, state.ACCOUNTS_FILE)
-    return {"ok": True, "restored": len(records)}
+    try:
+        restored = await asyncio.to_thread(restore_trash, body.ids, state.ACCOUNTS_FILE)
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    return {"ok": True, "restored": restored}

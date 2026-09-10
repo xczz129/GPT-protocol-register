@@ -285,12 +285,12 @@ def _save_state_unlocked(state: dict[str, dict[str, Any]]) -> None:
         try:
             os.chmod(STATE_FILE, 0o600)
         except Exception:
-            pass
+            logger.debug("_save_state_unlocked: ignoring exception", exc_info=True)
     finally:
         try:
             Path(tmp_name).unlink(missing_ok=True)
         except Exception:
-            pass
+            logger.debug("_save_state_unlocked: ignoring exception", exc_info=True)
 
 
 def _with_state_file_lock():
@@ -456,7 +456,7 @@ def _parse_received_at(value: Any) -> datetime | None:
         date = datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text)
         return date if date.tzinfo else date.replace(tzinfo=timezone.utc)
     except Exception:
-        pass
+        logger.debug("_parse_received_at: ignoring exception", exc_info=True)
     try:
         date = parsedate_to_datetime(text)
         return date if date.tzinfo else date.replace(tzinfo=timezone.utc)
@@ -732,7 +732,7 @@ class OutlookTokenProvider:
                 try:
                     imap.logout()
                 except Exception:
-                    pass
+                    logger.debug("_verify_imap_access: ignoring exception", exc_info=True)
         except Exception as error:
             return False, str(error)
 
@@ -956,7 +956,7 @@ class OutlookTokenProvider:
             try:
                 imap.logout()
             except Exception:
-                pass
+                logger.debug("_imap_messages: ignoring exception", exc_info=True)
 
     def _parse_imap_message(self, mailbox: dict[str, Any], raw: bytes) -> dict[str, Any]:
         message = message_from_bytes(raw, policy=policy.default)

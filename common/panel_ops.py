@@ -23,6 +23,7 @@ from common.account_store import (
     export_account_records,
     load_accounts,
     replace_account_records,
+    upsert_account_records,
 )
 from common.task_store import (
     delete_runtime as _delete_task_runtime,
@@ -296,6 +297,37 @@ def take_trash(ids: Iterable[str]) -> list[dict[str, Any]]:
         return taken
 
 
+def restore_trash(ids: Iterable[str], path: Path = ACCOUNTS_FILE) -> int:
+    """Keep the recovery source until the account batch has committed."""
+    wanted = {str(value or "").strip() for value in ids if str(value or "").strip()}
+    if not wanted:
+        return 0
+    with _TRASH_LOCK:
+        rows = _read_json(TRASH_FILE, [])
+        if not isinstance(rows, list):
+            return 0
+        records: list[dict[str, Any]] = []
+        kept: list[Any] = []
+        for row in rows:
+            if (
+                isinstance(row, dict)
+                and str(row.get("trash_id") or "") in wanted
+                and isinstance(row.get("record"), dict)
+            ):
+                records.append(dict(row["record"]))
+            else:
+                kept.append(row)
+        if not records:
+            return 0
+        # The store commits the whole batch or raises. A failed database write
+        # leaves every trash entry available for retry. If removing trash fails
+        # afterwards, retrying the upsert is safe and the source still exists.
+        upsert_account_records(records, path)
+        _write_json(TRASH_FILE, kept)
+        _invalidate_trash_cache()
+        return len(records)
+
+
 def _rotate_backups(retention_days: int = BACKUP_RETENTION_DAYS) -> None:
     'Delete archives older than the retention window; cap the file count.'
     if not BACKUP_DIR.is_dir():
@@ -330,8 +362,8 @@ def _backup_sqlite_snapshot(source: Path, dest: Path) -> bool:
         dst_conn = sqlite3.connect(str(dest))
         src_conn.backup(dst_conn)
         return True
-    except Exception:
-        return False
+    except Exception as exc:
+        raise RuntimeError(f"数据库快照失败: {source.name}") from exc
     finally:
         for conn in (src_conn, dst_conn):
             if conn is not None:
@@ -344,14 +376,16 @@ def _backup_sqlite_snapshot(source: Path, dest: Path) -> bool:
 def create_backup(*, auto: bool = False, retention_days: int | None = None) -> dict[str, Any]:
     'Archive the sqlite databases plus small config/state files.'
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    _rotate_backups(retention_days if retention_days else BACKUP_RETENTION_DAYS)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     kind = "auto-" if auto else ""
-    name = f"gpt-register-backup-{kind}{stamp}.zip"
+    name = f"gpt-register-backup-{kind}{stamp}-{uuid.uuid4().hex[:8]}.zip"
     path = BACKUP_DIR / name
-    with tempfile.TemporaryDirectory(prefix="db-backup-") as workdir:
+    # Only publish a complete archive. Failed snapshots must not leave a ZIP
+    # that the panel lists as a usable backup, or rotate out older good copies.
+    with tempfile.TemporaryDirectory(prefix=".db-backup-", dir=BACKUP_DIR) as workdir:
         work = Path(workdir)
-        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        pending = work / "archive.zip"
+        with zipfile.ZipFile(pending, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for arcname, source in BACKUP_FILES.items():
                 if source.is_file():
                     archive.write(source, arcname=arcname)
@@ -371,10 +405,9 @@ def create_backup(*, auto: bool = False, retention_days: int | None = None) -> d
                             member_file,
                             arcname=f"{prefix}/{member_file.relative_to(source_dir).as_posix()}",
                         )
-    try:
-        os.chmod(path, 0o600)
-    except Exception:
-        pass
+        os.chmod(pending, 0o600)
+        os.replace(pending, path)
+    _rotate_backups(retention_days if retention_days else BACKUP_RETENTION_DAYS)
     return {"name": name, "size": path.stat().st_size, "created_at": _now(), "auto": bool(auto)}
 
 
@@ -629,29 +662,15 @@ def restore_account_backup(name: str, mode: str = "merge") -> dict[str, Any]:
     if mode == "replace":
         replace_account_records(accounts, ACCOUNTS_FILE)
         return {"mode": mode, "restored": len(accounts), "skipped": 0, "total": len(accounts)}
-    current = load_accounts(ACCOUNTS_FILE)
-    existing: set[str] = set()
-    for record in current:
-        for field in ("account_id", "email"):
-            value = str(record.get(field) or "").strip().lower()
-            if value:
-                existing.add(value)
-    incoming: list[dict[str, Any]] = []
-    skipped = 0
-    for record in accounts:
-        keys = {
-            str(record.get(field) or "").strip().lower()
-            for field in ("account_id", "email")
-            if str(record.get(field) or "").strip()
-        }
-        if keys & existing:
-            skipped += 1
-            continue
-        incoming.append(record)
-        existing |= keys
-    if incoming:
-        replace_account_records(current + incoming, ACCOUNTS_FILE)
-    return {"mode": "merge", "restored": len(incoming), "skipped": skipped, "total": len(accounts)}
+    # Identity matching and insertion share the store transaction. A Team's
+    # workspace id is not a person, and unrelated concurrent writes survive.
+    inserted = upsert_account_records(accounts, ACCOUNTS_FILE, skip_existing=True)
+    return {
+        "mode": "merge",
+        "restored": len(inserted),
+        "skipped": len(accounts) - len(inserted),
+        "total": len(accounts),
+    }
 
 
 def delete_account_backup(name: str) -> str:

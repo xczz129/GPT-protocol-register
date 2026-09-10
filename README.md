@@ -88,13 +88,18 @@ mail:
 ## 依赖
 
 - Python 3.10+
+- Node.js：前端锁文件中的 Vite / Vue 插件要求 `^20.19.0 || >=22.12.0`；可使用 Node 22.12+。协议登录的 Sentinel 脚本运行时也需要 `node` 在 `PATH` 中。
 - **免费默认**：本机 Chrome/Chromium + Playwright stealth（`fingerprint.browser: local`）
 - **免费增强**：Camoufox 开源反检测 Firefox（`camoufox`）
 - **免费轻量**：Obscura Rust 无头浏览器 + CDP（`obscura`，内存约 30MB 级）
 
 ```bash
-cd /root/full/gpt-register-fp
-pip install -r requirements.txt
+# 在克隆后的项目根目录执行（以下为 Linux / macOS 命令）
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python -m pip check
+node --version
 ```
 
 ### 指纹浏览器怎么选（免费优先）
@@ -125,6 +130,38 @@ pip install -r requirements.txt
 cp config.example.yaml config.yaml
 # 编辑 mail.providers 与 proxy / fingerprint
 ```
+
+## 从源码构建前端
+
+首次克隆或更新前端源码后，先安装锁定依赖、检查并构建，再启动面板：
+
+```bash
+cd web-ui
+npm ci
+npm run check
+npm run build
+cd ..
+```
+
+`web-ui/vite.config.js` 同时构建两套 Vue 入口：
+
+| 源码入口 | 构建产物 / 访问路径 |
+|------|------|
+| `web-ui/index.html` → `src/main.js`（旧界面） | `web/static/vue/index.html` / `/static/vue/index.html` |
+| `web-ui/new.html` → `src/new/main.ts`（新界面） | `web/static/vue/new.html` / `/static/vue/new.html` |
+
+构建会清空并重新生成 `web/static/vue/`，包括两套入口共用的 `assets/`。该资源目录被 Git 忽略，因此新克隆即使已有 HTML，也必须执行构建；部署时应一起复制本次生成的 HTML 和完整 `assets/`，否则页面引用的 JS / CSS 会缺失。不要在正被访问的生产静态目录内直接构建，先在独立目录构建并验证后再发布。
+
+源码发布必须包含 `web-ui/` 的两份 HTML、全部 `src/`（含 `src/new/`）、`package.json`、`package-lock.json`、`vite.config.js`、`tsconfig.json`，以及 `web/static/` 中非构建生成的资源。协议流程还直接依赖 `register/sentinel_vm/runtime_worker.js`、`sentinel/sentinel-runner.js`、`sentinel/sdk.js`；这些 JS 是运行源码，不能作为缓存忽略。
+
+静态检查可运行 `python cli.py --help` 和以下命令，它们不会启动账号任务：
+
+```bash
+node --check register/sentinel_vm/runtime_worker.js
+node --check sentinel/sentinel-runner.js
+```
+
+不要用不带子命令的 `python cli.py` 做启动检查，它默认执行注册。主面板按下面的 `web` 子命令启动后，可访问 `/api/health` 检查 HTTP 服务，访问 `/login` 检查页面资源。
 
 ## 运行
 
@@ -195,6 +232,8 @@ python3 cli.py health -j 5
 
 ## 安全与版本控制
 
+Git 只保存可复现的源码、依赖锁文件和脱敏配置样例。`config.yaml`、`.env*`、账号数据库及 WAL/SHM、Cookie、Token、邮箱与代理状态、任务检查点、日志、截图和备份均属于本地运行数据，不得加入 Git；更换服务器时通过单独的数据备份恢复。前端 `node_modules/` 和构建生成的 `assets/` 也不提交，使用上面的锁文件安装与构建命令恢复。
+
 `.gitignore` 默认排除本地敏感与运行态文件：
 
 - `config.yaml` / `.env*`
@@ -211,8 +250,11 @@ gpt-register-fp/
   cli.py              # 入口（register / init / web）
   web_app.py          # FastAPI 本地面板（账号密码登录 + HttpOnly Cookie 会话）
   web/static/         # 前端 HTML/CSS/JS
+  web-ui/             # 旧 Vue 与新 Vue/TS 源码、锁文件、双入口构建配置
   register_gpt.py     # 兼容入口 → register/
   register/           # 注册流程拆分（flow / page / onboarding / batch）
+  register/sentinel_vm/ # Node 协议运行脚本
+  sentinel/           # Codex OAuth Node runner 与 SDK
   local_browser.py     # Local Chrome / Camoufox / Obscura
   mail/               # Outlook + iCloud 取码（跨进程文件锁）
   common/

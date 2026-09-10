@@ -1073,24 +1073,6 @@ def _run_job_thread(params: dict[str, Any]) -> None:
                 _state().JOB.skipped_count,
                 _state().JOB.total,
             )
-        if not maddy_domain:
-            mail_type = str(params.get("mail_type") or params.get("provider_type") or "").strip().lower()
-            if mail_type in {"maddy", "maddy_webui"}:
-                provider = _state()._find_provider(cfg, "maddy_webui") or {}
-                maddy_domain = str(provider.get("default_domain") or provider.get("domain") or "").strip().lower()
-        if maddy_domain:
-            _state()._maddy_auto_mark_domain_run(
-                maddy_domain,
-                result={
-                    "ok": not stopped and fc == 0,
-                    "success": sc,
-                    "failed": fc,
-                    "skipped": sk,
-                    "total": tot,
-                    "batch_id": _state().JOB.batch_id or "",
-                    "finished_at": _state()._now_iso(),
-                },
-            )
         if stopped:
             _state().JOB.append_log(f"任务已停止 · 成功={sc} 失败={fc} 跳过={sk} 总数={tot}")
         else:

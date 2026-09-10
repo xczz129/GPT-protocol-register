@@ -1,4 +1,5 @@
 import { defineConfig, loadEnv } from "vite";
+import { resolve } from "node:path";
 import vue from "@vitejs/plugin-vue";
 
 export default defineConfig(({ mode }) => {
@@ -15,6 +16,13 @@ export default defineConfig(({ mode }) => {
       outDir: "../web/static/vue",
       emptyOutDir: true,
       sourcemap: false,
+      rollupOptions: {
+        input: {
+          main: resolve(__dirname, "index.html"),
+          // 重构中的新前端，独立入口，灰度期间与旧 UI 并存
+          "new": resolve(__dirname, "new.html"),
+        },
+      },
     },
     server: {
       proxy: {

@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -711,11 +712,15 @@ async def consume_reset_credit(body: ResetCreditConsumeRequest) -> dict[str, Any
     return result
 
 
-@router.post("/api/cliproxy/refresh-quota")
-async def refresh_quota(body: QuotaRefreshRequest) -> dict:
+def refresh_quota_files(names: list[str] | None = None) -> dict:
+    """Refresh the quota cache for all (or selected) auth files.
+
+    Blocking worker shared by the HTTP route and the background auto-refresh
+    loop. Safe to call from a threadpool; updates _QUOTA_CACHE in place.
+    """
     paths = _auth_files()
-    if body.files:
-        wanted = {name for name in body.files if name}
+    if names:
+        wanted = {name for name in names if name}
         paths = [p for p in paths if p.name in wanted]
     if not paths:
         return {"items": {}}
@@ -745,6 +750,11 @@ async def refresh_quota(body: QuotaRefreshRequest) -> dict:
                 "fetched_ts": now,
             }
     return {"items": results}
+
+
+@router.post("/api/cliproxy/refresh-quota")
+async def refresh_quota(body: QuotaRefreshRequest) -> dict:
+    return await run_in_threadpool(refresh_quota_files, body.files or None)
 
 
 @router.get("/api/cliproxy/download")

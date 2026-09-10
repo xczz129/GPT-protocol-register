@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GPT Register FP · Console</title>
+    <script>
+      // 首屏前恢复主题，避免闪烁
+      try {
+        var t = localStorage.getItem("ui-theme-v2");
+        if (t === "dark" || t === "light") document.documentElement.dataset.theme = t;
+      } catch (e) {}
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/new/main.ts"></script>
+  </body>
+</html>

@@ -10,6 +10,8 @@ import string
 import time
 from typing import Any
 
+from common.team_workspace import requires_team_workspace, validate_session_replacement
+
 
 def _state() -> Any:
     # Delayed import is intentional: web_app imports this module.
@@ -28,6 +30,13 @@ def _persist_reauthenticated_account(
     refresh_token = str(tokens.get("refresh_token") or "").strip()
     if not access_token:
         raise RuntimeError("重新登录未返回 AT")
+    require_team = requires_team_workspace(account)
+    if require_team and (
+        tokens.get("workspace_selection_verified") is not True
+        or not str(tokens.get("selected_workspace_id") or "").strip()
+    ):
+        raise RuntimeError("team_workspace_unverified: 重新登录未完成团队工作区选择，保留原凭据")
+    identity = validate_session_replacement(account, tokens, require_identity=require_team)
     refreshed = {
         **account,
         "access_token": access_token,
@@ -65,13 +74,21 @@ def _persist_reauthenticated_account(
         "protocol_webgl_renderer",
         "device_id",
         "protocol_profile_id",
+        "selected_workspace_id",
+        "selected_workspace_name",
+        "workspace_selection_verified",
     ):
         if key in tokens:
             refreshed[key] = tokens[key]
+    if identity["user_id"]:
+        refreshed["user_id"] = identity["user_id"]
+    if identity["plan_type"]:
+        refreshed["plan_type"] = identity["plan_type"]
     checked = check_account(refreshed, persist=False, path=_state().ACCOUNTS_FILE)
     if _state().normalized_health_status(checked) not in {"alive", "limited"}:
         detail = str(checked.get("health_error") or "重新登录后的凭证测活失败")
         raise RuntimeError(detail[:400])
+    validate_session_replacement(account, checked, require_identity=require_team)
     return upsert_account_record(checked, _state().ACCOUNTS_FILE, create=False)
 
 
@@ -143,7 +160,9 @@ def _normalize_reauth_mode(value: Any) -> str:
 
 
 def _account_requires_protocol_reauth(account: dict[str, Any]) -> bool:
-    """Invalidated sessions must recover through stored credentials."""
+    """Invalidated and team sessions use the credential flow with workspace selection."""
+    if requires_team_workspace(account):
+        return True
     state = _state().normalized_health_status(account)
     if state in {"invalid", "reauth_required"}:
         return True
@@ -334,6 +353,10 @@ def _reauthenticate_account_sync(
                         1, "failed", error=detail
                     ),
                     proxy_config=proxy_cfg,
+                    **({
+                        "workspace_name": str(account.get("workspace_name") or account.get("selected_workspace_name") or "").strip(),
+                        "require_team_workspace": True,
+                    } if requires_team_workspace(account) else {}),
                 )
             else:
                 tokens = asyncio.run(

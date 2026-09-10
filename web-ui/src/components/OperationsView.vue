@@ -7,6 +7,7 @@ const props = defineProps({
   trash: { type: Array, default: () => [] },
   form: { type: Object, required: true },
   maddyAutoForm: { type: Object, required: true },
+  cliproxyQuotaForm: { type: Object, required: true },
   backupScheduleForm: { type: Object, required: true },
   smsForm: { type: Object, required: true },
   smsConfig: { type: Object, default: () => ({}) },
@@ -19,7 +20,7 @@ const props = defineProps({
   maintenanceRunning: Boolean,
   maddyAutoRunning: Boolean,
 });
-const emit = defineEmits(["refresh", "save", "run", "save-maddy-auto", "run-maddy-auto", "test-webhook", "backup", "save-backup-schedule", "save-sms-config", "test-sms", "pick-countries", "clear-docking-history", "restore-backup", "restore-trash", "change-password", "revoke-sessions", "refresh-sms-stats"]);
+const emit = defineEmits(["refresh", "save", "run", "save-cliproxy-quota", "save-maddy-auto", "run-maddy-auto", "test-webhook", "backup", "save-backup-schedule", "save-sms-config", "test-sms", "pick-countries", "clear-docking-history", "restore-backup", "restore-trash", "change-password", "revoke-sessions", "refresh-sms-stats"]);
 const dockingHistory = computed(() => {
   const list = (props.smsConfig && props.smsConfig.firefox_docking_code_history) || [];
   const cur = String(props.smsForm?.firefoxDockingCode || "").trim();
@@ -144,7 +145,17 @@ function formatTime(value) { if (!value) return "-"; try { const date = new Date
     </section>
 
     <section class="card">
-      <div class="card-h"><div><h2>Maddy 自动注册</h2><p class="subtle">按域名轮流启动独立注册批次。</p></div></div>
+          <section class="card">
+      <div class="card-h"><div><h2>中转账号额度</h2><p class="subtle">后台定时刷新中转账号（cliproxy）的额度缓存，无需手动加载。</p></div></div>
+      <div class="form two">
+        <label class="check"><input v-model="cliproxyQuotaForm.enabled" type="checkbox" />启用自动刷新</label>
+        <label>刷新间隔（秒）<input v-model.number="cliproxyQuotaForm.intervalSeconds" type="number" min="30" max="3600" /></label>
+      </div>
+      <div class="actions"><button class="primary" :disabled="busy" @click="emit('save-cliproxy-quota')">保存额度刷新设置</button></div>
+      <p class="hint">保存后后台任务按新间隔生效；间隔下限 30 秒，上限 3600 秒。</p>
+    </section>
+
+<div class="card-h"><div><h2>Maddy 自动注册</h2><p class="subtle">按域名轮流启动独立注册批次。</p></div></div>
       <div class="form two">
         <label class="check"><input v-model="maddyAutoForm.enabled" type="checkbox" />启用</label>
         <label class="check"><input v-model="maddyAutoForm.refreshDomains" type="checkbox" />自动刷新域名</label>

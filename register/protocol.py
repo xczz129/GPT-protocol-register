@@ -55,6 +55,7 @@ from mail.parsing import (
     parse_outlook_credentials,
 )
 from proxy_util import (
+    compute_proxy_retry_limit,
     is_proxy_transport_error,
     normalize_proxy_url,
     proxy_brief,
@@ -563,10 +564,7 @@ async def run_protocol_register(
     if not proxy_pool and fallback_proxy:
         proxy_pool = [fallback_proxy]
     rotate = bool(proxy_cfg.get("rotate_per_task", True))
-    proxy_retry_limit = max(
-        max_retries,
-        min(5, max(0, len(proxy_pool) - 1)),
-    )
+    proxy_retry_limit = compute_proxy_retry_limit(max_retries, proxy_pool)
     proxy_start_offset = (
         random.SystemRandom().randrange(len(proxy_pool))
         if rotate and proxy_pool
@@ -1162,10 +1160,7 @@ async def run_protocol_login(
     if not proxy_pool and fallback_proxy:
         proxy_pool = [fallback_proxy]
     rotate = bool(proxy_cfg.get("rotate_per_task", True))
-    proxy_retry_limit = max(
-        max_retries,
-        min(5, max(0, len(set(proxy_pool)) - 1)),
-    )
+    proxy_retry_limit = compute_proxy_retry_limit(max_retries, proxy_pool)
     protocol_runtime = ProtocolRuntimeSettings.from_config(reg_cfg)
     proxy_start_offset = (
         random.SystemRandom().randrange(len(proxy_pool))
@@ -1431,10 +1426,7 @@ async def run_protocol_relogin(
     )
     max_concurrency = max(1, int(concurrency if concurrency is not None else 1))
     max_retries = max(0, int(reg_cfg.get("protocol_login_retries") or 1))
-    proxy_retry_limit = max(
-        max_retries,
-        min(5, max(0, len(set(proxy_pool)) - 1)),
-    )
+    proxy_retry_limit = compute_proxy_retry_limit(max_retries, proxy_pool)
     results: dict[str, Any] = {
         "selected": len(candidates),
         "attempted": 0,

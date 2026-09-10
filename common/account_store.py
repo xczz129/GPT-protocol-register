@@ -280,8 +280,81 @@ def _epoch(value: Any) -> float:
         return 0.0
 
 
+def _jwt_auth_claims(token: Any) -> dict[str, Any]:
+    """Decode the OpenAI auth claim section from a JWT (no signature check)."""
+    text = _s(token)
+    parts = text.split(".")
+    if len(parts) < 2:
+        return {}
+    try:
+        padded = parts[1] + "=" * (-len(parts[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
+    except Exception:
+        return {}
+    if not isinstance(claims, dict):
+        return {}
+    auth = claims.get("https://api.openai.com/auth")
+    return auth if isinstance(auth, dict) else {}
+
+
+def _normalize_plan_type(value: Any) -> str:
+    """Map raw ChatGPT plan slugs to display-friendly plan names.
+
+    Workspace sessions report slugs like ``self_serve_business_prolite``
+    (ChatGPT Team) instead of the short names used for personal plans.
+    """
+    plan = _s(value or "free").strip().lower() or "free"
+    if "prolite" in plan or "team" in plan:
+        return "team"
+    if "enterprise" in plan:
+        return "enterprise"
+    if "business" in plan:
+        return "team"
+    return plan
+
+
+def account_stable_user_id(record: dict[str, Any]) -> str:
+    """Return the context-independent ChatGPT user id for one record.
+
+    The NextAuth ``account_id`` flips between a member id and the shared
+    workspace id depending on which workspace the session last selected,
+    so it cannot identify a person. ``chatgpt_user_id`` from the access
+    token is stable across personal/workspace contexts.
+    """
+    if not isinstance(record, dict):
+        return ""
+    direct = _s(record.get("user_id"))
+    if direct:
+        return direct.lower()
+    auth = _jwt_auth_claims(record.get("access_token"))
+    return _s(auth.get("chatgpt_user_id") or auth.get("user_id")).lower()
+
+
+def _ensure_stable_user_id(record: dict[str, Any]) -> dict[str, Any]:
+    """Backfill the ``user_id`` field from the access token when missing."""
+    auth = _jwt_auth_claims(record.get("access_token"))
+    uid = _s(auth.get("chatgpt_user_id") or auth.get("user_id"))
+    direct = _s(record.get("user_id"))
+    if direct:
+        if uid and uid.lower() != direct.lower():
+            raise ValueError("account_identity_conflict: 用户身份与访问凭证不一致")
+        return record
+    if uid:
+        record["user_id"] = uid
+    return record
+
+
 def _record_identity(record: dict[str, Any]) -> tuple[str, str]:
-    """Return a stable de-dup key: account_id wins, email is fallback."""
+    """Return a stable de-dup key: user id wins, then account_id, then email.
+
+    ``account_id`` is context-dependent for workspace accounts (personal id
+    on first login, shared workspace id after the session picks a team
+    workspace), so the JWT user id is the only collision-safe identity for
+    team members sharing one workspace.
+    """
+    user_id = account_stable_user_id(record)
+    if user_id:
+        return ("user", user_id)
     account_id = _s(record.get("account_id"))
     if account_id:
         return ("account_id", account_id.lower())
@@ -452,6 +525,60 @@ def _write_unlocked(path: Path, records: Iterable[dict[str, Any]]) -> None:
             pass
 
 
+def _account_match_keys(record: dict[str, Any]) -> set[tuple[str, str]]:
+    keys = {_record_identity(record)}
+    email = _norm_email(record.get("email"))
+    account_id = _s(record.get("account_id")).lower()
+    if email:
+        keys.add(("email", email))
+    if account_id:
+        keys.add(("account_id", account_id))
+    return keys
+
+
+def _safe_account_matches(
+    candidates: Iterable[dict[str, Any]], record: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Resolve one person; a shared workspace is only a weak identity hint."""
+    rows = list(candidates)
+    user = account_stable_user_id(record)
+    email = _norm_email(record.get("email"))
+    account_id = _s(record.get("account_id")).lower()
+    same_email = [row for row in rows if email and _norm_email(row.get("email")) == email]
+    same_account = [row for row in rows if account_id and _s(row.get("account_id")).lower() == account_id]
+    email_users = {account_stable_user_id(row) for row in same_email} - {""}
+    if len(email_users) > 1 or (user and email_users - {user}):
+        raise ValueError("account_identity_conflict: 同一邮箱对应不同用户，未合并账号")
+    foreign_members = [
+        row for row in same_account
+        if (account_stable_user_id(row) and account_stable_user_id(row) != user)
+        or (_norm_email(row.get("email")) and _norm_email(row.get("email")) != email)
+    ]
+    account_only = [
+        row for row in same_account
+        if not account_stable_user_id(row) and not _norm_email(row.get("email"))
+    ] if not foreign_members else []
+    if user:
+        matches = [row for row in rows if account_stable_user_id(row) == user or row in same_email]
+        # An account-only legacy fragment can complete a known user record.
+        # A different named member of the workspace must remain separate.
+        matches.extend(row for row in account_only if row not in matches)
+        return matches
+    if same_email:
+        matches = list(same_email)
+        matches.extend(row for row in account_only if row not in matches)
+        return matches
+    if same_account:
+        if len(same_account) > 1 or (
+            email and _norm_email(same_account[0].get("email"))
+            and email != _norm_email(same_account[0].get("email"))
+        ):
+            raise ValueError("account_identity_ambiguous: 工作区属于多个或不同成员，请提供用户身份或原邮箱")
+        return same_account
+    identity = _record_identity(record)
+    return [row for row in rows if _record_identity(row) == identity]
+
+
 def normalize_accounts(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     """De-duplicate and sort records newest first.
 
@@ -460,51 +587,33 @@ def normalize_accounts(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]
     both.  When that bridge record appears we must merge the two existing
     canonical groups instead of only linking future records.
     """
-    by_key: dict[tuple[str, str], dict[str, Any]] = {}
-    aliases: dict[tuple[str, str], tuple[str, str]] = {}
+    groups: dict[int, dict[str, Any]] = {}
+    aliases: dict[tuple[str, str], set[int]] = {}
 
-    for raw in records:
+    for sequence, raw in enumerate(records):
         if not isinstance(raw, dict):
             continue
-        rec = _ordered_record(raw)
-        key = _record_identity(rec)
-        email_key = ("email", _norm_email(rec.get("email"))) if _norm_email(rec.get("email")) else None
-        account_key = ("account_id", _s(rec.get("account_id")).lower()) if _s(rec.get("account_id")) else None
-        identity_keys = [k for k in (key, email_key, account_key) if k is not None]
-
-        existing_canonicals: list[tuple[str, str]] = []
-        for ident in identity_keys:
-            canonical = aliases.get(ident)
-            if canonical and canonical not in existing_canonicals:
-                existing_canonicals.append(canonical)
-
-        canonical = existing_canonicals[0] if existing_canonicals else key
-
-        # A bridge record can connect two groups that were previously separate
-        # (e.g. account_id-only and email-only).  Fold all existing groups into
-        # the selected canonical before merging the new record.
-        for other in existing_canonicals[1:]:
-            if other == canonical:
-                continue
-            other_record = by_key.pop(other, None)
-            if other_record is not None:
-                base = by_key.get(canonical)
-                by_key[canonical] = (
-                    _merge_record(other_record, base) if base else _ordered_record(other_record)
-                )
-            for alias_key, alias_value in list(aliases.items()):
-                if alias_value == other:
-                    aliases[alias_key] = canonical
-
-        existing = by_key.get(canonical)
-        by_key[canonical] = _merge_record(existing, rec) if existing else _ordered_record(rec)
-
-        # Link future records that only have email/account_id to the same account.
-        for ident in identity_keys:
-            aliases[ident] = canonical
+        rec = _ensure_stable_user_id(_ordered_record(raw))
+        candidate_ids: set[int] = set()
+        for key in _account_match_keys(rec):
+            candidate_ids.update(aliases.get(key, ()))
+        candidates = {number: groups[number] for number in sorted(candidate_ids)}
+        matches = _safe_account_matches(candidates.values(), rec)
+        matched_objects = {id(row) for row in matches}
+        matched_ids = [number for number, row in candidates.items() if id(row) in matched_objects]
+        base = None
+        for number in matched_ids:
+            previous = groups.pop(number)
+            for key in _account_match_keys(previous):
+                aliases[key].discard(number)
+            base = _merge_record(previous, base) if base is not None else previous
+        merged = _merge_record(base, rec) if base is not None else rec
+        groups[sequence] = merged
+        for key in _account_match_keys(merged):
+            aliases.setdefault(key, set()).add(sequence)
 
     return sorted(
-        (_ordered_record(item) for item in by_key.values()),
+        (_ordered_record(item) for item in groups.values()),
         key=lambda item: (_epoch(item.get("registered_at")), _norm_email(item.get("email"))),
         reverse=True,
     )
@@ -731,7 +840,9 @@ def _matching_sqlite_rows(
         decoded = _decode_payload(payload)
         if decoded is not None:
             result.append((str(key), decoded))
-    return result
+    matches = _safe_account_matches((decoded for _, decoded in result), record)
+    selected = {id(row) for row in matches}
+    return [(key, decoded) for key, decoded in result if id(decoded) in selected]
 
 
 def _upsert_sqlite_record(
@@ -830,6 +941,7 @@ def upsert_account_record(
     if not isinstance(record, dict):
         raise TypeError("account record must be a dict")
     prepared = _ordered_record(dict(record))
+    prepared = _ensure_stable_user_id(prepared)
     prepared.setdefault("registered_at", _utc_now_iso())
 
     sqlite_store = _ensure_sqlite(Path(path))
@@ -858,12 +970,9 @@ def upsert_account_record(
             return prepared
         records.append(prepared)
         normalized = normalize_accounts(records)
+        matches = _safe_account_matches(normalized, prepared)
         _write_unlocked(path, normalized)
-        key = _record_identity(prepared)
-        for item in normalized:
-            if _record_identity(item) == key:
-                return item
-        return prepared
+        return matches[0] if matches else prepared
 
 
 def upsert_account_records(
@@ -871,10 +980,13 @@ def upsert_account_records(
     path: Path = ACCOUNTS_FILE,
     *,
     create: bool = True,
+    skip_existing: bool = False,
 ) -> list[dict[str, Any]]:
     """Merge a batch with one locked read/normalize/write cycle.
 
-    Return only the records touched by this batch.  Callers that need a full
+    ``skip_existing`` atomically adds missing people without changing existing
+    rows, for backup merge/restore. Return only records actually written.
+    Callers that need a full
     store snapshot should use :func:`load_accounts`; returning every payload
     here made a large health-check batch repeatedly decode the whole SQLite
     database after each small write.
@@ -884,6 +996,7 @@ def upsert_account_records(
         if not isinstance(record, dict):
             raise TypeError("account record must be a dict")
         item = _ordered_record(dict(record))
+        item = _ensure_stable_user_id(item)
         item.setdefault("registered_at", _utc_now_iso())
         prepared.append(item)
     if not prepared:
@@ -896,7 +1009,8 @@ def upsert_account_records(
             connection.execute("BEGIN IMMEDIATE")
             saved: list[dict[str, Any]] = []
             for item in prepared:
-                if not create and not _matching_sqlite_rows(connection, item):
+                matches = _matching_sqlite_rows(connection, item)
+                if (skip_existing and matches) or (not create and not matches):
                     continue
                 saved.append(_upsert_sqlite_record(connection, item))
             if saved:
@@ -913,36 +1027,19 @@ def upsert_account_records(
     # legitimately take longer than the short timeout used by interactive writes.
     with _file_lock(path, timeout=30.0):
         snapshot = _canonical_snapshot(path)
-        merged = [*snapshot, *prepared]
-        if not create:
-            merged = [
-                *snapshot,
-                *[item for item in prepared if _record_matches_existing(snapshot, item)],
-            ]
+        touched = []
+        for item in prepared:
+            matches = _record_matches_existing([*snapshot, *touched], item)
+            if (skip_existing and matches) or (not create and not matches):
+                continue
+            touched.append(item)
+        if not touched:
+            return []
+        merged = [*snapshot, *touched]
         normalized = normalize_accounts(merged)
+        saved = [matches[0] for item in touched if (matches := _safe_account_matches(normalized, item))]
         _write_unlocked(path, normalized)
-        by_key = {account_delete_key(item): item for item in normalized}
-        by_email = {
-            _norm_email(item.get("email")): item
-            for item in normalized
-            if _norm_email(item.get("email"))
-        }
-        by_account_id = {
-            _s(item.get("account_id")).lower(): item
-            for item in normalized
-            if _s(item.get("account_id"))
-        }
-        return [
-            by_key.get(account_delete_key(item))
-            or by_account_id.get(_s(item.get("account_id")).lower())
-            or by_email.get(_norm_email(item.get("email")))
-            for item in prepared
-            if (
-                by_key.get(account_delete_key(item))
-                or by_account_id.get(_s(item.get("account_id")).lower())
-                or by_email.get(_norm_email(item.get("email")))
-            )
-        ]
+        return saved
 
 
 def compact_account_file(path: Path = ACCOUNTS_FILE) -> int:
@@ -1190,17 +1287,7 @@ def _record_matches_existing(
     prepared: dict[str, Any],
 ) -> bool:
     """Whether ``prepared`` matches a stored row by identity, email or id."""
-    identity = _record_identity(prepared)
-    email = _norm_email(prepared.get("email"))
-    account_id = _s(prepared.get("account_id")).lower()
-    for item in records:
-        if _record_identity(item) == identity:
-            return True
-        if email and _norm_email(item.get("email")) == email:
-            return True
-        if account_id and _s(item.get("account_id")).lower() == account_id:
-            return True
-    return False
+    return bool(_safe_account_matches(records, prepared))
 
 
 def account_record_exists(
@@ -1215,25 +1302,11 @@ def account_record_exists(
     """
     if not isinstance(record, dict):
         return False
-    clauses: list[str] = ["canonical_key = ?"]
-    params: list[Any] = [account_delete_key(record)]
-    email = _norm_email(record.get("email"))
-    account_id = _s(record.get("account_id")).lower()
-    if email:
-        clauses.append("(email <> '' AND email = ?)")
-        params.append(email)
-    if account_id:
-        clauses.append("(account_id <> '' AND account_id = ?)")
-        params.append(account_id)
     sqlite_store = _ensure_sqlite(Path(path))
     if sqlite_store is not None:
         _, connection = sqlite_store
         try:
-            row = connection.execute(
-                f"SELECT 1 FROM accounts WHERE {' OR '.join(clauses)} LIMIT 1",
-                params,
-            ).fetchone()
-            return row is not None
+            return bool(_matching_sqlite_rows(connection, record))
         finally:
             connection.close()
     return _record_matches_existing(_canonical_snapshot(path), record)
@@ -1252,7 +1325,7 @@ def load_account_record_by_identity(
     snapshot.  The JSON backend retains the legacy full-snapshot fallback.
 
     ``identity`` accepts the same forms used by ``account_delete_key`` and row
-    actions: ``email:...``, ``account_id:...``, a raw email, or a raw account
+    actions: ``user:...``, ``email:...``, ``account_id:...``, a raw email, or a raw account
     id.  Email/account-id prefixes are normalized case-insensitively.
     """
     raw = _s(identity).strip()
@@ -1262,7 +1335,10 @@ def load_account_record_by_identity(
     canonical = ""
     email = ""
     account_id = ""
-    if lowered.startswith("email:"):
+    if lowered.startswith("user:"):
+        user_id = _s(lowered[5:])
+        canonical = f"user:{user_id}" if user_id else ""
+    elif lowered.startswith("email:"):
         email = _norm_email(lowered[6:])
         canonical = f"email:{email}" if email else ""
     elif lowered.startswith("account_id:"):
@@ -1746,8 +1822,10 @@ def account_public_view(record: dict[str, Any]) -> dict[str, Any]:
         "totp_secret_masked": _mask_account_secret(totp_secret),
         "mfa_factor_type": _s(record.get("mfa_factor_type")),
         "security_repair_available": security_repair_available,
-        "plan_type": _s(record.get("plan_type") or "free").lower(),
+        "plan_type": _normalize_plan_type(record.get("plan_type")),
         "account_id": record.get("account_id"),
+        "user_id": _s(record.get("user_id")),
+        "workspace_account_id": _s(record.get("workspace_account_id")),
         "proxy": record.get("proxy"),
         "registration_method": registration_method,
         "registration_trace_file": _s(record.get("registration_trace_file")),

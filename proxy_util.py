@@ -120,6 +120,16 @@ def resolve_proxy_pool(proxy_cfg: dict[str, Any]) -> list[str]:
     return proxies or ([fallback] if fallback else [])
 
 
+def compute_proxy_retry_limit(max_retries: int, proxy_pool: list) -> int:
+    """Shared retry budget across distinct proxies (used by all schedulers).
+
+    Always retries at least ``max_retries`` times, and up to 5 extra attempts
+    when the pool has distinct proxies to rotate through.
+    """
+    distinct = len({str(p) for p in proxy_pool if str(p or "").strip()})
+    return max(int(max_retries or 0), min(5, max(0, distinct - 1)))
+
+
 def proxy_brief(proxy: str) -> str:
     value = str(proxy or "").strip()
     if not value:

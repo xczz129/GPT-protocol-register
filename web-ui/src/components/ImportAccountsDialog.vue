@@ -1,14 +1,12 @@
 <script setup>
 import { computed, ref, watch } from "vue";
-import { Upload, Users, Zap, X } from "@lucide/vue";
+import { ScrollText, Upload, Users, Zap, X } from "@lucide/vue";
 
 const props = defineProps({
   open: Boolean,
   busy: Boolean,
 });
-const emit = defineEmits(["close", "submit"]);
-
-const CONCURRENCY_OPTIONS = [1, 2, 3, 4, 5, 6, 8];
+const emit = defineEmits(["close", "submit", "history"]);
 
 const text = ref("");
 const accountType = ref("personal");
@@ -28,11 +26,11 @@ const invalidCount = computed(() => lines.value.length - valid.value.length);
 const workspaceMissing = computed(() => accountType.value === "team" && !workspace.value.trim());
 
 function setType(type) { accountType.value = type; }
-function setConcurrency(value) { concurrency.value = value; }
 
 function submit() {
   if (!valid.value.length || workspaceMissing.value) return;
-  emit("submit", { text: text.value, accountType: accountType.value, workspace: workspace.value.trim(), concurrency: concurrency.value });
+  const workers = Math.max(1, Math.floor(Number(concurrency.value) || 1));
+  emit("submit", { text: text.value, accountType: accountType.value, workspace: workspace.value.trim(), concurrency: workers });
 }
 </script>
 
@@ -47,7 +45,10 @@ function submit() {
               <h2>邮箱----密码----2FA 协议登录</h2>
               <small>协议登录(密码 + TOTP)写入账号库,套餐由登录后自动识别</small>
             </div>
-            <button class="app-dialog-close" type="button" title="关闭" aria-label="关闭" @click="emit('close')"><X :size="16" aria-hidden="true" /></button>
+            <div class="import-accounts-head-actions">
+              <button class="btn secondary sm" type="button" title="查看每个账号的历史导入日志" @click="emit('history')"><ScrollText :size="12" aria-hidden="true" />历史日志</button>
+              <button class="app-dialog-close" type="button" title="关闭" aria-label="关闭" @click="emit('close')"><X :size="16" aria-hidden="true" /></button>
+            </div>
           </div>
           <textarea v-model="text" class="import-accounts-textarea" placeholder="每行一条:邮箱----密码----2FA密钥(Base32)&#10;# 开头的行会被忽略" spellcheck="false"></textarea>
           <p class="hint">已识别 <b>{{ valid.length }}</b> 个账号<template v-if="invalidCount"> · {{ invalidCount }} 行格式不符</template></p>
@@ -61,9 +62,8 @@ function submit() {
             </div>
             <div class="import-accounts-field">
               <span class="import-accounts-label"><Zap :size="11" aria-hidden="true" /> 并发</span>
-              <div class="segmented" role="group" aria-label="并发数">
-                <button v-for="option in CONCURRENCY_OPTIONS" :key="option" type="button" :class="{ active: concurrency === option }" @click="setConcurrency(option)">{{ option }}</button>
-              </div>
+              <input v-model.number="concurrency" class="import-accounts-workspace import-accounts-concurrency-input" type="number" min="1" step="1" spellcheck="false" autocomplete="off" />
+              <small class="import-accounts-concurrency-hint">无上限,按网络/IP 承受能力设置</small>
             </div>
             <div v-if="accountType === 'team'" class="import-accounts-field import-accounts-field-grow">
               <span class="import-accounts-label">工作区名称</span>
@@ -80,3 +80,24 @@ function submit() {
     </Transition>
   </Teleport>
 </template>
+
+<style>
+.import-accounts-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.import-accounts-concurrency-input {
+  width: 88px;
+  text-align: center;
+}
+
+.import-accounts-concurrency-hint {
+  display: block;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--muted, #8a94a6);
+}
+</style>

@@ -110,7 +110,7 @@ async def account_reauthenticate_start(body: AccountReauthBatchRequest):
         if (reauth_mode == "protocol" or account_protocol) and not _state()._protocol_reauth_credentials_ready(account):
             raise HTTPException(
                 409,
-                f"{account.get('email') or key} 失效账号必须使用协议重新登录，且需要同时保存密码和 TOTP 2FA"
+                f"{account.get('email') or key} 此账号必须使用协议重新登录，且需要同时保存密码和 TOTP 2FA"
                 if account_protocol
                 else f"{account.get('email') or key} 协议重新登录要求同时保存密码和 TOTP 2FA",
             )

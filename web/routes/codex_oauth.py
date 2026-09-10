@@ -50,7 +50,6 @@ from codex_oauth.sms import (  # noqa: E402
     normalize_firefox_country,
     parse_firefox_docking_code,
 )
-from proxy_util import proxy_brief  # noqa: E402
 
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 
@@ -125,13 +124,48 @@ _STATE: dict[str, Any] = {
     "results": [],
     "started_at": "",
     "finished_at": "",
+    "batch_id": "",
 }
 _MAX_LOGS = 800
 
 
-def _log(message: str, level: str = "info") -> None:
+def _reserve_batch(mode: str, total: int, batch_id: str) -> threading.Event:
+    """Atomically occupy the shared import/SMS slot and its stop event."""
+    global _STOP
+    with _LOCK:
+        if _STATE["running"]:
+            raise HTTPException(409, "已有接码/导入任务在运行")
+        stop_event = threading.Event()
+        _STOP = stop_event
+        _STATE.update(
+            running=True, mode=mode, batch_id=batch_id, total=total,
+            done=0, success=0, failed=0, logs=[], results=[],
+            started_at=datetime.now().isoformat(timespec="seconds"), finished_at="",
+        )
+        return stop_event
+
+
+def _finish_batch(batch_id: str) -> None:
+    with _LOCK:
+        if _STATE.get("batch_id", "") == batch_id:
+            _STATE["running"] = False
+            _STATE["finished_at"] = datetime.now().isoformat(timespec="seconds")
+
+
+def _launch_batch(target, args: tuple, *, batch_id: str, stop_event: threading.Event, name: str) -> None:
+    try:
+        threading.Thread(target=target, args=args, name=name, daemon=True).start()
+    except Exception:
+        stop_event.set()
+        _finish_batch(batch_id)
+        raise
+
+
+def _log(message: str, level: str = "info", *, batch_id: str = "") -> None:
     stamp = datetime.now().strftime("%H:%M:%S")
     with _LOCK:
+        if batch_id and _STATE.get("batch_id") != batch_id:
+            return
         _STATE["logs"].append({"t": stamp, "level": level, "m": str(message)[:300]})
         overflow = len(_STATE["logs"]) - _MAX_LOGS
         if overflow > 0:
@@ -145,6 +179,40 @@ def _log(message: str, level: str = "info") -> None:
 
 _RT_HISTORY_PATH = Path("/root/full/gpt-register-fp/data/codex_rt_history.json")
 _RT_HISTORY_LOCK = threading.Lock()
+
+# 导入(协议登录)逐账号历史：每个账号完成时追加一行 JSONL，供面板的
+# "历史日志" 弹窗按批次查看每个账号的完整登录日志。
+_IMPORT_HISTORY_PATH = Path("/root/full/gpt-register-fp/data/import_history.jsonl")
+_IMPORT_HISTORY_LOCK = threading.Lock()
+_IMPORT_HISTORY_MAX_BYTES = 5 * 1024 * 1024
+_IMPORT_HISTORY_KEEP_LINES = 1500
+
+
+def _rotate_import_history() -> None:
+    """Keep the JSONL history bounded; called once per batch start."""
+    try:
+        if (
+            _IMPORT_HISTORY_PATH.is_file()
+            and _IMPORT_HISTORY_PATH.stat().st_size > _IMPORT_HISTORY_MAX_BYTES
+        ):
+            lines = _IMPORT_HISTORY_PATH.read_text(encoding="utf-8").splitlines()
+            _IMPORT_HISTORY_PATH.write_text(
+                "\n".join(lines[-_IMPORT_HISTORY_KEEP_LINES:]) + "\n",
+                encoding="utf-8",
+            )
+    except Exception:
+        pass
+
+
+def _append_import_history(entry: dict) -> None:
+    try:
+        line = json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
+        with _IMPORT_HISTORY_LOCK:
+            _IMPORT_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with _IMPORT_HISTORY_PATH.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+    except Exception:
+        pass
 
 
 def _clip_history_logs(logs: list) -> list:
@@ -517,19 +585,16 @@ def _process_one(
     sms_cfg: dict,
     steps: list | None = None,
     *,
-    proxy_candidates: list[str] | None = None,
-    proxy_offset: int = 0,
+    stop_event: threading.Event | None = None,
+    batch_id: str = "",
 ) -> dict:
+    stop_event = stop_event if stop_event is not None else _STOP
     email = str(rec.get("email") or "").strip()
     password = str(rec.get("password") or "")
     totp = str(rec.get("totp_secret") or "")
-    proxies = [str(value or "").strip() for value in (proxy_candidates or []) if str(value or "").strip()]
-    if not proxies:
-        stored_proxy = str(rec.get("proxy") or "").strip()
-        proxies = [stored_proxy] if stored_proxy else [""]
 
     def log(message: str, level: str = "info") -> None:
-        _log(f"{email} | {message}", level)
+        _log(f"{email} | {message}", level, batch_id=batch_id)
         if steps is not None:
             steps.append(
                 {
@@ -571,13 +636,12 @@ def _process_one(
     last_error = ""
     mfa_code_failures = 0
     for attempt in range(1, rounds + 1 + _MFA_CODE_RETRIES):
-        if _STOP.is_set():
+        if stop_event.is_set():
             raise RuntimeError("任务已停止")
-        proxy = proxies[(max(0, int(proxy_offset)) + attempt - 1) % len(proxies)]
-        client = ProtocolClient(email, timeout=30, proxy=proxy)
+        # 接码流程不再走注册代理,统一本地直连
+        client = ProtocolClient(email, timeout=30)
         try:
-            proxy_label = proxy_brief(proxy) if proxy else "直连"
-            log(f"使用注册代理 {proxy_label}" + (f"(第 {attempt} 轮)" if attempt > 1 else ""))
+            log("本地直连" + (f"(第 {attempt} 轮)" if attempt > 1 else ""))
             log("初始化会话与 PKCE")
             client.bootstrap()
             client.submit_email()
@@ -620,7 +684,7 @@ def _process_one(
                     log(f"已分配 {activation.phone}({desc})")
                     client.send_phone(activation.phone)
                     log("手机号已提交,等待短信验证码")
-                    code = sms.wait_code(activation, cancel_event=_STOP)
+                    code = sms.wait_code(activation, cancel_event=stop_event)
                     log("收到验证码,提交验证")
                     client.submit_phone_otp(code)
                     sms.finish(activation)
@@ -656,7 +720,7 @@ def _process_one(
             if not code:
                 raise RuntimeError("回调缺少授权 code")
             log("交换 OAuth Token")
-            token = exchange_code(code, client.verifier, proxy=proxy)
+            token = exchange_code(code, client.verifier)
             refresh = str(token.get("refresh_token") or "")
             if not refresh:
                 raise RuntimeError("响应缺少 refresh_token(scope 未含 offline_access?)")
@@ -687,7 +751,7 @@ def _process_one(
         except Exception as exc:
             last_error = str(exc)
             if attempt < rounds and _proxy_retryable_error(exc):
-                log(f"当前代理请求失败({last_error[:140]})，切换下一条注册代理", "warning")
+                log(f"网络请求失败({last_error[:140]})，重试下一轮", "warning")
                 continue
             if mfa_code_failures < _MFA_CODE_RETRIES and _mfa_code_error(exc):
                 mfa_code_failures += 1
@@ -716,60 +780,63 @@ def _process_one(
     raise RuntimeError(f"接码 {attempt} 次均失败: {last_error[:160]}")
 
 
-def _run_batch(records: list, sms_cfg: dict, proxy_candidates: list[str] | None = None) -> None:
-    try:
-        for index, rec in enumerate(records):
-            if _STOP.is_set():
-                _log("任务已停止(剩余账号跳过)", "warning")
-                break
-            steps: list = []
-            try:
-                # 账号库已有 RT = 之前已接码成功,直接跳过,不重跑登录流程
-                existing_rt = str(rec.get("refresh_token") or "").strip()
-                if existing_rt:
-                    email = str(rec.get("email") or "").strip()
-                    _log(f"{email} | 已有 RT,按已接码处理")
-                    steps.append(
-                        {
-                            "t": datetime.now().strftime("%H:%M:%S"),
-                            "level": "ok",
-                            "m": "账号库已有 RT,无需重新接码",
-                        }
-                    )
-                    result = {
-                        "email": email,
-                        "status": "success",
-                        "skipped": True,
-                        "refresh_token": existing_rt,
-                        "expires_in": None,
-                        "error": "",
-                        "phone": "",
-                        "logs": list(steps),
+def _run_batch(
+    records: list, sms_cfg: dict, concurrency: int = 1,
+    batch_id: str = "", stop_event: threading.Event | None = None,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    stop_event = stop_event if stop_event is not None else _STOP
+    batch_id = batch_id or str(_STATE.get("batch_id") or "")
+
+    def _handle(rec: dict) -> None:
+        # 停止后未开始的账号直接跳过,与旧版串行 break 行为一致
+        if stop_event.is_set():
+            return
+        steps: list = []
+        try:
+            # 账号库已有 RT = 之前已接码成功,直接跳过,不重跑登录流程
+            existing_rt = str(rec.get("refresh_token") or "").strip()
+            if existing_rt:
+                email = str(rec.get("email") or "").strip()
+                _log(f"{email} | 已有 RT,按已接码处理", batch_id=batch_id)
+                steps.append(
+                    {
+                        "t": datetime.now().strftime("%H:%M:%S"),
+                        "level": "ok",
+                        "m": "账号库已有 RT,无需重新接码",
                     }
-                else:
-                    result = _process_one(
-                        rec,
-                        sms_cfg,
-                        steps,
-                        proxy_candidates=proxy_candidates,
-                        proxy_offset=index,
-                    )
-                with _LOCK:
+                )
+                result = {
+                    "email": email,
+                    "status": "success",
+                    "skipped": True,
+                    "refresh_token": existing_rt,
+                    "expires_in": None,
+                    "error": "",
+                    "phone": "",
+                    "logs": list(steps),
+                }
+            else:
+                result = _process_one(rec, sms_cfg, steps, stop_event=stop_event, batch_id=batch_id)
+            with _LOCK:
+                if _STATE.get("batch_id", "") == batch_id:
                     _STATE["success"] += 1
                     _STATE["results"].append(result)
-                _append_rt_history(
-                    result.get("email") or rec.get("email"),
-                    {
-                        "at": datetime.now().isoformat(timespec="seconds"),
-                        "status": "success",
-                        "rt": str(result.get("refresh_token") or "")[:600],
-                        "phone": str(result.get("phone") or ""),
-                        "error": "",
-                        "logs": _clip_history_logs(result.get("logs") or steps),
-                    },
-                )
-            except Exception as exc:
-                with _LOCK:
+            _append_rt_history(
+                result.get("email") or rec.get("email"),
+                {
+                    "at": datetime.now().isoformat(timespec="seconds"),
+                    "status": "success",
+                    "rt": str(result.get("refresh_token") or "")[:600],
+                    "phone": str(result.get("phone") or ""),
+                    "error": "",
+                    "logs": _clip_history_logs(result.get("logs") or steps),
+                },
+            )
+        except Exception as exc:
+            with _LOCK:
+                if _STATE.get("batch_id", "") == batch_id:
                     _STATE["failed"] += 1
                     _STATE["results"].append(
                         {
@@ -781,25 +848,33 @@ def _run_batch(records: list, sms_cfg: dict, proxy_candidates: list[str] | None 
                             "error": str(exc)[:260],
                         }
                     )
-                _append_rt_history(
-                    rec.get("email"),
-                    {
-                        "at": datetime.now().isoformat(timespec="seconds"),
-                        "status": "failed",
-                        "rt": "",
-                        "phone": "",
-                        "error": str(exc)[:300],
-                        "logs": _clip_history_logs(steps),
-                    },
-                )
-                _log(f"{rec.get('email')} | 失败: {exc}", "error")
-            finally:
-                with _LOCK:
+            _append_rt_history(
+                rec.get("email"),
+                {
+                    "at": datetime.now().isoformat(timespec="seconds"),
+                    "status": "failed",
+                    "rt": "",
+                    "phone": "",
+                    "error": str(exc)[:300],
+                    "logs": _clip_history_logs(steps),
+                },
+            )
+            _log(f"{rec.get('email')} | 失败: {exc}", "error", batch_id=batch_id)
+        finally:
+            with _LOCK:
+                if _STATE.get("batch_id", "") == batch_id:
                     _STATE["done"] += 1
+
+    workers = max(1, min(int(concurrency or 1), len(records) or 1))
+    try:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="codex-sms") as pool:
+            futures = [pool.submit(_handle, rec) for rec in records]
+            for future in as_completed(futures):
+                future.result()
+    except Exception as exc:
+        _log(f"接码批次异常终止: {exc}", "error", batch_id=batch_id)
     finally:
-        with _LOCK:
-            _STATE["running"] = False
-            _STATE["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        _finish_batch(batch_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1343,6 +1418,16 @@ def _persist_imported_account(
     """
     from common.account_health import check_account
     from common.account_store import upsert_account_record
+    from common.team_workspace import validate_team_session
+
+    require_team = account.get("import_account_type") == "team"
+    selected_workspace_id = str(tokens.get("selected_workspace_id") or "").strip()
+    team_identity = None
+    if require_team:
+        if not selected_workspace_id or tokens.get("workspace_selection_verified") is not True:
+            raise RuntimeError("team_workspace_unverified: 未完成团队工作区选择，未写入账号库")
+        team_identity = validate_team_session(tokens, selected_workspace_id=selected_workspace_id)
+        log(f"Team 导入登录套餐={team_identity['plan_type']}，开始核对测活结果")
 
     access_token = str(tokens.get("access_token") or "").strip()
     if not access_token:
@@ -1377,6 +1462,9 @@ def _persist_imported_account(
         "protocol_webgl_renderer",
         "device_id",
         "protocol_profile_id",
+        "selected_workspace_id",
+        "selected_workspace_name",
+        "workspace_selection_verified",
     ):
         if key in tokens:
             refreshed[key] = tokens[key]
@@ -1389,6 +1477,13 @@ def _persist_imported_account(
         if _state().normalized_health_status(checked) not in {"alive", "limited"}:
             detail = str(checked.get("health_error") or "导入后测活失败")
             raise RuntimeError(detail[:400])
+    if require_team:
+        verified = validate_team_session(
+            checked,
+            selected_workspace_id=selected_workspace_id,
+            expected_user_id=team_identity["user_id"],
+        )
+        log(f"Team 导入测活套餐={checked.get('plan_type') or '?'}，最终工作区套餐={verified['plan_type']}，允许入库")
     return upsert_account_record(checked, _state().ACCOUNTS_FILE, create=True)
 
 
@@ -1399,7 +1494,11 @@ def _import_one(
     totp: str,
     workspace: str = "",
     account_type: str = "personal",
+    *,
+    stop_event: threading.Event | None = None,
+    batch_id: str = "",
 ) -> dict:
+    stop_event = stop_event if stop_event is not None else _STOP
     # Import uses the panel's own protocol login (email -> password -> TOTP ->
     # chatgpt.com session), the same engine as the protocol-reauth page.  No
     # SMS and no Codex OAuth PKCE flow are involved.
@@ -1422,7 +1521,7 @@ def _import_one(
     def log(message: str, level: str = "info") -> None:
         stamp = datetime.now().strftime("%H:%M:%S")
         account_logs.append({"t": stamp, "level": level, "m": str(message)[:300]})
-        _log(f"[{index}] {email} | {message}", level)
+        _log(f"[{index}] {email} | {message}", level, batch_id=batch_id)
 
     def account_log_sink(event: dict) -> None:
         # Structured protocol step events -> readable per-account log lines.
@@ -1442,7 +1541,7 @@ def _import_one(
     def error_sink(message: str) -> None:
         captured_errors.append(str(message))
 
-    if _STOP.is_set():
+    if stop_event.is_set():
         result["error"] = "任务已停止"
         log("任务已停止，账号未执行", "warning")
         result["logs"] = account_logs
@@ -1457,7 +1556,8 @@ def _import_one(
             totp_secret=totp,
             proxy="",
             workspace_name=str(workspace or "").strip(),
-            stop_check=lambda: _STOP.is_set(),
+            require_team_workspace=account_type == "team",
+            stop_check=stop_event.is_set,
             error_sink=error_sink,
             account_log_sink=account_log_sink,
         )
@@ -1479,10 +1579,9 @@ def _import_one(
             "registration_state": "complete",
             "proxy": "",
         }
-        # 账号类型只有 personal/team；套餐由登录后测活自动识别，
-        # team 标记仅作测活失败时的套餐兜底
+        # Team is a verified workspace constraint, never a fallback display label.
         if account_type == "team":
-            account["plan_type"] = "team"
+            account["import_account_type"] = "team"
             # 记录导入时选择的工作区名,接码/重登时按此工作区选择。
             account["workspace_name"] = str(workspace or "").strip()
         saved = _persist_imported_account(account, tokens, log)
@@ -1512,10 +1611,15 @@ def _run_import_batch(
     workspace: str = "",
     concurrency: int = 1,
     account_type: str = "personal",
+    batch_id: str = "",
+    stop_event: threading.Event | None = None,
 ) -> None:
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    workers = max(1, min(int(concurrency or 1), 8, len(creds) or 1))
+    stop_event = stop_event if stop_event is not None else _STOP
+    batch_id = batch_id or str(_STATE.get("batch_id") or "")
+    # 并发不设硬上限，实际并行数不超过待导入账号数
+    workers = max(1, min(int(concurrency or 1), len(creds) or 1))
     try:
         with ThreadPoolExecutor(
             max_workers=workers, thread_name_prefix="import"
@@ -1529,24 +1633,37 @@ def _run_import_batch(
                     totp,
                     workspace,
                     account_type,
+                    stop_event=stop_event,
+                    batch_id=batch_id,
                 )
                 for index, (email, password, totp) in enumerate(creds, start=1)
             ]
             for future in as_completed(futures):
                 result = future.result()
                 with _LOCK:
-                    _STATE["done"] += 1
-                    _STATE["results"].append(result)
-                    if result.get("status") == "success":
-                        _STATE["success"] += 1
-                    else:
-                        _STATE["failed"] += 1
+                    if _STATE.get("batch_id", "") == batch_id:
+                        _STATE["done"] += 1
+                        _STATE["results"].append(result)
+                        if result.get("status") == "success":
+                            _STATE["success"] += 1
+                        else:
+                            _STATE["failed"] += 1
+                _append_import_history(
+                    {
+                        "at": datetime.now().isoformat(timespec="seconds"),
+                        "batch_id": batch_id,
+                        "account_type": account_type,
+                        "workspace": workspace,
+                        "email": str(result.get("email") or ""),
+                        "status": str(result.get("status") or ""),
+                        "error": str(result.get("error") or ""),
+                        "logs": result.get("logs") or [],
+                    }
+                )
     except Exception as exc:
-        _log(f"导入批次异常终止: {exc}", "error")
+        _log(f"导入批次异常终止: {exc}", "error", batch_id=batch_id)
     finally:
-        with _LOCK:
-            _STATE["running"] = False
-            _STATE["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        _finish_batch(batch_id)
 
 
 class CodexOauthImportRequest(BaseModel):
@@ -1555,8 +1672,8 @@ class CodexOauthImportRequest(BaseModel):
     # 套餐(free/plus/pro/team)由登录后测活自动识别，不由导入时指定。
     account_type: str = Field(default="personal", max_length=16)
     workspace: str = Field(default="", max_length=128)
-    # 同时进行协议登录的账号数(1-8)
-    concurrency: int = Field(default=1, ge=1, le=8)
+    # 同时进行协议登录的账号数(不设上限,实际并发不超过账号数)
+    concurrency: int = Field(default=1, ge=1)
 
 
 @router.post("/api/codex-oauth/import")
@@ -1578,32 +1695,24 @@ async def codex_oauth_import(body: CodexOauthImportRequest):
         if account_type != "team":
             workspace = ""
         concurrency = int(body.concurrency or 1)
-        with _LOCK:
-            _STATE.update(
-                {
-                    "running": True,
-                    "mode": "import",
-                    "total": len(creds),
-                    "done": 0,
-                    "success": 0,
-                    "failed": 0,
-                    "logs": [],
-                    "results": [],
-                    "started_at": datetime.now().isoformat(timespec="seconds"),
-                    "finished_at": "",
-                }
+        batch_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{hashlib.sha256(f'{time.time()}-{len(creds)}'.encode()).hexdigest()[:6]}"
+        stop_event = _reserve_batch("import", len(creds), batch_id)
+        try:
+            _rotate_import_history()
+            _launch_batch(
+                _run_import_batch,
+                (creds, workspace, concurrency, account_type, batch_id, stop_event),
+                batch_id=batch_id, stop_event=stop_event, name="codex-oauth-import",
             )
-        _STOP.clear()
-        threading.Thread(
-            target=_run_import_batch,
-            args=(creds, workspace, concurrency, account_type),
-            name="codex-oauth-import",
-            daemon=True,
-        ).start()
+        except Exception:
+            stop_event.set()
+            _finish_batch(batch_id)
+            raise
         type_label = "Team" if account_type == "team" else "个人"
         plan = f"Team 工作区「{workspace}」" if workspace else type_label
         _log(
-            f"导入任务启动:{len(creds)} 个账号 · 协议登录(密码+TOTP) · {plan} · 并发 {min(concurrency, len(creds))}"
+            f"导入任务启动:{len(creds)} 个账号 · 协议登录(密码+TOTP) · {plan} · 并发 {min(concurrency, len(creds))}",
+            batch_id=batch_id,
         )
         return {"ok": True, "total": len(creds)}
 
@@ -1614,6 +1723,8 @@ class CodexOauthRunRequest(BaseModel):
     emails: list = Field(default_factory=list, max_length=200)
     # force=True: 忽略账号库已有 RT 全部重跑(中转凭据失效重新登录用)
     force: bool = False
+    # 同时进行接码登录的账号数(不设上限,实际并发不超过选中账号数)
+    concurrency: int = Field(default=1, ge=1)
 
 
 def _load_sms_batch_records(wanted: set[str]) -> list[dict[str, Any]]:
@@ -1635,7 +1746,7 @@ def _load_sms_batch_records(wanted: set[str]) -> list[dict[str, Any]]:
     ]
 
 
-def _start_sms_batch(wanted: set[str], force: bool = False) -> dict:
+def _start_sms_batch(wanted: set[str], force: bool = False, concurrency: int = 1) -> dict:
     """按选中邮箱启动接码批次。force 时忽略已有 RT 全部重跑。"""
     picked = _load_sms_batch_records(wanted)
     if not picked:
@@ -1647,46 +1758,23 @@ def _start_sms_batch(wanted: set[str], force: bool = False) -> dict:
             rec["refresh_token"] = ""
     cfg = _state()._read_config()
     sms_cfg = _sms_config_section(cfg)
-    proxy_cfg = cfg.get("proxy") if isinstance(cfg.get("proxy"), dict) else {}
-    proxy_candidates = (
-        _state().resolve_proxy_pool(proxy_cfg)
-        if bool(proxy_cfg.get("enabled"))
-        else []
-    )
-    if proxy_cfg.get("enabled") and not proxy_candidates:
-        raise HTTPException(400, "当前注册代理池没有可用线路，接码不会无代理直连")
     settings = SmsSettings.from_mapping(sms_cfg)
     if not settings.enabled or not settings.credentials_configured:
         if settings.provider == "firefox":
             raise HTTPException(400, "火狐狸接码需要先配置对接码(运维 → 接码设置 → 对接码)")
         raise HTTPException(400, f"接码未启用或未配置凭证({settings.provider_label})")
-    with _LOCK:
-        _STATE.update(
-            {
-                "running": True,
-                "mode": "codex",
-                "total": len(picked),
-                "done": 0,
-                "success": 0,
-                "failed": 0,
-                "logs": [],
-                "results": [],
-                "started_at": datetime.now().isoformat(timespec="seconds"),
-                "finished_at": "",
-            }
-        )
-    _STOP.clear()
-    threading.Thread(
-        target=_run_batch,
-        args=(picked, sms_cfg, proxy_candidates),
-        name="codex-oauth-batch",
-        daemon=True,
-    ).start()
+    batch_id = "codex-" + hashlib.sha256(str(time.time_ns()).encode()).hexdigest()[:16]
+    stop_event = _reserve_batch("codex", len(picked), batch_id)
+    _launch_batch(
+        _run_batch, (picked, sms_cfg, concurrency, batch_id, stop_event),
+        batch_id=batch_id, stop_event=stop_event, name="codex-oauth-batch",
+    )
+    workers = max(1, min(int(concurrency or 1), len(picked) or 1))
     _log(
         f"任务启动:{len(picked)} 个账号 · 接码渠道 {settings.provider_label} · "
-        f"注册代理 {len(proxy_candidates)} 条"
+        f"并发 {workers} · 本地直连", batch_id=batch_id,
     )
-    return {"ok": True, "total": len(picked), "proxy_count": len(proxy_candidates)}
+    return {"ok": True, "total": len(picked), "concurrency": workers}
 
 
 @router.post("/api/codex-oauth/run")
@@ -1698,7 +1786,9 @@ async def codex_oauth_run(body: CodexOauthRunRequest):
         wanted = {str(e).strip().lower() for e in body.emails if str(e).strip()}
         if not wanted:
             raise HTTPException(400, "未选择账号")
-        return _start_sms_batch(wanted, force=bool(body.force))
+        return _start_sms_batch(
+            wanted, force=bool(body.force), concurrency=int(body.concurrency or 1)
+        )
 
     return await asyncio.to_thread(_do)
 
@@ -1882,8 +1972,43 @@ async def codex_oauth_history(emails: str = ""):
     return await asyncio.to_thread(_do)
 
 
+@router.get("/api/codex-oauth/import-history")
+async def codex_oauth_import_history(limit: int = 200):
+    """Return persisted per-account import logs, newest first.
+
+    Each entry is one imported account: batch metadata plus the full login
+    log lines captured for that account, so the panel can offer a per-account
+    history view even after the live batch state has been replaced.
+    """
+
+    def _do():
+        cap = max(1, min(int(limit or 200), 1000))
+        if not _IMPORT_HISTORY_PATH.is_file():
+            return {"ok": True, "entries": []}
+        try:
+            lines = _IMPORT_HISTORY_PATH.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return {"ok": True, "entries": []}
+        entries: list = []
+        for line in reversed(lines):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except Exception:
+                continue
+            if len(entries) >= cap:
+                break
+        return {"ok": True, "entries": entries}
+
+    return await asyncio.to_thread(_do)
+
+
 @router.post("/api/codex-oauth/stop")
 async def codex_oauth_stop():
-    _STOP.set()
-    _log("已请求停止,当前账号完成后中止", "warning")
+    with _LOCK:
+        _STOP.set()
+        batch_id = str(_STATE.get("batch_id") or "")
+    _log("已请求停止,当前账号完成后中止", "warning", batch_id=batch_id)
     return {"ok": True}

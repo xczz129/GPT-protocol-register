@@ -23,6 +23,7 @@ from common.account_store import ACCOUNTS_FILE, upsert_account_record
 from common.account_operation_log import record_operation_event
 from mail import count_pool_capacity, release_stale_in_use
 from proxy_util import (
+    compute_proxy_retry_limit,
     is_proxy_transport_error,
     normalize_proxy_url,
     proxy_brief,
@@ -34,6 +35,18 @@ from register.flow import register_one
 from register.protocol import repair_security_one
 from register.protocol_runtime import ProtocolRuntimeSettings
 from register.util import REGISTER_TIMEOUT
+
+
+def _truthy(value, fallback: bool = False) -> bool:
+    """Robust bool parsing for config values (bool / str / int)."""
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off", "", "none"}:
+        return False
+    return fallback
 
 
 def _proxy_for_task(
@@ -261,9 +274,9 @@ async def run_register(
             proxy_config_loader=proxy_config_loader,
         )
     hybrid_mode = engine in {"hybrid", "auto_hybrid"}
-    post_security = engine == "browser" and str(
-        reg_cfg.get("browser_protocol_security_after_register", False)
-    ).strip().lower() in {"1", "true", "yes", "on"}
+    post_security = engine == "browser" and _truthy(
+        reg_cfg.get("browser_protocol_security_after_register")
+    )
     proxy_cfg = config.get("proxy") if isinstance(config.get("proxy"), dict) else {}
     mail_config = config.get("mail") if isinstance(config.get("mail"), dict) else {}
     c2a_cfg = c2a_config_from(config)
@@ -292,10 +305,7 @@ async def run_register(
         if rotate and len(proxy_pool) > 1
         else 0
     )
-    proxy_retry_limit = max(
-        max_retries,
-        min(5, max(0, len(set(proxy_pool)) - 1)),
-    )
+    proxy_retry_limit = compute_proxy_retry_limit(max_retries, proxy_pool)
     proxy_attempt_span = max(1, proxy_retry_limit + 1)
     batch_bad_proxies: set[str] = set()
 

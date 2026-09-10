@@ -220,6 +220,7 @@ _OPERATIONS_METRICS_VALUE: dict[str, Any] | None = None
 _PANEL_CACHE_WARM_TASK: asyncio.Task | None = None
 _SERVER_SHUTDOWN_EVENT = threading.Event()
 _BACKUP_AUTO_TASK = None
+_CLIPROXY_QUOTA_TASK: asyncio.Task | None = None
 
 # Email-rebind reservations are intentionally short-lived.  The mailbox
 # provider marks each candidate ``in_use`` in its shared state file; this
@@ -645,17 +646,17 @@ def _write_config(cfg: dict[str, Any]) -> None:
         try:
             apply_fingerprint_env(cfg)
         except Exception:
-            pass
+            logger.debug("_write_config: ignoring exception", exc_info=True)
         fp = cfg.get("fingerprint") if isinstance(cfg.get("fingerprint"), dict) else {}
         try:
             browser = str((fp or {}).get("browser") or "local").strip().lower()
             os.environ["FINGERPRINT_BROWSER"] = browser
         except Exception:
-            pass
+            logger.debug("_write_config: ignoring exception", exc_info=True)
         try:
             os.chmod(CONFIG_FILE, 0o600)
         except Exception:
-            pass
+            logger.debug("_write_config: ignoring exception", exc_info=True)
 
 
 @contextmanager
@@ -1296,7 +1297,7 @@ def _account_health_progress_snapshot(*, include_updates: bool = True) -> dict[s
 try:  # 服务重启后恢复被打断的测活进度(检查点不存在时为空操作)
     _account_health_checkpoint_restore()
 except Exception:
-    pass
+    logger.debug("module: ignoring exception", exc_info=True)
 
 
 def _prewarm_config_cache() -> None:
@@ -1305,7 +1306,7 @@ def _prewarm_config_cache() -> None:
     try:
         _read_config()
     except Exception:
-        pass
+        logger.debug("_prewarm_config_cache: ignoring exception", exc_info=True)
 
 
 threading.Thread(target=_prewarm_config_cache, daemon=True, name="config-prewarm").start()
@@ -1346,7 +1347,7 @@ class _LogStream(io.TextIOBase):
         try:
             self._original.write(s)
         except Exception:
-            pass
+            logger.debug("write: ignoring exception", exc_info=True)
         with self._lock:
             self._buf += s
             while "\n" in self._buf:
@@ -1405,7 +1406,7 @@ class _LogStream(io.TextIOBase):
         try:
             self._original.flush()
         except Exception:
-            pass
+            logger.debug("flush: ignoring exception", exc_info=True)
         with self._lock:
             if self._buf.strip():
                 self._job.append_log(self._buf)
@@ -1692,12 +1693,12 @@ async def _run_register_async(cfg: dict[str, Any], params: dict[str, Any]):
         try:
             loop_.default_exception_handler(context)
         except Exception:
-            pass
+            logger.debug("_silence_expected_browser_races: ignoring exception", exc_info=True)
 
     try:
         loop.set_exception_handler(_silence_expected_browser_races)
     except Exception:
-        pass
+        logger.debug("_run_register_async: ignoring exception", exc_info=True)
 
     cancel_event = asyncio.Event()
     with JOB.lock:
@@ -1757,8 +1758,6 @@ async def _run_register_async(cfg: dict[str, Any], params: dict[str, Any]):
 
 
 _MAINTENANCE_TASK: asyncio.Task | None = None
-_MADDY_AUTO_TASK: asyncio.Task | None = None
-_MADDY_AUTO_RUN_LOCK = threading.Lock()
 
 
 async def _wait_for_job_completion(poll_sec: float = 3.0) -> None:
@@ -1779,6 +1778,46 @@ async def _maintenance_loop() -> None:
         except Exception as exc:
             JOB.append_log(f"自动维护异常: {str(exc)[:160]}")
         await asyncio.sleep(60)
+
+
+def _cliproxy_quota_config(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Config for the cliproxy quota auto-refresh loop (config.yaml: cliproxy_quota)."""
+    source = cfg if isinstance(cfg, dict) else _read_config()
+    raw = source.get("cliproxy_quota") if isinstance(source.get("cliproxy_quota"), dict) else {}
+    return {
+        "enabled": bool(raw.get("enabled", True)),
+        "interval_seconds": max(30, min(int(raw.get("interval_seconds") or 60), 3600)),
+    }
+
+
+async def _cliproxy_quota_loop() -> None:
+    """Background auto-refresh for relay (cliproxy) account quotas.
+
+    Keeps the shared quota cache warm so the panel never needs a manual
+    refresh. Only failures are logged to avoid one log line per minute.
+    """
+    await asyncio.sleep(20)  # let the panel finish warming up first
+    while True:
+        try:
+            settings = _cliproxy_quota_config()
+            if settings["enabled"]:
+                from web.routes.cliproxy import refresh_quota_files
+
+                result = await asyncio.to_thread(refresh_quota_files)
+                items = result.get("items") or {}
+                errors = [name for name, item in items.items() if item.get("error")]
+                if errors:
+                    JOB.append_log(
+                        f"\u4e2d\u8f6c\u8d26\u53f7\u989d\u5ea6\u81ea\u52a8\u5237\u65b0: \u5171 {len(items)} \u4e2a, \u5931\u8d25 {len(errors)} \u4e2a"
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            try:
+                JOB.append_log(f"\u4e2d\u8f6c\u8d26\u53f7\u989d\u5ea6\u81ea\u52a8\u5237\u65b0\u5f02\u5e38: {str(exc)[:160]}")
+            except Exception:
+                logger.debug("_cliproxy_quota_loop: ignoring exception", exc_info=True)
+        await asyncio.sleep(max(30, int(_cliproxy_quota_config().get("interval_seconds") or 60)))
 
 
 async def _shutdown_active_background_jobs() -> None:
@@ -1874,13 +1913,13 @@ async def _backup_auto_loop() -> None:
                 try:
                     JOB.append_log(f"定时备份异常: {str(exc)[:160]}")
                 except Exception:
-                    pass
+                    logger.debug("_backup_auto_loop: ignoring exception", exc_info=True)
         await asyncio.sleep(60)
 
 
 @asynccontextmanager
 async def _app_lifespan(_app: FastAPI):
-    global _MAINTENANCE_TASK, _MADDY_AUTO_TASK, _PANEL_CACHE_WARM_TASK, _BACKUP_AUTO_TASK
+    global _MAINTENANCE_TASK, _PANEL_CACHE_WARM_TASK, _BACKUP_AUTO_TASK, _CLIPROXY_QUOTA_TASK
     loop = asyncio.get_running_loop()
     _SERVER_SHUTDOWN_EVENT.clear()
     web_executor = ThreadPoolExecutor(
@@ -1896,10 +1935,10 @@ async def _app_lifespan(_app: FastAPI):
     )
     if _MAINTENANCE_TASK is None or _MAINTENANCE_TASK.done():
         _MAINTENANCE_TASK = asyncio.create_task(_maintenance_loop(), name="account-maintenance")
-    if _MADDY_AUTO_TASK is None or _MADDY_AUTO_TASK.done():
-        _MADDY_AUTO_TASK = asyncio.create_task(_maddy_auto_loop(), name="maddy-auto-register")
     if _BACKUP_AUTO_TASK is None or _BACKUP_AUTO_TASK.done():
         _BACKUP_AUTO_TASK = asyncio.create_task(_backup_auto_loop(), name="backup-auto-scheduler")
+    if _CLIPROXY_QUOTA_TASK is None or _CLIPROXY_QUOTA_TASK.done():
+        _CLIPROXY_QUOTA_TASK = asyncio.create_task(_cliproxy_quota_loop(), name="cliproxy-quota-auto")
     try:
         yield
     finally:
@@ -1918,13 +1957,6 @@ async def _app_lifespan(_app: FastAPI):
             except asyncio.CancelledError:
                 pass
             _MAINTENANCE_TASK = None
-        if _MADDY_AUTO_TASK is not None:
-            _MADDY_AUTO_TASK.cancel()
-            try:
-                await _MADDY_AUTO_TASK
-            except asyncio.CancelledError:
-                pass
-            _MADDY_AUTO_TASK = None
         if _BACKUP_AUTO_TASK is not None:
             _BACKUP_AUTO_TASK.cancel()
             try:
@@ -1932,6 +1964,13 @@ async def _app_lifespan(_app: FastAPI):
             except asyncio.CancelledError:
                 pass
             _BACKUP_AUTO_TASK = None
+        if _CLIPROXY_QUOTA_TASK is not None:
+            _CLIPROXY_QUOTA_TASK.cancel()
+            try:
+                await _CLIPROXY_QUOTA_TASK
+            except asyncio.CancelledError:
+                pass
+            _CLIPROXY_QUOTA_TASK = None
         await _shutdown_active_background_jobs()
         web_executor.shutdown(wait=True, cancel_futures=True)
 
@@ -2090,9 +2129,9 @@ def _ensure_web_credentials() -> dict[str, str]:
                 try:
                     mtime = CONFIG_FILE.stat().st_mtime
                 except Exception:
-                    pass
+                    logger.debug("_ensure_web_credentials: ignoring exception", exc_info=True)
             except Exception:
-                pass
+                logger.debug("_ensure_web_credentials: ignoring exception", exc_info=True)
     out = {"username": username, "password": password, "secret": secret}
     _WEB_CREDS_CACHE = dict(out)
     _WEB_CREDS_CACHE_MTIME = mtime
@@ -2476,7 +2515,6 @@ app.include_router(mailbox_router)
 
 from web.routes.mailbox import (  # noqa: E402,F401
     FastmailAccountsRequest,
-    MaddyAutoRegisterUpdate,
     MailboxesUpdate,
     MailboxDeleteRequest,
     MailboxStateRequest,
@@ -2490,10 +2528,6 @@ from web.routes.mailbox import (  # noqa: E402,F401
     _merge_mailbox_credentials,
     _mailbox_items,
     _mailbox_provider_map,
-    _maddy_auto_config,
-    _maddy_auto_domains,
-    _maddy_auto_loop,
-    _maddy_auto_mark_domain_run,
     _maddy_blocked_domains,
     _maddy_webui_domains_payload,
     _public_mail_stats,
@@ -2503,8 +2537,6 @@ from web.routes.mailbox import (  # noqa: E402,F401
     mailboxes_delete,
     mailboxes_list,
     mailboxes_state,
-    maddy_auto_register_run,
-    maddy_auto_register_update,
     put_mailboxes,
     reset_failed_mail,
 )

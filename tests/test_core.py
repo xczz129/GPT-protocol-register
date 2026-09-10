@@ -6356,7 +6356,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
         self.assertEqual([item["status"] for item in account_events], ["running", "success"])
         self.assertEqual(account_events[-1]["step"], "修改密码完成")
 
-    def test_passwordless_login_restarts_when_otp_send_session_is_invalid(self):
+    def test_passwordless_login_proceeds_when_otp_already_auto_sent(self):
         from register.protocol import PlatformRegistrar
 
         registrar = PlatformRegistrar.__new__(PlatformRegistrar)
@@ -6365,7 +6365,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
         registrar._platform_authorize = MagicMock()
         registrar._authorize_continue_login = MagicMock(return_value={})
         registrar._send_passwordless_otp = MagicMock(
-            side_effect=[RuntimeError("invalid_state"), None]
+            side_effect=RuntimeError("invalid_state")
         )
         registrar._complete_passwordless_login = MagicMock(
             return_value={"access_token": "fresh", "refresh_token": "refresh"}
@@ -6375,11 +6375,9 @@ class ProtocolAndHealthTests(unittest.TestCase):
             tokens = registrar._passwordless_login("user@icloud.com", mailbox, 1)
 
         self.assertEqual(tokens["access_token"], "fresh")
-        self.assertEqual(registrar._send_passwordless_otp.call_count, 2)
-        registrar._reset_auth_cookies.assert_called_once()
-        registrar._platform_authorize.assert_called_once_with(
-            "user@icloud.com", 1, screen_hint="login_or_signup"
-        )
+        self.assertEqual(registrar._send_passwordless_otp.call_count, 1)
+        registrar._reset_auth_cookies.assert_not_called()
+        registrar._platform_authorize.assert_not_called()
 
     def test_protocol_oauth_callback_rejects_explicit_state_mismatch(self):
         from register.protocol import _callback_state_matches
@@ -11540,34 +11538,6 @@ class MaddyWebuiMailTests(unittest.TestCase):
                 self.assertTrue(result["ok"])
                 self.assertEqual(cfg["mail"]["providers"][0]["api_key"], "saved-key")
                 write_config.assert_called_once_with(cfg)
-
-    def test_maddy_auto_config_clamps_schedule_settings(self):
-        import web_app
-
-        settings = web_app._maddy_auto_config(
-            {
-                "registration": {"threads": 7, "engine": "protocol"},
-                "maddy_auto_register": {
-                    "enabled": True,
-                    "interval_hours": 0,
-                    "per_domain": 999,
-                    "concurrency": 99,
-                    "engine": "hybrid",
-                    "keep_on_fail": True,
-                    "refresh_domains": False,
-                    "group_id": "group-fixture",
-                },
-            }
-        )
-
-        self.assertTrue(settings["enabled"])
-        self.assertEqual(settings["interval_hours"], 1)
-        self.assertEqual(settings["per_domain"], 500)
-        self.assertEqual(settings["concurrency"], 20)
-        self.assertEqual(settings["engine"], "hybrid")
-        self.assertTrue(settings["keep_on_fail"])
-        self.assertFalse(settings["refresh_domains"])
-        self.assertEqual(settings["group_id"], "group-fixture")
 
     def test_maddy_auto_domain_override_targets_single_domain(self):
         import web_app

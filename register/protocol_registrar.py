@@ -14,6 +14,7 @@ from urllib.parse import urlencode
 from common.proxy_clearance import clearance_error, refresh_clearance
 from common.session_export import build_account_record, parse_jwt_payload
 from common.totp import totp_code
+from common.team_workspace import select_team_workspace, validate_team_session, workspace_entries
 from register.sessions import JobCancelled
 from mail import mark_mailbox_code_boundary, mark_mailbox_result, release_mailbox
 from mail.parsing import CANONICAL_PROVIDER_TYPES, normalize_provider_type
@@ -753,42 +754,42 @@ class PlatformRegistrar:
         factor_type = str((factor or {}).get("factor_type") or "").strip().lower()
         return factor_id, factor_type
 
-    def _auth_session_workspaces(self) -> list[dict[str, Any]]:
-        """Decode workspace entries from the oai-client-auth-session cookie."""
-        raw = (
-            self.session.cookies.get(
-                "oai-client-auth-session", domain=".auth.openai.com"
-            )
-            or self.session.cookies.get("oai-client-auth-session")
-            or ""
-        )
-        if not raw:
-            return []
-        try:
-            from urllib.parse import unquote
-
-            first = unquote(str(raw)).split(".", 1)[0]
-            pad = 4 - len(first) % 4
-            if pad != 4:
-                first += "=" * pad
-            payload = json.loads(base64.urlsafe_b64decode(first))
-            items = payload.get("workspaces") or []
-        except Exception:
-            items = []
-        if not isinstance(items, list):
-            return []
-        return [item for item in items if isinstance(item, dict) and item.get("id")]
+    def _auth_session_workspaces(self, *auth_payloads: Any) -> list[dict[str, Any]]:
+        """Prefer the current auth response; some responses do not update the cookie."""
+        # The first payload is the current MFA/dump response. Older snapshots
+        # (e.g. the pre-MFA dump) must not hide an updated post-MFA cookie.
+        for payload in auth_payloads[:1]:
+            items = workspace_entries(payload)
+            if items:
+                return items
+        for domain in (".auth.openai.com", "auth.openai.com", None):
+            try:
+                raw = self.session.cookies.get("oai-client-auth-session", **({"domain": domain} if domain else {}))
+            except Exception:
+                continue
+            items = workspace_entries(raw)
+            if items:
+                return items
+        for payload in auth_payloads[1:]:
+            items = workspace_entries(payload)
+            if items:
+                return items
+        return []
 
     def _select_workspace(
-        self, index: int, workspace_name: str, referer: str
+        self, index: int, workspace_name: str, referer: str,
+        *, require_team_workspace: bool = False, auth_payloads: tuple[Any, ...] = (),
     ) -> str:
-        """Team 账号工作区选择：按名称匹配（无匹配取第一个）并返回 callback URL。"""
-        workspaces = self._auth_session_workspaces()
+        """Select the requested workspace before consuming its callback."""
+        workspaces = self._auth_session_workspaces(*auth_payloads)
+        if not workspaces and require_team_workspace:
+            refreshed = self._dump_client_auth_session(referer, index)
+            workspaces = self._auth_session_workspaces(refreshed, *auth_payloads)
         if not workspaces:
-            raise RuntimeError("workspace_page_without_workspaces")
+            raise RuntimeError("workspace_page_without_workspaces: 同步认证会话后仍无工作区，未选择个人空间")
         wanted = str(workspace_name or "").strip().lower()
-        selected = None
-        if wanted:
+        selected = select_team_workspace(workspaces, workspace_name) if require_team_workspace else None
+        if wanted and selected is None:
             for item in workspaces:
                 label = str(
                     item.get("name")
@@ -838,6 +839,8 @@ class PlatformRegistrar:
                 "workspace_select_missing_continue: "
                 f"page={str(data.get('page') or '?')[:160]}"
             )
+        self._selected_workspace_id = workspace_id
+        self._selected_workspace_name = label
         # 抓包确认: workspace/select 的 continue_url 直接就是 chatgpt.com 的
         # OAuth callback URL，返回给调用方统一跟随（与个人账号 MFA 后流程一致）
         return continue_url
@@ -849,11 +852,14 @@ class PlatformRegistrar:
         totp_secret: str,
         index: int,
         workspace_name: str = "",
+        require_team_workspace: bool = False,
     ) -> dict[str, Any]:
         """Complete the HAR-observed password plus TOTP login transaction."""
         email = str(email or "").strip()
         password = str(password or "").strip()
         totp_secret = str(totp_secret or "").strip()
+        self._selected_workspace_id = ""
+        self._selected_workspace_name = ""
         if not email:
             raise RuntimeError("协议凭据登录缺少邮箱")
         if not password or not totp_secret:
@@ -939,7 +945,21 @@ class PlatformRegistrar:
         )
         step(index, "协议凭据登录[6/6] MFA 校验通过，准备跟随 OAuth callback")
         callback_url, callback_page = _auth_step_details(verified)
-        if not _is_chatgpt_callback_url(callback_url):
+        workspace_page = "workspace" in f"{callback_page or ''} {callback_url or ''}".lower()
+        if require_team_workspace:
+            # An immediate callback can represent the personal workspace. Select
+            # the team while the auth transaction is still live, BEFORE following
+            # either callback. Never replay a consumed callback as a fallback.
+            workspace_referer = _absolute_auth_url(callback_url) if workspace_page else mfa_referer
+            step(index, "Team 导入：强制选择团队工作区，不接受个人空间")
+            callback_url = self._select_workspace(
+                index, workspace_name, workspace_referer or mfa_referer,
+                require_team_workspace=True,
+                auth_payloads=(verified, session_dump),
+            )
+            if not _is_chatgpt_callback_url(callback_url):
+                raise RuntimeError("team_workspace_missing_callback: 团队选择未完成，未继续个人登录")
+        elif not _is_chatgpt_callback_url(callback_url):
             # Team 账号 MFA 后会进入工作区选择页：选择目标工作区后拿新 callback
             # 抓包确认: select 请求的 Referer 必须是 workspace 页面本身
             if "workspace" in f"{callback_page or ''} {callback_url or ''}".lower():
@@ -968,6 +988,13 @@ class PlatformRegistrar:
                 f"final={_safe_url_for_log(final_url)}"
             )
         tokens = self._read_chatgpt_session(email, password, index)
+        if require_team_workspace:
+            identity = validate_team_session(tokens, selected_workspace_id=self._selected_workspace_id)
+            tokens["selected_workspace_id"] = self._selected_workspace_id
+            tokens["selected_workspace_name"] = self._selected_workspace_name
+            tokens["workspace_selection_verified"] = True
+            tokens["user_id"] = identity["user_id"]
+            step(index, f"Team 工作区验证通过 · 套餐={identity['plan_type']}")
         step(index, "ChatGPT 会话读取完成，AT/Refresh 会话校验通过")
         tokens["mfa_factor_id"] = factor_id
         tokens["mfa_factor_type"] = "totp"
@@ -1796,7 +1823,14 @@ class PlatformRegistrar:
             try:
                 self._authorize_continue_login(email, index)
                 mark_mailbox_code_boundary(mailbox)
-                self._send_passwordless_otp(index)
+                try:
+                    self._send_passwordless_otp(index)
+                except RuntimeError as otp_error:
+                    if "invalid_state" not in str(otp_error).lower():
+                        raise
+                    # OpenAI 提交邮箱后会自动发送登录验证码,再次调用 send-otp
+                    # 会返回 409 invalid_state;视为已发送,直接进入等待收码。
+                    step(index, "验证码已自动发送,无需重复请求", "yellow")
             except RuntimeError as error:
                 if attempt == 0 and "invalid_state" in str(error).lower():
                     continue

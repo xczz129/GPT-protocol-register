@@ -6,6 +6,7 @@ import AccountsView from "./components/AccountsView.vue";
 import AccountLogDialog from "./components/AccountLogDialog.vue";
 import CodexOauthDialog from "./components/CodexOauthDialog.vue";
 import ImportAccountsDialog from "./components/ImportAccountsDialog.vue";
+import ImportHistoryDialog from "./components/ImportHistoryDialog.vue";
 import SmsCountryPicker from "./components/SmsCountryPicker.vue";
 import ConcurrencyDialog from "./components/ConcurrencyDialog.vue";
 import AppDialog from "./components/AppDialog.vue";
@@ -229,6 +230,7 @@ watch(() => tokenEligibilityForm.channel, async (value) => {
 const tokenEligibility = reactive({ loading: false, error: "", result: null, batch: { running: false, total: 0, done: 0, current: "", results: [], stopped: false } });
 const integrationForm = reactive({ enabled: false, autoUpload: true, url: "", key: "", groupId: "" });
 const maintenanceForm = reactive({ enabled: false, intervalHours: 12, workers: 10, autoDeleteInvalid: false, webhookUrl: "", notifyOnComplete: false, notifyOnPoolLow: false, poolLowThreshold: 3 });
+const cliproxyQuotaForm = reactive({ enabled: true, intervalSeconds: 60 });
 const backupScheduleForm = reactive({ enabled: false, time: "04:00", retentionDays: 7 });
 const maddyAutoForm = reactive({ enabled: false, intervalHours: 1, perDomain: 20, concurrency: 3, engine: "protocol", keepOnFail: false, refreshDomains: true, groupId: "" });
 const securityForm = reactive({ currentPassword: "", newPassword: "", confirmPassword: "" });
@@ -891,6 +893,8 @@ async function loadOperations() {
   Object.assign(maintenanceForm, { enabled: !!value.enabled, intervalHours: Number(value.interval_hours || 12), workers: Number(value.workers || 10), autoDeleteInvalid: !!value.auto_delete_invalid, webhookUrl: "", notifyOnComplete: !!value.notify_on_complete, notifyOnPoolLow: !!value.notify_on_pool_low, poolLowThreshold: Number(value.pool_low_threshold ?? 3) });
   const maddy = operations.value.maddy_auto_register || {};
   Object.assign(maddyAutoForm, { enabled: !!maddy.enabled, intervalHours: Number(maddy.interval_hours || 1), perDomain: Number(maddy.per_domain || 20), concurrency: Number(maddy.concurrency || 3), engine: maddy.engine || "protocol", keepOnFail: !!maddy.keep_on_fail, refreshDomains: maddy.refresh_domains !== false, groupId: maddy.group_id || "" });
+  const cliproxyQuota = operations.value.cliproxy_quota || {};
+  Object.assign(cliproxyQuotaForm, { enabled: cliproxyQuota.enabled !== false, intervalSeconds: Number(cliproxyQuota.interval_seconds || 60) });
   const backupSchedule = operations.value.backup_schedule || {};
   Object.assign(backupScheduleForm, { enabled: !!backupSchedule.enabled, time: backupSchedule.time || "04:00", retentionDays: Number(backupSchedule.retention_days ?? 7) });
 }
@@ -2902,6 +2906,7 @@ function exportGroupCredentials(groupId) {
   if (groupId) location.href = apiUrl(`/api/account-groups/${encodeURIComponent(groupId)}/export-credentials`);
 }
 function downloadLogs() { location.href = apiUrl("/api/logs/download"); }
+async function saveCliproxyQuota() { await run(() => api("/api/cliproxy-quota", { method: "PUT", body: jsonBody({ enabled: cliproxyQuotaForm.enabled, interval_seconds: cliproxyQuotaForm.intervalSeconds }) }), "中转额度刷新设置已保存", [loadOperations]); }
 async function saveMaintenance() { await run(() => api("/api/maintenance", { method: "PUT", body: jsonBody({ enabled: maintenanceForm.enabled, interval_hours: maintenanceForm.intervalHours, workers: maintenanceForm.workers, auto_delete_invalid: maintenanceForm.autoDeleteInvalid, webhook_url: maintenanceForm.webhookUrl, notify_on_complete: maintenanceForm.notifyOnComplete, notify_on_pool_low: maintenanceForm.notifyOnPoolLow, pool_low_threshold: maintenanceForm.poolLowThreshold }) }), "维护设置已保存", [loadOperations]); }
 async function runMaintenance() {
   if (maintenanceActive.value) return;
@@ -3022,7 +3027,21 @@ async function startCodexOauth(emails, skipConfirm = false) {
   if (!emails.length) return;
   if (!skipConfirm && !await confirmInside(`对选中 ${emails.length} 个账号接码?`, { title: "接码", confirmText: "开始" })) return;
   if (await resumeCodexOauthIfRunning()) return;
-  const result = await run(() => api("/api/codex-oauth/run", { method: "POST", body: jsonBody({ emails }) }), "接码任务已启动");
+  // 多账号时选择并发数;单账号固定 1 路不弹窗
+  let concurrency = 1;
+  if (emails.length > 1) {
+    if (!uiSettingsLoaded) await loadUiSettings();
+    const picked = await openConcurrencyDialog({
+      title: "接码并发设置",
+      message: `将 ${emails.length} 个账号并发接码,每路独立完成协议登录+取号+验证码,全程本地直连。`,
+      value: Math.max(1, Math.floor(Number(uiSettings.value.codex_sms_workers) || 2)),
+      kind: "codex_sms",
+      max: Math.max(1, emails.length),
+    });
+    if (!picked) return;
+    concurrency = Math.max(1, Math.floor(Number(picked.workers) || 2));
+  }
+  const result = await run(() => api("/api/codex-oauth/run", { method: "POST", body: jsonBody({ emails, concurrency }) }), "接码任务已启动");
   if (!result) return;
   codexOauthDialog.open = true;
   stopCodexOauthPolling();
@@ -3105,7 +3124,7 @@ function smsCountryIds() { const text = smsForm.provider === "firefox" ? smsForm
 const smsCountries = computed(() => { if (smsForm.provider === "firefox") { const dock = String(smsForm.firefoxDockingCode || "").trim(); return dock ? [dock] : []; } const list = String(smsForm.countryOrder || "").split(/[,,]/).map((s) => s.trim()).filter(Boolean); return list.map((raw) => { const parsed = parseSmsCountryToken(raw); const id = parsed?.id || raw; const hit = (smsCountryDialog.items || []).find((item) => String(item.id) === String(id)); const label = hit ? `${hit.name}${hit.calling || ""}` : id; if (parsed?.providerId) { const pids = String(parsed.providerId).split(/[|,]/).map((p) => `#${p.trim()}`).filter((p) => p !== "#"); return `${label} ${pids.join("→")}`; } if (parsed?.price) { return `${label}≤$${parsed.price}`; } return label; }); });
 async function openSmsCountryPicker() { smsCountryDialog.open = true; smsCountryDialog.loading = true; smsCountryDialog.error = ""; smsCountryDialog.selected = []; smsCountryDialog.items = []; for (const raw of smsCountryIds()) { const parsed = parseSmsCountryToken(raw); if (!parsed?.id) continue; smsCountryDialog.selected.push(parsed.id); if (parsed.price) { smsCountryPrices[parsed.id] = parsed.price; } else { delete smsCountryPrices[parsed.id]; } if (parsed.providerId) { smsCountryProviders[parsed.id] = parsed.providerId; } else { delete smsCountryProviders[parsed.id]; } } try { const value = await api(`/api/sms-countries?provider=${encodeURIComponent(smsForm.provider)}`); smsCountryDialog.items = value.items || []; } catch (error) { smsCountryDialog.error = error?.message || "获取国家列表失败"; } finally { smsCountryDialog.loading = false; } }
 function toggleSmsCountry(id) { const value = String(id); const list = smsCountryDialog.selected; const index = list.indexOf(value); if (index >= 0) { list.splice(index, 1); delete smsCountryPrices[value]; delete smsCountryProviders[value]; } else { list.push(value); } rebuildSmsCountryOrder(); }
-const uiSettings = ref({ health_workers: 20, reauth_workers: 3, trial_workers: 20, refresh_at_workers: 10, reauth_mode: "protocol", trial_channel: "v4" });
+const uiSettings = ref({ health_workers: 20, reauth_workers: 3, trial_workers: 20, refresh_at_workers: 10, codex_sms_workers: 2, reauth_mode: "protocol", trial_channel: "v4" });
 let uiSettingsLoaded = false;
 async function loadUiSettings() { try { const value = await api("/api/ui-settings"); uiSettings.value = value || {}; uiSettingsLoaded = true; } catch {} }
 const concurrencyDialog = reactive({ open: false, title: "", message: "", value: 10, kind: "health", max: 20, mode: "protocol", modeOptions: [], modeMessages: {} });
@@ -3133,16 +3152,55 @@ async function saveConcurrencyDefault(pick) {
     reauth_workers: Number(uiSettings.value.reauth_workers) || 3,
     trial_workers: Math.max(1, Math.min(20, Math.floor(Number(uiSettings.value.trial_workers) || 20))),
     refresh_at_workers: Math.max(1, Math.min(10, Math.floor(Number(uiSettings.value.refresh_at_workers) || 10))),
+    codex_sms_workers: Math.max(1, Math.min(64, Math.floor(Number(uiSettings.value.codex_sms_workers) || 2))),
     reauth_mode: uiSettings.value.reauth_mode === "browser" ? "browser" : "protocol",
     trial_channel: uiSettings.value.trial_channel === "nerver" ? "nerver" : "v4",
   };
   if (concurrencyDialog.kind === "health") { payload.health_workers = workers; }
   else if (concurrencyDialog.kind === "trial") { payload.trial_workers = Math.min(20, workers); payload.trial_channel = picked.mode === "nerver" ? "nerver" : "v4"; }
   else if (concurrencyDialog.kind === "refresh_at") { payload.refresh_at_workers = Math.min(10, workers); }
+  else if (concurrencyDialog.kind === "codex_sms") { payload.codex_sms_workers = Math.min(64, workers); }
   else { payload.reauth_workers = workers; payload.reauth_mode = mode; }
   try { await api("/api/ui-settings", { method: "PUT", body: jsonBody(payload) }); uiSettings.value = payload; notify("默认值已保存", "ok"); } catch (error) { notify(error?.message || "保存失败", "err"); }
 }
 const importAccountsDialog = reactive({ open: false });
+// 导入历史日志弹窗：逐账号持久化日志，按批次分组展示
+const importHistoryDialog = reactive({ open: false, loading: false, entries: [] });
+async function openImportHistory() {
+  importHistoryDialog.open = true;
+  importHistoryDialog.loading = true;
+  try {
+    const result = await api("/api/codex-oauth/import-history?limit=300");
+    importHistoryDialog.entries = result.entries || [];
+  } catch (error) {
+    notify(error?.message || "历史日志加载失败", "err");
+  } finally {
+    importHistoryDialog.loading = false;
+  }
+}
+// 统一的 codex/导入状态轮询：任务结束时刷新账号列表
+function beginCodexOauthWatch() {
+  stopCodexOauthPolling();
+  codexOauthTimer = setInterval(async () => {
+    try {
+      codexOauthStatus.value = await api("/api/codex-oauth/status");
+      if (!codexOauthStatus.value.running) { stopCodexOauthPolling(); loadAccounts(); }
+    } catch { stopCodexOauthPolling(); }
+  }, 2000);
+}
+// 点"导入账号"按钮：后台批次仍在运行时直接回到实时日志视图，而不是空白表单
+async function openImportAccounts() {
+  try {
+    const status = await api("/api/codex-oauth/status");
+    if (status?.running && status?.mode === "import") {
+      codexOauthStatus.value = status;
+      codexOauthDialog.open = true;
+      beginCodexOauthWatch();
+      return;
+    }
+  } catch {}
+  importAccountsDialog.open = true;
+}
 // 导入任务的 email -> 原始凭据行缓存：失败重试时无需重新粘贴全部内容
 const lastImportLines = ref(new Map());
 // 最近一次导入的账号类型/工作区/并发设置，重试失败项时沿用
@@ -3152,7 +3210,7 @@ async function submitImportAccounts(payload) {
   if (!value) return;
   const accountType = String(payload?.accountType || "personal").trim() || "personal";
   const workspace = String(payload?.workspace || "").trim();
-  const concurrency = Math.min(Math.max(Number(payload?.concurrency) || 1, 1), 8);
+  const concurrency = Math.max(Number(payload?.concurrency) || 1, 1);
   const rows = new Map();
   for (const line of value.split(/\r?\n/)) {
     const trimmed = line.trim();
@@ -3280,11 +3338,11 @@ onBeforeUnmount(() => {
         </template>
         <IntegrationView v-else-if="active === 'chatgpt2api'" :form="integrationForm" :groups="groups" :progress="progress" :busy="busy" @save="saveIntegration" @test="testIntegration" @upload="uploadIntegration" />
         <LogsView v-else-if="active === 'logs'" :logs="logs" :connected="connected" @refresh="loadLogs" @download="downloadLogs" @clear="logs = []" />
-        <AccountsView v-else-if="active === 'accounts'" :accounts="accounts" :accounts-loading="accountsLoading" :account-load-progress="accountLoadProgress" :account-load-error="accountLoadError" :groups="groups" :proxy-countries="proxyForm.countries" :busy="busy" :copying-at="copyingAccessToken" :health-progress="healthProgress" :reauth-progress="reauthProgress" :trial-progress="trialProgress" :refresh-at-progress="refreshAtProgress" @refresh="loadAccounts" @health="healthAccounts" @resume-health="resumeHealthCheck" @resume-trial="resumeTrialCheck" @trial-check="trialEligibilityAccounts" @refresh-at="refreshAtAccounts" @reauth="reauthAccounts" @security-repair="repairSecurityAccounts" @password-change="changeAccountPasswords" @totp-change="changeAccountTotp" @account-logs="openAccountLogs" @stop-reauth="stopReauth" @delete="deleteAccounts" @delete-invalid="deleteInvalidAccounts" @download="downloadAccounts" @copy-selected-at="copySelectedAccessTokens" @export-selected-at="exportSelectedAccessTokens" @export-security="exportSecurityCredentials" @create-group="createAccountGroup" @rename-group="renameAccountGroup" @delete-group="deleteAccountGroup" @move-group="moveAccountsToGroup" @export-group="exportGroupCredentials" @copy-at="copyAccessToken" @copy-session="copySessionToken" @copy-credential="copyAccountCredential" @copy-value="copyValue" @codex-oauth="runCodexOauth" @import-accounts="importAccountsDialog.open = true" :codex-oauth-running="codexOauthRunning" />
+        <AccountsView v-else-if="active === 'accounts'" :accounts="accounts" :accounts-loading="accountsLoading" :account-load-progress="accountLoadProgress" :account-load-error="accountLoadError" :groups="groups" :proxy-countries="proxyForm.countries" :busy="busy" :copying-at="copyingAccessToken" :health-progress="healthProgress" :reauth-progress="reauthProgress" :trial-progress="trialProgress" :refresh-at-progress="refreshAtProgress" @refresh="loadAccounts" @health="healthAccounts" @resume-health="resumeHealthCheck" @resume-trial="resumeTrialCheck" @trial-check="trialEligibilityAccounts" @refresh-at="refreshAtAccounts" @reauth="reauthAccounts" @security-repair="repairSecurityAccounts" @password-change="changeAccountPasswords" @totp-change="changeAccountTotp" @account-logs="openAccountLogs" @stop-reauth="stopReauth" @delete="deleteAccounts" @delete-invalid="deleteInvalidAccounts" @download="downloadAccounts" @copy-selected-at="copySelectedAccessTokens" @export-selected-at="exportSelectedAccessTokens" @export-security="exportSecurityCredentials" @create-group="createAccountGroup" @rename-group="renameAccountGroup" @delete-group="deleteAccountGroup" @move-group="moveAccountsToGroup" @export-group="exportGroupCredentials" @copy-at="copyAccessToken" @copy-session="copySessionToken" @copy-credential="copyAccountCredential" @copy-value="copyValue" @codex-oauth="runCodexOauth" @import-accounts="openImportAccounts" :codex-oauth-running="codexOauthRunning" />
         <RebindView v-else-if="active === 'rebind'" :progress="rebindProgress" :preflight="rebindPreflight" :busy="busy || rebindRequestBusy" :checking="rebindChecking" @preflight="preflightRebind" @start="startRebind" @stop="stopRebind" @reset="resetRebindForInput" @input-change="resetRebindForInput" />
         <CredentialExportView v-else-if="active === 'credential-export'" :accounts="accounts" :busy="busy" @export="exportSecurityByEmail" />
         <ProtocolLoginView v-else-if="active === 'protocol-login'" :accounts="accounts" :progress="reauthProgress" :health-progress="healthProgress" :preflight="protocolLoginPreflight" :busy="busy" @start="startProtocolLoginByEmail" @stop="stopReauth" @health="healthProtocolLoginEmails" @input-change="resetProtocolLoginResultsForInput" />
-        <OperationsView v-else-if="active === 'operations'" :operations="operations" :trash="trash" :form="maintenanceForm" :maddy-auto-form="maddyAutoForm" :backup-schedule-form="backupScheduleForm" :sms-form="smsForm" :sms-config="smsConfig" :groups="groups" :security="securityForm" :busy="busy" :maintenance-running="maintenanceActive" :maddy-auto-running="maddyAutoActive" :sms-stats="smsStats" :sms-stats-loading="smsStatsLoading" @refresh="() => Promise.all([loadOperations(), loadTrash(), loadSmsStats()])" @save="saveMaintenance" @run="runMaintenance" @save-maddy-auto="saveMaddyAutoRegister" @run-maddy-auto="runMaddyAutoRegister" @test-webhook="testWebhook" @backup="createBackupNow" @save-backup-schedule="saveBackupSchedule" @save-sms-config="saveSmsConfig" @test-sms="testSmsConfig" @pick-countries="openSmsCountryPicker" @clear-docking-history="clearDockingHistory" :sms-countries="smsCountries" @restore-backup="restoreBackupNow" @restore-trash="restoreTrash" @change-password="changePassword" @revoke-sessions="revokeSessions" @refresh-sms-stats="loadSmsStats" />
+        <OperationsView v-else-if="active === 'operations'" :operations="operations" :trash="trash" :form="maintenanceForm" :cliproxy-quota-form="cliproxyQuotaForm" :maddy-auto-form="maddyAutoForm" :backup-schedule-form="backupScheduleForm" :sms-form="smsForm" :sms-config="smsConfig" :groups="groups" :security="securityForm" :busy="busy" :maintenance-running="maintenanceActive" :maddy-auto-running="maddyAutoActive" :sms-stats="smsStats" :sms-stats-loading="smsStatsLoading" @refresh="() => Promise.all([loadOperations(), loadTrash(), loadSmsStats()])" @save="saveMaintenance" @save-cliproxy-quota="saveCliproxyQuota" @run="runMaintenance" @save-maddy-auto="saveMaddyAutoRegister" @run-maddy-auto="runMaddyAutoRegister" @test-webhook="testWebhook" @backup="createBackupNow" @save-backup-schedule="saveBackupSchedule" @save-sms-config="saveSmsConfig" @test-sms="testSmsConfig" @pick-countries="openSmsCountryPicker" @clear-docking-history="clearDockingHistory" :sms-countries="smsCountries" @restore-backup="restoreBackupNow" @restore-trash="restoreTrash" @change-password="changePassword" @revoke-sessions="revokeSessions" @refresh-sms-stats="loadSmsStats" />
           <CliproxyView v-else-if="active === 'cliproxy'" :accounts="cliproxyAccounts" :loading="cliproxyLoading" :refreshing="cliproxyRefreshing" :importing="cliproxyImporting" :deleting="cliproxyDeleting" :relogin-loading="cliproxyReloginLoading" :resetting-file="cliproxyResettingFile" @refresh="loadCliproxyAccounts" @refresh-quota="refreshCliproxyQuota" @import-cpa="importCliproxyCpa" @import-sub2="importCliproxySub2" @export-cpa="exportCliproxyCpa" @export-sub2="exportCliproxySub2" @consume-reset="consumeCliproxyReset" @delete-accounts="deleteCliproxyAccounts" @relogin-account="reloginCliproxyAccount" />
       </template>
     </main>
@@ -3295,8 +3353,9 @@ onBeforeUnmount(() => {
     <ClipboardDialog :open="clipboardDialog.open" :title="clipboardDialog.title" :value="clipboardDialog.value" @close="closeClipboardDialog" @copied="clipboardDialogCopied" />
     <ConcurrencyDialog :open="concurrencyDialog.open" :title="concurrencyDialog.title" :message="concurrencyDialog.message" :value="concurrencyDialog.value" :max="concurrencyDialog.max" :mode="concurrencyDialog.mode" :mode-options="concurrencyDialog.modeOptions" :mode-messages="concurrencyDialog.modeMessages" @confirm="closeConcurrencyDialog" @cancel="closeConcurrencyDialog(null)" @save="saveConcurrencyDefault" />
     <SmsCountryPicker :open="smsCountryDialog.open" :provider="smsForm.provider" :items="smsCountryDialog.items" :selected="smsCountryDialog.selected" :loading="smsCountryDialog.loading" :error="smsCountryDialog.error" :prices="smsCountryPrices" :providers="smsCountryProviders" @close="smsCountryDialog.open = false" @toggle="toggleSmsCountry" @set-price="setSmsCountryPrice" @set-provider="setSmsCountryProvider" />
-    <ImportAccountsDialog :open="importAccountsDialog.open" :busy="busy" @close="importAccountsDialog.open = false" @submit="submitImportAccounts" />
-    <CodexOauthDialog :open="codexOauthDialog.open" :status="codexOauthStatus" @close="closeCodexOauth" @stop="stopCodexOauth" @copy="codexCopyRt" @retry="retryCodexOauthFailed" @retry-all="retryAllCodexOauthFailed" />
+    <ImportAccountsDialog :open="importAccountsDialog.open" :busy="busy" @close="importAccountsDialog.open = false" @submit="submitImportAccounts" @history="openImportHistory" />
+    <CodexOauthDialog :open="codexOauthDialog.open" :status="codexOauthStatus" @close="closeCodexOauth" @stop="stopCodexOauth" @copy="codexCopyRt" @retry="retryCodexOauthFailed" @retry-all="retryAllCodexOauthFailed" @history="openImportHistory" />
+    <ImportHistoryDialog :open="importHistoryDialog.open" :loading="importHistoryDialog.loading" :entries="importHistoryDialog.entries" @close="importHistoryDialog.open = false" />
     <Teleport to="body">
       <Transition name="dialog-fade">
         <div v-if="codexHistoryDialog.open" class="app-dialog-mask" @click.self="closeCodexHistory">

@@ -1,4 +1,4 @@
-"""Mailbox domain: mail stats, mailbox pool, maddy auto-register and mail routes."""
+"""Mailbox domain: mail stats, mailbox pool and mail routes."""
 
 from __future__ import annotations
 
@@ -74,17 +74,6 @@ class MailboxStateRequest(BaseModel):
     emails: list[str] = Field(default_factory=list)
     action: str = "release"
     states: list[str] = Field(default_factory=list)
-
-
-class MaddyAutoRegisterUpdate(BaseModel):
-    enabled: bool = False
-    interval_hours: int = Field(1, ge=1, le=168)
-    per_domain: int = Field(20, ge=1, le=500)
-    concurrency: int = Field(3, ge=1, le=20)
-    engine: str = Field(default="protocol", min_length=1, max_length=16)
-    keep_on_fail: bool = False
-    refresh_domains: bool = True
-    group_id: str = Field(default="", max_length=256)
 
 
 def _mail_stats(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -998,27 +987,6 @@ def _public_mail_stats(cfg: dict[str, Any]) -> dict[str, Any]:
         return stats
 
 
-def _maddy_auto_config(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
-    source = cfg if isinstance(cfg, dict) else _state()._read_config()
-    raw = source.get("maddy_auto_register") if isinstance(source.get("maddy_auto_register"), dict) else {}
-    reg_cfg = source.get("registration") if isinstance(source.get("registration"), dict) else {}
-    engine = str(raw.get("engine") or reg_cfg.get("engine") or "protocol").strip().lower() or "protocol"
-    return {
-        "enabled": bool(raw.get("enabled")),
-        "interval_hours": max(1, min(int(raw.get("interval_hours") or 1), 168)),
-        "per_domain": max(1, min(int(raw.get("per_domain") or 20), 500)),
-        "concurrency": max(1, min(int(raw.get("concurrency") or reg_cfg.get("threads") or 3), 20)),
-        "engine": engine,
-        "keep_on_fail": bool(raw.get("keep_on_fail")),
-        "refresh_domains": raw.get("refresh_domains", True) is not False,
-        "group_id": str(raw.get("group_id") or "").strip(),
-    }
-
-
-def _maddy_auto_provider_entry(cfg: dict[str, Any]) -> dict[str, Any]:
-    return dict(_state()._find_provider(cfg, "maddy_webui") or {}, type="maddy_webui")
-
-
 def _sanitize_maddy_provider_entry(provider: dict[str, Any]) -> bool:
     if not isinstance(provider, dict):
         return False
@@ -1068,246 +1036,6 @@ def _maddy_blocked_domains(entry: dict[str, Any] | None = None) -> set[str]:
 def _maddy_allowed_domains(entry: dict[str, Any] | None, values: Any) -> list[str]:
     blocked = _state()._maddy_blocked_domains(entry)
     return [domain for domain in _state()._normalize_domain_list(values) if domain not in blocked]
-
-
-def _maddy_auto_domains(cfg: dict[str, Any], *, refresh: bool = True) -> list[str]:
-    entry = _maddy_auto_provider_entry(cfg)
-    if not entry:
-        return []
-    conf = _state()._make_config(cfg.get("mail") if isinstance(cfg.get("mail"), dict) else {})
-    conf["request_timeout"] = min(float(conf.get("request_timeout") or 30), 10.0)
-    provider = _state().MaddyWebuiProvider(entry, conf)
-    try:
-        if refresh:
-            try:
-                info = provider.fetch_domain_info(force=True)
-                domains = _maddy_allowed_domains(entry, info.get("domains") or [])
-                if domains:
-                    return domains
-            except Exception as exc:
-                _state().logger.warning("Maddy 自动注册拉取域名失败，回退本地配置: %s", str(exc)[:200])
-        domains = provider._configured_domains()
-        return _maddy_allowed_domains(entry, domains)
-    finally:
-        provider.close()
-
-
-def _maddy_auto_domain_last_runs(state: dict[str, Any]) -> dict[str, float]:
-    raw = state.get("maddy_auto_domain_last_epoch")
-    if not isinstance(raw, dict):
-        return {}
-    out: dict[str, float] = {}
-    for key, value in raw.items():
-        try:
-            out[str(key).strip().lower()] = float(value or 0)
-        except (TypeError, ValueError):
-            continue
-    return out
-
-
-def _maddy_auto_mark_domain_run(domain: str, *, result: dict[str, Any]) -> dict[str, Any]:
-    domain_l = str(domain or "").strip().lower()
-    if not domain_l:
-        return _state().load_ops_state()
-    state = _state().load_ops_state()
-    domain_runs = _maddy_auto_domain_last_runs(state)
-    domain_runs[domain_l] = time.time()
-    state.update(
-        {
-            "maddy_auto_current_domain": "",
-            "maddy_auto_current_started_at": "",
-            "maddy_auto_last_epoch": time.time(),
-            "maddy_auto_last_at": _state()._now_iso(),
-            "maddy_auto_last_result": dict(result),
-            "maddy_auto_domain_last_epoch": domain_runs,
-            "maddy_auto_last_domain": domain_l,
-        }
-    )
-    _state().update_ops_state(**state)
-    return state
-
-
-def _maddy_auto_mark_domain_start(domain: str, settings: dict[str, Any]) -> dict[str, Any]:
-    domain_l = str(domain or "").strip().lower()
-    state = _state().load_ops_state()
-    domain_runs = _maddy_auto_domain_last_runs(state)
-    domain_runs[domain_l] = time.time()
-    state.update(
-        {
-            "maddy_auto_current_domain": domain_l,
-            "maddy_auto_current_started_at": _state()._now_iso(),
-            "maddy_auto_current_interval_hours": int(settings.get("interval_hours") or 1),
-            "maddy_auto_current_per_domain": int(settings.get("per_domain") or 20),
-            "maddy_auto_domain_last_epoch": domain_runs,
-        }
-    )
-    _state().update_ops_state(**state)
-    return state
-
-
-def _apply_maddy_domain_to_config(cfg: dict[str, Any], domain: str) -> bool:
-    domain_l = str(domain or "").strip().lower()
-    if not domain_l:
-        return False
-    mail = cfg.get("mail") if isinstance(cfg.get("mail"), dict) else {}
-    providers = mail.get("providers") if isinstance(mail.get("providers"), list) else []
-    changed = False
-    for provider in providers:
-        if not isinstance(provider, dict):
-            continue
-        if _state().normalize_provider_type(str(provider.get("type") or "")) != "maddy_webui":
-            continue
-        if domain_l in _state()._maddy_blocked_domains(provider):
-            return False
-        provider["default_domain"] = domain_l
-        provider["domain"] = domain_l
-        provider_domains = _state()._normalize_domain_list(provider.get("domains"))
-        provider["domains"] = [
-            domain_l,
-            *[
-                item
-                for item in provider_domains
-                if item != domain_l and item not in _state()._maddy_blocked_domains(provider)
-            ],
-        ]
-        _state()._sanitize_maddy_provider_entry(provider)
-        changed = True
-    if changed and isinstance(mail, dict):
-        cfg["mail"] = mail
-    return changed
-
-
-def _maddy_auto_domain_plan(cfg: dict[str, Any], settings: dict[str, Any]) -> list[str]:
-    domains = _state()._maddy_auto_domains(cfg, refresh=bool(settings.get("refresh_domains")))
-    return _state()._normalize_domain_list(domains)
-
-
-async def _run_maddy_auto_register_once(*, force: bool = False) -> dict[str, Any]:
-    if not _state()._MADDY_AUTO_RUN_LOCK.acquire(blocking=False):
-        return {"ok": True, "skipped": True, "reason": "maddy_auto_already_running"}
-    try:
-        cfg = _state()._read_config()
-        settings = _state()._maddy_auto_config(cfg)
-        if not settings["enabled"] and not force:
-            # Skip before the domain fetch so a disabled feature never hits
-            # the Maddy API (and never logs remote errors) from the loop.
-            return {"ok": True, "skipped": True, "reason": "disabled", "settings": settings}
-        state = _state().load_ops_state()
-        now_epoch = time.time()
-        last_runs = _maddy_auto_domain_last_runs(state)
-        domains = _maddy_auto_domain_plan(cfg, settings)
-        if not domains:
-            _state().update_ops_state(
-                maddy_auto_last_epoch=now_epoch,
-                maddy_auto_last_at=_state()._now_iso(),
-                maddy_auto_last_error="no_domains",
-                maddy_auto_current_domain="",
-                maddy_auto_current_started_at="",
-            )
-            return {"ok": True, "skipped": True, "reason": "no_domains", "settings": settings}
-        due: list[str] = []
-        interval_sec = max(1, int(settings["interval_hours"])) * 3600
-        for domain in domains:
-            if force or now_epoch - float(last_runs.get(domain) or 0) >= interval_sec:
-                due.append(domain)
-        if not due:
-            return {
-                "ok": True,
-                "skipped": True,
-                "reason": "not_due",
-                "domains": domains,
-                "settings": settings,
-            }
-
-        results: list[dict[str, Any]] = []
-        for domain in due:
-            if _state()._SERVER_SHUTDOWN_EVENT.is_set():
-                break
-            with _state().JOB.lock:
-                busy = bool(_state().JOB.running)
-            if busy:
-                return {
-                    "ok": True,
-                    "skipped": True,
-                    "reason": "job_running",
-                    "domain": domain,
-                    "results": results,
-                    "settings": settings,
-                }
-            _maddy_auto_mark_domain_start(domain, settings)
-            try:
-                await _state().job_start(
-                    _state().StartJobRequest(
-                        total=int(settings["per_domain"]),
-                        concurrency=int(settings["concurrency"]),
-                        keep_on_fail=bool(settings["keep_on_fail"]),
-                        mail_type="maddy_webui",
-                        maddy_domain=domain,
-                        engine=str(settings["engine"] or "protocol"),
-                        group_id=str(settings["group_id"] or "") or None,
-                    )
-                )
-            except HTTPException as exc:
-                _state().update_ops_state(
-                    maddy_auto_last_error=str(exc.detail)[:200],
-                    maddy_auto_last_domain=domain,
-                    maddy_auto_current_domain="",
-                    maddy_auto_current_started_at="",
-                )
-                results.append({"domain": domain, "ok": False, "error": str(exc.detail)})
-                continue
-            except Exception as exc:
-                _state().update_ops_state(
-                    maddy_auto_last_error=str(exc)[:200],
-                    maddy_auto_last_domain=domain,
-                    maddy_auto_current_domain="",
-                    maddy_auto_current_started_at="",
-                )
-                results.append({"domain": domain, "ok": False, "error": str(exc)[:200]})
-                continue
-
-            await _state()._wait_for_job_completion()
-            job_snapshot = _state().JOB.snapshot()
-            ok = int(job_snapshot.get("success_count") or 0)
-            fail = int(job_snapshot.get("fail_count") or 0)
-            skipped = int(job_snapshot.get("skipped_count") or 0)
-            # 服务关闭导致等待提前返回时任务可能仍在跑，此时不能计为成功
-            stopped_by_shutdown = bool(_state()._SERVER_SHUTDOWN_EVENT.is_set())
-            result = {
-                "domain": domain,
-                "ok": (not stopped_by_shutdown) and fail == 0 and ok > 0,
-                "success": ok,
-                "failed": fail,
-                "skipped": skipped,
-                "total": int(job_snapshot.get("total") or int(settings["per_domain"])),
-                "batch_id": job_snapshot.get("batch_id") or "",
-                "finished_at": job_snapshot.get("finished_at") or _state()._now_iso(),
-            }
-            _state()._maddy_auto_mark_domain_run(domain, result=result)
-            results.append(result)
-
-        _state().update_ops_state(
-            maddy_auto_last_epoch=time.time(),
-            maddy_auto_last_at=_state()._now_iso(),
-            maddy_auto_last_result=results[-1] if results else {},
-            maddy_auto_last_error="",
-            maddy_auto_current_domain="",
-            maddy_auto_current_started_at="",
-        )
-        return {"ok": True, "skipped": False, "results": results, "settings": settings, "domains": domains}
-    finally:
-        _state()._MADDY_AUTO_RUN_LOCK.release()
-
-
-async def _maddy_auto_loop() -> None:
-    while not _state()._SERVER_SHUTDOWN_EVENT.is_set():
-        try:
-            await _run_maddy_auto_register_once()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            _state().JOB.append_log(f"Maddy 自动注册异常: {str(exc)[:160]}")
-        await asyncio.sleep(60)
 
 
 @router.put("/api/mailboxes")
@@ -1647,36 +1375,33 @@ async def reset_failed_mail():
     }
 
 
-@router.put("/api/maddy-auto-register")
-async def maddy_auto_register_update(body: MaddyAutoRegisterUpdate):
-    engine = str(body.engine or "protocol").strip().lower()
-    if engine not in _state().SUPPORTED_REGISTRATION_ENGINES:
-        raise HTTPException(400, f"不支持的注册引擎: {engine}")
-    group_id = str(body.group_id or "").strip()
-    if group_id:
-        groups = _state().list_groups(_state().GROUPS_FILE)
-        if not any(str(item.get("id") or "") == group_id for item in groups):
-            raise HTTPException(400, "目标分组不存在，请刷新分组列表")
-    with _state()._edit_config() as cfg:
-        current = cfg.setdefault("maddy_auto_register", {})
-        current.update(
-            {
-                "enabled": bool(body.enabled),
-                "interval_hours": max(1, min(int(body.interval_hours or 1), 168)),
-                "per_domain": max(1, min(int(body.per_domain or 20), 500)),
-                "concurrency": max(1, min(int(body.concurrency or 3), 20)),
-                "engine": engine,
-                "keep_on_fail": bool(body.keep_on_fail),
-                "refresh_domains": bool(body.refresh_domains),
-                "group_id": group_id,
-            }
-        )
-    return {"ok": True, "maddy_auto_register": _state()._maddy_auto_config(cfg)}
-
-
-@router.post("/api/maddy-auto-register/run")
-async def maddy_auto_register_run():
-    if _state()._MADDY_AUTO_RUN_LOCK.locked():
-        return {"ok": True, "skipped": True, "reason": "maddy_auto_already_running"}
-    asyncio.create_task(_run_maddy_auto_register_once(force=True))
-    return {"ok": True, "message": "Maddy 自动注册已触发"}
+def _apply_maddy_domain_to_config(cfg: dict[str, Any], domain: str) -> bool:
+    domain_l = str(domain or "").strip().lower()
+    if not domain_l:
+        return False
+    mail = cfg.get("mail") if isinstance(cfg.get("mail"), dict) else {}
+    providers = mail.get("providers") if isinstance(mail.get("providers"), list) else []
+    changed = False
+    for provider in providers:
+        if not isinstance(provider, dict):
+            continue
+        if _state().normalize_provider_type(str(provider.get("type") or "")) != "maddy_webui":
+            continue
+        if domain_l in _state()._maddy_blocked_domains(provider):
+            return False
+        provider["default_domain"] = domain_l
+        provider["domain"] = domain_l
+        provider_domains = _state()._normalize_domain_list(provider.get("domains"))
+        provider["domains"] = [
+            domain_l,
+            *[
+                item
+                for item in provider_domains
+                if item != domain_l and item not in _state()._maddy_blocked_domains(provider)
+            ],
+        ]
+        _state()._sanitize_maddy_provider_entry(provider)
+        changed = True
+    if changed and isinstance(mail, dict):
+        cfg["mail"] = mail
+    return changed

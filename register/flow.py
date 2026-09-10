@@ -91,6 +91,9 @@ from register.page import (
     fill_otp_verified,
 )
 from register.onboarding import handle_onboarding, is_identity_verification_page
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def _otp_resend_accepted(status: int | None) -> bool:
@@ -191,7 +194,7 @@ async def _read_otp_response(response) -> tuple[int, dict[str, Any]]:
             if isinstance(decoded, dict):
                 payload = decoded
         except Exception:
-            pass
+            logger.debug("_read_otp_response: ignoring exception", exc_info=True)
     return status, payload if isinstance(payload, dict) else {}
 
 
@@ -281,12 +284,12 @@ async def _submit_verification_code(
                 return
             response_future.set_result(response)
         except Exception:
-            pass
+            logger.debug("capture_otp_response: ignoring exception", exc_info=True)
 
     try:
         page.on("response", capture_otp_response)
     except Exception:
-        pass
+        logger.debug("_submit_verification_code: ignoring exception", exc_info=True)
     try:
         await dismiss_cookie_banner(page)
         if not await fill_otp_verified(page, code, tries=2):
@@ -360,7 +363,7 @@ async def _submit_verification_code(
         try:
             page.remove_listener("response", capture_otp_response)
         except Exception:
-            pass
+            logger.debug("_submit_verification_code: ignoring exception", exc_info=True)
 
 
 async def register_one(
@@ -405,7 +408,7 @@ async def register_one(
             try:
                 task_event(index, status, **fields)
             except Exception:
-                pass
+                logger.debug("emit: ignoring exception", exc_info=True)
 
     def check_timeout():
         if _stop():
@@ -466,7 +469,7 @@ async def register_one(
             if path:
                 _log(f"[诊断] 浏览器失败现场已保存: {path}")
         except Exception:
-            pass
+            logger.debug("_capture_registration_diagnostic: ignoring exception", exc_info=True)
 
     try:
         emit("queued", step="等待分配邮箱", proxy=proxy_brief(proxy))
@@ -518,7 +521,7 @@ async def register_one(
                         _log(f"打开注册页超时但页面已到达: {cur[:80]}")
                         break
                 except Exception:
-                    pass
+                    logger.debug("register_one: ignoring exception", exc_info=True)
                 _log(f"打开注册页重试 {attempt + 1}/2: {str(e)[:70]}")
                 await asyncio.sleep(0.5)
         if not goto_ok:
@@ -543,7 +546,7 @@ async def register_one(
                         timeout=10,
                     )
             except Exception:
-                pass
+                logger.debug("register_one: ignoring exception", exc_info=True)
         check_stop()
         await dump_state(page, "加载后")
 
@@ -574,7 +577,7 @@ async def register_one(
                             SIGNUP_URL, timeout=20000, wait_until="commit"
                         )
                     except Exception:
-                        pass
+                        logger.debug("register_one: ignoring exception", exc_info=True)
                     await wait_for_any(
                         page,
                         selectors=[EMAIL_INPUT_SELECTOR],
@@ -606,7 +609,7 @@ async def register_one(
                 try:
                     await page.reload(timeout=15000, wait_until="commit")
                 except Exception:
-                    pass
+                    logger.debug("register_one: ignoring exception", exc_info=True)
                 await wait_for_any(page, selectors=[EMAIL_INPUT_SELECTOR], timeout=10)
         if await safe_count(page, EMAIL_INPUT_SELECTOR, timeout=1.0) == 0:
             cur = (await _page_url(page)).strip().lower()
@@ -645,7 +648,7 @@ async def register_one(
                     try:
                         await old_page.close()
                     except Exception:
-                        pass
+                        logger.debug("register_one: ignoring exception", exc_info=True)
                     _log("[2] 干净标签页已恢复邮箱输入框")
             except Exception as error:
                 if not _is_navigation_race(error):
@@ -655,7 +658,7 @@ async def register_one(
                     try:
                         await fresh_page.close()
                     except Exception:
-                        pass
+                        logger.debug("register_one: ignoring exception", exc_info=True)
         if await safe_count(page, EMAIL_INPUT_SELECTOR, timeout=3.0) == 0:
             _log("[2] 快速检测未发现邮箱输入框，读取页面状态后最终复核…")
             await dump_state(page, "无邮箱输入框", verbose=True)
@@ -668,7 +671,7 @@ async def register_one(
                 try:
                     await page.screenshot(path=str(shot))
                 except Exception:
-                    pass
+                    logger.debug("register_one: ignoring exception", exc_info=True)
                 return None
 
         channel = _otp_channel_label(
@@ -723,7 +726,7 @@ async def register_one(
                 ):
                     _log(f"[auth] {item}")
             except Exception:
-                pass
+                logger.debug("_capture_auth_response: ignoring exception", exc_info=True)
 
         def _capture_auth_request(request) -> None:
             try:
@@ -739,7 +742,7 @@ async def register_one(
                     auth_trace.append(item)
                     del auth_trace[:-12]
             except Exception:
-                pass
+                logger.debug("_capture_auth_request: ignoring exception", exc_info=True)
 
         def _capture_auth_failure(request) -> None:
             try:
@@ -750,14 +753,14 @@ async def register_one(
                 auth_trace.append(f"FAILED {url[:150]} · {failure[:100]}")
                 del auth_trace[:-12]
             except Exception:
-                pass
+                logger.debug("_capture_auth_failure: ignoring exception", exc_info=True)
 
         try:
             page.on("request", _capture_auth_request)
             page.on("response", _capture_auth_response)
             page.on("requestfailed", _capture_auth_failure)
         except Exception:
-            pass
+            logger.debug("register_one: ignoring exception", exc_info=True)
 
         async def _left_email_step() -> bool:
             """True when we left the plain email-entry login screen."""
@@ -1341,7 +1344,7 @@ async def register_one(
                         _log("[4] 页面已关闭，停止等待验证码")
                         break
                 except Exception:
-                    pass
+                    logger.debug("register_one: ignoring exception", exc_info=True)
                 if code_try == 0:
                     _log(f"[4] 正在通过 {channel} 等待邮箱验证码…")
                     emit("running", step=f"等待邮箱验证码 ({channel})")
@@ -1679,7 +1682,7 @@ async def register_one(
                     timeout=10,
                 )
             except Exception:
-                pass
+                logger.debug("register_one: ignoring exception", exc_info=True)
         else:
             await asyncio.sleep(0.8)
         await dump_state(page, "最终")
@@ -1707,7 +1710,7 @@ async def register_one(
                 "",
             )
         except Exception:
-            pass
+            logger.debug("register_one: ignoring exception", exc_info=True)
         try:
             identity = await asyncio.wait_for(
                 page.evaluate(
@@ -1722,7 +1725,7 @@ async def register_one(
             if isinstance(identity, dict):
                 browser_identity.update(identity)
         except Exception:
-            pass
+            logger.debug("register_one: ignoring exception", exc_info=True)
 
         sess = None
         try:
@@ -1886,7 +1889,7 @@ async def register_one(
                         secrets=(password, record.get("access_token"), record.get("session_token")),
                     )
                 except Exception:
-                    pass
+                    logger.debug("register_one: ignoring exception", exc_info=True)
             return record
 
         last_error = "no_access_token"
@@ -1929,7 +1932,7 @@ async def register_one(
             tail = "\n".join(tb.strip().splitlines()[-10:])
             _log(f"堆栈:\n{tail}")
         except Exception:
-            pass
+            logger.debug("register_one: ignoring exception", exc_info=True)
         return None
     finally:
         if (
@@ -1940,7 +1943,7 @@ async def register_one(
             try:
                 await _capture_registration_diagnostic(last_error)
             except Exception:
-                pass
+                logger.debug("register_one: ignoring exception", exc_info=True)
         if persist_result and not success and last_error:
             try:
                 from common.account_operation_log import record_operation_event
@@ -1959,7 +1962,7 @@ async def register_one(
                     secrets=(password,),
                 )
             except Exception:
-                pass
+                logger.debug("register_one: ignoring exception", exc_info=True)
         if mailbox is not None:
             try:
                 if success:
@@ -1984,7 +1987,7 @@ async def register_one(
                 try:
                     release_mailbox(mailbox)
                 except Exception:
-                    pass
+                    logger.debug("register_one: ignoring exception", exc_info=True)
         if bb and pid:
             keep = keep_on_fail and not success and last_error != "cancelled"
             if keep:
@@ -2009,8 +2012,8 @@ async def register_one(
         try:
             _TASK_IDX.reset(token)
         except Exception:
-            pass
+            logger.debug("register_one: ignoring exception", exc_info=True)
         try:
             _TASK_EMAIL.reset(email_token)
         except Exception:
-            pass
+            logger.debug("register_one: ignoring exception", exc_info=True)

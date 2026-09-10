@@ -508,10 +508,17 @@ def refresh_chatgpt_session_tokens(
             or record.get("plan_type")
             or "free"
         ).strip()
+        user_id = str(
+            auth.get("chatgpt_user_id")
+            or auth.get("user_id")
+            or record.get("user_id")
+            or ""
+        ).strip()
         return {
             **record,
             "access_token": fresh_access,
             "account_id": account_id,
+            "user_id": user_id,
             "plan_type": plan_type,
             "session": data,
             "last_token_refresh_at": _now(),
@@ -746,6 +753,26 @@ def check_account(
         # use the current pool without replacing that field in the account.
         refreshed = dict(refreshed)
         refreshed.pop("proxy", None)
+        # Workspace sessions flip account_id between the member id and the
+        # shared workspace id. A health-check refresh must never rewrite the
+        # account identity — merging multiple members into one shared
+        # workspace id previously collapsed whole account batches.
+        new_user = str(refreshed.get("user_id") or "").strip().lower()
+        old_user = str(current.get("user_id") or "").strip().lower()
+        if new_user and old_user and new_user != old_user:
+            raise InvalidAccessTokenError(
+                "session_user_mismatch: 刷新返回了其他用户的会话，已拒绝写入"
+            )
+        new_account_id = str(refreshed.get("account_id") or "").strip()
+        old_account_id = str(current.get("account_id") or "").strip()
+        if (
+            new_account_id
+            and old_account_id
+            and new_account_id.lower() != old_account_id.lower()
+        ):
+            refreshed.pop("account_id", None)
+            refreshed.pop("email", None)
+            refreshed["workspace_account_id"] = new_account_id
         current.update(refreshed)
 
     def refresh_for_probe(*, force: bool = False) -> None:

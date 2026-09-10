@@ -525,9 +525,16 @@ def repair_security_one(
             token_fields: dict[str, Any] = {
                 "access_token": str(refreshed.get("access_token") or "").strip(),
                 "session_token": str(refreshed.get("session_token") or "").strip(),
-                "account_id": str(refreshed.get("account_id") or "").strip(),
             }
-            for key in ("plan_type", "expires_at", "oauth_client_id"):
+            # Workspace sessions flip account_id between member id and shared
+            # workspace id; keep the stored identity on mismatch.
+            _new_aid = str(refreshed.get("account_id") or "").strip()
+            _old_aid = str(account.get("account_id") or fields.get("account_id") or "").strip()
+            if _old_aid and _new_aid and _new_aid.lower() != _old_aid.lower():
+                token_fields["workspace_account_id"] = _new_aid
+            else:
+                token_fields["account_id"] = _new_aid
+            for key in ("plan_type", "expires_at", "oauth_client_id", "user_id"):
                 value = str(refreshed.get(key) or "").strip()
                 if value:
                     token_fields[key] = value
@@ -575,6 +582,12 @@ def repair_security_one(
                 if protocol_tokens.get(key) not in (None, "", {})
                 and protocol_tokens.get(key) != fields.get(key, account.get(key))
             }
+            # Same workspace-flip guard for the credential-confirmation path.
+            _new_aid = str(token_fields.get("account_id") or "").strip()
+            _old_aid = str(account.get("account_id") or fields.get("account_id") or "").strip()
+            if _old_aid and _new_aid and _new_aid.lower() != _old_aid.lower():
+                token_fields.pop("account_id", None)
+                token_fields["workspace_account_id"] = _new_aid
             token_fields.update(
                 {
                     "totp_secret": final_totp,
@@ -708,6 +721,7 @@ def login_with_password_totp_one(
     totp_secret: str,
     proxy: str = "",
     workspace_name: str = "",
+    require_team_workspace: bool = False,
     stop_check: Callable[[], bool] | None = None,
     task_event=None,
     error_sink: Callable[[str], None] | None = None,
@@ -754,6 +768,7 @@ def login_with_password_totp_one(
             totp_secret,
             index,
             workspace_name=workspace_name,
+            require_team_workspace=require_team_workspace,
         )
         # Return the exact identity used for this session so reauthentication
         # can replace stale browser metadata from an older Chrome account.
