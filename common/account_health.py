@@ -20,12 +20,13 @@ from common.account_store import (
     account_deactivation_reason,
     account_delete_key,
     account_is_deactivated,
+    load_account_records_by_keys,
     load_accounts,
     normalized_health_status,
-    upsert_account_record,
-    upsert_account_records,
+    update_account_record_fields,
 )
 from common.account_operation_log import record_operation_event
+from common.team_workspace import requires_team_workspace, session_identity, validate_session_replacement
 from proxy_util import is_proxy_transport_error, normalize_proxy_url
 
 AUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
@@ -358,14 +359,15 @@ def refresh_oauth_tokens(
             if response.status_code == 401:
                 raise InvalidAccessTokenError(error)
             raise RuntimeError(error)
-        return {
-            **record,
+        fresh = {
             "access_token": str(data.get("access_token") or access_token).strip(),
             "refresh_token": str(data.get("refresh_token") or refresh_token).strip(),
             "id_token": str(data.get("id_token") or record.get("id_token") or "").strip(),
             "last_token_refresh_at": _now(),
             "last_token_refresh_error": "",
         }
+        validate_session_replacement(record, fresh, require_identity=requires_team_workspace(record))
+        return {**record, **fresh}
     finally:
         session.close()
 
@@ -498,24 +500,20 @@ def refresh_chatgpt_session_tokens(
         account_id = str(
             account.get("id")
             or auth.get("chatgpt_account_id")
-            or record.get("account_id")
             or ""
         ).strip()
         plan_type = str(
             account.get("planType")
             or account.get("plan_type")
             or auth.get("chatgpt_plan_type")
-            or record.get("plan_type")
-            or "free"
+            or ""
         ).strip()
         user_id = str(
             auth.get("chatgpt_user_id")
             or auth.get("user_id")
-            or record.get("user_id")
             or ""
         ).strip()
-        return {
-            **record,
+        fresh = {
             "access_token": fresh_access,
             "account_id": account_id,
             "user_id": user_id,
@@ -523,6 +521,13 @@ def refresh_chatgpt_session_tokens(
             "session": data,
             "last_token_refresh_at": _now(),
             "last_token_refresh_error": "",
+        }
+        validate_session_replacement(record, fresh, require_identity=requires_team_workspace(record))
+        return {
+            **record, **fresh,
+            "account_id": account_id or record.get("account_id") or "",
+            "user_id": user_id or record.get("user_id") or "",
+            "plan_type": plan_type or record.get("plan_type") or "free",
         }
     finally:
         session.close()
@@ -714,6 +719,96 @@ def fetch_remote_account_info(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_HEALTH_OWNED_FIELDS = frozenset({
+    "access_token", "refresh_token", "id_token", "session_token", "session",
+    "account_id", "workspace_account_id", "user_id", "email", "plan_type",
+    "last_token_refresh_at", "last_token_refresh_error", "last_invalid_at",
+    "status", "health_status", "health_checked_at", "health_error",
+    "health_probe_error", "health_probe_proxy_mode", "reauth_blocked_reason",
+    "type", "quota", "image_quota_unknown", "limits_progress",
+    "default_model_slug", "restore_at", "device_id",
+})
+_HEALTH_EXPECTED_FIELDS = (
+    "access_token", "refresh_token", "session_token", "user_id", "email",
+    "account_id", "password", "totp_secret", "import_account_type",
+    "selected_workspace_id", "workspace_selection_verified",
+)
+
+
+def _persist_health_results(
+    pairs: list[tuple[dict[str, Any], dict[str, Any]]], path: Path,
+) -> list[dict[str, Any]]:
+    """Write only probe-owned changes, conditional on the credentials inspected.
+
+    Read back the actual rows for callbacks: a concurrent credential replacement
+    can invalidate a probe while it is in flight, and deletion must stay deleted.
+    """
+    updates = {}
+    expected = {}
+    lookup_keys = set()
+    for original, checked in pairs:
+        key = account_delete_key(original)
+        updates[key] = {
+            field: checked[field] for field in _HEALTH_OWNED_FIELDS
+            if field in checked and checked[field] != original.get(field)
+        }
+        expected[key] = {field: original.get(field) for field in _HEALTH_EXPECTED_FIELDS}
+        # The store backfills this field from JWT claims on insertion. A newly
+        # registered caller may still hold the pre-normalization dictionary.
+        if not expected[key]["user_id"]:
+            claims = _jwt_payload(str(original.get("access_token") or "")).get("https://api.openai.com/auth")
+            if isinstance(claims, dict):
+                known_user = str(claims.get("chatgpt_user_id") or claims.get("user_id") or "").strip()
+                if known_user:
+                    expected[key]["user_id"] = known_user
+        lookup_keys.update((key, account_delete_key(checked)))
+    update_account_record_fields(
+        updates, expected_fields=expected, include_records=False, path=path,
+    )
+    stored = load_account_records_by_keys(lookup_keys, path)
+    results = []
+    for original, checked in pairs:
+        key = account_delete_key(original)
+        current = stored.get(key) or stored.get(account_delete_key(checked))
+        if current is None:
+            results.append({
+                **{field: original[field] for field in ("email", "user_id", "account_id") if field in original},
+                "health_status": "skipped",
+                "health_error": "账号已删除或身份已更新，测活结果未写入",
+                "health_write_skipped": True,
+            })
+            continue
+        current = dict(current)
+        if any(current.get(field) != value for field, value in updates[key].items()):
+            current["health_write_skipped"] = True
+            current["health_write_skip_reason"] = "账号在测活期间发生变化，已保留最新记录"
+        results.append(current)
+    return results
+
+
+def _validate_health_metadata(
+    original: dict[str, Any], current: dict[str, Any], remote: dict[str, Any],
+) -> None:
+    """Check probe identity before token claims can mask conflicting /me data."""
+    previous = session_identity(original)
+    expected_user = str(original.get("user_id") or previous["user_id"] or "").strip().casefold()
+    expected_email = str(original.get("email") or previous["email"] or "").strip().casefold()
+    remote_user = str(remote.get("user_id") or "").strip().casefold()
+    remote_email = str(remote.get("email") or "").strip().casefold()
+    if expected_user and remote_user and remote_user != expected_user:
+        raise RuntimeError("session_identity_user_mismatch: 测活返回其他用户，保留原账号")
+    if expected_email and remote_email and remote_email != expected_email:
+        raise RuntimeError("session_identity_email_mismatch: 测活邮箱与原账号不一致，保留原账号")
+    if requires_team_workspace(original):
+        expected_workspace = str(original.get("selected_workspace_id") or previous["account_id"] or "").strip().casefold()
+        remote_workspace = str(remote.get("account_id") or "").strip().casefold()
+        if expected_workspace and remote_workspace and remote_workspace != expected_workspace:
+            raise RuntimeError("team_workspace_id_mismatch: 测活返回其他工作区，保留原团队会话")
+    validate_session_replacement(
+        original, {**current, **remote}, require_identity=requires_team_workspace(original),
+    )
+
+
 def check_account(
     record: dict[str, Any],
     *,
@@ -752,6 +847,9 @@ def check_account(
         # The saved registration proxy is historical metadata. Network calls
         # use the current pool without replacing that field in the account.
         refreshed = dict(refreshed)
+        validate_session_replacement(
+            record, refreshed, require_identity=requires_team_workspace(record),
+        )
         refreshed.pop("proxy", None)
         # Workspace sessions flip account_id between the member id and the
         # shared workspace id. A health-check refresh must never rewrite the
@@ -804,7 +902,7 @@ def check_account(
             updated_at=_now(),
         )
         if persist:
-            upsert_account_record(current, path)
+            current = _persist_health_results([(record, current)], path)[0]
         record_operation_event(
             current,
             "health_check",
@@ -846,6 +944,7 @@ def check_account(
                         )
                         apply_refreshed(refreshed)
                     remote = fetch_remote_account_info({**current, "proxy": probe_proxy})
+                _validate_health_metadata(record, current, remote)
                 remote["health_probe_proxy_mode"] = probe_proxy_mode
                 remote["health_probe_error"] = ""
                 current.update(remote)
@@ -935,7 +1034,7 @@ def check_account(
         path=operation_log_path,
     )
     if persist:
-        upsert_account_record(current, path)
+        current = _persist_health_results([(record, current)], path)[0]
     return current
 
 
@@ -987,7 +1086,7 @@ def check_accounts(
     requested = len(items) + len(skipped_items)
     actual_total = len(items)
     results: list[dict[str, Any]] = []
-    pending: list[dict[str, Any]] = []
+    pending: list[tuple[dict[str, Any], dict[str, Any]]] = []
     # A single SQLite transaction per worker completion is expensive for a
     # multi-thousand-account run. Keep progress durable in modest chunks while
     # avoiding thousands of full transaction/JSON cycles.
@@ -998,25 +1097,13 @@ def check_accounts(
             return
         batch = list(pending)
         pending.clear()
-        stored = upsert_account_records(batch, path, create=False)
-        by_key = {account_delete_key(item): item for item in stored}
-        by_account_id = {
-            str(item.get("account_id") or "").strip().lower(): item
-            for item in stored
-            if str(item.get("account_id") or "").strip()
-        }
-        by_email = {
-            str(item.get("email") or "").strip().lower(): item
-            for item in stored
-            if str(item.get("email") or "").strip()
-        }
-        for checked in batch:
-            persisted = by_key.get(account_delete_key(checked))
-            if persisted is None:
-                account_id = str(checked.get("account_id") or "").strip().lower()
-                email = str(checked.get("email") or "").strip().lower()
-                persisted = by_account_id.get(account_id) or by_email.get(email) or checked
+        for persisted in _persist_health_results(batch, path):
             results.append(persisted)
+            if callable(item_callback):
+                try:
+                    item_callback(len(results), len(items), persisted)
+                except Exception:
+                    pass
             if callable(progress_callback):
                 try:
                     progress_callback(len(results), len(items), persisted)
@@ -1053,7 +1140,6 @@ def check_accounts(
             limit_provider=worker_limit,
         )
 
-    completed = 0
     # Keep only a small number of futures queued.  Submitting every account at
     # once retains the complete payload of thousands of accounts while a
     # registration-priority gate may be allowing only one health probe.
@@ -1077,15 +1163,9 @@ def check_accounts(
                 tuple(in_flight), return_when=FIRST_COMPLETED
             )
             for future in completed_futures:
-                in_flight.pop(future, None)
+                original = in_flight.pop(future)
                 checked = future.result()
-                pending.append(checked)
-                completed += 1
-                if callable(item_callback):
-                    try:
-                        item_callback(completed, len(items), checked)
-                    except Exception:
-                        pass
+                pending.append((original, checked))
                 if len(pending) >= batch_size:
                     persist_pending()
                 submit_next()

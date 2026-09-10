@@ -267,6 +267,7 @@ def import_boundary(monkeypatch, tmp_path):
     monkeypatch.setattr(store, "upsert_account_record", upsert)
     monkeypatch.setattr(route, "_state", lambda: SimpleNamespace(
         ACCOUNTS_FILE=database,
+        _read_config=lambda: {},
         normalized_health_status=lambda record: record.get("health_status", "unknown"),
     ))
     monkeypatch.setattr(route, "_log", Mock())
@@ -299,7 +300,7 @@ def test_post_health_team_guard_prevents_upsert_and_preserves_prior_record(impor
         checked.update(_record("team", user="user-other"))
     boundary.check.return_value = checked
     boundary.check.side_effect = None
-    with pytest.raises(RuntimeError, match="team_workspace_"):
+    with pytest.raises(RuntimeError, match="team_workspace_|import_identity_user_mismatch"):
         boundary.route._persist_imported_account(existing, _record(), Mock())
     assert existing == before
     boundary.check.assert_called_once()
@@ -318,14 +319,14 @@ def test_team_import_requires_selection_proof_even_for_team_token(import_boundar
 
 
 def test_valid_team_import_can_persist_after_health_verification(import_boundary):
-    result = import_boundary.route._persist_imported_account({"import_account_type": "team"}, _record(), Mock())
+    result = import_boundary.route._persist_imported_account({"email": "team-import@example.test", "import_account_type": "team"}, _record(), Mock())
     assert result["plan_type"] == "team"
     import_boundary.upsert.assert_called_once()
     assert import_boundary.upsert.call_args.kwargs["create"] is True
 
 
 def test_personal_free_import_can_still_persist(import_boundary):
-    result = import_boundary.route._persist_imported_account({}, _record("free", "ws-personal"), Mock())
+    result = import_boundary.route._persist_imported_account({"email": "team-import@example.test"}, _record("free", "ws-personal"), Mock())
     assert result["plan_type"] == "free"
     import_boundary.upsert.assert_called_once()
 

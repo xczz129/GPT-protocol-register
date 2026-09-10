@@ -2780,6 +2780,7 @@ class WebPanelLogicTests(unittest.TestCase):
 
     def test_health_401_prefers_nextauth_session_over_platform_refresh(self):
         from common.account_health import InvalidAccessTokenError, check_account
+        from common.account_store import update_account_record_fields
 
         source = {
             "email": "session@example.com",
@@ -2797,24 +2798,31 @@ class WebPanelLogicTests(unittest.TestCase):
             "health_status": "alive",
             "health_error": "",
         }
-        with (
-            patch(
-                "common.account_health.refresh_chatgpt_session_tokens",
-                side_effect=[dict(source), refreshed],
-            ) as nextauth,
-            patch("common.account_health.refresh_oauth_tokens") as oauth,
-            patch(
-                "common.account_health.fetch_remote_account_info",
-                side_effect=[
-                    InvalidAccessTokenError("token invalidated (/backend-api/me)"),
-                    alive,
-                ],
-            ),
-            patch("common.account_health.upsert_account_record"),
-        ):
-            result = check_account(source)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "accounts.json"
+            upsert_account_record(source, path)
+            with (
+                patch(
+                    "common.account_health.refresh_chatgpt_session_tokens",
+                    side_effect=[dict(source), refreshed],
+                ) as nextauth,
+                patch("common.account_health.refresh_oauth_tokens") as oauth,
+                patch(
+                    "common.account_health.fetch_remote_account_info",
+                    side_effect=[
+                        InvalidAccessTokenError("token invalidated (/backend-api/me)"),
+                        alive,
+                    ],
+                ),
+                patch("common.account_health.update_account_record_fields", wraps=update_account_record_fields) as persist,
+            ):
+                result = check_account(source, path=path)
+            self.assertEqual(load_accounts(path)[0]["access_token"], refreshed["access_token"])
 
         self.assertEqual(result["health_status"], "alive")
+        persist.assert_called_once()
+        expected = next(iter(persist.call_args.kwargs["expected_fields"].values()))
+        self.assertEqual(expected["access_token"], source["access_token"])
         from common.account_health import _PROBE_REFRESH_TIMEOUT
 
         self.assertEqual(
@@ -6021,23 +6029,30 @@ class ProtocolAndHealthTests(unittest.TestCase):
 
     def test_expired_access_token_401_is_not_treated_as_dead_account(self):
         from common.account_health import InvalidAccessTokenError, check_account
+        from common.account_store import update_account_record_fields
 
         source = {
             "email": "expired@example.com",
             "access_token": _jwt({"exp": 1}),
         }
         with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "accounts.json"
+            upsert_account_record(source, path)
             with (
                 patch("common.account_health.refresh_oauth_tokens", return_value=dict(source)),
                 patch(
                     "common.account_health.fetch_remote_account_info",
                     side_effect=InvalidAccessTokenError("token invalidated (/backend-api/me)"),
                 ),
-                patch("common.account_health.upsert_account_record"),
+                patch("common.account_health.update_account_record_fields", wraps=update_account_record_fields) as persist,
             ):
-                result = check_account(source, path=Path(td) / "accounts.json")
+                result = check_account(source, path=path)
+            self.assertEqual(load_accounts(path)[0]["health_status"], "reauth_required")
 
         self.assertEqual(result["health_status"], "reauth_required")
+        persist.assert_called_once()
+        expected = next(iter(persist.call_args.kwargs["expected_fields"].values()))
+        self.assertEqual(expected["access_token"], source["access_token"])
 
     def test_icloud_mailbox_can_complete_passwordless_login_flow(self):
         from register.protocol import PlatformRegistrar
@@ -10166,6 +10181,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "accounts.json"
+            upsert_account_record(source, path)
             with (
                 patch("common.account_health.refresh_oauth_tokens", return_value=dict(source)),
                 patch("common.account_health.fetch_remote_account_info", return_value=remote),
@@ -10174,6 +10190,8 @@ class ProtocolAndHealthTests(unittest.TestCase):
             saved = load_accounts(path)[0]
         self.assertEqual(checked["health_status"], "alive")
         self.assertEqual(saved["quota"], 12)
+        self.assertEqual(saved["access_token"], source["access_token"])
+        self.assertEqual(saved["refresh_token"], source["refresh_token"])
         public = account_public_view(saved)
         self.assertTrue(public["has_access_token"])
         self.assertNotIn("access_token", public)
@@ -10353,19 +10371,25 @@ class ProtocolAndHealthTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "accounts.json"
+            upsert_account_record(source, path)
             with (
                 patch("common.account_health.refresh_oauth_tokens") as refresh,
                 patch("common.account_health.fetch_remote_account_info") as fetch,
             ):
                 checked = check_account(source, path=path)
+            saved = load_accounts(path)[0]
 
         self.assertEqual(checked["health_status"], "invalid")
         self.assertIn("account_deactivated", checked["health_error"])
+        self.assertEqual(saved["health_status"], "invalid")
+        self.assertEqual(saved["reauth_blocked_reason"], "account_deactivated")
+        self.assertEqual(saved["access_token"], source["access_token"])
         refresh.assert_not_called()
         fetch.assert_not_called()
 
     def test_bulk_health_skips_known_deactivated_rows_and_reports_separate_totals(self):
         from common.account_health import check_accounts
+        from common.account_store import update_account_record_fields
 
         records = [
             {
@@ -10384,14 +10408,16 @@ class ProtocolAndHealthTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "accounts.json"
+            upsert_account_records(records, path)
             with (
                 patch("common.account_health.check_account", side_effect=checked) as probe,
                 patch(
-                    "common.account_health.upsert_account_records",
-                    side_effect=lambda batch, _path, **_kwargs: [dict(item) for item in batch],
-                ),
+                    "common.account_health.update_account_record_fields",
+                    wraps=update_account_record_fields,
+                ) as persist,
             ):
                 result = check_accounts(records=records, workers=2, path=path)
+            saved = {item["email"]: item for item in load_accounts(path)}
 
         self.assertEqual(result["requested"], 3)
         self.assertEqual(result["actual_total"], 2)
@@ -10401,6 +10427,10 @@ class ProtocolAndHealthTests(unittest.TestCase):
         self.assertEqual(result["usable"], 2)
         self.assertEqual(result["unavailable"], 1)
         self.assertEqual(probe.call_count, 2)
+        persist.assert_called_once()
+        self.assertEqual(len(persist.call_args.args[0]), 2)
+        self.assertEqual(saved["not-checked@example.com"]["health_status"], "alive")
+        self.assertEqual(saved["already-dead@example.com"]["health_status"], "invalid")
         self.assertEqual(
             [item["email"] for item in result["skipped_items"]],
             ["already-dead@example.com"],
@@ -10416,11 +10446,14 @@ class ProtocolAndHealthTests(unittest.TestCase):
                 "health_error": "account_deactivated: account has been deleted",
             }
         ]
-        with (
-            patch("common.account_health.check_account") as probe,
-            patch("common.account_health.upsert_account_records") as persist,
-        ):
-            result = check_accounts(records=records, workers=3)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "accounts.json"
+            upsert_account_records(records, path)
+            with (
+                patch("common.account_health.check_account") as probe,
+                patch("common.account_health.update_account_record_fields") as persist,
+            ):
+                result = check_accounts(records=records, workers=3, path=path)
 
         self.assertEqual(result["requested"], 1)
         self.assertEqual(result["actual_total"], 0)
@@ -10432,6 +10465,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
 
     def test_bulk_health_batches_results_before_progress(self):
         from common.account_health import check_accounts
+        from common.account_store import update_account_record_fields
 
         records = [
             {"email": "one@example.com", "health_status": "alive"},
@@ -10440,20 +10474,25 @@ class ProtocolAndHealthTests(unittest.TestCase):
 
         def checked(record, **kwargs):
             self.assertFalse(kwargs["persist"])
-            return dict(record)
+            return {**record, "health_checked_at": "2026-09-10T12:00:00Z"}
 
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "accounts.json"
+            upsert_account_records(records, path)
             persisted = []
 
-            def persist_batch(batch, _path, **_kwargs):
-                persisted.extend(record["email"] for record in batch)
-                return [dict(record) for record in batch]
+            def persist_fields(updates, **kwargs):
+                result = update_account_record_fields(updates, **kwargs)
+                persisted.extend(
+                    record["email"] for record in load_accounts(path)
+                    if record.get("health_checked_at") == "2026-09-10T12:00:00Z"
+                )
+                return result
 
             progress = []
             with (
                 patch("common.account_health.check_account", side_effect=checked) as check_one,
-                patch("common.account_health.upsert_account_records", side_effect=persist_batch) as persist,
+                patch("common.account_health.update_account_record_fields", side_effect=persist_fields) as persist,
             ):
                 result = check_accounts(
                     records=records,
@@ -10470,6 +10509,8 @@ class ProtocolAndHealthTests(unittest.TestCase):
         self.assertEqual(check_one.call_count, 2)
         self.assertEqual(persist.call_count, 1)
         self.assertEqual(len(persist.call_args.args[0]), 2)
+        self.assertEqual(len(persist.call_args.kwargs["expected_fields"]), 2)
+        self.assertFalse(persist.call_args.kwargs["include_records"])
         self.assertEqual(len(progress), 2)
         for _done, email, visible_at_callback in progress:
             self.assertIn(email, visible_at_callback)

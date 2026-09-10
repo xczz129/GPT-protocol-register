@@ -1408,6 +1408,46 @@ def _parse_credential_lines(text: str) -> list:
     return creds
 
 
+def _validate_import_identity(account: dict, candidate: dict) -> dict[str, str]:
+    """Bind freshly returned credentials to the requested account before merging."""
+    from common.session_export import parse_jwt_payload
+    from common.team_workspace import session_identity
+
+    expected_email = str(account.get("email") or "").strip().casefold()
+    if not expected_email:
+        raise RuntimeError("import_identity_unverified: 缺少待导入账号邮箱")
+    payloads = [parse_jwt_payload(str(candidate.get(key) or "")) or {} for key in ("access_token", "id_token")]
+    session = candidate.get("session")
+    session = session if isinstance(session, dict) else {}
+    user = session.get("user")
+    user = user if isinstance(user, dict) else {}
+    email_values = [user.get("email"), session.get("email"), candidate.get("email")]
+    user_values = [user.get("id"), candidate.get("user_id")]
+    for payload in payloads:
+        profile = payload.get("https://api.openai.com/profile")
+        profile = profile if isinstance(profile, dict) else {}
+        auth = payload.get("https://api.openai.com/auth")
+        auth = auth if isinstance(auth, dict) else {}
+        email_values.extend((profile.get("email"), payload.get("email")))
+        # OAuth `sub` is a different namespace; compare only ChatGPT user IDs.
+        user_values.extend((auth.get("chatgpt_user_id"), auth.get("user_id")))
+    emails = {
+        str(value).strip().casefold()
+        for value in email_values
+        if str(value or "").strip()
+    }
+    if not emails:
+        raise RuntimeError("import_identity_unverified: 返回会话缺少可核对的邮箱，未写入账号库")
+    if emails != {expected_email}:
+        raise RuntimeError("import_identity_email_mismatch: 返回会话邮箱与导入账号不一致，未写入账号库")
+    identity = session_identity(candidate)
+    expected_user = str(account.get("user_id") or "").strip().casefold()
+    users = {str(value).strip().casefold() for value in user_values if str(value or "").strip()}
+    if len(users) > 1 or (expected_user and users != {expected_user}):
+        raise RuntimeError("import_identity_user_mismatch: 返回会话用户与导入账号不一致，未写入账号库")
+    return identity
+
+
 def _persist_imported_account(
     account: dict, tokens: dict, log
 ) -> dict:
@@ -1432,6 +1472,7 @@ def _persist_imported_account(
     access_token = str(tokens.get("access_token") or "").strip()
     if not access_token:
         raise RuntimeError("协议登录未返回 AT")
+    login_identity = _validate_import_identity(account, tokens)
     refreshed = {
         **account,
         "access_token": access_token,
@@ -1441,6 +1482,8 @@ def _persist_imported_account(
         "session_token": str(tokens.get("session_token") or "").strip(),
         "session": tokens.get("session") or account.get("session"),
     }
+    if login_identity["user_id"]:
+        refreshed["user_id"] = login_identity["user_id"]
     for key in (
         "plan_type",
         "type",
@@ -1477,6 +1520,9 @@ def _persist_imported_account(
         if _state().normalized_health_status(checked) not in {"alive", "limited"}:
             detail = str(checked.get("health_error") or "导入后测活失败")
             raise RuntimeError(detail[:400])
+    _validate_import_identity(
+        {"email": account["email"], "user_id": login_identity["user_id"]}, checked,
+    )
     if require_team:
         verified = validate_team_session(
             checked,
@@ -1548,18 +1594,33 @@ def _import_one(
         return result
 
     try:
+        from proxy_util import normalize_proxy_url, resolve_proxy_pool
+        from register.protocol_runtime import ProtocolRuntimeSettings
+
+        cfg = _state()._read_config()
+        proxy_cfg = cfg.get("proxy") if isinstance(cfg.get("proxy"), dict) else {}
+        registration = cfg.get("registration") if isinstance(cfg.get("registration"), dict) else {}
+        proxies = [normalize_proxy_url(value) for value in resolve_proxy_pool(proxy_cfg)]
+        proxies = [value for value in proxies if value]
+        if proxy_cfg.get("enabled") and not proxies:
+            raise RuntimeError("import_proxy_unavailable: 已启用代理，但没有可用代理，未直连导入")
+        proxy = proxies[max(0, index - 1) % len(proxies)] if proxies else ""
+        runtime = ProtocolRuntimeSettings.from_config(registration)
+        runtime = runtime.with_deadline(time.monotonic() + runtime.account_timeout)
         log("协议登录启动(密码 + TOTP)")
         tokens = login_with_password_totp_one(
             index,
             email=email,
             password=password,
             totp_secret=totp,
-            proxy="",
+            proxy=proxy,
             workspace_name=str(workspace or "").strip(),
             require_team_workspace=account_type == "team",
             stop_check=stop_event.is_set,
             error_sink=error_sink,
             account_log_sink=account_log_sink,
+            proxy_config=proxy_cfg,
+            protocol_runtime=runtime,
         )
         if not tokens or not str(tokens.get("access_token") or "").strip():
             # The real failure reason arrives via error_sink; keep the generic
@@ -1577,7 +1638,7 @@ def _import_one(
             "registration_method": "protocol",
             "source_type": "imported",
             "registration_state": "complete",
-            "proxy": "",
+            "proxy": proxy,
         }
         # Team is a verified workspace constraint, never a fallback display label.
         if account_type == "team":

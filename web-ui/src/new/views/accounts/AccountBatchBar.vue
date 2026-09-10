@@ -107,12 +107,21 @@ function removeSelected() {
 
 /* --- 接码：选中邮箱直接启动 codex 批次（默认并发 3） --- */
 function codexSelected() {
-  run(async () => {
-    const emails = accounts.pageRows
-      .filter((a) => accounts.selectedSet.has(a.delete_key))
-      .map((a) => a.email)
-      .filter(Boolean);
-    if (!emails.length) return;
+  return run(async () => {
+    if (accounts.loading) {
+      ui.notify("账号列表正在加载，请加载完成后再接码", "warning");
+      return;
+    }
+    // 选择会跨页保留；必须使用完整列表，并在任何选中记录缺失时停止。
+    const selected = accounts.selectedSet;
+    const selectedRows = accounts.rows.filter((a) => selected.has(a.delete_key));
+    if (selectedRows.length !== selected.size) {
+      throw new Error("所选账号已变化或尚未加载完整，请刷新账号列表并重新选择");
+    }
+    const emails = selectedRows.map((a) => String(a.email || "").trim()).filter(Boolean);
+    if (!emails.length || emails.length !== selectedRows.length) {
+      throw new Error("所选账号缺少邮箱，请检查后重新选择");
+    }
     await batch.runCodex(emails, 3);
     emit("codex");
   });

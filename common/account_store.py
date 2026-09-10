@@ -1629,16 +1629,44 @@ def update_account_record_fields(
     *,
     include_records: bool = True,
     path: Path = ACCOUNTS_FILE,
+    expected_fields: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[int, list[dict[str, Any]]]:
     """Apply distinct field maps to many account rows in one atomic rewrite.
 
     The default return contract remains ``(changed, full_snapshot)``.  Batch
     workers should pass ``include_records=False`` when they do not consume the
     snapshot, avoiding a full payload decode on every flush.
+
+    Optional per-key expectations are checked against the current row inside
+    the write transaction. A stale row is skipped. Identity-key migrations
+    remove the old row atomically; an occupied target key aborts the batch
+    instead of overwriting another row or implicitly merging its credentials.
     """
     wanted = {str(key): value for key, value in updates.items() if str(key) and isinstance(value, dict)}
+    expected = {} if expected_fields is None else {
+        str(key): value for key, value in expected_fields.items()
+    }
+    if any(not isinstance(value, dict) for value in expected.values()):
+        raise TypeError("expected_fields values must be field maps")
     if not wanted:
         return 0, load_accounts(path) if include_records else []
+
+    def prepare_update(key: str, record: dict[str, Any], now_iso: str) -> dict[str, Any] | None:
+        fields = wanted.get(key)
+        if not fields:
+            return None
+        condition = expected.get(key)
+        if condition is not None and any(
+            record.get(field) != value for field, value in condition.items()
+        ):
+            return None
+        updated = _ensure_stable_user_id({**record, **fields, "updated_at": now_iso})
+        old_user = account_stable_user_id(record)
+        new_user = account_stable_user_id(updated)
+        if old_user and new_user != old_user:
+            raise ValueError("account_identity_conflict: 字段更新不能替换已有用户身份")
+        return updated
+
     sqlite_store = _ensure_sqlite(Path(path))
     if sqlite_store is not None:
         _, connection = sqlite_store
@@ -1657,14 +1685,24 @@ def update_account_record_fields(
                 )
             changed = 0
             now_iso = _utc_now_iso()
+            reserved_keys = {str(key) for key, _ in rows}
             for key, payload in rows:
                 record = _decode_payload(payload)
-                fields = wanted.get(str(key))
-                if record is None or not fields:
+                if record is None:
                     continue
-                record.update(fields)
-                record["updated_at"] = now_iso
-                _store_sqlite_record(connection, record)
+                updated = prepare_update(str(key), record, now_iso)
+                if updated is None:
+                    continue
+                new_key = account_delete_key(updated)
+                if new_key != str(key):
+                    occupied = connection.execute(
+                        "SELECT 1 FROM accounts WHERE canonical_key = ?", (new_key,)
+                    ).fetchone()
+                    if new_key in reserved_keys or occupied is not None:
+                        raise ValueError("account_identity_conflict: 更新后的账号标识已存在，未覆盖原记录")
+                    reserved_keys.add(new_key)
+                    connection.execute("DELETE FROM accounts WHERE canonical_key = ?", (key,))
+                _store_sqlite_record(connection, updated)
                 changed += 1
             if changed:
                 _bump_revision(connection)
@@ -1677,13 +1715,20 @@ def update_account_record_fields(
             connection.close()
     with _file_lock(path, timeout=30.0):
         records = _canonical_snapshot(path)
+        reserved_keys = {account_delete_key(record) for record in records}
         changed = 0
-        for record in records:
-            fields = wanted.get(account_delete_key(record))
-            if not fields:
+        now_iso = _utc_now_iso()
+        for index, record in enumerate(records):
+            key = account_delete_key(record)
+            updated = prepare_update(key, record, now_iso)
+            if updated is None:
                 continue
-            record.update(fields)
-            record["updated_at"] = _utc_now_iso()
+            new_key = account_delete_key(updated)
+            if new_key != key:
+                if new_key in reserved_keys:
+                    raise ValueError("account_identity_conflict: 更新后的账号标识已存在，未覆盖原记录")
+                reserved_keys.add(new_key)
+            records[index] = updated
             changed += 1
         normalized = normalize_accounts(records) if changed else records
         # A stale key set is a valid no-op. Avoid rewriting the entire legacy

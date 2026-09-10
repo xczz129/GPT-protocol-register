@@ -748,9 +748,10 @@ def login_with_password_totp_one(
     stop_token = _STOP_CHECK.set(stop)
     email_token = _FIXED_EMAIL.set(email)
     proxy_config_token = _PROXY_CONFIG.set(dict(proxy_config or {}))
-    runtime_context = activate_runtime(
-        protocol_runtime or ProtocolRuntimeSettings()
-    )
+    runtime = protocol_runtime or ProtocolRuntimeSettings()
+    if runtime.deadline is None:
+        runtime = runtime.with_deadline(time.monotonic() + runtime.account_timeout)
+    runtime_context = activate_runtime(runtime)
     runtime_context.__enter__()
     registrar = None
 
