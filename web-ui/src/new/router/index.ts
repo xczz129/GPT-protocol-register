@@ -28,7 +28,7 @@ const routes: RouteRecordRaw[] = [
 
   /* --- 账号管理 --- */
   { path: "/accounts", component: AccountsView, meta: { title: "账号列表", subtitle: "搜索、测活、分组并导出已注册账号", section: "账号管理" } },
-  { path: "/accounts/export", component: CredentialExportView, meta: { title: "凭据导出", subtitle: "按邮箱筛选并导出账号、密码和 2FA", section: "账号管理" } },
+  { path: "/accounts/export", component: CredentialExportView, meta: { title: "凭据导出", subtitle: "导出中转 JSON 文件或账号、密码和 2FA", section: "账号管理" } },
   { path: "/accounts/rebind", component: RebindView, meta: { title: "邮箱换绑", subtitle: "将账号换绑到邮箱池中的未占用地址", section: "账号管理" } },
   { path: "/accounts/reauth", component: ProtocolLoginView, meta: { title: "协议登录", subtitle: "按邮箱批量重新登录并查看账号状态", section: "账号管理" } },
 
@@ -93,7 +93,7 @@ export const navSections: NavSection[] = [
     label: "账号管理",
     items: [
       { to: "/accounts", label: "账号列表", desc: "测活、分组与导出", icon: "contact" },
-      { to: "/accounts/export", label: "凭据导出", desc: "账号密码与 2FA", icon: "file-down" },
+      { to: "/accounts/export", label: "凭据导出", desc: "中转 JSON 与账号凭据", icon: "file-down" },
       { to: "/accounts/rebind", label: "邮箱换绑", desc: "换绑到空闲邮箱", icon: "swap" },
       { to: "/accounts/reauth", label: "协议登录", desc: "批量重新登录", icon: "login" },
     ],

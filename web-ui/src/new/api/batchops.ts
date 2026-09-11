@@ -8,7 +8,18 @@ export interface CodexLogLine {
   m: string;
 }
 
-export interface CodexResultItem {
+export type RelayStrategy = "auto" | "sync_only" | "reauthorize";
+export type RelayAction = "sync_only" | "reauthorize";
+
+export interface RelayOutcome {
+  action?: string;
+  relay_status?: string;
+  relay_file?: string;
+  authorization_status?: string;
+  retry_action?: RelayAction;
+}
+
+export interface CodexResultItem extends RelayOutcome {
   email: string;
   status: string;
   refresh_token?: string;
@@ -17,6 +28,7 @@ export interface CodexResultItem {
   error?: string;
   skipped?: boolean;
   logs?: CodexLogLine[];
+  outcome?: string;
 }
 
 /** Per-run overrides contain public settings only; API keys stay on the server. */
@@ -32,9 +44,11 @@ export interface CodexRunOptions {
   concurrency: number;
   force: boolean;
   sms_options?: SmsOptions;
+  strategy?: RelayStrategy;
+  account_actions?: Record<string, RelayAction>;
 }
 
-export interface CodexItem {
+export interface CodexItem extends RelayOutcome {
   email: string;
   status: string;
   stage?: string;
@@ -54,6 +68,7 @@ export interface CodexCounts {
   cancelled: number;
   pending: number;
   active: number;
+  synced?: number;
 }
 
 export interface CodexStatus {
@@ -89,6 +104,13 @@ export interface CodexPreflight {
   limit: number;
   configured: boolean;
   emails: string[];
+  sync_needed?: number;
+  relay_ready?: number;
+  reauthorize?: number;
+  relay_configured?: boolean;
+  sms_required_if_challenged?: boolean;
+  relay_issues?: { email: string; reason: string; relay_status: string }[];
+  action_items?: { email: string; action: RelayAction | "ready" | "blocked"; reason: string; relay_status: string }[];
   settings: SmsOptions & {
     provider: string;
     provider_label: string;
@@ -102,7 +124,7 @@ export interface CodexPreflight {
   };
 }
 
-export interface CodexHistoryEntry {
+export interface CodexHistoryEntry extends RelayOutcome {
   at: string;
   status: string;
   phone?: string;
@@ -242,14 +264,14 @@ export interface ImportHistoryEntry {
 }
 
 /* --- 接码 / 导入（共用 codex 批次状态） --- */
-export function codexRun(emails: string[], concurrency: number, force = false, smsOptions?: SmsOptions) {
+export function codexRun(emails: string[], concurrency: number, force = false, smsOptions?: SmsOptions, strategy?: RelayStrategy, accountActions?: Record<string, RelayAction>) {
   return api<CodexStartResult>("/api/codex-oauth/run", {
     method: "POST",
-    body: jsonBody({ emails, concurrency, force, ...(smsOptions ? { sms_options: smsOptions } : {}) }),
+    body: jsonBody({ emails, concurrency, force, ...(smsOptions ? { sms_options: smsOptions } : {}), ...(strategy ? { strategy } : {}), ...(accountActions ? { account_actions: accountActions } : {}) }),
   });
 }
 
-export function preflightCodex(payload: { emails: string[]; concurrency?: number; force?: boolean; sms_options?: SmsOptions }) {
+export function preflightCodex(payload: { emails: string[]; concurrency?: number; force?: boolean; sms_options?: SmsOptions; strategy?: RelayStrategy; account_actions?: Record<string, RelayAction> }) {
   return api<CodexPreflight>("/api/codex-oauth/preflight", { method: "POST", body: jsonBody(payload) });
 }
 

@@ -35,6 +35,89 @@ export interface CliproxyAccounts {
   items: CliproxyItem[];
 }
 
+/** Metadata only: token contents are downloaded only after an explicit export. */
+export interface CliproxyExportItem {
+  file: string;
+  email: string;
+  account_id: string;
+  plan_type: string;
+  size_bytes: number;
+  valid: boolean;
+  error?: string;
+  revision: string;
+}
+
+export interface CliproxyExportPreview {
+  configured: boolean;
+  total_files: number;
+  matched_files: number;
+  matched_emails: number;
+  not_found: string[];
+  items: CliproxyExportItem[];
+}
+
+export type CliproxyExportFormat = "original" | "merged" | "sub2";
+
+export function fetchCliproxyExportPreview(
+  payload: { emails: string[]; all: boolean },
+  signal?: AbortSignal,
+): Promise<CliproxyExportPreview> {
+  return api("/api/cliproxy/export-preview", {
+    method: "POST", body: jsonBody(payload), signal,
+  });
+}
+
+function attachmentFilename(header: string | null, fallback: string): string {
+  const encoded = header?.match(/filename\*\s*=\s*UTF-8''([^;]+)/i)?.[1];
+  const plain = header?.match(/filename\s*=\s*(?:"([^"]+)"|([^;]+))/i);
+  let name = plain?.[1] || plain?.[2]?.trim() || fallback;
+  if (encoded) {
+    try { name = decodeURIComponent(encoded.trim().replace(/^"|"$/g, "")); } catch { /* Use the plain name if decoding fails. */ }
+  }
+  return name.replace(/[\\/]/g, "_").replace(/[\u0000-\u001f\u007f]/g, "").trim() || fallback;
+}
+
+/** Exact, reviewed file selection. Empty selection never means export all. */
+export async function exportCliproxyFiles(
+  files: string[], format: CliproxyExportFormat, revisions: Record<string, string>,
+): Promise<{ exported: number; filename: string }> {
+  const selected = [...new Set(files)];
+  if (!selected.length) throw new ApiError("请先勾选要导出的中转文件", 400);
+  if (selected.some((file) => !file || /[\\/\u0000]/.test(file) || !revisions[file])) {
+    throw new ApiError("所选文件信息不完整，请重新加载中转文件", 400);
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60000);
+  try {
+    const response = await fetch(apiUrl("/api/cliproxy/export-files"), {
+      method: "POST", credentials: "include", cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: jsonBody({ files: selected, format, revisions: Object.fromEntries(selected.map((file) => [file, revisions[file]])) }),
+      signal: controller.signal,
+    });
+    if (response.status === 401) {
+      location.replace("/login");
+      throw new ApiError("登录会话已过期", 401);
+    }
+    if (!response.ok) {
+      let detail = response.statusText;
+      try {
+        const body = await response.json();
+        detail = typeof body?.detail === "string" ? body.detail : body?.detail ? JSON.stringify(body.detail) : detail;
+      } catch { /* Use the status text if the response is not JSON. */ }
+      throw new ApiError(detail || "中转文件导出失败", response.status);
+    }
+    const fallback = format === "original" ? selected.length === 1 ? selected[0] : "cliproxy-auths-selected.zip" : `cliproxy-${format === "merged" ? "cpa" : "sub2"}-selected.json`;
+    const filename = attachmentFilename(response.headers.get("Content-Disposition"), fallback);
+    const url = URL.createObjectURL(await response.blob());
+    const anchor = document.createElement("a");
+    anchor.href = url; anchor.download = filename;
+    document.body.append(anchor); anchor.click(); anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    return { exported: Number(response.headers.get("X-Exported-Count") || selected.length), filename };
+  } finally { clearTimeout(timeout); }
+}
+
 export function fetchCliproxyAccounts(): Promise<CliproxyAccounts> {
   return api<CliproxyAccounts>("/api/cliproxy/accounts");
 }

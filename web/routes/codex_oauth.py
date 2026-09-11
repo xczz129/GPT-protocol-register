@@ -12,9 +12,11 @@ import copy
 import hashlib
 import json
 import math
+import os
 import re
 import sys
 import threading
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -36,11 +38,14 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from common.account_store import account_delete_key, update_account_record_fields  # noqa: E402
 from common.team_workspace import requires_team_workspace, session_identity, validate_session_replacement  # noqa: E402
+from common.relay_recovery import (  # noqa: E402
+    auth_known_invalid, read_relay_entry, relay_entry_status, relay_state, safe_stored_bundle, scan_relay,
+)
 from codex_oauth.oauth import (  # noqa: E402
     ProtocolClient,
     decode_jwt_payload,
     exchange_code,
-    save_auth_record,
+    token_metadata,
     totp_from_secret,
 )
 from codex_oauth.sms import (  # noqa: E402
@@ -59,40 +64,53 @@ CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 
 # cli-proxy-api 容器挂载的 auths 目录;接码成功后自动写入,账号即可被中转使用
 CLIPROXY_AUTHS_DIR = Path("/opt/codex-services/data/cliproxy/auths")
+_RELAY_WRITE_LOCK = threading.Lock()
 
 
 def _cliproxy_auth_filename(email: str, account_id: str, plan_type: str) -> str:
     digest = hashlib.sha256(str(account_id).encode("utf-8")).hexdigest()[:8]
     plan_norm = re.sub(r"[^a-z0-9]+", "-", str(plan_type or "").lower()).strip("-")
-    base = f"codex-{digest}-{email}"
+    safe_email = re.sub(r"[^a-zA-Z0-9@._+\-]", "_", email)
+    base = f"codex-{digest}-{safe_email}"
     return f"{base}-{plan_norm}.json" if plan_norm else f"{base}.json"
 
 
-def _sync_cliproxy_auth(email: str, token: dict, log) -> str:
-    """把接码成功的凭据写成 cliproxy auth 文件(存在则用新 token 覆盖)。"""
+def _sync_cliproxy_auth(email: str, token: dict, log, *, expected_hash: str | None = None) -> str:
+    """Write and read back a fresh/safely reusable bundle; no silent success."""
     if not CLIPROXY_AUTHS_DIR.is_dir():
-        log("未检测到中转目录(/opt/codex-services/data/cliproxy/auths),跳过同步", "warning")
-        return ""
-    claims = decode_jwt_payload(str(token.get("id_token") or "")) or decode_jwt_payload(str(token.get("access_token") or ""))
-    auth = claims.get("https://api.openai.com/auth") if isinstance(claims, dict) else {}
-    account_id = str(
-        (auth or {}).get("chatgpt_account_id")
-        or claims.get("chatgpt_account_id")
-        or claims.get("account_id")
-        or ""
-    ).strip()
+        raise RuntimeError("未检测到中转 auths 目录，凭据尚未同步")
+    identity = session_identity(token)
+    account_id = identity["account_id"]
     if not account_id:
-        log("token 中缺少 chatgpt_account_id,跳过中转同步", "warning")
-        return ""
-    plan_type = str(
-        (auth or {}).get("chatgpt_plan_type")
-        or claims.get("chatgpt_plan_type")
-        or ""
-    ).strip()
+        raise RuntimeError("Token 缺少实际工作区 ID，凭据尚未同步")
+    if not str(token.get("access_token") or "").strip() or not str(token.get("refresh_token") or "").strip():
+        raise RuntimeError("AT/RT 不完整，凭据尚未同步")
+    plan_type = identity["plan_type"]
     filename = _cliproxy_auth_filename(email, account_id, plan_type)
     target = CLIPROXY_AUTHS_DIR / filename
+    if target.is_symlink():
+        raise RuntimeError("中转目标是符号链接，未覆盖")
     existed = target.exists()
-    save_auth_record(token, email, target)
+    record = token_metadata(token, email)
+    record.update(account_id=account_id, plan_type=plan_type, user_id=identity["user_id"], oauth_client_id=CODEX_CLIENT_ID)
+    descriptor, temp_name = tempfile.mkstemp(prefix=".codex-sync-", suffix=".tmp", dir=str(CLIPROXY_AUTHS_DIR))
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            os.chmod(temp_name, 0o600)
+            json.dump(record, handle, ensure_ascii=False, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        if expected_hash is not None:
+            observed_hash = read_relay_entry(target).get("sha256") or "missing"
+            if observed_hash != expected_hash:
+                raise RuntimeError("中转文件在同步期间被其他操作更新，未覆盖，请重新检查")
+        os.replace(temp_name, target)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+    saved = read_relay_entry(target)["record"]
+    if any(saved.get(key) != record.get(key) for key in ("email", "account_id", "access_token", "refresh_token")):
+        raise RuntimeError("中转凭据写后核验失败，请重试同步")
     # 覆盖/写入后清掉面板的额度缓存,下次查询会用新凭据重新拉取
     try:
         from web.routes.cliproxy import _QUOTA_CACHE, _QUOTA_LOCK
@@ -103,6 +121,91 @@ def _sync_cliproxy_auth(email: str, token: dict, log) -> str:
         pass
     log(f"{'已覆盖更新中转(旧凭据失效时重新登录的常规操作)' if existed else '已同步到中转'} {filename}", "ok")
     return filename
+
+
+def _relay_context() -> dict:
+    from web.routes.cliproxy import _QUOTA_CACHE, _QUOTA_LOCK
+
+    with _QUOTA_LOCK:
+        cache = copy.deepcopy(_QUOTA_CACHE)
+    return scan_relay(CLIPROXY_AUTHS_DIR, cache)
+
+
+def _current_relay_context(rec: dict, context: dict) -> dict:
+    """Recheck only this account's indexed candidates after waiting in a queue."""
+    email = str(rec.get("email") or "").strip().lower()
+    identity = session_identity(rec)
+    names = {entry["file"] for entry in context.get("by_email", {}).get(email, [])}
+    if identity["account_id"]:
+        names.add(_cliproxy_auth_filename(email, identity["account_id"], identity["plan_type"]))
+    result = {"configured": CLIPROXY_AUTHS_DIR.is_dir(), "by_email": {email: []}, "by_file": {}}
+    for name in names:
+        path = CLIPROXY_AUTHS_DIR / name
+        if not path.exists():
+            continue
+        snapshot = context.get("by_file", {}).get(name) or {}
+        entry = read_relay_entry(path, snapshot.get("cache"))
+        if snapshot.get("sha256") and entry.get("sha256") != snapshot["sha256"]:
+            entry["cache"] = {}
+        result["by_file"][name] = entry
+        result["by_email"][email].append(entry)
+    return result
+
+
+class _RelayRequiresAuth(RuntimeError):
+    pass
+
+
+def _sync_existing_relay(rec: dict, context: dict, log) -> tuple[str, bool]:
+    """Reuse only verified bundles and preserve any already-healthy relay file."""
+    rec = _current_sms_record(rec)
+    token = safe_stored_bundle(rec)
+    identity = session_identity(token)
+    filename = _cliproxy_auth_filename(rec["email"], identity["account_id"], identity["plan_type"])
+    snapshot_state = relay_state(rec, context)
+    pending = _fresh_relay_pending(rec)
+    with _RELAY_WRITE_LOCK:
+        # Recheck the matching file as well as the canonical write target.
+        names = {filename, snapshot_state.get("file") or filename}
+        for name in names:
+            path = CLIPROXY_AUTHS_DIR / name
+            if not path.exists():
+                continue
+            snapshot = context.get("by_file", {}).get(name) or {}
+            entry = read_relay_entry(path, snapshot.get("cache"))
+            if snapshot.get("sha256") and entry.get("sha256") != snapshot.get("sha256"):
+                entry["cache"] = {}
+            status = relay_entry_status(rec, entry)
+            if status == "ready" and not pending:
+                log(f"中转已有完整凭据，保留当前文件 {name}", "ok")
+                return name, False
+            if name == filename:
+                record = entry.get("record") or {}
+                if pending and status in ("ready", "invalid", "incomplete"):
+                    if status == "invalid" and record.get("refresh_token") == token["refresh_token"]:
+                        raise _RelayRequiresAuth("当前同一 RT 已有明确认证失效记录，需要重新授权")
+                    if status == "ready" and record.get("access_token") == token["access_token"] and record.get("refresh_token") == token["refresh_token"]:
+                        _mark_relay_synced(rec, token)
+                        return name, True
+                elif status == "incomplete" and record.get("access_token") and record.get("refresh_token"):
+                    # Repair missing metadata without rolling back a relay RT
+                    # that may have rotated after the account-store snapshot.
+                    try:
+                        token = safe_stored_bundle({**rec, **record})
+                    except RuntimeError as exc:
+                        raise _RelayRequiresAuth(str(exc)) from exc
+                elif entry.get("unsafe") or (record.get("access_token") and record.get("refresh_token")):
+                    raise _RelayRequiresAuth("中转目标含已有凭据但无法安全复用，需要重新授权，未覆盖")
+                if record.get("email") and str(record["email"]).casefold() != str(rec["email"]).casefold():
+                    raise _RelayRequiresAuth("中转目标属于其他邮箱，未覆盖")
+        expected = rec.get("relay_sync_base_hash") if pending else (
+            (context.get("by_file", {}).get(filename) or {}).get("sha256") or "missing"
+        )
+        result = _sync_cliproxy_auth(rec["email"], token, log, expected_hash=expected)
+        if not result:
+            raise RuntimeError("中转同步未返回已写入文件，凭据尚未同步")
+        _mark_relay_synced(rec, token)
+        return result, True
 
 
 def _state() -> Any:
@@ -169,13 +272,13 @@ def _finish_batch(batch_id: str) -> None:
 def _sms_counts_locked() -> None:
     """Reconcile terminal, queued and active rows while holding _LOCK."""
     items = _STATE.get("items") or []
-    counts = {key: 0 for key in ("success", "skipped", "failed", "cancelled", "pending", "active")}
+    counts = {key: 0 for key in ("success", "synced", "skipped", "failed", "cancelled", "pending", "active")}
     for item in items:
         status = item.get("status", "pending")
         if status in counts:
             counts[status] += 1
     counts["total"] = len(items)
-    counts["done"] = sum(counts[key] for key in ("success", "skipped", "failed", "cancelled"))
+    counts["done"] = sum(counts[key] for key in ("success", "synced", "skipped", "failed", "cancelled"))
     _STATE["counts"] = counts
 
 
@@ -633,17 +736,24 @@ def _mfa_code_error(error: BaseException | str) -> bool:
     )
 
 
-def _persist_sms_tokens(previous: dict, token: dict) -> None:
+def _persist_sms_tokens(previous: dict, token: dict) -> dict:
     """Validate fresh evidence and update only tokens whose starting row is current."""
     identity = validate_session_replacement(
         previous, token, require_identity=requires_team_workspace(previous),
     )
+    target = CLIPROXY_AUTHS_DIR / _cliproxy_auth_filename(
+        str(previous.get("email") or ""), identity["account_id"], identity["plan_type"],
+    )
+    relay_hash = read_relay_entry(target).get("sha256") or "missing"
     fields = {
         "refresh_token": str(token.get("refresh_token") or ""),
         "id_token": str(token.get("id_token") or ""),
         "access_token": str(token.get("access_token") or ""),
         "oauth_client_id": CODEX_CLIENT_ID,
         "last_token_refresh_at": _state()._now_iso(), "last_token_refresh_error": "",
+        "relay_sync_pending": True,
+        "relay_sync_token_hash": hashlib.sha256(str(token.get("refresh_token") or "").encode()).hexdigest(),
+        "relay_sync_base_hash": relay_hash,
     }
     for field in ("user_id", "plan_type"):
         if identity.get(field):
@@ -659,6 +769,25 @@ def _persist_sms_tokens(previous: dict, token: dict) -> None:
     )
     if not changed:
         raise RuntimeError("sms_credentials_changed: 账号已删除或凭据/工作区在接码期间更新，未覆盖当前记录")
+    return {"base_hash": relay_hash}
+
+
+def _fresh_relay_pending(rec: dict) -> bool:
+    rt = str(rec.get("refresh_token") or "")
+    return bool(rt and rec.get("relay_sync_pending") is True and rec.get("relay_sync_token_hash") == hashlib.sha256(rt.encode()).hexdigest())
+
+
+def _mark_relay_synced(previous: dict, token: dict) -> None:
+    current = {**previous, **{key: token.get(key) or "" for key in ("access_token", "refresh_token")}}
+    identity = session_identity(token)
+    if identity["user_id"]:
+        current["user_id"] = identity["user_id"]
+    key = account_delete_key(current)
+    update_account_record_fields(
+        {key: {"relay_sync_pending": False}},
+        expected_fields={key: {"refresh_token": token.get("refresh_token")}},
+        include_records=False, path=_state().ACCOUNTS_FILE,
+    )
 
 
 def _process_one(
@@ -874,21 +1003,29 @@ def _process_one(
             refresh = str(token.get("refresh_token") or "")
             if not refresh:
                 raise RuntimeError("响应缺少 refresh_token(scope 未含 offline_access?)")
-            _persist_sms_tokens(rec, token)
+            pending_sync = _persist_sms_tokens(rec, token)
             log("RT 已写回账号库", "ok")
+            relay_file, relay_error = "", ""
             try:
-                _sync_cliproxy_auth(email, token, log)
+                relay_file = _sync_cliproxy_auth(email, token, log, expected_hash=pending_sync["base_hash"])
+                if not relay_file:
+                    raise RuntimeError("中转同步未返回已写入文件")
+                _mark_relay_synced(rec, token)
             except Exception as exc:
-                log(f"同步中转失败: {exc}", "warning")
+                relay_error = str(exc)[:220]
+                log(f"授权成功，但中转同步失败: {relay_error}；重试只同步凭据", "warning")
             return {
                 "email": email,
-                "status": "success",
+                "status": "failed" if relay_error else "success",
                 "refresh_token": refresh,
                 "expires_in": token.get("expires_in"),
-                "error": "",
+                "error": relay_error,
                 "phone": phone_used,
                 "logs": list(steps or []),
                 "phone_attempts": list(phone_attempts),
+                "action": "reauthorize", "authorization_status": "success",
+                "relay_status": "failed" if relay_error else "synced", "relay_file": relay_file,
+                "retry_action": "sync_only" if relay_error else "",
             }
         except Exception as exc:
             last_error = str(exc)
@@ -931,12 +1068,14 @@ def _process_one(
 def _run_batch(
     records: list, sms_cfg: dict, concurrency: int = 1,
     batch_id: str = "", stop_event: threading.Event | None = None,
+    relay_context: dict | None = None,
 ) -> None:
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     stop_event = stop_event if stop_event is not None else _STOP
     batch_id = batch_id or str(_STATE.get("batch_id") or "")
     workers = max(1, min(int(concurrency or 1), len(records) or 1))
+    context = relay_context if relay_context is not None else _relay_context()
     with _LOCK:
         options = copy.deepcopy(_STATE.get("options") or {})
         if _STATE.get("batch_id", "") == batch_id and _STATE.get("mode") == "codex":
@@ -953,59 +1092,94 @@ def _run_batch(
             _sms_counts_locked()
 
     def _handle(rec: dict) -> None:
+        with _LOCK:
+            if _STATE.get("batch_id", "") != batch_id:
+                return
         email = str(rec.get("email") or "").strip()
         steps: list = []
         attempts: list = []
         result: dict = {}
         outcome = "failed"
+        action = {"action": "blocked", "relay_status": "missing", "relay_file": ""}
         try:
             if stop_event.is_set():
                 raise _SmsCancelled("停止时尚未执行")
+            rec = _current_sms_record(rec)
             _set_sms_item(email, batch_id, status="active", stage="preparing", message="正在检查账号")
             issue = _sms_account_issue(rec)
             if issue in ("not_found", "deactivated"):
                 raise RuntimeError("选中账号在库中不存在" if issue == "not_found" else "账号已停用，无法接码")
-            existing_rt = "" if options.get("force") else str(rec.get("refresh_token") or "").strip()
-            if existing_rt:
+            strategy = (options.get("account_actions") or {}).get(email) or _run_strategy(options.get("strategy"), bool(options.get("force")))
+            current_context = _current_relay_context(rec, context)
+            action = _relay_action(rec, strategy, current_context)
+            if action["action"] == "blocked":
+                raise _RelayRequiresAuth(action["reason"])
+            if action["action"] == "ready":
+                current = current_context["by_file"][action["relay_file"]]
                 outcome = "skipped"
-                _log(f"{email} | 已有 RT,按已接码处理", batch_id=batch_id)
+                _log(f"{email} | 中转已有匹配完整凭据，未在线验证", batch_id=batch_id)
                 steps.append({
                     "t": datetime.now().strftime("%H:%M:%S"), "level": "ok",
-                    "m": "账号库已有 RT,无需重新接码",
+                    "m": "中转已有匹配完整凭据，保留中转当前 Token",
                 })
                 result = {
                     "email": email, "status": "success", "skipped": True,
-                    "refresh_token": existing_rt, "expires_in": None, "error": "", "phone": "",
+                    "refresh_token": str(current["record"].get("refresh_token") or ""), "expires_in": None, "error": "", "phone": "",
                     "logs": list(steps), "phone_attempts": [],
+                    "action": "ready", "relay_status": "ready", "relay_file": action["relay_file"],
+                    "authorization_status": "reused", "retry_action": "",
+                }
+            elif action["action"] == "sync_only":
+                _set_sms_item(email, batch_id, stage="syncing_relay", message="同步已有凭据到中转，无需接码")
+
+                def sync_log(message, level="info"):
+                    _log(f"{email} | {message}", level, batch_id=batch_id)
+                    steps.append({"t": datetime.now().strftime("%H:%M:%S"), "level": level, "m": str(message)[:300]})
+
+                filename, wrote = _sync_existing_relay(rec, current_context, sync_log)
+                outcome = "synced" if wrote else "skipped"
+                saved = read_relay_entry(CLIPROXY_AUTHS_DIR / filename)["record"]
+                result = {
+                    "email": email, "status": "success", "skipped": not wrote,
+                    "refresh_token": str(saved.get("refresh_token") or ""), "expires_in": None, "error": "", "phone": "",
+                    "logs": list(steps), "phone_attempts": [], "action": "sync_only",
+                    "relay_status": "synced" if wrote else "ready", "relay_file": filename,
+                    "authorization_status": "reused", "retry_action": "",
                 }
             else:
                 result = _process_one(
                     rec, sms_cfg, steps, stop_event=stop_event, batch_id=batch_id,
                     phone_attempts=attempts,
                 )
-                outcome = "success"
+                outcome = "success" if result.get("status") == "success" else "failed"
         except Exception as exc:
             outcome = "cancelled" if isinstance(exc, _SmsCancelled) or stop_event.is_set() else "failed"
             result = {
                 "email": email, "status": outcome, "refresh_token": "", "expires_in": None,
                 "phone": "", "logs": list(steps), "error": str(exc)[:260],
                 "phone_attempts": list(attempts),
+                "action": action["action"],
+                "authorization_status": "failed" if action["action"] == "reauthorize" else "not_started",
+                "relay_status": "requires_auth" if isinstance(exc, _RelayRequiresAuth) else "failed",
+                "relay_file": action.get("relay_file") or "",
+                "retry_action": "reauthorize" if isinstance(exc, _RelayRequiresAuth) or action["action"] == "reauthorize" else "sync_only",
             }
             _log(f"{email} | {'已取消' if outcome == 'cancelled' else '失败'}: {exc}",
                  "warning" if outcome == "cancelled" else "error", batch_id=batch_id)
         finally:
             result.update(batch_id=batch_id, options=copy.deepcopy(options), outcome=outcome)
             message = {
-                "success": "已获取新 RT", "skipped": "沿用已有 RT", "cancelled": result.get("error") or "已取消",
+                "success": "已重新授权并同步到中转", "synced": "已有凭据已同步到中转", "skipped": "中转已有匹配凭据", "cancelled": result.get("error") or "已取消",
                 "failed": result.get("error") or "执行失败",
             }[outcome]
             _set_sms_item(
                 email, batch_id, status=outcome, stage=outcome, message=message,
                 attempt=len(attempts), wait_deadline=None,
+                **{key: result.get(key) for key in ("action", "relay_status", "relay_file", "authorization_status", "retry_action")},
             )
             with _LOCK:
                 if _STATE.get("batch_id", "") == batch_id:
-                    if outcome in ("success", "skipped"):
+                    if outcome in ("success", "synced", "skipped"):
                         _STATE["success"] += 1  # Old clients count existing RTs as success.
                     elif outcome == "failed":
                         _STATE["failed"] += 1
@@ -1019,6 +1193,7 @@ def _run_batch(
                 "phone": str(result.get("phone") or ""), "error": result.get("error") or "",
                 "logs": _clip_history_logs(result.get("logs") or steps),
                 "phone_attempts": list(result.get("phone_attempts") or attempts),
+                **{key: result.get(key) for key in ("action", "relay_status", "relay_file", "authorization_status", "retry_action")},
             })
 
     try:
@@ -1954,6 +2129,78 @@ class CodexOauthRunRequest(BaseModel):
     # 同时进行接码登录的账号数(不设上限,实际并发不超过选中账号数)
     concurrency: int = Field(default=1, ge=1)
     sms_options: SmsRunOptions | None = None
+    strategy: Literal["auto", "sync_only", "reauthorize"] | None = None
+    account_actions: dict[str, Literal["sync_only", "reauthorize"]] = Field(default_factory=dict, max_length=200)
+
+
+def _run_strategy(strategy: str | None, force: bool = False) -> str:
+    return strategy or ("reauthorize" if force else "auto")
+
+
+def _current_sms_record(previous: dict) -> dict:
+    """Refresh an indexed account snapshot before a queued operation uses it."""
+    candidates = _load_sms_batch_records({str(previous.get("email") or "").strip().lower()})
+    key = account_delete_key(previous)
+    matched = [rec for rec in candidates if account_delete_key(rec) == key]
+    if len(matched) != 1:
+        raise RuntimeError("账号已删除或身份在等待期间改变，请重新选择账号")
+    current = dict(matched[0])
+    old_id = session_identity(previous)
+    current_id = session_identity(current)
+    if old_id["user_id"] and current_id["user_id"] and old_id["user_id"] != current_id["user_id"]:
+        raise RuntimeError("账号用户身份在等待期间改变，未继续操作")
+    for field in ("selected_workspace_id", "selected_workspace_name", "workspace_name", "import_account_type"):
+        if previous.get(field) != current.get(field):
+            raise RuntimeError("账号工作区在等待期间改变，请重新选择账号")
+    return current
+
+
+def _normalized_account_actions(wanted: set[str], actions: dict | None, strategy: str) -> dict:
+    normalized = {str(email).strip().lower(): action for email, action in (actions or {}).items()}
+    if set(normalized) - wanted:
+        raise HTTPException(400, "逐账号操作包含未选择的邮箱")
+    if any(action not in {"sync_only", "reauthorize"} for action in normalized.values()):
+        raise HTTPException(400, "未知逐账号操作")
+    if strategy == "sync_only" and "reauthorize" in normalized.values():
+        raise HTTPException(400, "仅同步模式不能包含重新授权操作")
+    return normalized
+
+
+def _relay_action(rec: dict, strategy: str, context: dict) -> dict:
+    state = relay_state(rec, context)
+    action = {"email": rec["email"], "action": "blocked", "reason": "", "relay_status": state["status"], "relay_file": state["file"]}
+    issue = _sms_account_issue(rec)
+    if issue in ("not_found", "deactivated"):
+        action["reason"] = "账号不存在" if issue == "not_found" else "账号已停用"
+        return action
+    fresh_pending = _fresh_relay_pending(rec)
+    relay_record = (context.get("by_file", {}).get(state["file"]) or {}).get("record") or {}
+    invalid_same_rt = state["status"] == "invalid" and relay_record.get("refresh_token") == rec.get("refresh_token")
+    if strategy != "reauthorize" and state["status"] == "ready" and not fresh_pending:
+        return {**action, "action": "ready", "reason": "中转已有完整匹配凭据，未在线验证"}
+    reason = "需要重新授权"
+    reusable = False
+    if strategy != "reauthorize":
+        try:
+            safe_stored_bundle(rec)
+            reusable = True
+        except RuntimeError as exc:
+            reason = str(exc)
+    known_invalid = auth_known_invalid(rec) or state["status"] == "invalid"
+    identity = session_identity(rec)
+    canonical = _cliproxy_auth_filename(rec["email"], identity["account_id"], identity["plan_type"])
+    unsafe_target = state["status"] in ("unverified", "mismatch") and state["file"] == canonical
+    if unsafe_target:
+        reason = "中转目标的客户端或用户身份无法确认，需要重新授权"
+    if strategy != "reauthorize" and reusable and not unsafe_target and not invalid_same_rt and (fresh_pending or not known_invalid):
+        return {**action, "action": "sync_only", "reason": "补同步已授权凭据" if fresh_pending else "使用现有 Codex 凭据补齐中转，无需登录或接码"}
+    if known_invalid:
+        reason = "已有明确认证失效记录，需要重新授权"
+    if strategy == "sync_only":
+        return {**action, "reason": reason, "relay_status": "requires_auth"}
+    if issue == "missing_credentials":
+        return {**action, "reason": "需要重新授权，但账号缺少密码或 2FA 密钥", "relay_status": "requires_auth"}
+    return {**action, "action": "reauthorize", "reason": "按所选策略重新授权" if strategy == "reauthorize" else reason}
 
 
 def _effective_sms_config(cfg: dict, options: SmsRunOptions | dict | None = None) -> dict:
@@ -2024,7 +2271,10 @@ def _sms_account_issue(rec: dict) -> str:
     return ""
 
 
-def _sms_preflight(wanted: set[str], force: bool, sms_cfg: dict) -> tuple[dict, list]:
+def _sms_preflight(
+    wanted: set[str], force: bool, sms_cfg: dict, *, strategy: str | None = None,
+    account_actions: dict | None = None, relay_context: dict | None = None,
+) -> tuple[dict, list]:
     if not wanted:
         raise HTTPException(400, "未选择账号")
     if len(wanted) > 200:
@@ -2034,26 +2284,41 @@ def _sms_preflight(wanted: set[str], force: bool, sms_cfg: dict) -> tuple[dict, 
         by_email.setdefault(str(rec.get("email") or "").strip().lower(), rec)
     picked = [dict(by_email.get(email) or {"email": email, "_sms_not_found": True}) for email in sorted(wanted)]
     settings = _safe_sms_settings(sms_cfg)
+    strategy = _run_strategy(strategy, force)
+    actions = _normalized_account_actions(wanted, account_actions, strategy)
+    context = relay_context if relay_context is not None else _relay_context()
     payload = {
         "ok": True, "total": len(wanted), "eligible": 0, "skipped": 0,
         "missing_credentials": [], "not_found": [], "deactivated": [], "limit": 200,
         "configured": bool(settings["enabled"] and settings["configured"]),
         "settings": settings, "emails": sorted(wanted),
+        "strategy": strategy, "sync_needed": 0, "relay_ready": 0, "reauthorize": 0,
+        "relay_configured": bool(context["configured"]), "relay_issues": [], "action_items": [],
     }
     for rec in picked:
         email = str(rec.get("email") or "").strip().lower()
         rec["email"] = email
         issue = _sms_account_issue(rec)
+        action = _relay_action(rec, actions.get(email, strategy), context)
+        payload["action_items"].append(action)
+        if action["relay_status"] != "ready":
+            payload["relay_issues"].append({"email": email, "reason": action["reason"], "relay_status": action["relay_status"]})
         if issue in ("not_found", "deactivated"):
             payload[issue].append(email)
-        elif not force and str(rec.get("refresh_token") or "").strip():
+        elif action["action"] == "ready":
             payload["skipped"] += 1
+            payload["relay_ready"] += 1
+        elif action["action"] == "sync_only":
+            payload["sync_needed"] += 1
+            payload["eligible"] += 1
+        elif action["action"] == "reauthorize":
+            payload["reauthorize"] += 1
+            payload["eligible"] += 1
         elif issue == "missing_credentials":
             payload["missing_credentials"].append({
                 "email": email, "missing": [key for key in ("password", "totp_secret") if not str(rec.get(key) or "").strip()],
             })
-        else:
-            payload["eligible"] += 1
+    payload["sms_required_if_challenged"] = bool(payload["reauthorize"] and not payload["configured"])
     return payload, picked
 
 
@@ -2062,7 +2327,7 @@ async def codex_oauth_preflight(body: CodexOauthRunRequest):
     def _do():
         wanted = {str(email).strip().lower() for email in body.emails if str(email).strip()}
         sms_cfg = _effective_sms_config(_state()._read_config(), body.sms_options)
-        return _sms_preflight(wanted, bool(body.force), sms_cfg)[0]
+        return _sms_preflight(wanted, bool(body.force), sms_cfg, strategy=body.strategy, account_actions=body.account_actions)[0]
 
     return await asyncio.to_thread(_do)
 
@@ -2089,27 +2354,28 @@ def _load_sms_batch_records(wanted: set[str]) -> list[dict[str, Any]]:
 def _start_sms_batch(
     wanted: set[str], force: bool = False, concurrency: int = 1,
     sms_options: SmsRunOptions | dict | None = None,
+    strategy: str | None = None, account_actions: dict | None = None,
 ) -> dict:
     """按选中邮箱启动接码批次。force 时忽略已有 RT 全部重跑。"""
     sms_cfg = _effective_sms_config(_state()._read_config(), sms_options)
-    preflight, picked = _sms_preflight(wanted, force, sms_cfg)
+    strategy = _run_strategy(strategy, force)
+    actions = _normalized_account_actions(wanted, account_actions, strategy)
+    context = _relay_context()
+    preflight, picked = _sms_preflight(wanted, force, sms_cfg, strategy=strategy, account_actions=actions, relay_context=context)
     if len(preflight["not_found"]) == len(wanted):
         raise HTTPException(404, "选中账号在库中不存在")
     settings = SmsSettings.from_mapping(sms_cfg)
-    if not settings.enabled or not settings.credentials_configured:
-        if settings.provider == "firefox":
-            raise HTTPException(400, "火狐狸接码需要先配置对接码(运维 → 接码设置 → 对接码)")
-        raise HTTPException(400, f"接码未启用或未配置凭证({settings.provider_label})")
     batch_id = "codex-" + hashlib.sha256(str(time.time_ns()).encode()).hexdigest()[:16]
     stop_event = _reserve_batch("codex", len(picked), batch_id)
     workers = max(1, min(int(concurrency or 1), len(picked) or 1))
     safe = preflight["settings"]
     options = {
-        "force": bool(force), "concurrency": workers,
+        "force": strategy == "reauthorize", "concurrency": workers,
+        "strategy": strategy, "account_actions": actions,
         "sms_options": {key: safe[key] for key in ("provider", "country_order", "max_price", "max_phone_attempts", "timeout_seconds")},
     }
     with _LOCK:
-        _STATE.update(options=options, force=bool(force), concurrency=workers)
+        _STATE.update(options=options, force=options["force"], concurrency=workers)
         _STATE["items"] = [
             {
                 "email": rec["email"], "status": "pending", "stage": "queued", "message": "等待执行",
@@ -2120,7 +2386,7 @@ def _start_sms_batch(
         ]
         _sms_counts_locked()
     _launch_batch(
-        _run_batch, (picked, sms_cfg, concurrency, batch_id, stop_event),
+        _run_batch, (picked, sms_cfg, concurrency, batch_id, stop_event, context),
         batch_id=batch_id, stop_event=stop_event, name="codex-oauth-batch",
     )
     _log(
@@ -2141,6 +2407,7 @@ async def codex_oauth_run(body: CodexOauthRunRequest):
             raise HTTPException(400, "未选择账号")
         return _start_sms_batch(
             wanted, force=bool(body.force), concurrency=int(body.concurrency or 1), sms_options=body.sms_options,
+            strategy=body.strategy, account_actions=body.account_actions,
         )
 
     return await asyncio.to_thread(_do)

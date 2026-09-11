@@ -81,7 +81,7 @@ const allChecked = computed(() => pageKeys.value.length > 0 && pageKeys.value.ev
           <td>
             <div class="status-tags">
               <AppTag :kind="healthChip(account).kind">{{ healthChip(account).text }}</AppTag>
-              <AppTag :kind="smsChip(account).kind" :title="account.has_refresh_token ? '已接码：账号已持有 RT' : '未接码：可在操作列点接码按钮补发'">
+              <AppTag :kind="smsChip(account).kind" :title="account.has_refresh_token ? '账号库持有 RT；中转是否齐全请打开接码与中转预检' : '账号库缺少 RT；可通过授权与中转任务补齐'">
                 {{ smsChip(account).text }}
               </AppTag>
               <AppTag :kind="trialChip(account).kind">{{ trialChip(account).text }}</AppTag>
@@ -151,7 +151,7 @@ const allChecked = computed(() => pageKeys.value.length > 0 && pageKeys.value.ev
             </button>
             <button
               class="row-action" type="button"
-              :title="account.has_refresh_token ? '接码设置（已有 RT，可选择重新获取）' : '接码设置（补取缺少的 RT）'"
+              :title="account.has_refresh_token ? '检查中转、补同步或重新授权' : '授权并补齐中转'"
               :aria-label="`设置 ${account.email} 的接码任务`"
               :disabled="account.is_deactivated"
               @click="emit('codex', account)"

@@ -109,15 +109,16 @@ function preflightResult(overrides = {}) {
   return { ok: true, total: 1, eligible: 1, skipped: 0, missing_credentials: [], not_found: [], deactivated: [], limit: 200, configured: true, emails: ["a@example.test"], settings: { provider: "smsbower", provider_label: "SMSBower", configured: true, enabled: true, country_order: "6, 4", max_price: "0.20", max_phone_attempts: 2, timeout_seconds: 90, price_cap_supported: true }, ...overrides };
 }
 
-test("start dialog defaults to missing-RT mode despite a previous forced batch, and opening only preflights", async () => {
+test("start dialog defaults to auto relay repair despite a previous forced batch, and opening only preflights", async () => {
   const requests = [];
   const h = component("SmsStartDialog", ["form", "options", "check", "launch"], { api: { codexPreflight: async (body) => { requests.push(body); return preflightResult(); } } });
   // The open watcher reads codexStartForce, not the prior accepted batch's force.
   h.watches[0].handler(true);
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(h.form.force, false);
+  assert.equal(h.form.strategy, "auto");
   assert.equal(requests.length, 1);
   assert.equal(requests[0].force, false);
+  assert.equal(requests[0].strategy, "auto");
   assert.equal(h.form.timeout, 90);
   assert.equal(h.form.maxPrice, "0.20");
   assert.equal(h.calls.length, 0);
@@ -142,9 +143,39 @@ test("start validates limits and sends only per-run public options after deliber
   await h.launch();
   assert.equal(launches.length, 1);
   assert.equal(launches[0][2], false);
+  assert.equal(launches[0][4], "auto");
   assert.equal(launches[0][3].max_phone_attempts, 2);
   assert.equal(launches[0][3].max_price, "0.25");
   assert.equal(Object.hasOwn(launches[0][3], "api_key"), false);
+  h.dispose();
+});
+
+test("sync-only does not require SMS setup or emit SMS settings", async () => {
+  const launches = [];
+  const h = component("SmsStartDialog", ["check", "form", "options", "launch", "launchDisabled"], {
+    api: { codexPreflight: async () => preflightResult({ sync_needed: 1, reauthorize: 0, relay_ready: 0, relay_configured: true, configured: false }) },
+    task: { runCodex: async (...args) => launches.push(args) },
+  });
+  h.form.strategy = "sync_only";
+  await h.check(true);
+  assert.equal(h.launchDisabled.value, false);
+  await h.launch();
+  assert.equal(launches[0][4], "sync_only");
+  assert.deepEqual(JSON.parse(JSON.stringify(launches[0][3])), {});
+  h.dispose();
+});
+
+test("explicit reauthorization is not disabled merely because RT already exists", async () => {
+  const launches = [];
+  const h = component("SmsStartDialog", ["check", "form", "launch"], {
+    api: { codexPreflight: async () => preflightResult({ reauthorize: 1, sync_needed: 0, relay_ready: 0, relay_configured: true }) },
+    task: { runCodex: async (...args) => launches.push(args) },
+  });
+  h.form.strategy = "reauthorize";
+  await h.check(true);
+  await h.launch();
+  assert.equal(launches[0][2], true);
+  assert.equal(launches[0][4], "reauthorize");
   h.dispose();
 });
 

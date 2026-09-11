@@ -22,6 +22,7 @@ const limit = ref(60);
 let requestId = 0;
 
 function outcome(entry: CodexHistoryEntry) {
+  if (entry.outcome === "synced" || entry.status === "synced" || (entry.action === "sync_only" && entry.relay_status === "synced")) return "synced";
   if (entry.skipped || entry.outcome === "skipped" || entry.status === "skipped") return "skipped";
   if (entry.status === "cancelled" || (entry.status === "failed" && /^(?:任务已(?:停止|取消)|用户(?:停止|取消)|cancel(?:led|ed)\b)/i.test(entry.error || ""))) return "cancelled";
   return entry.status === "error" ? "failed" : entry.status;
@@ -58,11 +59,11 @@ const latestFailures = computed(() => {
   }
   return failures;
 });
-const labels: Record<string, string> = { success: "新获取", skipped: "沿用已有", failed: "失败", cancelled: "取消" };
+const labels: Record<string, string> = { success: "授权成功", synced: "已补同步", skipped: "已存在 / 旧记录沿用", failed: "失败", cancelled: "取消" };
 function optionLabel(entry: HistoryRow) {
   const options = entry.options?.sms_options;
   if (!options) return "";
-  return [options.provider === "firefox" ? "火狐狸" : options.provider === "smsbower" ? "SMSBower" : "", options.country_order ? `国家 ${options.country_order}` : "", options.max_phone_attempts ? `每账号最多 ${options.max_phone_attempts} 次` : ""].filter(Boolean).join(" · ");
+  return [entry.options?.strategy ? ({ auto: "自动补齐中转", sync_only: "仅补同步", reauthorize: "重新授权" }[entry.options.strategy]) : "", options.provider === "firefox" ? "火狐狸" : options.provider === "smsbower" ? "SMSBower" : "", options.country_order ? `国家 ${options.country_order}` : "", options.max_phone_attempts ? `每账号最多 ${options.max_phone_attempts} 次` : ""].filter(Boolean).join(" · ");
 }
 function retryEntries(emails: string[]) {
   batch.codexHistoryOpen = false;
@@ -83,7 +84,7 @@ function logClass(level: string) { return level === "error" ? "log-error" : leve
 <template>
   <AppModal :open="batch.codexHistoryOpen" title="接码历史" subtitle="按时间查看账号处理记录；仅重试最新结果仍失败的账号" width="900px" @close="batch.codexHistoryOpen = false">
     <template #icon><History :size="18" /></template>
-    <div class="history-toolbar"><label class="search-field"><Search :size="14" /><input v-model="query" type="search" placeholder="搜索邮箱" aria-label="按邮箱筛选接码历史" /></label><select v-model="filter" class="filter-select" aria-label="筛选接码历史结果"><option value="all">全部记录</option><option value="success">新获取</option><option value="skipped">沿用已有</option><option value="failed">失败</option><option value="cancelled">取消</option></select><AppButton size="sm" :loading="loading" @click="load"><RefreshCw :size="14" />刷新</AppButton></div>
+    <div class="history-toolbar"><label class="search-field"><Search :size="14" /><input v-model="query" type="search" placeholder="搜索邮箱" aria-label="按邮箱筛选接码历史" /></label><select v-model="filter" class="filter-select" aria-label="筛选接码历史结果"><option value="all">全部记录</option><option value="success">授权成功</option><option value="synced">补同步中转</option><option value="skipped">已存在 / 旧记录沿用</option><option value="failed">失败</option><option value="cancelled">取消</option></select><AppButton size="sm" :loading="loading" @click="load"><RefreshCw :size="14" />刷新</AppButton></div>
     <div v-if="latestFailures.length" class="failed-summary"><span>最新结果仍失败 <b>{{ latestFailures.length }}</b> 个账号</span><div class="actions"><AppButton size="sm" @click="copyFailures"><Clipboard :size="13" />复制失败邮箱</AppButton><AppButton size="sm" :disabled="batch.codex.running || batch.codexStartBusy" @click="retryEntries(latestFailures.map((entry) => entry.email))"><RefreshCw :size="13" />设置重试任务</AppButton></div></div>
     <p v-if="error" class="error-box" role="alert">{{ error }}</p>
     <p v-if="loading && !entries.length" class="empty-state">正在加载接码历史…</p>
@@ -91,9 +92,9 @@ function logClass(level: string) { return level === "error" ? "log-error" : leve
     <div class="history-list">
       <article v-for="entry in filtered.slice(0, limit)" :key="entry.key" :class="['history-row', `outcome-${entry.outcome}`]">
         <header><b>{{ entry.email }}</b><span class="outcome">{{ labels[entry.outcome] || entry.outcome }}</span><time>{{ entry.at.replace('T', ' ') }}</time></header>
-        <p class="message">{{ entry.outcome === 'skipped' ? '沿用已有 RT，未重复取号' : entry.error || entry.note || (entry.outcome === 'cancelled' ? '任务取消' : 'RT 获取成功') }}</p>
-        <small v-if="optionLabel(entry)" class="options">{{ optionLabel(entry) }}</small>
-        <footer><small>{{ entry.phone_attempts?.length ? `取号 ${entry.phone_attempts.length} 次` : entry.phone ? `号码 ${entry.phone}` : entry.batch_id ? `批次 ${entry.batch_id.slice(0, 12)}` : '历史记录' }}</small><div class="actions"><AppButton v-if="entry.logs?.length || entry.phone_attempts?.length" size="sm" :aria-expanded="!!expanded[entry.key]" @click="expanded = { ...expanded, [entry.key]: !expanded[entry.key] }"><ScrollText :size="13" />{{ expanded[entry.key] ? '收起详情' : '记录详情' }}</AppButton><AppButton v-if="entry.rt && ['success', 'skipped'].includes(entry.outcome)" size="sm" @click="copyRt(entry)"><Clipboard :size="13" />复制历史 RT</AppButton><AppButton v-if="entry.outcome === 'failed' && latestFailures.some((item) => item.key === entry.key)" size="sm" :disabled="batch.codex.running || batch.codexStartBusy" @click="retryEntries([entry.email])"><RefreshCw :size="13" />重试</AppButton></div></footer>
+        <p class="message">{{ entry.outcome === 'synced' ? '已补齐中转 JSON，未重新授权' : entry.outcome === 'skipped' ? (entry.relay_status === 'ready' ? '中转已有匹配凭据，未在线验证' : '旧记录仅确认持有 RT，未核对中转') : entry.error || entry.note || (entry.outcome === 'cancelled' ? '任务取消' : 'RT 获取成功') }}</p>
+        <small v-if="entry.relay_file" class="options">中转文件：{{ entry.relay_file }}</small><small v-if="entry.authorization_status === 'success' && entry.relay_status === 'failed'" class="options">授权已成功，需补同步中转</small><small v-if="optionLabel(entry)" class="options">{{ optionLabel(entry) }}</small>
+        <footer><small>{{ entry.phone_attempts?.length ? `取号 ${entry.phone_attempts.length} 次` : entry.phone ? `号码 ${entry.phone}` : entry.batch_id ? `批次 ${entry.batch_id.slice(0, 12)}` : '历史记录' }}</small><div class="actions"><AppButton v-if="entry.logs?.length || entry.phone_attempts?.length" size="sm" :aria-expanded="!!expanded[entry.key]" @click="expanded = { ...expanded, [entry.key]: !expanded[entry.key] }"><ScrollText :size="13" />{{ expanded[entry.key] ? '收起详情' : '记录详情' }}</AppButton><AppButton v-if="entry.rt && ['success', 'synced', 'skipped'].includes(entry.outcome)" size="sm" @click="copyRt(entry)"><Clipboard :size="13" />复制历史 RT</AppButton><AppButton v-if="entry.outcome === 'failed' && latestFailures.some((item) => item.key === entry.key)" size="sm" :disabled="batch.codex.running || batch.codexStartBusy" @click="retryEntries([entry.email])"><RefreshCw :size="13" />重试</AppButton></div></footer>
         <div v-if="expanded[entry.key]" class="details"><div v-if="entry.phone_attempts?.length" class="phone-attempts"><p v-for="(attempt, index) in entry.phone_attempts" :key="index">第 {{ index + 1 }} 次 · {{ attempt.phone || '未取到号码' }} · {{ ({ success: '成功', failed: '失败', cancelled: '取消', timeout: '等码超时' } as Record<string, string>)[attempt.status || ''] || attempt.status || '已记录' }}</p></div><p v-for="(line, index) in entry.logs || []" :key="index" :class="logClass(line.level)"><span class="log-time">{{ line.t }}</span>{{ line.m }}</p></div>
       </article>
       <AppButton v-if="filtered.length > limit" size="sm" @click="limit += 60">再显示 {{ Math.min(60, filtered.length - limit) }} 条记录</AppButton>

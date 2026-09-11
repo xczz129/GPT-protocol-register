@@ -223,11 +223,11 @@ export function methodChip(account: Account): { text: string; cls: string } {
   return { text: account.registration_method || "未知方式", cls: "is-unknown" };
 }
 
-/* --- 接码状态：持有 RT = 已接码（绿），否则未接码（橙） --- */
+/* --- 仅表示账号库是否持有 RT，不代表中转存在或凭据仍有效 --- */
 export function smsChip(account: Account): { text: string; kind: "success" | "warning" } {
   return account.has_refresh_token
-    ? { text: "已接码", kind: "success" }
-    : { text: "未接码", kind: "warning" };
+    ? { text: "持有 RT", kind: "success" }
+    : { text: "缺少 RT", kind: "warning" };
 }
 
 /* --- 状态文案与样式映射（表格/卡片共用）

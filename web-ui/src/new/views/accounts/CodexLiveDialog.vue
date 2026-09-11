@@ -33,7 +33,8 @@ const disconnected = computed(() => ["reconnecting", "offline", "error"].include
 const progress = computed(() => summary.value.total ? Math.min(100, Math.round(summary.value.done / summary.value.total * 100)) : 0);
 type DisplayItem = CodexItem & Partial<CodexResultItem>;
 
-function resultState(item: { status: string; skipped?: boolean; error?: string }) {
+function resultState(item: { status: string; skipped?: boolean; error?: string; outcome?: string; action?: string; relay_status?: string }) {
+  if (item.outcome === "synced" || item.status === "synced" || (item.action === "sync_only" && item.relay_status === "synced")) return "synced";
   if (item.skipped || item.status === "skipped") return "skipped";
   if (item.status === "failed" && /^(?:任务已(?:停止|取消)|用户(?:停止|取消)|cancel(?:led|ed)\b)/i.test(item.error || "")) return "cancelled";
   return item.status === "error" ? "failed" : item.status;
@@ -51,14 +52,16 @@ const items = computed<DisplayItem[]>(() => {
 });
 const filteredItems = computed(() => items.value.filter((item) => (!query.value.trim() || item.email.toLowerCase().includes(query.value.trim().toLowerCase())) && (filter.value === "all" || item.status === filter.value)));
 const failedEmails = computed(() => [...new Set(items.value.filter((item) => item.status === "failed").map((item) => item.email))]);
-const tokenResults = computed(() => (status.value.results || []).filter((item) => ["success", "skipped"].includes(resultState(item)) && item.refresh_token));
+const tokenResults = computed(() => (status.value.results || []).filter((item) => ["success", "synced", "skipped"].includes(resultState(item)) && item.refresh_token));
 const filteredLogs = computed(() => (status.value.logs || []).filter((line) => logFilter.value === "all" || (logFilter.value === "issues" ? ["warning", "error"].includes(line.level) : line.level === logFilter.value)));
 const lastUpdated = computed(() => batch.codexLastUpdated ? new Date(batch.codexLastUpdated).toLocaleTimeString() : "尚未同步");
-const stageLabels: Record<string, string> = { pending: "等待执行", login: "登录", password: "验证密码", mfa: "二次认证", acquiring: "获取号码", phone: "提交号码", waiting_sms: "等待短信", verifying_sms: "验证短信", workspace: "选择工作区", token: "保存 RT", mfa_retry: "等待认证窗口" };
-const statusLabels: Record<string, string> = { pending: "未执行", active: "处理中", success: "新获取", skipped: "沿用已有", failed: "失败", cancelled: "已取消" };
+const stageLabels: Record<string, string> = { pending: "等待执行", login: "登录", password: "验证密码", mfa: "二次认证", acquiring: "获取号码", phone: "提交号码", waiting_sms: "等待短信", verifying_sms: "验证短信", workspace: "选择工作区", token: "保存 RT", mfa_retry: "等待认证窗口", relay_sync: "同步中转", syncing: "同步中转", relay_check: "检查中转" };
+const statusLabels: Record<string, string> = { pending: "未执行", active: "处理中", success: "授权并同步", synced: "已补同步", skipped: "中转已有", failed: "失败", cancelled: "已取消" };
 function label(item: DisplayItem) {
   if (item.status === "active") return stageLabels[item.stage || ""] || item.message || "处理中";
   if (isImport.value && item.status === "success") return "导入成功";
+  if (item.status === "skipped" && item.relay_status !== "ready") return "沿用已有 RT（旧记录）";
+  if (item.status === "failed" && item.authorization_status === "success") return "授权成功 · 同步失败";
   return statusLabels[item.status] || item.status;
 }
 function countdown(item: DisplayItem) {
@@ -112,27 +115,27 @@ function close() { batch.codexDialogOpen = false; }
 </script>
 
 <template>
-  <AppModal :open="batch.codexDialogOpen" :title="isImport ? '协议登录任务' : '接码任务'" subtitle="关闭窗口或切换页面后，任务与进度同步仍会继续" width="900px" @close="close">
+  <AppModal :open="batch.codexDialogOpen" :title="isImport ? '协议登录任务' : '授权与中转任务'" subtitle="关闭窗口或切换页面后，任务与进度同步仍会继续" width="900px" @close="close">
     <template #icon><Upload v-if="isImport" :size="18" /><Smartphone v-else :size="18" /></template>
     <div class="task-head">
       <div class="task-state" role="status"><span :class="['state-dot', { running: status.running, stale: disconnected }]"></span><b>{{ disconnected ? '同步中断 · 自动重连中' : stopping ? '正在停止…' : status.running ? '任务运行中' : status.status === 'cancelled' ? '任务已停止' : summary.total ? '任务已结束' : '暂无任务' }}</b><span>已处理 {{ summary.done }} / {{ summary.total }}</span></div>
       <div class="actions"><AppButton size="sm" @click="history"><ScrollText :size="14" />{{ isImport ? '导入历史' : '接码历史' }}</AppButton><AppButton v-if="status.running" variant="danger" size="sm" :disabled="stopping" :loading="batch.codexStopBusy" @click="batch.stopCodex()">{{ stopping ? '正在停止' : '停止任务' }}</AppButton></div>
     </div>
     <div class="progress-track" role="progressbar" aria-label="账号处理进度" :aria-valuenow="summary.done" :aria-valuemin="0" :aria-valuemax="Math.max(1, summary.total)"><div :style="{ transform: `scaleX(${progress / 100})` }"></div></div>
-    <div class="result-summary"><span><b>{{ summary.newSuccess }}</b>{{ isImport ? '导入成功' : '新获取' }}</span><span><b>{{ summary.reused }}</b>沿用已有</span><span :class="{ failure: summary.failed }"><b>{{ summary.failed }}</b>失败</span><span><b>{{ summary.cancelled }}</b>取消</span><span><b>{{ summary.pending }}</b>未执行</span><span><b>{{ summary.active }}</b>处理中</span></div>
+    <div :class="['result-summary', { 'with-relay': !isImport }]"><span><b>{{ summary.newSuccess }}</b>{{ isImport ? '导入成功' : '授权并同步' }}</span><span v-if="!isImport"><b>{{ summary.synced }}</b>补同步中转</span><span><b>{{ summary.reused }}</b>{{ isImport ? '沿用已有' : '中转已有' }}</span><span :class="{ failure: summary.failed }"><b>{{ summary.failed }}</b>失败</span><span><b>{{ summary.cancelled }}</b>取消</span><span><b>{{ summary.pending }}</b>未执行</span><span><b>{{ summary.active }}</b>处理中</span></div>
     <div v-if="disconnected || batch.codexError" class="connection-warning" role="alert"><WifiOff :size="16" /><span>{{ batch.codexError || '暂时无法同步进度，已自动重连。当前显示上次同步结果。' }}<small>最近同步 {{ lastUpdated }}</small></span><AppButton size="sm" @click="batch.refreshCodexStatus()">立即重连</AppButton></div>
     <p v-if="stopping" class="task-note" role="status">正在收尾，不再开始新的账号。请等待服务端确认，结束后会分别显示已取消和未执行的数量。</p>
     <p v-if="isImport && hasFailed && !status.running && !batch.canRetryImport()" class="task-note">当前浏览器没有全部失败账号的原始导入凭据，可单条重试仍有凭据的账号，或复制失败邮箱后重新粘贴导入。</p>
     <div class="results-toolbar">
       <label class="search-field"><Search :size="15" /><input v-model="query" aria-label="按邮箱筛选任务结果" placeholder="搜索邮箱" type="search" /></label>
-      <select v-model="filter" class="filter-select" aria-label="筛选任务结果"><option value="all">全部结果 ({{ items.length }})</option><option value="active">处理中</option><option value="success">{{ isImport ? '导入成功' : '新获取' }}</option><option value="skipped">沿用已有</option><option value="failed">失败</option><option value="cancelled">取消</option><option value="pending">未执行</option></select>
+      <select v-model="filter" class="filter-select" aria-label="筛选任务结果"><option value="all">全部结果 ({{ items.length }})</option><option value="active">处理中</option><option value="success">{{ isImport ? '导入成功' : '授权并同步' }}</option><option v-if="!isImport" value="synced">补同步中转</option><option value="skipped">{{ isImport ? '沿用已有' : '中转已有 / 旧记录沿用' }}</option><option value="failed">失败</option><option value="cancelled">取消</option><option value="pending">未执行</option></select>
       <div class="actions"><AppButton v-if="failedEmails.length" size="sm" @click="copyFailed"><Clipboard :size="13" />复制失败邮箱</AppButton><AppButton v-if="retryAvailable" size="sm" :loading="batch.codexStartBusy" @click="retry()"><RefreshCw :size="13" />只重试失败项</AppButton></div>
     </div>
     <div class="result-list">
       <p v-if="!filteredItems.length" class="empty-state">{{ items.length ? '没有匹配条件的账号' : status.running ? '正在准备账号，请稍候…' : '本批次暂无账号结果' }}</p>
       <article v-for="item in filteredItems.slice(0, visibleLimit)" :key="item.email" :class="['result-row', `result-${item.status}`]">
-        <div class="result-main"><div class="result-title"><b>{{ item.email }}</b><span class="result-status">{{ label(item) }}</span></div><small v-if="item.error" class="error-text">{{ item.error }}</small><small v-else-if="item.status === 'skipped'">已有 RT，未重复取号</small><small v-else-if="item.status === 'pending'">{{ status.running ? '等待空闲处理位' : '尚未执行，可重新选择后启动' }}</small><small v-else-if="item.status === 'cancelled'">本次处理已取消</small><small v-else-if="item.status === 'success'">{{ item.token_kind === 'at' ? 'AT' : 'RT' }} 已保存</small><small v-else>{{ item.message || '正在处理' }}</small><div v-if="!isImport && (item.attempt || item.wait_deadline)" class="stage-meta"><span v-if="item.attempt">取号 {{ item.attempt }} / {{ item.max_phone_attempts || '—' }} 次</span><span v-if="countdown(item)" class="countdown">{{ countdown(item) }}</span></div></div>
-        <div class="actions"><AppButton v-if="item.logs?.length" size="sm" :aria-expanded="!!expandedLogs[item.email]" @click="toggleLogs(item)"><ScrollText :size="13" />{{ expandedLogs[item.email] ? '收起' : '日志' }}</AppButton><AppButton v-if="item.status === 'failed' && !status.running && (!isImport || batch.canRetryImport(item.email))" size="sm" :disabled="batch.codexStartBusy" :aria-label="`重试 ${item.email}`" @click="retry(item.email)"><RefreshCw :size="13" />重试</AppButton><AppButton v-if="item.refresh_token && ['success', 'skipped'].includes(item.status)" size="sm" :aria-label="`复制 ${item.email} 的 Token`" @click="copyToken(item)"><Check v-if="copiedKey === `codex-${item.email}`" :size="13" /><Clipboard v-else :size="13" />{{ item.token_kind === 'at' ? '复制 AT' : '复制 RT' }}</AppButton></div>
+        <div class="result-main"><div class="result-title"><b>{{ item.email }}</b><span class="result-status">{{ label(item) }}</span></div><small v-if="item.error" class="error-text">{{ item.error }}</small><small v-else-if="item.status === 'skipped'">{{ item.relay_status === 'ready' ? '中转已有匹配凭据，未在线验证' : '旧记录仅确认持有 RT，未核对中转' }}</small><small v-else-if="item.status === 'synced'">已补齐中转 JSON，未重新授权或取号</small><small v-else-if="item.status === 'pending'">{{ status.running ? '等待空闲处理位' : '尚未执行，可重新选择后启动' }}</small><small v-else-if="item.status === 'cancelled'">本次处理已取消</small><small v-else-if="item.status === 'success'">{{ item.token_kind === 'at' ? 'AT' : 'RT' }} 已保存</small><small v-else>{{ item.message || '正在处理' }}</small><small v-if="item.relay_file" class="relay-file">中转文件：{{ item.relay_file }}</small><small v-if="item.authorization_status === 'success' && item.relay_status === 'failed'" class="relay-warning">新凭据已保存在账号库，重试只补同步，不再重复授权。</small><div v-if="!isImport && (item.attempt || item.wait_deadline)" class="stage-meta"><span v-if="item.attempt">取号 {{ item.attempt }} / {{ item.max_phone_attempts || '—' }} 次</span><span v-if="countdown(item)" class="countdown">{{ countdown(item) }}</span></div></div>
+        <div class="actions"><AppButton v-if="item.logs?.length" size="sm" :aria-expanded="!!expandedLogs[item.email]" @click="toggleLogs(item)"><ScrollText :size="13" />{{ expandedLogs[item.email] ? '收起' : '日志' }}</AppButton><AppButton v-if="item.status === 'failed' && !status.running && (!isImport || batch.canRetryImport(item.email))" size="sm" :disabled="batch.codexStartBusy" :aria-label="`重试 ${item.email}`" @click="retry(item.email)"><RefreshCw :size="13" />{{ item.retry_action === 'sync_only' ? '补同步中转' : '重试' }}</AppButton><AppButton v-if="item.refresh_token && ['success', 'synced', 'skipped'].includes(item.status)" size="sm" :aria-label="`复制 ${item.email} 的 Token`" @click="copyToken(item)"><Check v-if="copiedKey === `codex-${item.email}`" :size="13" /><Clipboard v-else :size="13" />{{ item.token_kind === 'at' ? '复制 AT' : '复制 RT' }}</AppButton></div>
         <div v-if="expandedLogs[item.email]" class="account-logs"><p v-for="(line, index) in item.logs || []" :key="index" :class="logClass(line.level)"><span class="log-time">{{ line.t }}</span>{{ line.m }}</p></div>
       </article>
       <AppButton v-if="filteredItems.length > visibleLimit" size="sm" @click="visibleLimit += 40">再显示 {{ Math.min(40, filteredItems.length - visibleLimit) }} 个账号</AppButton>
@@ -144,6 +147,9 @@ function close() { batch.codexDialogOpen = false; }
 </template>
 
 <style scoped>
+.result-summary.with-relay { grid-template-columns: repeat(7, minmax(0, 1fr)); }
+.relay-file { overflow-wrap: anywhere; }.relay-warning { color: var(--warning); }
+@media(max-width:640px) { .result-summary.with-relay { grid-template-columns: repeat(3, minmax(0,1fr)); } }
 .task-head,.task-state,.actions,.results-toolbar,.log-controls,.footer-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }.task-head,.footer-actions { justify-content: space-between; width: 100%; }.task-state { color: var(--text-secondary); font-size: .78rem; }.task-state b { color: var(--text-primary); font-size: .85rem; }.state-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--success); }.state-dot.running { background: var(--accent); }.state-dot.stale { background: var(--warning); }
 .progress-track { height: 4px; background: var(--progress-track); border-radius: 10px; overflow: hidden; margin: 13px 0; }.progress-track div { height: 100%; width: 100%; background: var(--accent); transform-origin: left; transition: transform .3s ease; }
 .result-summary { display: grid; grid-template-columns: repeat(6, minmax(0,1fr)); gap: 1px; border: 1px solid var(--field-border); border-radius: var(--radius-sm); overflow: hidden; margin-bottom: 15px; background: var(--line-subtle); }.result-summary span { display: grid; gap: 4px; padding: 10px 12px; font-size: .72rem; background: var(--field-bg); color: var(--text-secondary); }.result-summary b { font: 600 1.2rem var(--mono); color: var(--text-primary); }.result-summary .failure b { color: var(--error); }

@@ -9,16 +9,20 @@ import base64
 import hashlib
 import io
 import json
+import os
 import re
+import shutil
+import stat
 import tempfile
 import threading
 import time
 import uuid
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
@@ -377,6 +381,20 @@ class ResetCreditConsumeRequest(BaseModel):
     credit_id: str = Field(default="", max_length=256)
 
 
+class RelayExportPreviewRequest(BaseModel):
+    emails: list[str] = Field(default_factory=list, max_length=20000)
+    all: bool = False
+
+
+class RelayExportFilesRequest(BaseModel):
+    files: list[str] = Field(min_length=1, max_length=20000)
+    format: Literal["original", "merged", "sub2"] = "original"
+    # The new UI supplies revisions so a changed file cannot silently replace
+    # the account/workspace selected in the preview. Explicit API callers may
+    # omit them to request the current files directly.
+    revisions: dict[str, str] | None = None
+
+
 def _first_text(*values: Any) -> str:
     for value in values:
         text = str(value or "").strip()
@@ -626,6 +644,232 @@ def _auth_records(paths: list[Path]) -> list[dict[str, Any]]:
         if isinstance(record, dict) and record:
             records.append(record)
     return records
+
+
+def _export_inventory() -> list[str]:
+    """Inventory actual relay files, including broken symlinks for diagnostics."""
+    if not AUTHS_DIR.is_dir():
+        return []
+    try:
+        return sorted(
+            path.name for path in AUTHS_DIR.iterdir()
+            if path.suffix.lower() == ".json" and (path.is_file() or path.is_symlink())
+        )
+    except OSError as exc:
+        raise HTTPException(503, "无法读取中转凭据目录") from exc
+
+
+def _validate_export_name(name: str) -> str:
+    if (
+        not name or name in {".", ".."} or "/" in name or "\\" in name
+        or "\x00" in name or ":" in name or Path(name).suffix.lower() != ".json"
+    ):
+        raise HTTPException(400, "请选择预览列表中的 JSON 文件名，不允许目录路径")
+    return name
+
+
+def _same_file_version(left: os.stat_result, right: os.stat_result) -> bool:
+    fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+    # Windows lstat/fstat may expose creation/change time differently; file
+    # identity, size, modification time and the content revision remain stable.
+    if os.name != "nt":
+        fields += ("st_ctime_ns",)
+    return all(getattr(left, field) == getattr(right, field) for field in fields)
+
+
+@contextmanager
+def _export_auth_reader(name: str):
+    """Open one exact basename without following a file symlink.
+
+    Verify both the descriptor and directory entry after reading, so replacement
+    or in-place updates fail the whole selection rather than mixing versions.
+    """
+    name = _validate_export_name(name)
+    try:
+        root = AUTHS_DIR.resolve(strict=True)
+    except OSError as exc:
+        raise HTTPException(503, "中转凭据目录尚未配置或已不可用") from exc
+    path = root / name
+    try:
+        before = path.lstat()
+        if stat.S_ISLNK(before.st_mode):
+            raise HTTPException(400, f"{name}: 不允许导出符号链接")
+        if not stat.S_ISREG(before.st_mode) or path.resolve(strict=True).parent != root:
+            raise HTTPException(400, f"{name}: 不是目录内的普通 JSON 文件")
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+    except FileNotFoundError as exc:
+        raise HTTPException(409, f"{name}: 文件已不存在，请重新预览；本次未导出") from exc
+    except OSError as exc:
+        raise HTTPException(409, f"{name}: 文件无法读取或已变化，请重新预览；本次未导出") from exc
+
+    with os.fdopen(descriptor, "rb") as handle:
+        opened = os.fstat(handle.fileno())
+        if not stat.S_ISREG(opened.st_mode) or not _same_file_version(before, opened):
+            raise HTTPException(409, f"{name}: 文件已变化，请重新预览；本次未导出")
+        yield handle
+        try:
+            current = path.lstat()
+            final = os.fstat(handle.fileno())
+            if stat.S_ISLNK(current.st_mode) or not _same_file_version(opened, current) or not _same_file_version(opened, final):
+                raise HTTPException(409, f"{name}: 文件已变化，请重新预览；本次未导出")
+        except OSError as exc:
+            raise HTTPException(409, f"{name}: 文件已不存在，请重新预览；本次未导出") from exc
+
+
+def _parse_export_record(raw: bytes, name: str) -> dict[str, Any]:
+    try:
+        def invalid_constant(_value: str):
+            raise ValueError("invalid JSON constant")
+        record = json.loads(raw.decode("utf-8-sig"), parse_constant=invalid_constant)
+    except (ValueError, UnicodeError) as exc:
+        # Never include parse exceptions or source fragments in a preview.
+        raise HTTPException(422, f"{name}: 文件不是有效的 JSON 对象") from exc
+    if not isinstance(record, dict):
+        raise HTTPException(422, f"{name}: 文件不是有效的 JSON 对象")
+    return record
+
+
+def _export_metadata(record: dict[str, Any]) -> dict[str, str]:
+    claims = _jwt_payload(str(record.get("id_token") or "")) or _jwt_payload(str(record.get("access_token") or ""))
+    profile = claims.get("https://api.openai.com/profile")
+    profile = profile if isinstance(profile, dict) else {}
+
+    def text(*values: Any) -> str:
+        return next((value.strip() for value in values if isinstance(value, str) and value.strip()), "")
+
+    return {
+        "email": text(record.get("email"), claims.get("email"), profile.get("email")).lower(),
+        "account_id": text(record.get("account_id"), _claim(claims, "chatgpt_account_id")),
+        "plan_type": _plan_from_record(record),
+    }
+
+
+def _export_preview_sync(body: RelayExportPreviewRequest) -> dict[str, Any]:
+    names = _export_inventory()
+    requested = list(dict.fromkeys(email.strip().lower() for email in body.emails if email.strip()))
+    wanted = set(requested)
+    matched: set[str] = set()
+    items: list[dict[str, Any]] = []
+    if body.all or wanted:
+        for name in names:
+            item: dict[str, Any] = {
+                "file": name, "email": "", "account_id": "", "plan_type": "",
+                "size_bytes": 0, "valid": False, "revision": "",
+            }
+            try:
+                with _export_auth_reader(name) as handle:
+                    raw = handle.read()
+                    item["size_bytes"] = len(raw)
+                    record = _parse_export_record(raw, name)
+                item.update(_export_metadata(record), valid=True, revision=hashlib.sha256(raw).hexdigest())
+            except HTTPException as exc:
+                # Unreadable files cannot be reliably matched to an email. Show
+                # them as unselectable diagnostics instead of hiding them.
+                item["error"] = str(exc.detail)
+                items.append(item)
+                continue
+            if body.all or item["email"] in wanted:
+                items.append(item)
+                if item["email"]:
+                    matched.add(item["email"])
+    return {
+        "configured": AUTHS_DIR.is_dir(), "total_files": len(names),
+        "matched_emails": len(matched), "matched_files": sum(item["valid"] for item in items),
+        "not_found": [email for email in requested if email not in matched],
+        "invalid_files": sum(not item["valid"] for item in items), "items": items,
+    }
+
+
+@router.post("/api/cliproxy/export-preview")
+async def export_preview(body: RelayExportPreviewRequest) -> dict[str, Any]:
+    """Preview relay JSON metadata only; never query quota or refresh tokens."""
+    return await asyncio.to_thread(_export_preview_sync, body)
+
+
+class _RelayExportResponse(FileResponse):
+    """Delete the private export snapshot on success, failure or disconnect."""
+    def __init__(self, path: Path, temporary: tempfile.TemporaryDirectory, **kwargs):
+        self._temporary = temporary
+        super().__init__(path, **kwargs)
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._temporary.cleanup()
+
+
+def _export_files_sync(body: RelayExportFilesRequest) -> FileResponse:
+    # Do not reuse _safe_auth_paths: its legacy empty-list behavior selects all.
+    names = [_validate_export_name(name) for name in body.files]
+    if not names:
+        raise HTTPException(400, "请先明确选择需要导出的文件")
+    if len(set(names)) != len(names):
+        raise HTTPException(400, "文件选择包含重复项，请重新预览")
+    if body.revisions is not None and any(not body.revisions.get(name) for name in names):
+        raise HTTPException(409, "文件预览版本不完整，请重新预览；本次未导出")
+    if not AUTHS_DIR.is_dir():
+        raise HTTPException(503, "中转凭据目录尚未配置或已不可用")
+
+    temporary = tempfile.TemporaryDirectory(prefix="cliproxy-export-")
+    work = Path(temporary.name)
+    try:
+        snapshots: list[tuple[str, Path]] = []
+        # Materialize and validate the complete selection before any response
+        # bytes are sent. Only one file at a time is parsed into memory.
+        for index, name in enumerate(names):
+            snapshot = work / f"source-{index}.json"
+            digest = hashlib.sha256()
+            with _export_auth_reader(name) as source, snapshot.open("wb") as target:
+                while chunk := source.read(1024 * 1024):
+                    target.write(chunk)
+                    digest.update(chunk)
+            if body.revisions is not None and digest.hexdigest() != body.revisions[name]:
+                raise HTTPException(409, f"{name}: 文件已变化，请重新预览；本次未导出")
+            _parse_export_record(snapshot.read_bytes(), name)
+            snapshots.append((name, snapshot))
+
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        if body.format == "original" and len(snapshots) == 1:
+            filename, output = snapshots[0]
+            media_type = "application/json"
+        elif body.format == "original":
+            filename = f"cliproxy-auths-{stamp}.zip"
+            output = work / "export.zip"
+            media_type = "application/zip"
+            with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+                for name, snapshot in snapshots:
+                    with snapshot.open("rb") as source, archive.open(name, "w") as target:
+                        shutil.copyfileobj(source, target, length=1024 * 1024)
+        else:
+            filename = f"cliproxy-{'sub2' if body.format == 'sub2' else 'cpa'}-{stamp}.json"
+            output = work / "export.json"
+            media_type = "application/json"
+            with output.open("w", encoding="utf-8", newline="\n") as target:
+                if body.format == "sub2":
+                    target.write('{"exported_at":' + json.dumps(_now_iso()) + ',"proxies":[],"accounts":[')
+                else:
+                    target.write("[")
+                for index, (name, snapshot) in enumerate(snapshots):
+                    record = _parse_export_record(snapshot.read_bytes(), name)
+                    if index:
+                        target.write(",\n")
+                    json.dump(_sub2_export_record(record) if body.format == "sub2" else record, target, ensure_ascii=False)
+                target.write("]}\n" if body.format == "sub2" else "]\n")
+        return _RelayExportResponse(
+            output, temporary, filename=filename, media_type=media_type,
+            headers={"Cache-Control": "no-store", "X-Exported-Count": str(len(snapshots))},
+        )
+    except Exception:
+        temporary.cleanup()
+        raise
+
+
+@router.post("/api/cliproxy/export-files")
+async def export_files(body: RelayExportFilesRequest) -> Any:
+    """Export the exact selected relay files; preserve every unknown CPA field."""
+    return await asyncio.to_thread(_export_files_sync, body)
 
 
 @router.get("/api/cliproxy/export-cpa")

@@ -147,8 +147,8 @@ async function removeOne(id: string, name: string) {
 
       <select v-model="accounts.smsFilter" class="input filter-select" aria-label="接码筛选">
         <option value="all">全部接码状态</option>
-        <option value="sms">已接码</option>
-        <option value="no-sms">未接码</option>
+        <option value="sms">持有 RT</option>
+        <option value="no-sms">缺少 RT</option>
       </select>
 
       <select v-model="accounts.groupFilter" class="input filter-select" aria-label="分组筛选">

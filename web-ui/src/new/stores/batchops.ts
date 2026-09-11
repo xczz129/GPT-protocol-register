@@ -6,7 +6,7 @@ import {
   fetchRefreshAtProgress, fetchTrialProgress, passwordChangeStart, preflightCodex, reauthByEmailStart, reauthStart,
   reauthStop, refreshAtStart, securityRepairStart, totpChangeStart, trialStart,
   type CodexRunOptions, type CodexStatus, type ProtocolLoginStartResult, type ReauthProgress,
-  type RefreshAtProgress, type SmsOptions, type TrialProgress,
+  type RefreshAtProgress, type RelayAction, type RelayStrategy, type SmsOptions, type TrialProgress,
 } from "../api/batchops";
 
 export const useBatchOpsStore = defineStore("batchops", () => {
@@ -18,6 +18,7 @@ export const useBatchOpsStore = defineStore("batchops", () => {
   const codexStartOpen = ref(false);
   const codexStartEmails = ref<string[]>([]);
   const codexStartForce = ref(false);
+  const codexStartStrategy = ref<RelayStrategy>("auto");
   const codexHistoryOpen = ref(false);
   const codexHistoryEmails = ref<string[]>([]);
   const lastCodexOptions = reactive<CodexRunOptions>({ concurrency: 3, force: false });
@@ -54,15 +55,16 @@ export const useBatchOpsStore = defineStore("batchops", () => {
     const results = value.results || [];
     const items = value.items || [];
     const reused = number(counts.skipped, results.filter((item) => item.skipped || item.status === "skipped").length);
+    const synced = number(counts.synced, results.filter((item) => item.outcome === "synced" || item.status === "synced" || (item.action === "sync_only" && item.relay_status === "synced")).length);
     const legacyCancelled = results.filter(cancelledItem).length;
-    const newSuccess = number(counts.success, Math.max(0, number(value.success) - reused));
+    const newSuccess = number(counts.success, Math.max(0, number(value.success) - reused - synced));
     const failed = number(counts.failed, Math.max(0, number(value.failed) - legacyCancelled));
     const cancelled = number(counts.cancelled, number(value.cancelled, legacyCancelled));
     const active = number(counts.active, items.filter((item) => item.status === "active").length);
-    const done = Math.max(number(counts.done, number(value.done)), newSuccess + reused + failed + cancelled);
+    const done = Math.max(number(counts.done, number(value.done)), newSuccess + synced + reused + failed + cancelled);
     const total = Math.max(number(counts.total, number(value.total)), done + active);
     const pending = number(counts.pending, Math.max(0, total - done - active));
-    return { newSuccess, reused, failed, cancelled, pending, active, total, done };
+    return { newSuccess, synced, reused, failed, cancelled, pending, active, total, done };
   });
 
   function normalizedEmails(emails: string[]) {
@@ -100,6 +102,8 @@ export const useBatchOpsStore = defineStore("batchops", () => {
     lastCodexOptions.concurrency = options?.concurrency ?? status?.concurrency ?? lastCodexOptions.concurrency;
     lastCodexOptions.force = options?.force ?? status?.force ?? lastCodexOptions.force;
     if (options?.sms_options) lastCodexOptions.sms_options = { ...options.sms_options };
+    if (options?.strategy) lastCodexOptions.strategy = options.strategy;
+    if (options?.account_actions) lastCodexOptions.account_actions = { ...options.account_actions };
   }
 
   function finishCodexOnce(status: CodexStatus) {
@@ -193,9 +197,10 @@ export const useBatchOpsStore = defineStore("batchops", () => {
     return Boolean(status?.running);
   }
 
-  function openCodexStart(emails: string[], force = false) {
+  function openCodexStart(emails: string[], force = false, strategy?: RelayStrategy) {
     codexStartEmails.value = normalizedEmails(emails);
     codexStartForce.value = force;
+    codexStartStrategy.value = strategy || (force ? "reauthorize" : "auto");
     codexStartOpen.value = true;
   }
 
@@ -238,12 +243,14 @@ export const useBatchOpsStore = defineStore("batchops", () => {
     }
   }
 
-  async function runCodex(emails: string[], concurrency: number, force = false, smsOptions?: SmsOptions) {
+  async function runCodex(emails: string[], concurrency: number, force = false, smsOptions?: SmsOptions, strategy?: RelayStrategy, accountActions?: Record<string, RelayAction>) {
     const requested = normalizedEmails(emails);
     if (!requested.length) throw new Error("请先选择需要接码的账号");
-    const options: CodexRunOptions = { concurrency, force, ...(smsOptions ? { sms_options: { ...smsOptions } } : {}) };
-    await launchCodexBatch("codex", requested.length, () => codexRun(requested, concurrency, force, smsOptions), () => {
+    const options: CodexRunOptions = { concurrency, force, ...(smsOptions ? { sms_options: { ...smsOptions } } : {}), ...(strategy ? { strategy } : {}), ...(accountActions ? { account_actions: { ...accountActions } } : {}) };
+    await launchCodexBatch("codex", requested.length, () => codexRun(requested, concurrency, force, smsOptions, strategy, accountActions), () => {
       delete lastCodexOptions.sms_options;
+      delete lastCodexOptions.strategy;
+      delete lastCodexOptions.account_actions;
       saveCodexOptions(options);
     });
   }
@@ -286,7 +293,15 @@ export const useBatchOpsStore = defineStore("batchops", () => {
     const options: CodexRunOptions = {
       concurrency: lastCodexOptions.concurrency, force: lastCodexOptions.force,
       ...(lastCodexOptions.sms_options ? { sms_options: { ...lastCodexOptions.sms_options } } : {}),
+      ...(lastCodexOptions.strategy ? { strategy: lastCodexOptions.strategy } : {}),
     };
+    const actions: Record<string, RelayAction> = {};
+    for (const email of emails) {
+      const result = (codex.value.results || []).find(item => String(item.email || "").trim().toLowerCase() === email);
+      const action = result?.retry_action || lastCodexOptions.account_actions?.[email];
+      if (action) actions[email] = action;
+    }
+    if (Object.keys(actions).length) options.account_actions = actions;
     codexStartBusy.value = true;
     let preview;
     try {
@@ -298,7 +313,7 @@ export const useBatchOpsStore = defineStore("batchops", () => {
       || preview.total !== emails.length) {
       throw new Error("部分失败账号已删除、停用或缺少登录凭据，请先处理后重试；本次未启动");
     }
-    await runCodex(emails, options.concurrency, options.force, options.sms_options);
+    await runCodex(emails, options.concurrency, options.force, options.sms_options, options.strategy, options.account_actions);
   }
 
   /** 导入账号（协议登录 密码+TOTP） */
@@ -520,7 +535,7 @@ export const useBatchOpsStore = defineStore("batchops", () => {
   }
 
   return {
-    codex, codexDialogOpen, codexStartOpen, codexStartEmails, codexStartForce, codexHistoryOpen, codexHistoryEmails, lastCodexOptions,
+    codex, codexDialogOpen, codexStartOpen, codexStartEmails, codexStartForce, codexStartStrategy, codexHistoryOpen, codexHistoryEmails, lastCodexOptions,
     codexConnection, codexLastUpdated, codexError, codexStartBusy, codexStopBusy, codexSummary,
     lastImportLines, lastImportOptions, canRetryImport,
     openCodexStart, openCodexHistory, openCodexDialog, openCodexDialogIfRunning, restoreCodex, refreshCodexStatus,

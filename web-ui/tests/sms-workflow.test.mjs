@@ -231,11 +231,11 @@ test("summary separates new RTs, reused RTs, cancellations and unexecuted accoun
     { email: "reuse@example.test", status: "success", skipped: true },
     { email: "cancel@example.test", status: "failed", error: "任务已停止" },
   ] });
-  assert.deepEqual(plain(h.store.codexSummary.value), { newSuccess: 2, reused: 1, failed: 1, cancelled: 1, pending: 2, active: 0, total: 7, done: 5 });
+  assert.deepEqual(plain(h.store.codexSummary.value), { newSuccess: 2, synced: 0, reused: 1, failed: 1, cancelled: 1, pending: 2, active: 0, total: 7, done: 5 });
   h.store.codex.value = status({ total: 8, done: 6, success: 4, failed: 1, counts: {
     total: 8, done: 6, success: 2, skipped: 2, failed: 1, cancelled: 1, pending: 1, active: 1,
   } });
-  assert.deepEqual(plain(h.store.codexSummary.value), { newSuccess: 2, reused: 2, failed: 1, cancelled: 1, pending: 1, active: 1, total: 8, done: 6 });
+  assert.deepEqual(plain(h.store.codexSummary.value), { newSuccess: 2, synced: 0, reused: 2, failed: 1, cancelled: 1, pending: 1, active: 1, total: 8, done: 6 });
 });
 
 test("SMS retry selects failures only and preserves original settings when another start dialog was cancelled", async () => {
@@ -323,4 +323,28 @@ test("terminal cancelled response clears a stale stopping flag", async () => {
   await h.store.restoreCodex();
   assert.equal(h.store.codex.value.running, false);
   assert.equal(h.store.codex.value.stopping, false);
+});
+
+test("relay syncs are counted independently from newly authorized RTs", () => {
+  const h = harness();
+  h.store.codex.value = status({ total: 3, done: 3, success: 3, counts: {
+    total: 3, done: 3, success: 1, synced: 1, skipped: 1, failed: 0, cancelled: 0, pending: 0, active: 0,
+  } });
+  assert.deepEqual(plain(h.store.codexSummary.value), { newSuccess: 1, synced: 1, reused: 1, failed: 0, cancelled: 0, pending: 0, active: 0, total: 3, done: 3 });
+});
+
+test("partial authorization success retries only relay sync while other auth failures preserve reauthorization", async () => {
+  const h = harness();
+  h.store.codex.value = status({ total: 2, done: 2, results: [
+    { email: "sync@example.test", status: "failed", authorization_status: "success", relay_status: "failed", retry_action: "sync_only" },
+    { email: "auth@example.test", status: "failed", retry_action: "reauthorize" },
+  ] });
+  Object.assign(h.store.lastCodexOptions, { concurrency: 2, force: true, strategy: "reauthorize" });
+  h.responses.push({ total: 2, missing_credentials: [], not_found: [], deactivated: [] }, { ok: true, batch_id: "repair" }, status({ batch_id: "repair" }));
+  await h.store.retryCodexFailed();
+  for (const call of h.calls.slice(0, 2)) {
+    const payload = JSON.parse(call.options.body);
+    assert.deepEqual(payload.account_actions, { "sync@example.test": "sync_only", "auth@example.test": "reauthorize" });
+    assert.equal(payload.strategy, "reauthorize");
+  }
 });

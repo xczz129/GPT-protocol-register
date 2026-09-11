@@ -20,7 +20,10 @@ def route(monkeypatch, tmp_path):
     monkeypatch.setattr(module, "_LOCK", threading.Lock())
     monkeypatch.setattr(module, "_STOP", threading.Event())
     monkeypatch.setattr(module, "_RT_HISTORY_PATH", tmp_path / "history.json")
-    monkeypatch.setattr(module, "_sync_cliproxy_auth", lambda *args: "")
+    monkeypatch.setattr(module, "_sync_cliproxy_auth", lambda *args, **kwargs: "synced.json")
+    relay_dir = tmp_path / "relay"
+    relay_dir.mkdir()
+    monkeypatch.setattr(module, "CLIPROXY_AUTHS_DIR", relay_dir)
     monkeypatch.setattr(module, "totp_from_secret", lambda *args, **kwargs: "123456")
     monkeypatch.setattr(module, "exchange_code", lambda *args: {"refresh_token": "test-rt"})
     monkeypatch.setattr(module, "update_account_record_fields", lambda *args, **kwargs: (1, []))
@@ -136,6 +139,7 @@ def test_waiting_status_has_deadline_and_no_otp_or_secret(route, monkeypatch):
         return "654321"
 
     fake_login(route, monkeypatch, wait=wait)
+    monkeypatch.setattr(route, "_load_sms_batch_records", lambda _: [account()])
     route._run_batch([account()], config(), batch_id="batch", stop_event=stop)
     item = snapshots[0]["items"][0]
     assert item["stage"] == "waiting_sms"
@@ -157,6 +161,7 @@ def test_stop_reconciles_cancelled_active_and_never_started_accounts(route, monk
 
     calls = fake_login(route, monkeypatch, wait=wait)
     records = [account(f"{i}@example.invalid") for i in range(3)]
+    monkeypatch.setattr(route, "_load_sms_batch_records", lambda wanted: [rec for rec in records if rec["email"] in wanted])
     route._run_batch(records, config(), batch_id="batch", stop_event=stop)
     assert calls.acquire == 1
     assert route._STATE["done"] == route._STATE["total"] == 3
@@ -169,11 +174,16 @@ def test_stop_reconciles_cancelled_active_and_never_started_accounts(route, monk
     assert all(rows[0]["outcome"] == "cancelled" for rows in history.values())
 
 
-def test_existing_rt_counts_separately_without_login_and_persists_options(route, monkeypatch):
+def test_matching_relay_counts_separately_without_login_and_persists_options(route, monkeypatch):
     stop = route._reserve_batch("codex", 1, "batch")
     route._STATE["options"] = {"concurrency": 1, "force": False, "sms_options": {"provider": "smsbower"}}
     monkeypatch.setattr(route, "_process_one", lambda *args, **kwargs: pytest.fail("unexpected login"))
-    route._run_batch([account(refresh_token="existing-rt")], config(), batch_id="batch", stop_event=stop)
+    previous = team_account(refresh_token="existing-rt")
+    monkeypatch.setattr(route, "_load_sms_batch_records", lambda _: [previous])
+    (route.CLIPROXY_AUTHS_DIR / "ready.json").write_text(json.dumps({
+        **previous, "type": "codex", "account_id": "team-a",
+    }))
+    route._run_batch([previous], config(), batch_id="batch", stop_event=stop)
     assert route._STATE["success"] == 1  # Legacy contract.
     assert route._STATE["counts"]["success"] == 0
     assert route._STATE["counts"]["skipped"] == 1
@@ -198,7 +208,7 @@ def test_preflight_categorizes_without_supplier_calls_or_mutation(route, monkeyp
     )
     result = asyncio.run(route.codex_oauth_preflight(body))
     assert result["total"] == 5
-    assert result["eligible"] == result["skipped"] == 1
+    assert result["eligible"] == 2 and result["skipped"] == 0
     assert result["deactivated"] == ["off@example.invalid"]
     assert result["not_found"] == ["unknown@example.invalid"]
     assert result["missing_credentials"] == [{"email": "missing@example.invalid", "missing": ["password", "totp_secret"]}]
@@ -213,7 +223,7 @@ def test_force_preflight_requires_credentials_for_existing_rt(route, monkeypatch
     monkeypatch.setattr(route, "_load_sms_batch_records", lambda _: [{"email": "x@example.invalid", "refresh_token": "old"}])
     skip, _ = route._sms_preflight({"x@example.invalid"}, False, config())
     force, _ = route._sms_preflight({"x@example.invalid"}, True, config())
-    assert skip["skipped"] == 1 and not skip["missing_credentials"]
+    assert skip["skipped"] == 0 and len(skip["missing_credentials"]) == 1
     assert force["skipped"] == 0 and len(force["missing_credentials"]) == 1
 
 
@@ -335,6 +345,7 @@ def test_balance_metadata_names_actual_saved_provider(route, monkeypatch, failur
 
 def team_token(user="member-a", workspace="team-a", plan="team"):
     payload = {
+        "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
         "https://api.openai.com/auth": {
             "chatgpt_user_id": user, "chatgpt_account_id": workspace, "chatgpt_plan_type": plan,
         },
@@ -370,7 +381,7 @@ def test_team_sms_preserves_strict_id_and_persists_matching_fresh_evidence(route
     monkeypatch.setattr(route, "exchange_code", lambda *args: candidate)
     writes, syncs = [], []
     monkeypatch.setattr(route, "update_account_record_fields", lambda *args, **kwargs: writes.append((args, kwargs)) or (1, []))
-    monkeypatch.setattr(route, "_sync_cliproxy_auth", lambda *args: syncs.append(args))
+    monkeypatch.setattr(route, "_sync_cliproxy_auth", lambda *args, **kwargs: syncs.append(args) or "synced.json")
     result = route._process_one(team_account(), config())
     assert result["status"] == "success"
     assert calls.workspaces == [(("",), {"strict_team": True, "expected_workspace_id": "team-a"})]
