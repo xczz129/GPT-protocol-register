@@ -151,7 +151,8 @@ const allChecked = computed(() => pageKeys.value.length > 0 && pageKeys.value.ev
             </button>
             <button
               class="row-action" type="button"
-              :title="account.has_refresh_token ? '接码（已有 RT，点击将强制重发）' : '接码（补发 Refresh Token）'"
+              :title="account.has_refresh_token ? '接码设置（已有 RT，可选择重新获取）' : '接码设置（补取缺少的 RT）'"
+              :aria-label="`设置 ${account.email} 的接码任务`"
               :disabled="account.is_deactivated"
               @click="emit('codex', account)"
             >

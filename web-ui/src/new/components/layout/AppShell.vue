@@ -1,15 +1,36 @@
 <script setup lang="ts">
 /* --- 应用外壳：氛围背景 + 侧栏 + 顶栏 + 内容区 --- */
-import { watch } from "vue";
+import { onMounted, provide, ref, watch } from "vue";
 import { useRoute } from "vue-router";
 import AppSidebar from "./AppSidebar.vue";
 import AppTopbar from "./AppTopbar.vue";
 import { useUiStore } from "../../stores/ui";
 import { useStatusStore } from "../../stores/status";
+import { useAccountsStore } from "../../stores/accounts";
+import { useBatchOpsStore } from "../../stores/batchops";
+import SmsTaskBar from "../../views/accounts/SmsTaskBar.vue";
+import SmsStartDialog from "../../views/accounts/SmsStartDialog.vue";
+import SmsHistoryDialog from "../../views/accounts/SmsHistoryDialog.vue";
+import CodexLiveDialog from "../../views/accounts/CodexLiveDialog.vue";
+import ImportHistoryDialog from "../../views/accounts/ImportHistoryDialog.vue";
 
 const ui = useUiStore();
 const status = useStatusStore();
 const route = useRoute();
+const accounts = useAccountsStore();
+const batch = useBatchOpsStore();
+const importHistoryOpen = ref(false);
+
+function openImportHistory() {
+  batch.codexDialogOpen = false;
+  importHistoryOpen.value = true;
+}
+provide("open-import-history", openImportHistory);
+
+onMounted(() => {
+  batch.setOnCodexFinished(() => accounts.load());
+  void batch.restoreCodex();
+});
 
 status.load();
 
@@ -40,6 +61,7 @@ watch(
     <AppSidebar />
     <div class="shell-main">
       <AppTopbar />
+      <SmsTaskBar @import-history="openImportHistory" />
       <main class="shell-content">
         <RouterView v-slot="{ Component }">
           <Transition name="page" mode="out-in">
@@ -50,6 +72,10 @@ watch(
       <footer class="shell-foot">gpt-register-fp · Vue 3</footer>
     </div>
   </div>
+  <SmsStartDialog />
+  <CodexLiveDialog @history="openImportHistory" />
+  <SmsHistoryDialog />
+  <ImportHistoryDialog :open="importHistoryOpen" @close="importHistoryOpen = false" />
 </template>
 
 <style scoped>

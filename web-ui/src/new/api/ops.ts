@@ -195,8 +195,17 @@ export function updateSmsConfig(body: Record<string, unknown>) {
   return api("/api/sms-config", { method: "PUT", body: jsonBody(body) });
 }
 
-export function testSmsConfig() {
-  return api<{ ok: boolean; message: string }>("/api/sms-config/test", { method: "POST", body: jsonBody({}) });
+export interface SmsBalanceResult {
+  ok: boolean;
+  message: string;
+  provider?: string;
+  provider_label?: string;
+  checked_at?: string;
+  balance?: { balance: string; level?: string; points?: string };
+}
+
+export function testSmsConfig(): Promise<SmsBalanceResult> {
+  return api<SmsBalanceResult>("/api/sms-config/test", { method: "POST", body: jsonBody({}) });
 }
 
 export function clearSmsDockingHistory() {
@@ -211,12 +220,17 @@ export interface SmsStatsRow {
   rate: number;
   cost: number;
   price: number;
+  cancelled?: number;
+  unknown?: number;
+  unpriced?: number;
+  currency?: string;
 }
 
 export interface SmsStats {
-  summary: { total: number; success: number; failed: number; rate: number };
+  summary: { total: number; success: number; failed: number; rate: number; cancelled?: number; unknown?: number; unpriced?: number };
   countries: SmsStatsRow[];
   tiers: SmsStatsRow[];
+  cost_is_estimate?: boolean;
 }
 
 export function fetchSmsStats(): Promise<SmsStats> {

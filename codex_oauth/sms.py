@@ -735,6 +735,11 @@ class SmsActivation:
     finished: bool = False
     # 面板日志展示用:国家名称/档位价格(如 "印度尼西亚 #1170 $0.107")。
     label: str = ""
+    # Optional telemetry supplied by the panel. Catalogue prices are estimates,
+    # never a claim that the provider charged/refunded this amount.
+    provider: str = ""
+    tier: str = ""
+    estimated_price: float | None = None
 
 
 class SmsBowerClient:

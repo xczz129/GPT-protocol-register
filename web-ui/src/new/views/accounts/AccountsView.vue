@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /* --- 账号列表页：工具栏 + 测活进度 + 表格/卡片 + 批量操作条 + 全部批任务弹窗 --- */
-import { onMounted, ref, watch } from "vue";
+import { inject, onMounted, ref, watch } from "vue";
 import { useAccountsStore } from "../../stores/accounts";
 import { useGroupsStore } from "../../stores/groups";
 import { useBatchOpsStore } from "../../stores/batchops";
@@ -12,10 +12,8 @@ import AccountCardList from "./AccountCardList.vue";
 import AccountBatchBar from "./AccountBatchBar.vue";
 import HealthProgress from "./HealthProgress.vue";
 import AccountLogDialog from "./AccountLogDialog.vue";
-import CodexLiveDialog from "./CodexLiveDialog.vue";
 import DeviceInfoDialog from "./DeviceInfoDialog.vue";
 import ImportAccountsDialog from "./ImportAccountsDialog.vue";
-import ImportHistoryDialog from "./ImportHistoryDialog.vue";
 import BatchStartDialog, { type BatchKind } from "./BatchStartDialog.vue";
 import BatchJobDialog from "./BatchJobDialog.vue";
 import AppEmpty from "../../components/ui/AppEmpty.vue";
@@ -32,7 +30,11 @@ const confirm = useConfirm();
 const logDialogKey = ref("");
 const logDialogOpen = ref(false);
 const importDialogOpen = ref(false);
-const historyDialogOpen = ref(false);
+const showImportHistory = inject<() => void>("open-import-history");
+function openImportHistory() {
+  importDialogOpen.value = false;
+  showImportHistory?.();
+}
 
 /* 设备信息弹窗 */
 const deviceDialogOpen = ref(false);
@@ -55,13 +57,9 @@ async function refreshAtOne(account: Account) {
   }
 }
 
-/** 行内单账号接码：强制重发 RT，实时进度走接码弹窗 */
-async function codexOne(account: Account) {
-  try {
-    await batch.runCodex([account.email], 1, true);
-  } catch (error) {
-    ui.notify(error instanceof Error ? error.message : "接码任务启动失败", "error");
-  }
+/** 单条与批量共用预检表单，默认补取缺少的 RT。 */
+function codexOne(account: Account) {
+  batch.openCodexStart([account.email]);
 }
 
 /* 批任务启动弹窗状态 */
@@ -159,7 +157,6 @@ watch(
 );
 
 onMounted(async () => {
-  /* 批次完成后刷新账号列表 */
   batch.setOnFinished(() => accounts.load());
   await Promise.all([groups.load(), accounts.load(), accounts.refreshHealth()]);
   /* 后台已有 reauth 批次运行时重连进度显示 */
@@ -222,9 +219,7 @@ onMounted(async () => {
     <DeviceInfoDialog :open="deviceDialogOpen" :account-key="deviceDialogKey" :email="deviceDialogEmail" @close="deviceDialogOpen = false" />
 
     <!-- 批任务弹窗组 -->
-    <ImportAccountsDialog :open="importDialogOpen" @close="importDialogOpen = false" @history="historyDialogOpen = true" />
-    <ImportHistoryDialog :open="historyDialogOpen" @close="historyDialogOpen = false" />
-    <CodexLiveDialog @history="historyDialogOpen = true" />
+    <ImportAccountsDialog :open="importDialogOpen" @close="importDialogOpen = false" @history="openImportHistory" />
     <BatchStartDialog :open="startDialogOpen" :kind="startDialogKind" :keys="startDialogKeys" :all="startDialogAll" @close="startDialogOpen = false" @started="onBatchStarted" />
     <BatchJobDialog :open="reauthJobDialogOpen || batch.reauthDialogOpen" kind="reauth" @close="reauthJobDialogOpen = false; batch.reauthDialogOpen = false" />
     <BatchJobDialog :open="refreshAtDialogOpen" kind="refreshAt" @close="refreshAtDialogOpen = false" />

@@ -40,7 +40,10 @@ function harness() {
   let timerId = 0;
   const { useBatchOpsStore } = loadModule("../src/new/stores/batchops.ts", {
     "../api/batchops": api,
-    vue: { reactive: (value) => value, ref: (value) => ({ value }) },
+    vue: {
+      reactive: (value) => value, ref: (value) => ({ value }),
+      computed: (get) => ({ get value() { return get(); } }),
+    },
     pinia: { defineStore: (_name, setup) => setup },
   }, {
     setInterval(callback) { timers.set(++timerId, callback); return timerId; },

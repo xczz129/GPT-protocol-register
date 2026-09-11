@@ -37,6 +37,10 @@ const smsStatsRows = computed(() => {
     rate: Number(row.rate || 0),
     cost: Number(row.cost || 0),
     price: Number(row.price || 0),
+    cancelled: Number(row.cancelled || 0),
+    unknown: Number(row.unknown || 0),
+    unpriced: Number(row.unpriced || 0),
+    currency: row.currency || "渠道报价单位",
   }));
 });
 const smsStatsMaxTotal = computed(() => Math.max(1, ...smsStatsRows.value.map((row) => row.total)));
@@ -130,9 +134,10 @@ async function refresh() {
 
       <div class="rank-card">
         <div class="rank-head">
-          <b>接码成功率</b>
-          <span class="rank-total">{{ smsStatsSummary.success }} 通过 / {{ smsStatsSummary.total }} 取号</span>
+          <b>短信验证统计</b>
+          <span class="rank-total">{{ smsStatsSummary.success }} 通过 / {{ smsStatsSummary.total }} 次取号尝试</span>
         </div>
+        <p class="sms-estimate-note">按号码尝试记录统计。报价合计用于比较渠道，实际扣费及退款以平台账单为准。</p>
         <div class="sms-toolbar">
           <div class="seg">
             <button type="button" class="seg-btn" :class="{ active: smsStatsView === 'country' }" @click="smsStatsView = 'country'">按国家</button>
@@ -152,7 +157,7 @@ async function refresh() {
                 <strong :class="`rate-${smsRateLevel(row.rate)}`">{{ row.rate }}%</strong>
               </div>
               <div class="rank-track"><i :style="{ width: `${Math.max(2, (row.total * 100) / smsStatsMaxTotal)}%` }"></i></div>
-              <small class="sms-meta">拒 {{ row.fail }} · ${{ row.cost.toFixed(3) }}<template v-if="row.price"> · 单价 ${{ row.price.toFixed(3) }}</template></small>
+              <small class="sms-meta">失败 {{ row.fail }} · 取消 {{ row.cancelled }} · 未知 {{ row.unknown }} · <template v-if="row.unpriced >= row.total">暂无报价</template><template v-else>已知报价合计 {{ row.cost.toFixed(3) }} {{ row.currency }}</template><template v-if="row.unpriced"> · {{ row.unpriced }} 次未提供报价</template></small>
             </div>
           </div>
         </div>
@@ -162,6 +167,7 @@ async function refresh() {
 </template>
 
 <style scoped>
+.sms-estimate-note { margin: 4px 0 10px; font-size: 0.75rem; line-height: 1.5; color: var(--text-muted); }
 .metrics-panel {
   padding: 18px 20px;
 }

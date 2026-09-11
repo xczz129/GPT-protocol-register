@@ -105,7 +105,7 @@ function removeSelected() {
   });
 }
 
-/* --- 接码：选中邮箱直接启动 codex 批次（默认并发 3） --- */
+/* --- 接码：完整跨页选择进入统一设置与预检，不直接取号 --- */
 function codexSelected() {
   return run(async () => {
     if (accounts.loading) {
@@ -122,7 +122,7 @@ function codexSelected() {
     if (!emails.length || emails.length !== selectedRows.length) {
       throw new Error("所选账号缺少邮箱，请检查后重新选择");
     }
-    await batch.runCodex(emails, 3);
+    batch.openCodexStart(emails);
     emit("codex");
   });
 }
@@ -142,7 +142,7 @@ function openStart(kind: BatchKind) {
         <AppButton variant="primary" size="sm" :disabled="busy" @click="healthSelected">
           <Activity :size="14" /><span>测活</span>
         </AppButton>
-        <AppButton variant="ghost" size="sm" :disabled="busy || batch.codex.running" title="对选中账号接码并查看批量日志" @click="codexSelected">
+        <AppButton variant="ghost" size="sm" :disabled="busy || batch.codex.running || batch.codexStartBusy" title="设置选中账号的接码参数并预检" aria-label="设置选中账号的接码任务" @click="codexSelected">
           <Smartphone :size="14" /><span>接码</span>
         </AppButton>
         <AppButton variant="ghost" size="sm" :disabled="busy" title="复制选中账号的 Access Token" @click="copyTokens">
@@ -189,7 +189,7 @@ function openStart(kind: BatchKind) {
         <AppButton variant="danger" size="sm" :disabled="busy" @click="removeSelected">
           <Trash2 :size="14" /><span>删除</span>
         </AppButton>
-        <AppButton variant="ghost" size="sm" title="清除选择" @click="accounts.clearSelection()">
+        <AppButton variant="ghost" size="sm" title="清除选择" aria-label="清除选择" @click="accounts.clearSelection()">
           <X :size="14" />
         </AppButton>
       </div>

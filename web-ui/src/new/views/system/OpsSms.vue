@@ -21,6 +21,7 @@ const form = reactive({
   dockingCode: "",
   timeoutSeconds: 600,
   maxPhoneAttempts: 3,
+  maxPrice: "" as string | number,
 });
 
 let inited = false;
@@ -36,12 +37,30 @@ watch(
     form.dockingCode = String(cfg.firefox_docking_code || "");
     form.timeoutSeconds = Number(cfg.timeout_seconds ?? 600);
     form.maxPhoneAttempts = Number(cfg.max_phone_attempts ?? 3);
+    form.maxPrice = String(cfg.max_price || "");
   },
   { immediate: true },
 );
 
 const cfg = computed(() => ops.smsConfig);
 const isFirefox = computed(() => form.provider === "firefox");
+const savedProviderLabel = computed(() => cfg.value?.provider_label || "接码平台");
+const hasUnsavedChanges = computed(() => {
+  const c = cfg.value;
+  if (!c) return false;
+  return !!(form.apiKey.trim() || form.firefoxToken.trim())
+    || form.enabled !== !!c.enabled || form.provider !== c.provider
+    || form.countryOrder.trim() !== String(c.country_order || "6, 4, 151").trim()
+    || form.firefoxApiName.trim() !== String(c.firefox_api_name || "").trim()
+    || form.dockingCode.trim() !== String(c.firefox_docking_code || "").trim()
+    || String(form.maxPrice ?? "").trim() !== String(c.max_price || "").trim()
+    || form.timeoutSeconds !== Number(c.timeout_seconds ?? 600)
+    || form.maxPhoneAttempts !== Number(c.max_phone_attempts ?? 3);
+});
+const balanceTime = computed(() => {
+  const value = ops.smsBalance?.checkedAt;
+  return value ? new Date(value).toLocaleString() : "";
+});
 
 /* 历史对接码：当前值置顶 + 去重，最多 20 条 */
 const dockingHistory = computed(() => {
@@ -183,6 +202,13 @@ const statusHint = computed(() => {
 
 function buildBody(): Record<string, unknown> {
   const c = cfg.value;
+  const price = String(form.maxPrice ?? "").trim();
+  if (!isFirefox.value && price && (!Number.isFinite(Number(price)) || Number(price) <= 0)) {
+    throw new Error("每号最高价必须是大于 0 的数字，或留空不限价");
+  }
+  if (!Number.isInteger(form.maxPhoneAttempts) || form.maxPhoneAttempts < 1) {
+    throw new Error("最多使用号码数必须是大于或等于 1 的整数");
+  }
   const body: Record<string, unknown> = {
     enabled: form.enabled,
     provider: form.provider,
@@ -190,7 +216,7 @@ function buildBody(): Record<string, unknown> {
     country_order: form.countryOrder.trim(),
     poll_interval_ms: c?.poll_interval_ms ?? 2000,
     timeout_seconds: form.timeoutSeconds,
-    max_price: c?.max_price || "",
+    max_price: isFirefox.value ? c?.max_price || "" : price,
     max_phone_attempts: form.maxPhoneAttempts,
     firefox_api_name: form.firefoxApiName.trim(),
     firefox_docking_code: form.dockingCode.trim(),
@@ -210,8 +236,8 @@ async function save() {
     form.apiKey = "";
     form.firefoxToken = "";
     ui.notify("接码设置已保存", "success");
-  } catch {
-    ui.notify("接码设置保存失败", "error");
+  } catch (error) {
+    ui.notify(error instanceof Error ? error.message : "接码设置保存失败", "error");
   }
 }
 
@@ -219,8 +245,8 @@ async function testBalance() {
   try {
     const result = await ops.testSms();
     ui.notify(result.message || (result.ok ? "查询成功" : "查询失败"), result.ok ? "success" : "error");
-  } catch {
-    ui.notify("余额查询请求失败", "error");
+  } catch (error) {
+    ui.notify(error instanceof Error ? error.message : "余额查询请求失败", "error");
   }
 }
 
@@ -275,6 +301,11 @@ async function clearHistory() {
         <div v-if="countryChips.length" class="span-2 chips">
           <span v-for="(label, index) in countryChips" :key="label + index" class="chip">{{ index + 1 }}. {{ label }}</span>
         </div>
+        <label class="field span-2">
+          <span>每号最高价</span>
+          <input v-model="form.maxPrice" class="input" type="number" min="0" step="0.001" placeholder="留空不限价" />
+          <small>取号时使用的价格上限。国家选择器中的价格筛选只影响列表展示。</small>
+        </label>
       </template>
 
       <template v-else>
@@ -320,16 +351,29 @@ async function clearHistory() {
         <input v-model.number="form.timeoutSeconds" class="input" type="number" min="30" max="1800" />
       </label>
       <label class="field">
-        <span>换号重试次数</span>
+        <span>最多取号次数（包含首次）</span>
         <input v-model.number="form.maxPhoneAttempts" class="input" type="number" min="1" />
       </label>
     </div>
 
     <div class="actions">
       <AppButton variant="primary" :loading="ops.busy['sms-save']" @click="save">保存接码设置</AppButton>
-      <AppButton :loading="ops.busy['sms-test']" @click="testBalance">查看余额</AppButton>
+      <AppButton :loading="ops.busy['sms-test']" :disabled="!cfg?.configured || ops.busy['sms-save']" @click="testBalance">查询已保存的 {{ savedProviderLabel }} 余额</AppButton>
     </div>
     <p class="hint">{{ statusHint }}</p>
+    <p v-if="hasUnsavedChanges" class="draft-hint" role="status">有未保存的更改。余额查询仍使用已保存的 {{ savedProviderLabel }} 配置。</p>
+    <div class="balance-panel" aria-live="polite">
+      <div>
+        <span class="balance-label">{{ ops.smsBalance?.providerLabel || savedProviderLabel }} · 账户余额</span>
+        <strong v-if="ops.smsBalance && !ops.smsBalance.error && ops.smsBalance.amount">{{ ops.smsBalance.amount }} <small>平台余额单位</small></strong>
+        <span v-else-if="ops.smsBalance?.error" class="balance-error">{{ ops.smsBalance.error }}</span>
+        <span v-else class="hint">尚未查询</span>
+      </div>
+      <div v-if="ops.smsBalance" class="balance-meta">
+        <span v-if="ops.smsBalance.points">积分 {{ ops.smsBalance.points }}</span>
+        <span>查询时间 {{ balanceTime }}</span>
+      </div>
+    </div>
   </section>
 
   <SmsCountryPicker
@@ -480,6 +524,15 @@ async function clearHistory() {
   font-size: 0.72rem;
   color: var(--text-muted);
 }
+
+.field small { color: var(--text-muted); line-height: 1.5; }
+.draft-hint { margin: 0; color: var(--warning); font-size: 0.8rem; }
+.balance-panel { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; padding: 14px 16px; border: 1px solid var(--glass-border); border-radius: var(--radius-sm); background: var(--glass-bg); }
+.balance-panel > div { display: flex; flex-direction: column; gap: 6px; }
+.balance-label { color: var(--text-secondary); font-size: 0.78rem; }
+.balance-panel strong { font-size: 1.5rem; font-variant-numeric: tabular-nums; }
+.balance-panel strong small, .balance-meta { font-size: 0.75rem; font-weight: 400; color: var(--text-muted); }
+.balance-error { color: var(--error); font-size: 0.8rem; }
 
 @media (max-width: 640px) {
   .form-grid {

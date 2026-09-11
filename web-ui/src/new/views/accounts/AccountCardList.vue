@@ -87,7 +87,7 @@ const {
         <button type="button" :disabled="!account.has_session_token || account.is_deactivated" title="刷新 Access Token" @click="emit('refresh-at', account)">
           <RefreshCw :size="13" />刷AT
         </button>
-        <button type="button" :disabled="account.is_deactivated" title="接码（补发 Refresh Token）" @click="emit('codex', account)">
+        <button type="button" :disabled="account.is_deactivated" title="接码设置（默认补取缺少的 RT）" :aria-label="`设置 ${account.email} 的接码任务`" @click="emit('codex', account)">
           <Smartphone :size="13" />接码
         </button>
         <button type="button" title="查看设备信息" @click="emit('device', account)">

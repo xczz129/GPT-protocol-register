@@ -34,6 +34,7 @@ export const useOperationsStore = defineStore("operations", {
     trashLoaded: false,
     smsConfig: null as SmsConfig | null,
     smsStats: null as SmsStats | null,
+    smsBalance: null as { provider: string; providerLabel: string; amount: string; points?: string; level?: string; checkedAt: string; error: string } | null,
   }),
   actions: {
     async _run<T>(key: string, task: () => Promise<T>): Promise<T> {
@@ -100,16 +101,43 @@ export const useOperationsStore = defineStore("operations", {
       });
     },
     async loadSmsConfig() {
-      this.smsConfig = await this._run("sms", fetchSmsConfig);
+      const next = await this._run("sms", fetchSmsConfig);
+      if (this.smsConfig && ["provider", "firefox_api_name", "api_key_masked", "firefox_api_token_masked"].some(
+        key => this.smsConfig?.[key as keyof SmsConfig] !== next[key as keyof SmsConfig],
+      )) this.smsBalance = null;
+      this.smsConfig = next;
     },
     saveSmsConfig(body: Record<string, unknown>) {
       return this._run("sms-save", async () => {
         await updateSmsConfig(body);
+        this.smsBalance = null;
         await this.loadSmsConfig();
       });
     },
     testSms() {
-      return this._run("sms-test", () => testSmsConfig());
+      const configured = this.smsConfig;
+      return this._run("sms-test", async () => {
+        try {
+          const result = await testSmsConfig();
+          this.smsBalance = {
+            provider: result.provider || configured?.provider || "",
+            providerLabel: result.provider_label || configured?.provider_label || "接码平台",
+            amount: result.ok ? String(result.balance?.balance ?? "") : "",
+            points: result.balance?.points,
+            level: result.balance?.level,
+            checkedAt: result.checked_at || new Date().toISOString(),
+            error: result.ok ? "" : result.message,
+          };
+          return result;
+        } catch (error) {
+          this.smsBalance = {
+            provider: configured?.provider || "", providerLabel: configured?.provider_label || "接码平台",
+            amount: "", checkedAt: new Date().toISOString(),
+            error: error instanceof Error ? error.message : "余额查询失败，请重试",
+          };
+          throw error;
+        }
+      });
     },
     clearDockingHistory() {
       return this._run("sms-dock-clear", async () => {

@@ -75,7 +75,7 @@ async function harness({ count = 250 } = {}) {
     "../../stores/groups": { useGroupsStore: () => ({}) },
     "../../stores/batchops": {
       useBatchOpsStore: () => ({
-        async runCodex(emails, concurrency) { launches.push({ emails: [...emails], concurrency }); },
+        openCodexStart(emails, force = false) { launches.push({ emails: [...emails], force }); },
       }),
     },
     "../../stores/ui": { useUiStore: () => ({ notify: (...args) => notices.push(args) }) },
@@ -86,7 +86,7 @@ async function harness({ count = 250 } = {}) {
   return { accounts, codexSelected, requests, launches, notices, events, sourceRows };
 }
 
-test("SMS submits all 30 cross-page selections after the store loads every server page", async () => {
+test("SMS preflight opens all 30 cross-page selections without taking any number", async () => {
   const h = await harness();
   assert.deepEqual(h.requests, [{ limit: 200, offset: 0 }, { limit: 1000, offset: 200 }]);
   assert.equal(h.accounts.rows.length, 250);
@@ -96,7 +96,7 @@ test("SMS submits all 30 cross-page selections after the store loads every serve
 
   await h.codexSelected();
 
-  assert.deepEqual(h.launches, [{ emails: h.sourceRows.slice(0, 30).map((row) => row.email), concurrency: 3 }]);
+  assert.deepEqual(h.launches, [{ emails: h.sourceRows.slice(0, 30).map((row) => row.email), force: false }]);
   assert.deepEqual(h.events, [["codex"]]);
   assert.deepEqual(h.notices, []);
 });

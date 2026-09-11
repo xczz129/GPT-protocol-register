@@ -538,13 +538,30 @@ class ProtocolClient:
             raise RuntimeError("no workspaces in auth session (phone verification pending?)")
         return [item for item in workspaces if isinstance(item, dict) and item.get("id")]
 
-    def workspace_id(self, workspace_name: str = "") -> str:
+    def workspace_id(
+        self, workspace_name: str = "", *, strict_team: bool = False,
+        expected_workspace_id: str = "",
+    ) -> str:
         """Resolve the workspace id, matching by name when one is given.
 
         Team accounts carry multiple workspaces; picking the first one
         silently lands the token on the wrong (personal) workspace.
         """
         workspaces = self._auth_workspaces()
+        expected_id = str(expected_workspace_id or "").strip().casefold()
+        if expected_id:
+            selected = [item for item in workspaces if str(item.get("id") or "").strip().casefold() == expected_id]
+            if len(selected) != 1:
+                raise RuntimeError("team_workspace_id_not_found: 认证会话中未找到原团队工作区，未选择其他空间")
+            if strict_team:
+                from common.team_workspace import select_team_workspace
+
+                return str(select_team_workspace(selected)["id"])
+            return str(selected[0]["id"])
+        if strict_team:
+            from common.team_workspace import select_team_workspace
+
+            return str(select_team_workspace(workspaces, workspace_name)["id"])
         wanted = str(workspace_name or "").strip().lower()
         if wanted:
             for item in workspaces:
@@ -576,8 +593,14 @@ class ProtocolClient:
                 return factor["id"]
         raise RuntimeError("TOTP MFA factor not found in auth session")
 
-    def select_workspace(self, workspace_name: str = "") -> str:
-        r = self.post_json("/api/accounts/workspace/select", {"workspace_id": self.workspace_id(workspace_name)})
+    def select_workspace(
+        self, workspace_name: str = "", *, strict_team: bool = False,
+        expected_workspace_id: str = "",
+    ) -> str:
+        selected_id = self.workspace_id(
+            workspace_name, strict_team=strict_team, expected_workspace_id=expected_workspace_id,
+        ) if strict_team or expected_workspace_id else self.workspace_id(workspace_name)
+        r = self.post_json("/api/accounts/workspace/select", {"workspace_id": selected_id})
         location = r.headers.get("location", "")
         # 当前接口通常返回 JSON continue_url，而不是 Location 头。
         try:

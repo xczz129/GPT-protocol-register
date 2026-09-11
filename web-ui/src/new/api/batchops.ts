@@ -19,6 +19,43 @@ export interface CodexResultItem {
   logs?: CodexLogLine[];
 }
 
+/** Per-run overrides contain public settings only; API keys stay on the server. */
+export interface SmsOptions {
+  provider?: string;
+  country_order?: string;
+  max_price?: string;
+  max_phone_attempts?: number;
+  timeout_seconds?: number;
+}
+
+export interface CodexRunOptions {
+  concurrency: number;
+  force: boolean;
+  sms_options?: SmsOptions;
+}
+
+export interface CodexItem {
+  email: string;
+  status: string;
+  stage?: string;
+  message?: string;
+  attempt?: number;
+  max_phone_attempts?: number;
+  wait_deadline?: number | null;
+  updated_at?: string | number;
+}
+
+export interface CodexCounts {
+  total: number;
+  done: number;
+  success: number;
+  skipped: number;
+  failed: number;
+  cancelled: number;
+  pending: number;
+  active: number;
+}
+
 export interface CodexStatus {
   running: boolean;
   mode: string;
@@ -28,8 +65,64 @@ export interface CodexStatus {
   failed: number;
   logs: CodexLogLine[];
   results: CodexResultItem[];
+  batch_id?: string;
+  status?: string;
+  stopping?: boolean;
+  cancelled?: number;
+  force?: boolean;
+  concurrency?: number;
+  options?: CodexRunOptions;
+  items?: CodexItem[];
+  counts?: Partial<CodexCounts>;
   started_at?: string;
   finished_at?: string;
+}
+
+export interface CodexPreflight {
+  ok: boolean;
+  total: number;
+  eligible: number;
+  skipped: number;
+  missing_credentials: { email: string; missing: string[] }[];
+  not_found: string[];
+  deactivated: string[];
+  limit: number;
+  configured: boolean;
+  emails: string[];
+  settings: SmsOptions & {
+    provider: string;
+    provider_label: string;
+    enabled: boolean;
+    configured: boolean;
+    country_order: string;
+    max_price: string;
+    max_phone_attempts: number;
+    timeout_seconds: number;
+    price_cap_supported: boolean;
+  };
+}
+
+export interface CodexHistoryEntry {
+  at: string;
+  status: string;
+  phone?: string;
+  rt?: string;
+  error?: string;
+  note?: string;
+  skipped?: boolean;
+  outcome?: string;
+  logs?: CodexLogLine[];
+  batch_id?: string;
+  options?: CodexRunOptions;
+  phone_attempts?: { phone?: string; status?: string; [key: string]: unknown }[];
+}
+
+export interface CodexStartResult {
+  ok?: boolean;
+  batch_id?: string;
+  total?: number;
+  concurrency?: number;
+  options?: CodexRunOptions;
 }
 
 export interface ReauthJobItem {
@@ -149,22 +242,28 @@ export interface ImportHistoryEntry {
 }
 
 /* --- 接码 / 导入（共用 codex 批次状态） --- */
-export function codexRun(emails: string[], concurrency: number, force = false) {
-  return api("/api/codex-oauth/run", {
+export function codexRun(emails: string[], concurrency: number, force = false, smsOptions?: SmsOptions) {
+  return api<CodexStartResult>("/api/codex-oauth/run", {
     method: "POST",
-    body: jsonBody({ emails, concurrency, force }),
+    body: jsonBody({ emails, concurrency, force, ...(smsOptions ? { sms_options: smsOptions } : {}) }),
   });
 }
 
+export function preflightCodex(payload: { emails: string[]; concurrency?: number; force?: boolean; sms_options?: SmsOptions }) {
+  return api<CodexPreflight>("/api/codex-oauth/preflight", { method: "POST", body: jsonBody(payload) });
+}
+
+export const codexPreflight = preflightCodex;
+
 export function codexImport(text: string, accountType: string, workspace: string, concurrency: number) {
-  return api("/api/codex-oauth/import", {
+  return api<CodexStartResult>("/api/codex-oauth/import", {
     method: "POST",
     body: jsonBody({ text, account_type: accountType, workspace, concurrency }),
   });
 }
 
-export function fetchCodexStatus(): Promise<CodexStatus> {
-  return api<CodexStatus>("/api/codex-oauth/status");
+export function fetchCodexStatus(signal?: AbortSignal): Promise<CodexStatus> {
+  return api<CodexStatus>("/api/codex-oauth/status", signal ? { signal } : {});
 }
 
 export function codexStop() {
@@ -173,6 +272,11 @@ export function codexStop() {
 
 export function fetchImportHistory(limit = 300): Promise<{ entries: ImportHistoryEntry[] }> {
   return api<{ entries: ImportHistoryEntry[] }>(`/api/codex-oauth/import-history?limit=${limit}`);
+}
+
+export function fetchCodexHistory(emails?: string[]): Promise<{ ok: boolean; history: Record<string, CodexHistoryEntry[]> }> {
+  const query = emails?.length ? `?emails=${encodeURIComponent(emails.join(","))}` : "";
+  return api(`/api/codex-oauth/history${query}`);
 }
 
 /* --- 重新登录 / 安全修复 / 改密 / 改2FA（共用 reauth 批次状态） --- */

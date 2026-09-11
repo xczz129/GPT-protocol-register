@@ -8,15 +8,17 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
+import math
 import re
 import sys
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qs, urlparse
 
 from fastapi import APIRouter, HTTPException
@@ -32,6 +34,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from common.account_store import account_delete_key, update_account_record_fields  # noqa: E402
+from common.team_workspace import requires_team_workspace, session_identity, validate_session_replacement  # noqa: E402
 from codex_oauth.oauth import (  # noqa: E402
     ProtocolClient,
     decode_jwt_payload,
@@ -125,6 +129,12 @@ _STATE: dict[str, Any] = {
     "started_at": "",
     "finished_at": "",
     "batch_id": "",
+    "status": "idle",
+    "items": [],
+    "options": {},
+    "counts": {},
+    "force": False,
+    "concurrency": 1,
 }
 _MAX_LOGS = 800
 
@@ -141,6 +151,7 @@ def _reserve_batch(mode: str, total: int, batch_id: str) -> threading.Event:
             running=True, mode=mode, batch_id=batch_id, total=total,
             done=0, success=0, failed=0, logs=[], results=[],
             started_at=datetime.now().isoformat(timespec="seconds"), finished_at="",
+            status="running", items=[], options={}, counts={}, force=False, concurrency=1,
         )
         return stop_event
 
@@ -150,6 +161,37 @@ def _finish_batch(batch_id: str) -> None:
         if _STATE.get("batch_id", "") == batch_id:
             _STATE["running"] = False
             _STATE["finished_at"] = datetime.now().isoformat(timespec="seconds")
+            _STATE["status"] = "cancelled" if (
+                _STATE.get("status") == "stopping" or (_STATE.get("counts") or {}).get("cancelled")
+            ) else "completed"
+
+
+def _sms_counts_locked() -> None:
+    """Reconcile terminal, queued and active rows while holding _LOCK."""
+    items = _STATE.get("items") or []
+    counts = {key: 0 for key in ("success", "skipped", "failed", "cancelled", "pending", "active")}
+    for item in items:
+        status = item.get("status", "pending")
+        if status in counts:
+            counts[status] += 1
+    counts["total"] = len(items)
+    counts["done"] = sum(counts[key] for key in ("success", "skipped", "failed", "cancelled"))
+    _STATE["counts"] = counts
+
+
+def _set_sms_item(email: str, batch_id: str, **updates) -> None:
+    with _LOCK:
+        if _STATE.get("mode") != "codex" or _STATE.get("batch_id", "") != batch_id:
+            return
+        for item in _STATE.get("items", []):
+            if item["email"] == email:
+                item.update(updates, updated_at=datetime.now().isoformat(timespec="seconds"))
+                _sms_counts_locked()
+                return
+
+
+class _SmsCancelled(RuntimeError):
+    pass
 
 
 def _launch_batch(target, args: tuple, *, batch_id: str, stop_event: threading.Event, name: str) -> None:
@@ -462,7 +504,9 @@ class _PanelSmsBowerClient(SmsBowerClient):
             }
             if tier:
                 params["providerIds"] = tier
-            price = max_price or self.settings.max_price
+            # An annotated country price must never defeat the run-wide cap.
+            caps = [p for p in (max_price, self.settings.max_price) if p]
+            price = str(min(float(p) for p in caps)) if caps else ""
             if price:
                 params["maxPrice"] = price
             try:
@@ -483,7 +527,15 @@ class _PanelSmsBowerClient(SmsBowerClient):
             # 号码来自当前组合;游标推进到后继组合,失败换号时不再重复它。
             self._cursor = (index + 1) % total
             label = self._country_label(country, tier, prices)
-            return SmsActivation(parts[1], parts[2], int(country), self.settings.api_key, label=label)
+            raw_price = prices.get(str(country), {}).get(str(tier))
+            try:
+                estimate = float(raw_price) if raw_price is not None else None
+            except (TypeError, ValueError):
+                estimate = None
+            return SmsActivation(
+                parts[1], parts[2], int(country), self.settings.api_key, label=label,
+                provider="smsbower", tier=str(tier), estimated_price=estimate,
+            )
         raise SmsError(last_error)
 
     @staticmethod
@@ -543,6 +595,7 @@ class _PanelFirefoxSmsClient(FirefoxSmsClient):
             country=returned_country,
             api_key=self._token,
             label=label,
+            provider="firefox",
         )
 
 
@@ -580,6 +633,34 @@ def _mfa_code_error(error: BaseException | str) -> bool:
     )
 
 
+def _persist_sms_tokens(previous: dict, token: dict) -> None:
+    """Validate fresh evidence and update only tokens whose starting row is current."""
+    identity = validate_session_replacement(
+        previous, token, require_identity=requires_team_workspace(previous),
+    )
+    fields = {
+        "refresh_token": str(token.get("refresh_token") or ""),
+        "id_token": str(token.get("id_token") or ""),
+        "access_token": str(token.get("access_token") or ""),
+        "oauth_client_id": CODEX_CLIENT_ID,
+        "last_token_refresh_at": _state()._now_iso(), "last_token_refresh_error": "",
+    }
+    for field in ("user_id", "plan_type"):
+        if identity.get(field):
+            fields[field] = identity[field]
+    key = account_delete_key(previous)
+    expected = {field: previous.get(field) for field in (
+        "access_token", "refresh_token", "email", "selected_workspace_id",
+        "selected_workspace_name", "workspace_name", "import_account_type", "plan_type",
+    )}
+    changed, _ = update_account_record_fields(
+        {key: fields}, expected_fields={key: expected}, include_records=False,
+        path=_state().ACCOUNTS_FILE,
+    )
+    if not changed:
+        raise RuntimeError("sms_credentials_changed: 账号已删除或凭据/工作区在接码期间更新，未覆盖当前记录")
+
+
 def _process_one(
     rec: dict,
     sms_cfg: dict,
@@ -587,11 +668,21 @@ def _process_one(
     *,
     stop_event: threading.Event | None = None,
     batch_id: str = "",
+    phone_attempts: list | None = None,
 ) -> dict:
     stop_event = stop_event if stop_event is not None else _STOP
     email = str(rec.get("email") or "").strip()
     password = str(rec.get("password") or "")
     totp = str(rec.get("totp_secret") or "")
+    phone_attempts = phone_attempts if phone_attempts is not None else []
+
+    def stage(name: str, message: str, *, wait_deadline: float | None = None) -> None:
+        if stop_event.is_set():
+            raise _SmsCancelled("任务已停止")
+        _set_sms_item(
+            email, batch_id, status="active", stage=name, message=message,
+            attempt=len(phone_attempts), wait_deadline=wait_deadline,
+        )
 
     def log(message: str, level: str = "info") -> None:
         _log(f"{email} | {message}", level, batch_id=batch_id)
@@ -624,7 +715,13 @@ def _process_one(
     sms = _sms_client(settings, specs)
 
     # Team 账号按导入时指定的工作区名选择;个人账号为空,默认第一个。
-    workspace_name = str(rec.get("workspace_name") or "").strip()
+    strict_team = requires_team_workspace(rec)
+    workspace_name = str(rec.get("selected_workspace_name") or rec.get("workspace_name") or "").strip()
+    expected_workspace_id = str(rec.get("selected_workspace_id") or "").strip()
+    if strict_team and not expected_workspace_id and requires_team_workspace({
+        "access_token": rec.get("access_token"), "session": rec.get("session"),
+    }):
+        expected_workspace_id = session_identity(rec)["account_id"]
     if workspace_name:
         log(f"使用工作区「{workspace_name}」")
 
@@ -637,17 +734,21 @@ def _process_one(
     mfa_code_failures = 0
     for attempt in range(1, rounds + 1 + _MFA_CODE_RETRIES):
         if stop_event.is_set():
-            raise RuntimeError("任务已停止")
+            raise _SmsCancelled("任务已停止")
         # 接码流程不再走注册代理,统一本地直连
         client = ProtocolClient(email, timeout=30)
         try:
             log("本地直连" + (f"(第 {attempt} 轮)" if attempt > 1 else ""))
+            stage("login", "初始化登录会话")
             log("初始化会话与 PKCE")
             client.bootstrap()
+            stage("login", "提交账号邮箱")
             client.submit_email()
             log("邮箱已提交")
+            stage("password", "验证密码")
             client.verify_password(password)
             log("密码验证通过")
+            stage("mfa", "验证二次认证")
             mfa_id = client.mfa_id()
             client.issue_mfa_challenge(mfa_id)
             # 重试时换用相邻时间窗口的验证码,补偿本地与服务器时钟偏移
@@ -677,21 +778,61 @@ def _process_one(
                         log("已进入手机验证页面")
                     except Exception as exc:
                         log(f"进入手机验证页面失败({str(exc)[:100]})", "warning")
-                log(f"接码获取号码(第 {attempt} 次)")
-                activation = sms.acquire()
+                # MFA/login retries do not grant extra paid number attempts.
+                if len(phone_attempts) >= rounds:
+                    raise RuntimeError(f"已达到最多 {rounds} 次取号上限")
+                stage("acquiring", "正在获取号码")
+                phone_attempt = {
+                    "attempt": len(phone_attempts) + 1, "provider": settings.provider,
+                    "country": "", "country_label": "未知", "tier": "",
+                    "estimated_price": None, "price_source": "unknown",
+                    "acquired": False, "result": "acquiring",
+                    "at": datetime.now().isoformat(timespec="seconds"),
+                }
+                phone_attempts.append(phone_attempt)
+                _set_sms_item(email, batch_id, attempt=len(phone_attempts))
+                log(f"接码获取号码(第 {len(phone_attempts)}/{rounds} 次)")
+                try:
+                    activation = sms.acquire()
+                except Exception:
+                    phone_attempt["result"] = "acquire_failed"
+                    raise
+                label = activation.label or str(activation.country)
+                country_label = re.split(r"\s+#|\s+\$", label, maxsplit=1)[0]
+                estimate = getattr(activation, "estimated_price", None)
+                phone_attempt.update(
+                    acquired=True, country=str(activation.country), country_label=country_label,
+                    tier=str(getattr(activation, "tier", "") or ""),
+                    estimated_price=estimate, price_source="catalogue" if estimate is not None else "unknown",
+                    result="pending",
+                )
                 try:
                     desc = activation.label or f"国家 {activation.country}"
                     log(f"已分配 {activation.phone}({desc})")
+                    stage("phone", "正在提交手机号")
                     client.send_phone(activation.phone)
                     log("手机号已提交,等待短信验证码")
+                    stage("waiting_sms", "等待短信验证码", wait_deadline=time.time() + settings.timeout_seconds)
                     code = sms.wait_code(activation, cancel_event=stop_event)
+                    stage("verifying_sms", "正在验证短信")
                     log("收到验证码,提交验证")
                     client.submit_phone_otp(code)
-                    sms.finish(activation)
+                    phone_attempt["result"] = "success"
+                    try:
+                        sms.finish(activation)
+                    except Exception:
+                        # The upstream already accepted this number. A supplier
+                        # acknowledgement failure must not buy another number.
+                        log("手机验证已通过，供应商完成确认失败，请稍后核对供应商记录", "warning")
                     log("手机验证通过")
                     phone_used = activation.phone
                 except Exception as exc:
                     last_error = str(exc)
+                    cancelled = stop_event.is_set() or isinstance(exc, _SmsCancelled)
+                    # Successful phone verification remains successful even if
+                    # the provider's finish request subsequently fails.
+                    if phone_attempt["result"] != "success":
+                        phone_attempt["result"] = "cancelled" if cancelled else "failed"
                     # 号码不可用:取消激活,会话作废,由外层重新登录换号。
                     try:
                         sms.cancel(activation)
@@ -699,11 +840,19 @@ def _process_one(
                     except Exception:
                         log("号码取消失败(继续换号)", "warning")
                     log(f"号码 {activation.phone} 失败: {last_error[:200]}", "warning")
+                    _set_sms_item(email, batch_id, wait_deadline=None)
+                    if cancelled:
+                        raise _SmsCancelled("任务已停止") from exc
+                    if len(phone_attempts) >= rounds:
+                        raise RuntimeError(f"取号 {len(phone_attempts)}/{rounds} 次均未完成: {last_error[:160]}") from exc
                     continue
             else:
                 log("无需手机验证,直接进入 workspace")
+            stage("workspace", "选择工作区")
             try:
-                callback = client.select_workspace(workspace_name)
+                callback = client.select_workspace(
+                    workspace_name, strict_team=True, expected_workspace_id=expected_workspace_id,
+                ) if strict_team else client.select_workspace(workspace_name)
             except Exception as exc:
                 if (
                     sms is not None
@@ -720,20 +869,12 @@ def _process_one(
             if not code:
                 raise RuntimeError("回调缺少授权 code")
             log("交换 OAuth Token")
+            stage("token", "正在获取并保存 RT")
             token = exchange_code(code, client.verifier)
             refresh = str(token.get("refresh_token") or "")
             if not refresh:
                 raise RuntimeError("响应缺少 refresh_token(scope 未含 offline_access?)")
-            updates = {
-                **rec,
-                "refresh_token": refresh,
-                "id_token": str(token.get("id_token") or ""),
-                "access_token": str(token.get("access_token") or ""),
-                "oauth_client_id": CODEX_CLIENT_ID,
-                "last_token_refresh_at": _state()._now_iso(),
-                "last_token_refresh_error": "",
-            }
-            _state().upsert_account_record(updates, _state().ACCOUNTS_FILE, create=False)
+            _persist_sms_tokens(rec, token)
             log("RT 已写回账号库", "ok")
             try:
                 _sync_cliproxy_auth(email, token, log)
@@ -747,9 +888,14 @@ def _process_one(
                 "error": "",
                 "phone": phone_used,
                 "logs": list(steps or []),
+                "phone_attempts": list(phone_attempts),
             }
         except Exception as exc:
             last_error = str(exc)
+            if stop_event.is_set() or isinstance(exc, _SmsCancelled):
+                raise _SmsCancelled("任务已停止") from exc
+            if len(phone_attempts) >= rounds:
+                raise
             if attempt < rounds and _proxy_retryable_error(exc):
                 log(f"网络请求失败({last_error[:140]})，重试下一轮", "warning")
                 continue
@@ -763,7 +909,9 @@ def _process_one(
                         f"({mfa_code_failures}/{_MFA_CODE_RETRIES})",
                         "warning",
                     )
-                    time.sleep(wait)
+                    stage("mfa_retry", "等待下一次二次认证窗口")
+                    if stop_event.wait(wait):
+                        raise _SmsCancelled("任务已停止") from exc
                 else:
                     log(
                         f"2FA 验证码被拒,换相邻时间窗口验证码自动重试"
@@ -777,7 +925,7 @@ def _process_one(
                 client.session.close()
             except Exception:
                 pass
-    raise RuntimeError(f"接码 {attempt} 次均失败: {last_error[:160]}")
+    raise RuntimeError(f"取号 {len(phone_attempts)}/{rounds} 次，登录未完成: {last_error[:160]}")
 
 
 def _run_batch(
@@ -788,84 +936,91 @@ def _run_batch(
 
     stop_event = stop_event if stop_event is not None else _STOP
     batch_id = batch_id or str(_STATE.get("batch_id") or "")
+    workers = max(1, min(int(concurrency or 1), len(records) or 1))
+    with _LOCK:
+        options = copy.deepcopy(_STATE.get("options") or {})
+        if _STATE.get("batch_id", "") == batch_id and _STATE.get("mode") == "codex":
+            if not _STATE.get("items"):
+                _STATE["items"] = [
+                    {
+                        "email": str(rec.get("email") or "").strip(), "status": "pending",
+                        "stage": "queued", "message": "等待执行", "attempt": 0,
+                        "max_phone_attempts": int(sms_cfg.get("max_phone_attempts") or 5),
+                        "wait_deadline": None, "updated_at": datetime.now().isoformat(timespec="seconds"),
+                    }
+                    for rec in records
+                ]
+            _sms_counts_locked()
 
     def _handle(rec: dict) -> None:
-        # 停止后未开始的账号直接跳过,与旧版串行 break 行为一致
-        if stop_event.is_set():
-            return
+        email = str(rec.get("email") or "").strip()
         steps: list = []
+        attempts: list = []
+        result: dict = {}
+        outcome = "failed"
         try:
-            # 账号库已有 RT = 之前已接码成功,直接跳过,不重跑登录流程
-            existing_rt = str(rec.get("refresh_token") or "").strip()
+            if stop_event.is_set():
+                raise _SmsCancelled("停止时尚未执行")
+            _set_sms_item(email, batch_id, status="active", stage="preparing", message="正在检查账号")
+            issue = _sms_account_issue(rec)
+            if issue in ("not_found", "deactivated"):
+                raise RuntimeError("选中账号在库中不存在" if issue == "not_found" else "账号已停用，无法接码")
+            existing_rt = "" if options.get("force") else str(rec.get("refresh_token") or "").strip()
             if existing_rt:
-                email = str(rec.get("email") or "").strip()
+                outcome = "skipped"
                 _log(f"{email} | 已有 RT,按已接码处理", batch_id=batch_id)
-                steps.append(
-                    {
-                        "t": datetime.now().strftime("%H:%M:%S"),
-                        "level": "ok",
-                        "m": "账号库已有 RT,无需重新接码",
-                    }
-                )
+                steps.append({
+                    "t": datetime.now().strftime("%H:%M:%S"), "level": "ok",
+                    "m": "账号库已有 RT,无需重新接码",
+                })
                 result = {
-                    "email": email,
-                    "status": "success",
-                    "skipped": True,
-                    "refresh_token": existing_rt,
-                    "expires_in": None,
-                    "error": "",
-                    "phone": "",
-                    "logs": list(steps),
+                    "email": email, "status": "success", "skipped": True,
+                    "refresh_token": existing_rt, "expires_in": None, "error": "", "phone": "",
+                    "logs": list(steps), "phone_attempts": [],
                 }
             else:
-                result = _process_one(rec, sms_cfg, steps, stop_event=stop_event, batch_id=batch_id)
-            with _LOCK:
-                if _STATE.get("batch_id", "") == batch_id:
-                    _STATE["success"] += 1
-                    _STATE["results"].append(result)
-            _append_rt_history(
-                result.get("email") or rec.get("email"),
-                {
-                    "at": datetime.now().isoformat(timespec="seconds"),
-                    "status": "success",
-                    "rt": str(result.get("refresh_token") or "")[:600],
-                    "phone": str(result.get("phone") or ""),
-                    "error": "",
-                    "logs": _clip_history_logs(result.get("logs") or steps),
-                },
-            )
+                result = _process_one(
+                    rec, sms_cfg, steps, stop_event=stop_event, batch_id=batch_id,
+                    phone_attempts=attempts,
+                )
+                outcome = "success"
         except Exception as exc:
-            with _LOCK:
-                if _STATE.get("batch_id", "") == batch_id:
-                    _STATE["failed"] += 1
-                    _STATE["results"].append(
-                        {
-                            "email": rec.get("email"),
-                            "status": "failed",
-                            "refresh_token": "",
-                            "expires_in": None,
-                            "logs": list(steps),
-                            "error": str(exc)[:260],
-                        }
-                    )
-            _append_rt_history(
-                rec.get("email"),
-                {
-                    "at": datetime.now().isoformat(timespec="seconds"),
-                    "status": "failed",
-                    "rt": "",
-                    "phone": "",
-                    "error": str(exc)[:300],
-                    "logs": _clip_history_logs(steps),
-                },
-            )
-            _log(f"{rec.get('email')} | 失败: {exc}", "error", batch_id=batch_id)
+            outcome = "cancelled" if isinstance(exc, _SmsCancelled) or stop_event.is_set() else "failed"
+            result = {
+                "email": email, "status": outcome, "refresh_token": "", "expires_in": None,
+                "phone": "", "logs": list(steps), "error": str(exc)[:260],
+                "phone_attempts": list(attempts),
+            }
+            _log(f"{email} | {'已取消' if outcome == 'cancelled' else '失败'}: {exc}",
+                 "warning" if outcome == "cancelled" else "error", batch_id=batch_id)
         finally:
+            result.update(batch_id=batch_id, options=copy.deepcopy(options), outcome=outcome)
+            message = {
+                "success": "已获取新 RT", "skipped": "沿用已有 RT", "cancelled": result.get("error") or "已取消",
+                "failed": result.get("error") or "执行失败",
+            }[outcome]
+            _set_sms_item(
+                email, batch_id, status=outcome, stage=outcome, message=message,
+                attempt=len(attempts), wait_deadline=None,
+            )
             with _LOCK:
                 if _STATE.get("batch_id", "") == batch_id:
+                    if outcome in ("success", "skipped"):
+                        _STATE["success"] += 1  # Old clients count existing RTs as success.
+                    elif outcome == "failed":
+                        _STATE["failed"] += 1
+                    _STATE["results"].append(result)
                     _STATE["done"] += 1
+            _append_rt_history(email, {
+                "at": datetime.now().isoformat(timespec="seconds"),
+                "status": result.get("status", outcome), "outcome": outcome,
+                "skipped": outcome == "skipped", "batch_id": batch_id, "options": copy.deepcopy(options),
+                "rt": str(result.get("refresh_token") or "")[:600],
+                "phone": str(result.get("phone") or ""), "error": result.get("error") or "",
+                "logs": _clip_history_logs(result.get("logs") or steps),
+                "phone_attempts": list(result.get("phone_attempts") or attempts),
+            })
 
-    workers = max(1, min(int(concurrency or 1), len(records) or 1))
     try:
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="codex-sms") as pool:
             futures = [pool.submit(_handle, rec) for rec in records]
@@ -875,7 +1030,6 @@ def _run_batch(
         _log(f"接码批次异常终止: {exc}", "error", batch_id=batch_id)
     finally:
         _finish_batch(batch_id)
-
 
 # ---------------------------------------------------------------------------
 # SMS provider configuration stored under config.yaml ``sms_code``
@@ -1358,15 +1512,20 @@ async def sms_config_test():
         cfg = _state()._read_config()
         section = _sms_config_section(cfg)
         settings = SmsSettings.from_mapping(section)
+        metadata = {
+            "provider": settings.provider, "provider_label": settings.provider_label,
+            "checked_at": datetime.now().isoformat(timespec="seconds"),
+        }
         try:
             balance = check_sms_balance(settings)
             return {
                 "ok": True,
                 "message": f"{settings.provider_label} 余额: {balance.get('balance', '?')}",
                 "balance": balance,
+                **metadata,
             }
         except Exception as exc:
-            return {"ok": False, "message": str(exc)[:200]}
+            return {"ok": False, "message": str(exc)[:200], **metadata}
 
     return await asyncio.to_thread(_do)
 
@@ -1780,12 +1939,132 @@ async def codex_oauth_import(body: CodexOauthImportRequest):
     return await asyncio.to_thread(_do)
 
 
+class SmsRunOptions(BaseModel):
+    provider: Literal["smsbower", "firefox"] | None = None
+    country_order: str | None = Field(default=None, max_length=4000)
+    max_price: str | float | None = Field(default=None)
+    max_phone_attempts: int | None = Field(default=None, ge=1, le=50)
+    timeout_seconds: int | None = Field(default=None, ge=30, le=1800)
+
+
 class CodexOauthRunRequest(BaseModel):
-    emails: list = Field(default_factory=list, max_length=200)
+    emails: list[str] = Field(default_factory=list, max_length=200)
     # force=True: 忽略账号库已有 RT 全部重跑(中转凭据失效重新登录用)
     force: bool = False
     # 同时进行接码登录的账号数(不设上限,实际并发不超过选中账号数)
     concurrency: int = Field(default=1, ge=1)
+    sms_options: SmsRunOptions | None = None
+
+
+def _effective_sms_config(cfg: dict, options: SmsRunOptions | dict | None = None) -> dict:
+    """Copy only supported run settings; credentials always come from saved config."""
+    section = dict(_sms_config_section(cfg))
+    override = options.model_dump(exclude_none=True) if isinstance(options, SmsRunOptions) else dict(options or {})
+    if override.get("provider") is not None:
+        if override["provider"] not in {"smsbower", "firefox"}:
+            raise HTTPException(400, "未知接码渠道")
+        section["provider"] = override["provider"]
+    provider = str(section.get("provider") or "smsbower")
+    for key in ("max_phone_attempts", "timeout_seconds"):
+        if key in override:
+            section[key] = override[key]
+    if "country_order" in override:
+        countries = str(override["country_order"] or "").strip()
+        if provider == "firefox":
+            dock_country = parse_firefox_docking_code(str(section.get("firefox_docking_code") or ""))[0]
+            if countries and countries != dock_country:
+                raise HTTPException(400, "火狐狸国家由已保存的对接码固定，请在接码设置中更换对接码")
+        else:
+            if not countries or not _country_specs({"country_order": countries, "provider": provider}):
+                raise HTTPException(400, "请填写有效的国家/档位顺序")
+            section["country_order"] = countries
+    if "max_price" in override:
+        price = str(override["max_price"] if override["max_price"] is not None else "").strip()
+        if price:
+            try:
+                number = float(price)
+            except (TypeError, ValueError):
+                raise HTTPException(400, "每号最高价必须为正数") from None
+            if not math.isfinite(number) or number <= 0:
+                raise HTTPException(400, "每号最高价必须为正数")
+        if provider == "firefox" and price:
+            raise HTTPException(400, "火狐狸对接码接口未确认支持限价，请先在供应商端确认价格")
+        section["max_price"] = price
+    if provider == "firefox":
+        # Do not imply that the supplier enforces an undocumented price field.
+        section["max_price"] = ""
+    return section
+
+
+def _safe_sms_settings(sms_cfg: dict) -> dict:
+    settings = SmsSettings.from_mapping(sms_cfg)
+    provider = settings.provider
+    country_order = str(sms_cfg.get("country_order") or "6, 4, 151")
+    if provider == "firefox":
+        country_order = parse_firefox_docking_code(str(sms_cfg.get("firefox_docking_code") or ""))[0]
+    return {
+        "provider": provider, "provider_label": settings.provider_label,
+        "enabled": settings.enabled, "configured": settings.credentials_configured,
+        "country_order": country_order, "max_price": str(sms_cfg.get("max_price") or ""),
+        "max_phone_attempts": int(getattr(settings, "max_phone_attempts", sms_cfg.get("max_phone_attempts") or 5)),
+        "timeout_seconds": int(getattr(settings, "timeout_seconds", sms_cfg.get("timeout_seconds") or 180)),
+        "price_cap_supported": provider == "smsbower",
+    }
+
+
+def _sms_account_issue(rec: dict) -> str:
+    from common.account_store import account_is_deactivated
+
+    if rec.get("_sms_not_found"):
+        return "not_found"
+    if account_is_deactivated(rec):
+        return "deactivated"
+    if not str(rec.get("password") or "").strip() or not str(rec.get("totp_secret") or "").strip():
+        return "missing_credentials"
+    return ""
+
+
+def _sms_preflight(wanted: set[str], force: bool, sms_cfg: dict) -> tuple[dict, list]:
+    if not wanted:
+        raise HTTPException(400, "未选择账号")
+    if len(wanted) > 200:
+        raise HTTPException(400, "单批最多选择 200 个账号")
+    by_email = {}
+    for rec in _load_sms_batch_records(wanted):
+        by_email.setdefault(str(rec.get("email") or "").strip().lower(), rec)
+    picked = [dict(by_email.get(email) or {"email": email, "_sms_not_found": True}) for email in sorted(wanted)]
+    settings = _safe_sms_settings(sms_cfg)
+    payload = {
+        "ok": True, "total": len(wanted), "eligible": 0, "skipped": 0,
+        "missing_credentials": [], "not_found": [], "deactivated": [], "limit": 200,
+        "configured": bool(settings["enabled"] and settings["configured"]),
+        "settings": settings, "emails": sorted(wanted),
+    }
+    for rec in picked:
+        email = str(rec.get("email") or "").strip().lower()
+        rec["email"] = email
+        issue = _sms_account_issue(rec)
+        if issue in ("not_found", "deactivated"):
+            payload[issue].append(email)
+        elif not force and str(rec.get("refresh_token") or "").strip():
+            payload["skipped"] += 1
+        elif issue == "missing_credentials":
+            payload["missing_credentials"].append({
+                "email": email, "missing": [key for key in ("password", "totp_secret") if not str(rec.get(key) or "").strip()],
+            })
+        else:
+            payload["eligible"] += 1
+    return payload, picked
+
+
+@router.post("/api/codex-oauth/preflight")
+async def codex_oauth_preflight(body: CodexOauthRunRequest):
+    def _do():
+        wanted = {str(email).strip().lower() for email in body.emails if str(email).strip()}
+        sms_cfg = _effective_sms_config(_state()._read_config(), body.sms_options)
+        return _sms_preflight(wanted, bool(body.force), sms_cfg)[0]
+
+    return await asyncio.to_thread(_do)
 
 
 def _load_sms_batch_records(wanted: set[str]) -> list[dict[str, Any]]:
@@ -1807,18 +2086,15 @@ def _load_sms_batch_records(wanted: set[str]) -> list[dict[str, Any]]:
     ]
 
 
-def _start_sms_batch(wanted: set[str], force: bool = False, concurrency: int = 1) -> dict:
+def _start_sms_batch(
+    wanted: set[str], force: bool = False, concurrency: int = 1,
+    sms_options: SmsRunOptions | dict | None = None,
+) -> dict:
     """按选中邮箱启动接码批次。force 时忽略已有 RT 全部重跑。"""
-    picked = _load_sms_batch_records(wanted)
-    if not picked:
+    sms_cfg = _effective_sms_config(_state()._read_config(), sms_options)
+    preflight, picked = _sms_preflight(wanted, force, sms_cfg)
+    if len(preflight["not_found"]) == len(wanted):
         raise HTTPException(404, "选中账号在库中不存在")
-    if force:
-        # 清掉内存记录里的旧 RT 标记,_run_batch 就不会按"已接码"跳过;
-        # 登录成功后新 RT 会覆盖写回账号库。
-        for rec in picked:
-            rec["refresh_token"] = ""
-    cfg = _state()._read_config()
-    sms_cfg = _sms_config_section(cfg)
     settings = SmsSettings.from_mapping(sms_cfg)
     if not settings.enabled or not settings.credentials_configured:
         if settings.provider == "firefox":
@@ -1826,16 +2102,32 @@ def _start_sms_batch(wanted: set[str], force: bool = False, concurrency: int = 1
         raise HTTPException(400, f"接码未启用或未配置凭证({settings.provider_label})")
     batch_id = "codex-" + hashlib.sha256(str(time.time_ns()).encode()).hexdigest()[:16]
     stop_event = _reserve_batch("codex", len(picked), batch_id)
+    workers = max(1, min(int(concurrency or 1), len(picked) or 1))
+    safe = preflight["settings"]
+    options = {
+        "force": bool(force), "concurrency": workers,
+        "sms_options": {key: safe[key] for key in ("provider", "country_order", "max_price", "max_phone_attempts", "timeout_seconds")},
+    }
+    with _LOCK:
+        _STATE.update(options=options, force=bool(force), concurrency=workers)
+        _STATE["items"] = [
+            {
+                "email": rec["email"], "status": "pending", "stage": "queued", "message": "等待执行",
+                "attempt": 0, "max_phone_attempts": safe["max_phone_attempts"], "wait_deadline": None,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            for rec in picked
+        ]
+        _sms_counts_locked()
     _launch_batch(
         _run_batch, (picked, sms_cfg, concurrency, batch_id, stop_event),
         batch_id=batch_id, stop_event=stop_event, name="codex-oauth-batch",
     )
-    workers = max(1, min(int(concurrency or 1), len(picked) or 1))
     _log(
         f"任务启动:{len(picked)} 个账号 · 接码渠道 {settings.provider_label} · "
         f"并发 {workers} · 本地直连", batch_id=batch_id,
     )
-    return {"ok": True, "total": len(picked), "concurrency": workers}
+    return {"ok": True, "total": len(picked), "concurrency": workers, "batch_id": batch_id, "options": options}
 
 
 @router.post("/api/codex-oauth/run")
@@ -1848,113 +2140,147 @@ async def codex_oauth_run(body: CodexOauthRunRequest):
         if not wanted:
             raise HTTPException(400, "未选择账号")
         return _start_sms_batch(
-            wanted, force=bool(body.force), concurrency=int(body.concurrency or 1)
+            wanted, force=bool(body.force), concurrency=int(body.concurrency or 1), sms_options=body.sms_options,
         )
 
     return await asyncio.to_thread(_do)
 
 
+def _historical_phone_attempts(rec: dict) -> list[dict]:
+    """Conservative fallback for old log formats, including tiers without prices."""
+    assign_re = re.compile(r"已分配\s+(\S+?)\(([^)]*)\)")
+    fail_re = re.compile(r"号码\s+(\S+?)\s+失败")
+    attempts: list[dict] = []
+    by_phone: dict[str, dict] = {}
+    latest = None
+    for line in rec.get("logs") or []:
+        if not isinstance(line, dict):
+            continue
+        message = str(line.get("m") or "")
+        match = assign_re.search(message)
+        if match:
+            phone, label = match.groups()
+            tier_match = re.search(r"\s+#(\d+)", label)
+            price_match = re.search(r"\s+\$([0-9.]+)", label)
+            try:
+                estimate = float(price_match.group(1)) if price_match else None
+            except ValueError:
+                estimate = None
+            latest = {
+                "provider": "legacy", "country_label": re.split(r"\s+#|\s+\$", label, maxsplit=1)[0] or "未知",
+                "tier": tier_match.group(1) if tier_match else "",
+                "estimated_price": estimate, "result": "unknown", "acquired": True,
+            }
+            attempts.append(latest)
+            by_phone[phone] = latest
+        match = fail_re.search(message)
+        if match:
+            phone = match.group(1)
+            if phone not in by_phone:
+                by_phone[phone] = {
+                    "provider": "legacy", "country_label": "未知", "tier": "",
+                    "estimated_price": None, "result": "unknown", "acquired": True,
+                }
+                attempts.append(by_phone[phone])
+            by_phone[phone]["result"] = "failed"
+        if "手机验证通过" in message and latest:
+            latest["result"] = "success"
+    phone = str(rec.get("phone") or "")
+    if rec.get("status") == "success" and phone:
+        if phone in by_phone:
+            by_phone[phone]["result"] = "success"
+        else:
+            attempts.append({
+                "provider": "legacy", "country_label": "未知", "tier": "",
+                "estimated_price": None, "result": "success", "acquired": True,
+            })
+    return attempts
+
+
 @router.get("/api/sms/stats")
 async def sms_stats():
-    """接码成功率统计:解析历史日志里的取号/失败/通过记录,
-    按国家和档位(国家x档位)聚合,展示给运维面板。"""
-
+    """Aggregate individual attempts; catalogue quotes are not billing records."""
     def _do():
-        import re
         from collections import defaultdict
-
-        assign_re = re.compile(r"已分配\s+(\S+?)\((.+?)\s+#(\d+)\s+\$([0-9.]+)\)")
-        fail_re = re.compile(r"号码\s+(\S+?)\s+失败")
 
         try:
             history = json.loads(_RT_HISTORY_PATH.read_text(encoding="utf-8"))
         except Exception:
             history = {}
-        if not isinstance(history, dict):
-            history = {}
-
-        numbers: dict[str, dict] = {}
-        rows = []
-        for email, records in history.items():
+        attempts = []
+        structured = historical = 0
+        for records in (history.values() if isinstance(history, dict) else []):
             if not isinstance(records, list):
                 continue
             for rec in records:
-                rows.append((str(rec.get("at") or ""), email, rec))
-        rows.sort(key=lambda r: r[0])
-
-        for at, email, rec in rows:
-            logs = rec.get("logs") or []
-            for line in logs:
-                text = str(line.get("m") or "")
-                m = assign_re.search(text)
-                if m:
-                    phone, country, tier, price = m.groups()
-                    numbers[phone] = {
-                        "country": country,
-                        "tier": tier,
-                        "price": float(price),
-                        "result": "unknown",
-                        "at": at,
-                    }
-                m = fail_re.search(text)
-                if m and m.group(1) in numbers:
-                    numbers[m.group(1)]["result"] = "fail"
-            if rec.get("status") == "success" and rec.get("phone"):
-                phone = str(rec["phone"])
-                if phone in numbers:
-                    numbers[phone]["result"] = "ok"
+                if not isinstance(rec, dict):
+                    continue
+                if isinstance(rec.get("phone_attempts"), list):
+                    rows = [dict(row) for row in rec["phone_attempts"] if isinstance(row, dict)]
+                    structured += len(rows)
                 else:
-                    numbers[phone] = {
-                        "country": "其他",
-                        "tier": "",
-                        "price": 0.0,
-                        "result": "ok",
-                        "at": at,
-                    }
+                    rows = _historical_phone_attempts(rec)
+                    historical += len(rows)
+                attempts.extend(rows)
 
-        total = len(numbers)
-        ok_n = sum(1 for v in numbers.values() if v["result"] == "ok")
-        fail_n = sum(1 for v in numbers.values() if v["result"] == "fail")
+        def blank():
+            return {"total": 0, "ok": 0, "fail": 0, "cancelled": 0, "unknown": 0,
+                    "unpriced": 0, "cost": 0.0, "cost_is_estimate": True}
 
-        countries = defaultdict(lambda: {"total": 0, "ok": 0, "fail": 0, "cost": 0.0})
-        tiers = defaultdict(lambda: {"total": 0, "ok": 0, "fail": 0, "cost": 0.0})
-        for v in numbers.values():
-            c = countries[v["country"]]
-            c["total"] += 1
-            c["cost"] += v["price"]
-            if v["result"] == "ok":
-                c["ok"] += 1
-            elif v["result"] == "fail":
-                c["fail"] += 1
-            tier_key = f'{v["country"]} #{v["tier"]}'
-            t = tiers[tier_key]
-            t["total"] += 1
-            t["cost"] += v["price"]
-            t["price"] = v["price"]
-            if v["result"] == "ok":
-                t["ok"] += 1
-            elif v["result"] == "fail":
-                t["fail"] += 1
+        countries, tiers = defaultdict(blank), defaultdict(blank)
+        summary = blank()
+        for attempt in attempts:
+            country = str(attempt.get("country_label") or attempt.get("country") or "未知")
+            tier = str(attempt.get("tier") or "")
+            provider = {"firefox": "火狐狸", "smsbower": "SMSBower", "legacy": "历史"}.get(
+                str(attempt.get("provider") or ""), "未知渠道",
+            )
+            country_key = f"{provider} · {country}"
+            tier_key = f"{country_key} #{tier}" if tier else f"{country_key} · 未指定档位"
+            raw_price = attempt.get("estimated_price")
+            try:
+                price = float(raw_price) if raw_price is not None else None
+            except (TypeError, ValueError):
+                price = None
+            if price is not None and (not math.isfinite(price) or price < 0):
+                price = None
+            result = str(attempt.get("result") or "unknown")
+            for row in (summary, countries[country_key], tiers[tier_key]):
+                row["total"] += 1
+                if result == "success":
+                    row["ok"] += 1
+                elif result in ("failed", "acquire_failed"):
+                    row["fail"] += 1
+                elif result == "cancelled":
+                    row["cancelled"] += 1
+                else:
+                    row["unknown"] += 1
+                if price is None:
+                    row["unpriced"] += 1
+                else:
+                    row["cost"] += price
+            tiers[tier_key]["price"] = price
 
-        def _with_rate(item: dict) -> dict:
-            rate = round(item["ok"] / item["total"] * 100, 1) if item["total"] else 0.0
-            return {**item, "rate": rate}
+        def with_rate(row):
+            return {
+                **row, "rate": round(row["ok"] / row["total"] * 100, 1) if row["total"] else 0.0,
+                "cost": round(row["cost"], 6),
+            }
 
         return {
-            "ok": True,
+            "ok": True, "cost_is_estimate": True, "billing_source": "catalogue_quotes_only",
             "summary": {
-                "total": total,
-                "success": ok_n,
-                "failed": fail_n,
-                "rate": round(ok_n / total * 100, 1) if total else 0.0,
+                "total": summary["total"], "success": summary["ok"], "failed": summary["fail"],
+                "cancelled": summary["cancelled"], "unknown": summary["unknown"], "unpriced": summary["unpriced"],
+                "rate": with_rate(summary)["rate"], "structured": structured, "historical": historical,
             },
             "countries": [
-                {"name": name, **_with_rate(data)}
-                for name, data in sorted(countries.items(), key=lambda kv: -kv[1]["total"])
+                {"name": name, **with_rate(data)}
+                for name, data in sorted(countries.items(), key=lambda pair: -pair[1]["total"])
             ],
             "tiers": [
-                {"name": name, **_with_rate(data)}
-                for name, data in sorted(tiers.items(), key=lambda kv: -kv[1]["total"])
+                {"name": name, **with_rate(data)}
+                for name, data in sorted(tiers.items(), key=lambda pair: -pair[1]["total"])
             ],
         }
 
@@ -1964,10 +2290,7 @@ async def sms_stats():
 @router.get("/api/codex-oauth/status")
 async def codex_oauth_status():
     with _LOCK:
-        payload = {
-            key: (list(value) if key in ("logs", "results") else value)
-            for key, value in _STATE.items()
-        }
+        payload = copy.deepcopy(_STATE)
     return {"ok": True, **payload}
 
 
@@ -2069,7 +2392,11 @@ async def codex_oauth_import_history(limit: int = 200):
 @router.post("/api/codex-oauth/stop")
 async def codex_oauth_stop():
     with _LOCK:
-        _STOP.set()
         batch_id = str(_STATE.get("batch_id") or "")
-    _log("已请求停止,当前账号完成后中止", "warning", batch_id=batch_id)
-    return {"ok": True}
+        running = bool(_STATE.get("running"))
+        if running:
+            _STOP.set()
+            _STATE["status"] = "stopping"
+    if running:
+        _log("已请求停止，正在结束当前请求并取消未执行账号", "warning", batch_id=batch_id)
+    return {"ok": True, "batch_id": batch_id, "status": "stopping" if running else "idle"}
