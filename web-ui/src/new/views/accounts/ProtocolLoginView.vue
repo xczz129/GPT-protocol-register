@@ -16,40 +16,65 @@ const batch = useBatchOpsStore();
 const ui = useUiStore();
 const confirm = useConfirm();
 
-const input = ref("");
+const emailInput = ref("");
+const credentialColumnsRemoved = ref(false);
+const input = computed({
+  get: () => emailInput.value,
+  set: (value: string) => {
+    const raw = String(value || "");
+    const cleaned = stripCredentialColumns(raw);
+    credentialColumnsRemoved.value = raw !== cleaned;
+    emailInput.value = cleaned;
+  },
+});
 const concurrency = ref(3);
 const pasteError = ref("");
 const selected = ref<string[]>([]);
 const busy = ref(false);
 
+function stripCredentialColumns(value: string): string {
+  return String(value || "").split(/\r\n?|\n/)
+    .map(line => line.split("----", 1)[0].replace(/\\@/g, "@"))
+    .join("\n");
+}
+
+function onInput(event: Event) {
+  const target = event.target as HTMLTextAreaElement;
+  input.value = target.value;
+  // Update the DOM even when pasting another credential row for the same email.
+  target.value = input.value;
+}
+
 function parseEmails(value: string): string[] {
   const seen = new Set<string>();
-  return String(value || "")
+  return stripCredentialColumns(value)
     .split(/[\s,，;；]+/)
-    .map((item) => item.trim().replace(/^['"`]|['"`]$/g, "").toLowerCase())
-    .filter((item) => item && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(item) && !seen.has(item) && seen.add(item));
+    .map((item) => item.trim().replace(/^['"`]+|['"`]+$/g, "").toLowerCase())
+    .filter((item) => item && /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(item) && !seen.has(item) && seen.add(item));
 }
 
 const requestedEmails = computed(() => parseEmails(input.value));
+const accountsReady = computed(() => !accounts.loading && !accounts.loadError
+  && accounts.rows.length >= accounts.total && accounts.loadProgress.loaded >= accounts.loadProgress.total);
 const accountIndex = computed(() => new Map(accounts.rows.map((item) => [String(item.email || "").trim().toLowerCase(), item])));
-const matched = computed(() => requestedEmails.value.map((email) => accountIndex.value.get(email)).filter((item): item is NonNullable<typeof item> => Boolean(item)));
+const matched = computed(() => accountsReady.value ? requestedEmails.value.map((email) => accountIndex.value.get(email)).filter((item): item is NonNullable<typeof item> => Boolean(item)) : []);
 const ready = computed(() => matched.value.filter((item) => item.has_password && item.has_totp));
 const readyEmails = computed(() => new Set(ready.value.map((item) => String(item.email || "").trim().toLowerCase())));
 const selectedReadyEmails = computed(() => selected.value.filter((email) => readyEmails.value.has(email)));
 const incomplete = computed(() => matched.value.filter((item) => !item.has_password || !item.has_totp));
-const notFound = computed(() => requestedEmails.value.filter((email) => !accountIndex.value.has(email)));
+const notFound = computed(() => accountsReady.value ? requestedEmails.value.filter((email) => !accountIndex.value.has(email)) : []);
 
 const progress = computed(() => batch.reauth);
 const health = computed(() => accounts.health);
 const progressByEmail = computed(() => new Map((progress.value.items || []).map((item) => [String(item.email || item.key || "").toLowerCase(), item])));
 
 const rows = computed(() => requestedEmails.value.map((email) => {
-  const account = accountIndex.value.get(email);
+  const account = accountsReady.value ? accountIndex.value.get(email) : undefined;
   const job = progressByEmail.value.get(email);
   const missing: string[] = [];
   if (account && !account.has_password) missing.push("密码");
   if (account && !account.has_totp) missing.push("2FA");
-  return { email, account, job, missing };
+  return { email, account, job, missing, matching: !accountsReady.value };
 }));
 
 const allReadySelected = computed({
@@ -57,7 +82,7 @@ const allReadySelected = computed({
   set: (checked: boolean) => { selected.value = checked ? [...readyEmails.value] : []; },
 });
 
-const canStart = computed(() => selectedReadyEmails.value.length > 0 && !busy.value && !progress.value.running && !health.value.running);
+const canStart = computed(() => accountsReady.value && selectedReadyEmails.value.length > 0 && !busy.value && !progress.value.running && !health.value.running);
 const donePercent = computed(() => progress.value.total ? Math.round((Number(progress.value.done || 0) / Number(progress.value.total)) * 100) : 0);
 const healthPercent = computed(() => health.value.total ? Math.round((Number(health.value.done || 0) / Number(health.value.total)) * 100) : 0);
 
@@ -135,6 +160,7 @@ async function stopJob() {
 
 /** 查看状态：对输入列表中匹配到的账号做协议测活（不启动浏览器） */
 async function healthCheck() {
+  if (!accountsReady.value) return;
   const wanted = new Set(requestedEmails.value);
   const keys = accounts.rows.filter((item) => wanted.has(String(item.email || "").trim().toLowerCase())).map((item) => item.delete_key).filter(Boolean);
   if (!keys.length || health.value.running || progress.value.running) return;
@@ -148,8 +174,11 @@ async function healthCheck() {
 
 function saveInputState() {
   try {
-    localStorage.setItem(INPUT_STATE_KEY, JSON.stringify({ input: input.value, concurrency: Number(concurrency.value) || 3 }));
-  } catch { /* 本地存储不可用时仅内存可用 */ }
+    localStorage.setItem(INPUT_STATE_KEY, JSON.stringify({ input: stripCredentialColumns(input.value), concurrency: Number(concurrency.value) || 3 }));
+  } catch {
+    // Do not leave a legacy credential-bearing cache when rewriting fails.
+    try { localStorage.removeItem(INPUT_STATE_KEY); } catch { /* storage unavailable */ }
+  }
 }
 
 watch([input, concurrency], saveInputState);
@@ -164,9 +193,10 @@ onMounted(async () => {
     if (saved && typeof saved === "object") {
       if (typeof saved.input === "string") input.value = saved.input;
       if (Number.isFinite(Number(saved.concurrency))) concurrency.value = Math.min(20, Math.max(1, Number(saved.concurrency)));
+      saveInputState(); // Sanitize v1 caches immediately, including old full rows.
     }
   } catch { /* 忽略损坏的本地状态 */ }
-  if (!accounts.rows.length) await accounts.load();
+  if (!accounts.loading && (!accountsReady.value || !accounts.rows.length)) await accounts.load();
   await accounts.refreshHealth();
   batch.attachReauthIfRunning();
 });
@@ -185,7 +215,9 @@ onMounted(async () => {
     <div class="toolbar">
       <label class="field emails-field">
         <span>邮箱列表</span>
-        <textarea v-model="input" class="input" rows="9" spellcheck="false" placeholder="每行一个邮箱，也支持逗号或空格分隔"></textarea>
+        <textarea :value="input" @input="onInput" class="input" rows="9" spellcheck="false" placeholder="每行一个邮箱；也支持每行一条 邮箱----密码----2FA，会自动只提取邮箱"></textarea>
+        <small class="input-help">本页使用账号库已保存的密码和 2FA。完整凭据行仅提取邮箱，不会更新账号凭据；新账号请到账号列表使用“导入账号”。</small>
+        <small v-if="credentialColumnsRemoved" class="input-help" role="status">已提取邮箱并移除密码、2FA 列，浏览器缓存只保存邮箱。</small>
       </label>
       <div class="controls">
         <label class="field">
@@ -202,11 +234,15 @@ onMounted(async () => {
 
     <div class="summary" aria-live="polite">
       <span>识别 <b>{{ requestedEmails.length }}</b></span>
-      <span>匹配 <b>{{ matched.length }}</b></span>
-      <span class="ok-text">可登录 <b>{{ ready.length }}</b></span>
+      <span>匹配 <b>{{ accountsReady ? matched.length : '—' }}</b></span>
+      <span class="ok-text">可登录 <b>{{ accountsReady ? ready.length : '—' }}</b></span>
       <span class="info-text">已选 <b>{{ selectedReadyEmails.length }}</b></span>
-      <span class="warn-text">缺凭据 <b>{{ incomplete.length }}</b></span>
-      <span class="error-text">未找到 <b>{{ notFound.length }}</b></span>
+      <span class="warn-text">缺凭据 <b>{{ accountsReady ? incomplete.length : '—' }}</b></span>
+      <span class="error-text">未找到 <b>{{ accountsReady ? notFound.length : '—' }}</b></span>
+    </div>
+    <div v-if="!accountsReady" class="matching-notice" role="status">
+      <span>{{ accounts.loadError ? `账号库加载失败：${accounts.loadError}` : accounts.loading ? `正在加载账号库 ${accounts.loadProgress.loaded} / ${accounts.loadProgress.total}，完成后显示匹配结果。` : '账号库尚未加载完整，请重新加载后匹配。' }}</span>
+      <AppButton size="sm" :disabled="accounts.loading" @click="accounts.load()">重新加载账号</AppButton>
     </div>
 
     <div v-if="progress.total" class="progress-block">
@@ -255,13 +291,13 @@ onMounted(async () => {
             <td><strong class="email">{{ row.email }}</strong></td>
             <td>
               <span :class="['cred-state', row.account?.has_password && row.account?.has_totp ? 'yes' : 'no']">
-                {{ row.account ? (row.missing.length ? `缺 ${row.missing.join("、")}` : "密码 / 2FA 齐全") : "未找到" }}
+                {{ row.matching ? "正在匹配" : row.account ? (row.missing.length ? `缺 ${row.missing.join("、")}` : "密码 / 2FA 齐全") : "未找到" }}
               </span>
             </td>
-            <td><AppTag :kind="row.account?.is_deactivated ? 'error' : 'default'">{{ healthLabel(row.account) }}</AppTag></td>
+            <td><AppTag :kind="row.account?.is_deactivated ? 'error' : 'default'">{{ row.matching ? '正在匹配' : healthLabel(row.account) }}</AppTag></td>
             <td>
               <span :class="['job-status', `is-${row.job?.status || (row.account ? 'ready' : 'not-found')}`]">
-                {{ row.job?.message || (row.account ? (row.missing.length ? "跳过：缺少凭据" : "待提交") : "未找到本地账号") }}
+                {{ row.job?.message || (row.matching ? "等待账号库加载" : row.account ? (row.missing.length ? "跳过：缺少凭据" : "待提交") : "未找到本地账号，请先导入") }}
               </span>
             </td>
             <td><span :class="['plan-text', `is-${rowPlan(row)}`]">{{ planLabel(row) }}</span></td>
@@ -294,6 +330,8 @@ onMounted(async () => {
 </template>
 
 <style scoped>
+.input-help { font-size: .76rem; line-height: 1.6; color: var(--text-secondary); }
+.matching-notice { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 10px 12px; border-radius: var(--radius-sm); background: var(--accent-bg); color: var(--text-secondary); font-size: .8rem; }
 .protocol-panel {
   padding: 18px 20px;
   display: flex;
