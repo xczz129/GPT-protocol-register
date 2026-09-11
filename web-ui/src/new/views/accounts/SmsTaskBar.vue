@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import { ChevronRight, History, RefreshCw, Smartphone, Upload, WifiOff } from "@lucide/vue";
+import { ChevronRight, History, RefreshCw, ScrollText, Smartphone, Upload, WifiOff } from "@lucide/vue";
 import AppButton from "../../components/ui/AppButton.vue";
 import { useBatchOpsStore } from "../../stores/batchops";
 
@@ -23,7 +23,7 @@ function openHistory() { if (isImport.value) emit("importHistory"); else batch.o
       <ChevronRight :size="16" class="entry-arrow" />
     </button>
     <span v-if="offline" class="last-sync" role="status">{{ lastSync }}</span>
-    <div class="task-actions"><AppButton v-if="offline" size="sm" @click="batch.refreshCodexStatus()"><RefreshCw :size="14" />重连</AppButton><AppButton size="sm" @click="openHistory"><History :size="14" />{{ isImport ? '导入历史' : '接码历史' }}</AppButton><AppButton v-if="isImport" size="sm" @click="batch.openCodexHistory()"><Smartphone :size="14" />接码历史</AppButton></div>
+    <div class="task-actions"><AppButton v-if="hasTask" size="sm" @click="batch.openCodexDialog()"><ScrollText :size="14" />{{ batch.codex.running ? '实时日志' : '最近任务日志' }}</AppButton><AppButton v-if="offline" size="sm" @click="batch.refreshCodexStatus()"><RefreshCw :size="14" />重连</AppButton><AppButton size="sm" @click="openHistory"><History :size="14" />{{ isImport ? '导入历史' : '接码历史' }}</AppButton><AppButton v-if="isImport" size="sm" @click="batch.openCodexHistory()"><Smartphone :size="14" />接码历史</AppButton></div>
     <div v-if="hasTask" class="task-progress" aria-hidden="true"><span :style="{ transform: `scaleX(${progress})` }"></span></div>
   </section>
 </template>
