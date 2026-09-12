@@ -717,8 +717,10 @@ def _proxy_retryable_error(error: BaseException | str) -> bool:
         marker in text
         for marker in (
             "http 429", "http_429", "rate limit", "rate_limit", "proxy",
-            "connection reset", "connection closed", "timed out", "tls connect",
-            "curl: (7)", "curl: (28)", "curl: (35)", "curl: (56)",
+            "connection reset", "connection closed", "connection aborted", "timed out", "tls connect",
+            "tls handshake", "ssl error", "sslerror", "ssl connect", "certificate verify failed",
+            "unexpected eof", "proxy tunnel", "gateway timeout",
+            "curl: (7)", "curl: (27)", "curl: (28)", "curl: (35)", "curl: (56)",
         )
     )
 
@@ -727,6 +729,9 @@ def _proxy_retryable_error(error: BaseException | str) -> bool:
 # 第 1 次等下一个 30s 窗口换新码;第 2/3 次用 +1/-1 相邻窗口码,
 # 补偿本地与服务器之间的时钟偏移。
 _MFA_CODE_RETRIES = 3
+# Route/TLS failures are independent from the paid phone-number budget.  A
+# single configured phone attempt must still get a few fresh HTTP sessions.
+_NETWORK_RETRIES = 3
 
 
 def _mfa_code_error(error: BaseException | str) -> bool:
@@ -861,7 +866,8 @@ def _process_one(
     rounds = int(settings.max_phone_attempts or 5) if sms is not None else 1
     last_error = ""
     mfa_code_failures = 0
-    for attempt in range(1, rounds + 1 + _MFA_CODE_RETRIES):
+    network_failures = 0
+    for attempt in range(1, rounds + _NETWORK_RETRIES + 1 + _MFA_CODE_RETRIES):
         if stop_event.is_set():
             raise _SmsCancelled("任务已停止")
         # 接码流程不再走注册代理,统一本地直连
@@ -1033,8 +1039,13 @@ def _process_one(
                 raise _SmsCancelled("任务已停止") from exc
             if len(phone_attempts) >= rounds:
                 raise
-            if attempt < rounds and _proxy_retryable_error(exc):
-                log(f"网络请求失败({last_error[:140]})，重试下一轮", "warning")
+            if _proxy_retryable_error(exc) and network_failures < _NETWORK_RETRIES:
+                network_failures += 1
+                log(
+                    f"网络/代理/TLS 请求失败({last_error[:140]})，重建会话自动重试 "
+                    f"({network_failures}/{_NETWORK_RETRIES})",
+                    "warning",
+                )
                 continue
             if mfa_code_failures < _MFA_CODE_RETRIES and _mfa_code_error(exc):
                 mfa_code_failures += 1

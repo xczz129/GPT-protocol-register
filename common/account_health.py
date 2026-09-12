@@ -953,6 +953,23 @@ def check_account(
                 if _is_health_transport_error(exc):
                     last_transport_error = exc
                     if attempt + 1 < max_attempts:
+                        # Imported OAuth records usually have no historical
+                        # registration proxy. Give the next probe a real
+                        # fallback route instead of retrying the same direct
+                        # socket and marking a healthy token as failed.
+                        if not configured_proxies and attempt == 0:
+                            try:
+                                from common.trial_proxy_pool import selected_trial_proxies
+
+                                country, fallback = selected_trial_proxies(
+                                    limit=2,
+                                    exclude={stored_proxy} if stored_proxy else set(),
+                                )
+                            except Exception:
+                                country, fallback = "", []
+                            if fallback:
+                                probe_proxies[attempt + 1] = fallback[0]
+                                probe_proxy_mode = f"{country or 'fallback'}_pool"
                         time.sleep(0.25)
                         continue
                     raise

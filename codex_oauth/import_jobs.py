@@ -36,6 +36,7 @@ from .sms import (
     load_sms_settings,
 )
 from .token_files import TokenFileError, move_token_files_to_trash
+from proxy_util import is_proxy_transport_error
 
 
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
@@ -223,6 +224,24 @@ def redact_log(value: Any) -> str:
     # attempt while avoiding a complete number in the browser log.
     text = PHONE_RE.sub(lambda match: _mask_phone(match.group(0)), text)
     return text[:600]
+
+
+def _is_retryable_network_error(error: BaseException | str) -> bool:
+    """Return true for route/TLS failures that are safe to retry.
+
+    OAuth credentials and workspace errors are terminal; a proxy tunnel or
+    TLS handshake failure only says that this network route failed.  Retrying
+    the whole HTTP session is necessary because the auth flow is stateful.
+    """
+    text = str(error or "").lower()
+    if is_proxy_transport_error(text):
+        return True
+    return any(marker in text for marker in (
+        "ssl", "tls", "handshake", "certificate verify failed",
+        "connection reset", "connection aborted", "connection closed",
+        "timed out", "timeout", "unexpected eof", "gateway timeout",
+        "http 502", "http 503", "http 504", "curl: (27)",
+    ))
 
 
 def _atomic_write(data: Any, path: Path) -> None:
@@ -551,6 +570,9 @@ class ImportJob:
     # Monotonically increasing attempt number, shown in the single per-email
     # card while preserving every attempt's logs in the persisted history.
     attempt: int = 1
+    # Number of automatic route retries for this attempt.  It is persisted so
+    # a worker restart cannot loop forever on the same broken proxy.
+    network_retries: int = 0
     skip_phone_event: threading.Event = field(default_factory=threading.Event, repr=False)
     _on_change: Callable[[], None] | None = field(default=None, repr=False, compare=False)
 
@@ -605,6 +627,7 @@ class ImportJob:
             phone_required_at=phone_required_at,
             phone_masked=str(value.get("phone_masked") or ""),
             attempt=attempt,
+            network_retries=max(0, min(3, int(value.get("network_retries") or 0))),
         )
 
     def as_persisted(self) -> dict[str, Any]:
@@ -627,6 +650,7 @@ class ImportJob:
             "phone_required_at": max(0, int(self.phone_required_at)),
             "phone_masked": _mask_phone(self.current_phone) or self.phone_masked,
             "attempt": max(1, int(self.attempt)),
+            "network_retries": max(0, min(3, int(self.network_retries))),
             "logs": [
                 {
                     "at": max(0, int(item.get("at") or 0)),
@@ -1690,6 +1714,7 @@ class ImportJobManager:
             self._persist_jobs_locked()
         client: ProtocolClient | None = None
         slot_acquired = False
+        retry_requested = False
         try:
             # The executor has a fixed upper bound; this gate is the live,
             # operator-configurable limit for network/OAuth work.
@@ -1844,7 +1869,27 @@ class ImportJobManager:
                 self._persist_jobs_locked()
             self.store.update(account.id, status="cancelled", last_error=str(exc))
         except Exception as exc:
-            self._fail_job(job, str(exc))
+            message = str(exc)
+            if _is_retryable_network_error(message) and job.network_retries < 3:
+                # Do not reuse the partially authenticated client.  The
+                # finally block closes it and releases the worker slot before
+                # the fresh session is queued again.
+                job.network_retries += 1
+                job.status = "queued"
+                job.step = "queued"
+                job.progress = 0
+                job.error = redact_log(message)
+                job.waiting_for = ""
+                job.add_log(
+                    f"网络/代理暂时不可用，{min(3 - job.network_retries, 3)} 次自动重试后仍失败将停止：{message[:180]}",
+                    "warning",
+                )
+                self.store.update(job.account_id, status="queued", last_error=job.error)
+                with self._lock:
+                    self._persist_jobs_locked()
+                retry_requested = True
+            else:
+                self._fail_job(job, message)
         finally:
             if client is not None:
                 try:
@@ -1853,6 +1898,10 @@ class ImportJobManager:
                     pass
             if slot_acquired:
                 self._release_worker_slot()
+        if retry_requested:
+            # Backoff outside the worker slot so another account can progress.
+            time.sleep(min(8.0, 1.0 * (2 ** (job.network_retries - 1))))
+            self._run_job(job_id)
 
     def _fail_job(self, job: ImportJob, message: str) -> None:
         with self._lock:

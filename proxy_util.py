@@ -165,6 +165,22 @@ def is_proxy_transport_error(error: BaseException | str | None) -> bool:
         "chatgpt_home_http_403",
         "cf_blocked",
         "rate_limit_exceeded",
+        # curl-cffi/OpenSSL and proxy bridges use several equivalent labels
+        # for a transient TLS tunnel failure.  These errors do not say
+        # anything about the account credential, so a different route should
+        # be tried before marking the account failed.
+        "curl: (27)",
+        "ssl error",
+        "sslerror",
+        "ssl connect",
+        "ssl handshake",
+        "tls handshake",
+        "tlsv1_alert",
+        "certificate verify failed",
+        "unexpected eof while reading",
+        "eof occurred in violation of protocol",
+        "proxy tunnel",
+        "gateway timeout",
     )
     if any(marker in message for marker in exact_markers):
         return True
@@ -174,6 +190,7 @@ def is_proxy_transport_error(error: BaseException | str | None) -> bool:
             "curl: (56) recv failure",
             "connection reset by peer",
             "connection closed abruptly",
+            "connection aborted",
             "broken pipe",
         )
-    ) and ("proxy" in message or "curl" in message)
+    )
