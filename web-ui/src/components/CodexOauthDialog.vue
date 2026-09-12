@@ -17,7 +17,13 @@ const dialogTitle = computed(() => (isImport.value ? "协议登录进度" : "接
 const dialogHint = computed(() =>
   isImport.value ? "协议登录(密码 + TOTP) · 失败项可展开查看该账号的完整登录日志" : "自动接码 · 完成后可复制 RT",
 );
-const failedCount = computed(() => Number(props.status?.failed || 0));
+const failedItems = computed(() => (props.status?.results || []).filter((item) => {
+  const status = String(item?.status || "").toLowerCase();
+  const outcome = String(item?.outcome || "").toLowerCase();
+  const relayFailed = String(item?.relay_status || "").toLowerCase() === "failed";
+  return (status === "failed" || status === "error" || status === "failure" || outcome === "failed" || relayFailed) && !item?.skipped;
+}));
+const failedCount = computed(() => Math.max(Number(props.status?.failed || 0), failedItems.value.length));
 const skippedCount = computed(() => (props.status?.results || []).filter((item) => item.skipped).length);
 const canRetry = computed(() => !props.status?.running && failedCount.value > 0);
 

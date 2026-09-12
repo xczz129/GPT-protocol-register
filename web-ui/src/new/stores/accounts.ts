@@ -148,46 +148,137 @@ export const useAccountsStore = defineStore("accounts", () => {
   }
 
   /* --- 测活进度 --- */
-  const health = shallowRef<HealthProgress>({} as HealthProgress);
-  let healthTimer: ReturnType<typeof setInterval> | null = null;
+  const health = shallowRef<HealthProgress>({
+    running: false, done: 0, total: 0, actualTotal: 0, requested: 0, checked: 0,
+    usable: 0, alive: 0, limited: 0, invalid: 0, invalidOther: 0, reauthRequired: 0,
+    error: 0, skippedKnownDeactivated: 0, pendingCount: 0, current: "", message: "",
+    interrupted: false, workers: 0, requestedWorkers: 0, updates: {},
+  });
+  const healthError = ref("");
+  const healthSubmitting = ref(false);
+  let healthTimer: ReturnType<typeof setTimeout> | null = null;
+  let healthGeneration = 0;
+  let healthInFlight: { generation: number; controller: AbortController; promise: Promise<HealthProgress | null> } | null = null;
+  let healthMonitoring = false;
+  let healthFailures = 0;
+  let healthAwaitingStart = false;
+  let healthPreviousStartedAt = "";
+  let healthLoadQueued = false;
 
-  async function refreshHealth() {
-    try {
-      health.value = await fetchHealthProgress(false);
-      if (health.value.running) startHealthPolling();
-      else stopHealthPolling();
-    } catch {
-      /* 进度查询失败不打断页面 */
-    }
-  }
-
-  function startHealthPolling() {
-    if (healthTimer) return;
-    healthTimer = setInterval(async () => {
-      const wasRunning = health.value.running;
-      await refreshHealth();
-      if (wasRunning && !health.value.running) {
-        // 测活结束后刷新列表以反映最新状态
-        await load();
-      }
-    }, 1000);
+  function clearHealthTimer() {
+    if (healthTimer !== null) { clearTimeout(healthTimer); healthTimer = null; }
   }
 
   function stopHealthPolling() {
-    if (healthTimer) {
-      clearInterval(healthTimer);
+    clearHealthTimer();
+    healthMonitoring = false;
+    healthGeneration += 1;
+    healthInFlight?.controller.abort();
+  }
+
+  function scheduleHealthPoll() {
+    clearHealthTimer();
+    if (!healthMonitoring || healthSubmitting.value) return;
+    const generation = healthGeneration;
+    const delay = Math.min(10000, healthFailures ? 1000 * (2 ** Math.min(healthFailures - 1, 3)) : 700);
+    healthTimer = setTimeout(() => {
       healthTimer = null;
+      if (generation === healthGeneration && healthMonitoring) void requestHealthProgress(generation);
+    }, delay);
+  }
+
+  function applyHealthProgress(next: HealthProgress, generation: number) {
+    if (generation !== healthGeneration) return;
+    // A GET started before POST /health may return the previous completed
+    // snapshot. Ignore it until the server exposes the new run.
+    if (healthAwaitingStart && !next.running && next.startedAt === healthPreviousStartedAt) return;
+    if (healthAwaitingStart && (next.running || next.startedAt !== healthPreviousStartedAt)) healthAwaitingStart = false;
+    const wasRunning = health.value.running;
+    health.value = next;
+    healthError.value = "";
+    healthFailures = 0;
+    if (next.running) {
+      healthMonitoring = true;
+    } else {
+      healthMonitoring = false;
+      clearHealthTimer();
+      if (wasRunning && !healthLoadQueued) {
+        healthLoadQueued = true;
+        void load().finally(() => { healthLoadQueued = false; });
+      }
+    }
+  }
+
+  function requestHealthProgress(generation: number): Promise<HealthProgress | null> {
+    if (generation !== healthGeneration) return Promise.resolve(null);
+    if (healthInFlight?.generation === generation) return healthInFlight.promise;
+    clearHealthTimer();
+    const request = { generation, controller: new AbortController(), promise: null as unknown as Promise<HealthProgress | null> };
+    healthInFlight = request;
+    request.promise = (async () => {
+      const timeout = setTimeout(() => request.controller.abort(), 15000);
+      try {
+        const next = await fetchHealthProgress(false, request.controller.signal);
+        applyHealthProgress(next, generation);
+        return next;
+      } catch (error) {
+        if (generation !== healthGeneration) return null;
+        healthFailures += 1;
+        healthError.value = error instanceof Error ? error.message : "测活进度暂时不可用，正在重连";
+        healthMonitoring = true;
+        return null;
+      } finally {
+        clearTimeout(timeout);
+        if (healthInFlight === request) healthInFlight = null;
+        if (generation === healthGeneration) scheduleHealthPoll();
+      }
+    })();
+    return request.promise;
+  }
+
+  /** Refresh once and keep polling while the server task is running. */
+  function refreshHealth(): Promise<HealthProgress | null> {
+    healthMonitoring = true;
+    return requestHealthProgress(healthGeneration);
+  }
+
+  async function launchHealth(start: () => Promise<unknown>, requested: number, workers: number) {
+    if (healthSubmitting.value || health.value.running) throw new Error("已有测活任务正在运行，请等待完成");
+    healthSubmitting.value = true;
+    healthGeneration += 1;
+    const generation = healthGeneration;
+    clearHealthTimer();
+    healthInFlight?.controller.abort();
+    healthMonitoring = true;
+    healthFailures = 0;
+    healthPreviousStartedAt = health.value.startedAt || "";
+    healthAwaitingStart = true;
+    // Show feedback before the long-running POST returns. The first progress
+    // snapshot replaces this optimistic state as soon as the server accepts it.
+    health.value = {
+      ...health.value, running: true, requested, total: requested, actualTotal: requested,
+      done: 0, checked: 0, workers, requestedWorkers: workers, pendingCount: 0,
+      current: "", message: "正在启动测活…", interrupted: false, updates: {},
+    };
+    void requestHealthProgress(generation);
+    try {
+      await start();
+      healthAwaitingStart = false;
+      await requestHealthProgress(generation);
+    } finally {
+      healthSubmitting.value = false;
+      if (healthMonitoring) scheduleHealthPoll();
     }
   }
 
   async function startHealth(keys: string[], deleteAll: boolean, workers = 20) {
-    await startHealthCheck(keys, deleteAll, workers);
-    await refreshHealth();
+    const requested = deleteAll ? Math.max(activeCount.value, 1) : Math.max(keys.length, 1);
+    await launchHealth(() => startHealthCheck(keys, deleteAll, workers), requested, workers);
   }
 
   async function resumeHealth(workers = 20) {
-    await resumeHealthCheck(workers);
-    await refreshHealth();
+    const requested = Math.max(health.value.pendingCount, 1);
+    await launchHealth(() => resumeHealthCheck(workers), requested, workers);
   }
 
   /* --- 删除后同步 --- */
@@ -211,7 +302,7 @@ export const useAccountsStore = defineStore("accounts", () => {
     page, pageSize, filtered, pageCount, pageRows, resetPage,
     activeCount, atRiskKeys, protocolReauthKeys, invalidKeys,
     selectedKeys, selectedSet, toggle, toggleAll, clearSelection,
-    health, refreshHealth, startHealth, resumeHealth,
+    health, healthError, healthSubmitting, refreshHealth, startHealth, resumeHealth,
     remove, removeInvalid,
   };
 });

@@ -35,6 +35,24 @@ const title = computed(() => {
   return titleMap[props.kind];
 });
 
+const connection = computed(() => {
+  if (props.kind === "reauth") return batch.reauthConnection;
+  if (props.kind === "refreshAt") return batch.refreshAtConnection;
+  return batch.trialConnection;
+});
+
+const progressError = computed(() => {
+  if (props.kind === "reauth") return batch.reauthError;
+  if (props.kind === "refreshAt") return batch.refreshAtError;
+  return batch.trialError;
+});
+
+const lastUpdated = computed(() => {
+  if (props.kind === "reauth") return batch.reauthLastUpdated;
+  if (props.kind === "refreshAt") return batch.refreshAtLastUpdated;
+  return batch.trialLastUpdated;
+});
+
 const stats = computed(() => {
   if (props.kind === "reauth") {
     const p = batch.reauth;
@@ -95,7 +113,14 @@ const percent = computed(() => {
 
 async function stop() {
   if (props.kind === "reauth") await batch.stopReauthBatch();
-  /* refresh-at / trial 的停止由后端 job 控制，这里预留 */
+  else if (props.kind === "refreshAt") await batch.stopRefreshAt();
+  else await batch.stopTrial();
+}
+
+async function refreshNow() {
+  if (props.kind === "reauth") await batch.refreshReauthProgress();
+  else if (props.kind === "refreshAt") await batch.refreshRefreshAtProgress();
+  else await batch.refreshTrialProgress();
 }
 </script>
 
@@ -103,8 +128,8 @@ async function stop() {
   <AppModal :open="open" :title="title" :subtitle="stats.running ? '任务运行中，关闭弹窗后台继续执行' : '任务已结束'" width="620px" @close="emit('close')">
     <template #icon><Activity :size="18" /></template>
 
-    <div class="progress-line">
-      <div class="progress-track">
+    <div class="progress-line" aria-live="polite">
+      <div class="progress-track" role="progressbar" :aria-valuenow="percent" aria-valuemin="0" aria-valuemax="100" :aria-label="`${title}进度 ${percent}%`">
         <div class="progress-fill" :class="{ running: stats.running }" :style="{ width: `${percent}%` }"></div>
       </div>
       <span class="progress-text">{{ stats.done }} / {{ stats.total }} · {{ percent }}%</span>
@@ -119,6 +144,15 @@ async function stop() {
 
     <p v-if="stats.current" class="current-line">{{ stats.current }}</p>
     <p v-if="stats.message" class="message-line">{{ stats.message }}</p>
+    <p v-if="progressError" class="error-line" role="alert">
+      {{ progressError }}
+      <AppButton variant="ghost" size="sm" @click="refreshNow">立即重连</AppButton>
+    </p>
+    <p v-if="connection !== 'connected'" class="connection-line" role="status">
+      {{ connection === 'offline' ? '进度连接已断开，仍会自动重试。' : '进度连接暂时不稳定，正在自动重试。' }}
+      <AppButton variant="ghost" size="sm" @click="refreshNow">手动刷新</AppButton>
+    </p>
+    <p v-if="lastUpdated" class="updated-line">最近更新 {{ new Date(lastUpdated).toLocaleTimeString() }}</p>
 
     <div v-if="stats.items.length" class="item-list">
       <div v-for="(item, index) in stats.items" :key="index" :class="['item-row', item.status]">
@@ -129,7 +163,8 @@ async function stop() {
     </div>
 
     <template #footer>
-      <AppButton v-if="stats.running && kind === 'reauth'" variant="danger" @click="stop">停止任务</AppButton>
+      <AppButton v-if="stats.running" variant="danger" @click="stop">停止任务</AppButton>
+      <AppButton v-if="!stats.running && connection !== 'connected'" variant="ghost" @click="refreshNow">重新连接</AppButton>
       <AppButton variant="ghost" @click="emit('close')">关闭</AppButton>
     </template>
   </AppModal>
@@ -205,6 +240,21 @@ async function stop() {
   color: var(--text-secondary);
   margin-bottom: 8px;
 }
+
+.error-line,
+.connection-line,
+.updated-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 0.76rem;
+  margin-bottom: 8px;
+}
+
+.error-line { color: var(--error); }
+.connection-line { color: var(--warning); }
+.updated-line { color: var(--text-muted); }
 
 .item-list {
   max-height: 300px;

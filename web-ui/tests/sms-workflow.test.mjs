@@ -258,6 +258,26 @@ test("SMS retry selects failures only and preserves original settings when anoth
   assert.deepEqual(JSON.parse(h.calls[1].options.body), { emails: ["failed@example.test"], ...options });
 });
 
+test("SMS retry batches failed and error snapshots together", async () => {
+  const h = harness();
+  h.store.codex.value = status({ total: 4, done: 4, failed: 3, results: [
+    { email: "first@example.test", status: "failed" },
+    { email: "second@example.test", status: "error", error: "号码不可用" },
+    { email: "third@example.test", outcome: "failed", status: "complete" },
+    { email: "ok@example.test", status: "success" },
+  ] });
+  Object.assign(h.store.lastCodexOptions, { concurrency: 3, force: false });
+  h.responses.push(
+    { total: 3, missing_credentials: [], not_found: [], deactivated: [] },
+    { ok: true, batch_id: "retry-three" },
+    status({ batch_id: "retry-three" }),
+  );
+  await h.store.retryCodexFailed();
+  const payload = JSON.parse(h.calls[0].options.body);
+  assert.deepEqual(payload.emails, ["first@example.test", "second@example.test", "third@example.test"]);
+  assert.equal(h.calls.filter((call) => call.path.endsWith("/run")).length, 1);
+});
+
 test("SMS retry refuses a missing-account partial retry and refuses retrying successful rows", async () => {
   const h = harness();
   h.store.codex.value = status({ results: [

@@ -1074,9 +1074,7 @@ async function reloginCliproxyAccount(payload) {
     const result = await run(() => api("/api/codex-oauth/run", { method: "POST", body: jsonBody({ emails: [email], force: true }) }), "重新登录任务已启动");
     if (!result) return;
     codexOauthDialog.open = true;
-    stopCodexOauthPolling();
-    try { codexOauthStatus.value = await api("/api/codex-oauth/status"); } catch {}
-    codexOauthTimer = setInterval(async () => { try { codexOauthStatus.value = await api("/api/codex-oauth/status"); if (!codexOauthStatus.value.running) stopCodexOauthPolling(); } catch { stopCodexOauthPolling(); } }, 2000);
+    beginCodexOauthWatch();
   } finally {
     cliproxyReloginLoading.value = false;
   }
@@ -2960,10 +2958,14 @@ const smsConfig = ref({});
 const codexOauthDialog = reactive({ open: false });
 const codexOauthStatus = ref({ running: false, total: 0, done: 0, success: 0, failed: 0, logs: [], results: [] });
 let codexOauthTimer = null;
+let codexOauthPollInFlight = false;
+let codexOauthPollFailures = 0;
+let codexOauthWatchGeneration = 0;
 const codexOauthRunning = computed(() => codexOauthDialog.open && !!codexOauthStatus.value.running);
 function stopCodexOauthPolling() {
+  codexOauthWatchGeneration += 1;
   if (codexOauthTimer) {
-    clearInterval(codexOauthTimer);
+    clearTimeout(codexOauthTimer);
     codexOauthTimer = null;
     // 接码/重新登录任务结束后刷新中转列表(新 RT 会覆盖写入 auth 文件)
     void loadCliproxyAccounts();
@@ -2975,8 +2977,7 @@ async function resumeCodexOauthIfRunning() {
     if (st && st.running) {
       codexOauthStatus.value = st;
       codexOauthDialog.open = true;
-      stopCodexOauthPolling();
-      codexOauthTimer = setInterval(async () => { try { codexOauthStatus.value = await api("/api/codex-oauth/status"); if (!codexOauthStatus.value.running) stopCodexOauthPolling(); } catch { stopCodexOauthPolling(); } }, 2000);
+      beginCodexOauthWatch();
       notify("检测到接码/重新登录任务进行中,已为你打开实时日志", "ok");
       return true;
     }
@@ -3043,10 +3044,8 @@ async function startCodexOauth(emails, skipConfirm = false) {
   }
   const result = await run(() => api("/api/codex-oauth/run", { method: "POST", body: jsonBody({ emails, concurrency }) }), "接码任务已启动");
   if (!result) return;
-  codexOauthDialog.open = true;
-  stopCodexOauthPolling();
-  try { codexOauthStatus.value = await api("/api/codex-oauth/status"); } catch {}
-  codexOauthTimer = setInterval(async () => { try { codexOauthStatus.value = await api("/api/codex-oauth/status"); if (!codexOauthStatus.value.running) stopCodexOauthPolling(); } catch { stopCodexOauthPolling(); } }, 2000);
+    codexOauthDialog.open = true;
+    beginCodexOauthWatch();
 }
 async function runCodexOauth(selected) {
   const incoming = Array.isArray(selected) ? selected : [];
@@ -3181,12 +3180,20 @@ async function openImportHistory() {
 // 统一的 codex/导入状态轮询：任务结束时刷新账号列表
 function beginCodexOauthWatch() {
   stopCodexOauthPolling();
-  codexOauthTimer = setInterval(async () => {
+  const generation = codexOauthWatchGeneration;
+  codexOauthPollFailures = 0;
+  const poll = async () => {
+    if (generation !== codexOauthWatchGeneration || codexOauthPollInFlight) return;
+    codexOauthPollInFlight = true;
     try {
       codexOauthStatus.value = await api("/api/codex-oauth/status");
-      if (!codexOauthStatus.value.running) { stopCodexOauthPolling(); loadAccounts(); }
-    } catch { stopCodexOauthPolling(); }
-  }, 2000);
+      codexOauthPollFailures = 0;
+      if (!codexOauthStatus.value.running) { stopCodexOauthPolling(); loadAccounts(); return; }
+    } catch { codexOauthPollFailures += 1; }
+    finally { codexOauthPollInFlight = false; }
+    if (generation === codexOauthWatchGeneration) codexOauthTimer = setTimeout(poll, Math.min(12000, codexOauthPollFailures ? 1000 * (2 ** Math.min(codexOauthPollFailures - 1, 3)) : 2000));
+  };
+  void poll();
 }
 // 点"导入账号"按钮：后台批次仍在运行时直接回到实时日志视图，而不是空白表单
 async function openImportAccounts() {
@@ -3223,7 +3230,7 @@ async function submitImportAccounts(payload) {
   lastImportOptions.workspace = workspace;
   lastImportOptions.concurrency = concurrency;
   await run(() => api("/api/codex-oauth/import", { method: "POST", body: jsonBody({ text: value, account_type: accountType, workspace, concurrency }) }), "导入任务已启动");
-  importAccountsDialog.open = false; codexOauthDialog.open = true; stopCodexOauthPolling(); codexOauthTimer = setInterval(async () => { try { codexOauthStatus.value = await api("/api/codex-oauth/status"); if (!codexOauthStatus.value.running) { stopCodexOauthPolling(); loadAccounts(); } } catch { stopCodexOauthPolling(); } }, 2000); }
+  importAccountsDialog.open = false; codexOauthDialog.open = true; beginCodexOauthWatch(); }
 async function retryCodexOauthFailed(item) {
   const email = String(item?.email || "").trim();
   if (!email) return;
@@ -3236,11 +3243,16 @@ async function retryCodexOauthFailed(item) {
   await startCodexOauth([email], true);
 }
 async function retryAllCodexOauthFailed() {
-  const failed = (codexOauthStatus.value?.results || []).filter((item) => item?.status === "failed");
+  const failed = (codexOauthStatus.value?.results || []).filter((item) => {
+    const status = String(item?.status || "").toLowerCase();
+    const outcome = String(item?.outcome || "").toLowerCase();
+    const relayFailed = String(item?.relay_status || "").toLowerCase() === "failed";
+    return (status === "failed" || status === "error" || status === "failure" || outcome === "failed" || relayFailed) && !item?.skipped;
+  });
   if (!failed.length) return;
   if (codexOauthStatus.value?.mode === "import") {
     const lines = failed.map((item) => lastImportLines.value.get(String(item.email || "").trim().toLowerCase())).filter(Boolean);
-    if (!lines.length) { notify("失败账号的原始导入行已丢失,请重新粘贴导入", "err"); return; }
+    if (lines.length !== failed.length) { notify(`有 ${failed.length - lines.length} 个失败账号缺少原始导入行，请重新粘贴后再批量重试`, "err"); return; }
     await submitImportAccounts({ text: lines.join("\n"), accountType: lastImportOptions.accountType, workspace: lastImportOptions.workspace, concurrency: lastImportOptions.concurrency });
     return;
   }

@@ -9,11 +9,11 @@ const accounts = useAccountsStore();
 const ui = useUiStore();
 
 const health = computed(() => accounts.health);
-const visible = computed(() => !!(health.value.requested || health.value.total));
+const visible = computed(() => !!(health.value.requested || health.value.total || health.value.running || accounts.healthSubmitting));
 const percent = computed(() => {
   const h = health.value;
   if (!h.total) return h.requested && !h.running ? 100 : 0;
-  return Math.round(((h.done || 0) / h.total) * 100);
+  return Math.min(100, Math.max(0, Math.round(((h.done || 0) / h.total) * 100)));
 });
 
 async function resume() {
@@ -26,7 +26,7 @@ async function resume() {
 </script>
 
 <template>
-  <section v-if="visible" :class="['health-panel glass-panel', { active: health.running }]" aria-live="polite">
+  <section v-if="visible" :class="['health-panel glass-panel', { active: health.running, warning: accounts.healthError }]" aria-live="polite">
     <div class="health-head">
       <strong>
         {{ health.running ? "账号测活进行中" : health.pendingCount ? "测活任务已中断" : "最近一次测活完成" }}
@@ -37,9 +37,14 @@ async function resume() {
       </AppButton>
     </div>
 
-    <div class="progress-track">
+    <div class="progress-track" role="progressbar" :aria-valuenow="percent" aria-valuemin="0" aria-valuemax="100" :aria-label="`测活进度 ${percent}%`">
       <div class="progress-fill" :style="{ width: percent + '%' }"></div>
     </div>
+
+    <p v-if="accounts.healthError" class="health-error" role="status">
+      {{ accounts.healthError }}，正在自动重连
+    </p>
+    <p v-else-if="health.message" class="health-message">{{ health.message }}</p>
 
     <div class="health-stats">
       <span v-if="health.current">当前：{{ health.current }}</span>
@@ -113,4 +118,6 @@ async function resume() {
 .health-stats .ok { color: var(--success); }
 .health-stats .warn { color: var(--warning); }
 .health-stats .err { color: var(--error); }
+.health-error { margin: 0; color: var(--warning); font-size: .75rem; }
+.health-message { margin: 0; color: var(--text-muted); font-size: .75rem; }
 </style>

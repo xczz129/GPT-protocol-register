@@ -159,8 +159,8 @@ watch(
 onMounted(async () => {
   batch.setOnFinished(() => accounts.load());
   await Promise.all([groups.load(), accounts.load(), accounts.refreshHealth()]);
-  /* 后台已有 reauth 批次运行时重连进度显示 */
-  batch.attachReauthIfRunning();
+  /* 页面刷新后接管所有后台批次，避免刷新 AT/试用检测继续运行但进度窗口丢失。 */
+  await batch.restoreBackgroundBatches();
 });
 </script>
 
@@ -222,8 +222,8 @@ onMounted(async () => {
     <ImportAccountsDialog :open="importDialogOpen" @close="importDialogOpen = false" @history="openImportHistory" />
     <BatchStartDialog :open="startDialogOpen" :kind="startDialogKind" :keys="startDialogKeys" :all="startDialogAll" @close="startDialogOpen = false" @started="onBatchStarted" />
     <BatchJobDialog :open="reauthJobDialogOpen || batch.reauthDialogOpen" kind="reauth" @close="reauthJobDialogOpen = false; batch.reauthDialogOpen = false" />
-    <BatchJobDialog :open="refreshAtDialogOpen" kind="refreshAt" @close="refreshAtDialogOpen = false" />
-    <BatchJobDialog :open="trialDialogOpen" kind="trial" @close="trialDialogOpen = false" />
+    <BatchJobDialog :open="refreshAtDialogOpen || batch.refreshAtDialogOpen" kind="refreshAt" @close="refreshAtDialogOpen = false; batch.refreshAtDialogOpen = false" />
+    <BatchJobDialog :open="trialDialogOpen || batch.trialDialogOpen" kind="trial" @close="trialDialogOpen = false; batch.trialDialogOpen = false" />
   </div>
 </template>
 

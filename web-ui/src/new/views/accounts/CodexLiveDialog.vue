@@ -20,6 +20,7 @@ const logFilter = ref("all");
 const followLogs = ref(true);
 const showLogs = ref(true);
 const visibleLimit = ref(40);
+const retrySelection = ref<string[]>([]);
 const now = ref(Date.now());
 let clock: ReturnType<typeof setInterval> | undefined;
 
@@ -27,8 +28,6 @@ const status = computed(() => batch.codex);
 const summary = computed(() => batch.codexSummary);
 const isImport = computed(() => status.value.mode === "import");
 const stopping = computed(() => status.value.stopping || status.value.status === "stopping");
-const hasFailed = computed(() => summary.value.failed > 0);
-const retryAvailable = computed(() => !status.value.running && hasFailed.value && (!isImport.value || batch.canRetryImport()));
 const disconnected = computed(() => ["reconnecting", "offline", "error"].includes(batch.codexConnection));
 const progress = computed(() => summary.value.total ? Math.min(100, Math.round(summary.value.done / summary.value.total * 100)) : 0);
 type DisplayItem = CodexItem & Partial<CodexResultItem>;
@@ -68,6 +67,13 @@ const items = computed<DisplayItem[]>(() => {
 });
 const filteredItems = computed(() => items.value.filter((item) => (!query.value.trim() || item.email.toLowerCase().includes(query.value.trim().toLowerCase())) && (filter.value === "all" || item.status === filter.value)));
 const failedEmails = computed(() => [...new Set(items.value.filter((item) => item.status === "failed").map((item) => item.email))]);
+const selectedRetryTargets = computed(() => retrySelection.value.filter((email) => failedEmails.value.includes(email)));
+const retryTargets = computed(() => selectedRetryTargets.value.length ? selectedRetryTargets.value : failedEmails.value);
+const hasSelection = computed(() => selectedRetryTargets.value.length > 0);
+// Use the visible result rows as the source of truth. Some server snapshots
+// omit aggregate failed counts while still returning failed/error items.
+const hasFailed = computed(() => failedEmails.value.length > 0 || summary.value.failed > 0);
+const retryAvailable = computed(() => !status.value.running && hasFailed.value && (!isImport.value || batch.canRetryImport(hasSelection.value ? selectedRetryTargets.value : undefined)));
 const tokenResults = computed(() => (status.value.results || []).filter((item) => ["success", "synced", "skipped"].includes(resultState(item)) && item.refresh_token));
 const filteredLogs = computed(() => (status.value.logs || []).filter((line) => logFilter.value === "all" || (logFilter.value === "issues" ? ["warning", "error"].includes(line.level) : line.level === logFilter.value)));
 const lastUpdated = computed(() => batch.codexLastUpdated ? new Date(batch.codexLastUpdated).toLocaleTimeString() : "尚未同步");
@@ -99,7 +105,7 @@ watch(() => batch.codexDialogOpen, (open) => {
     void batch.refreshCodexStatus();
   }
 }, { immediate: true });
-watch(() => status.value.batch_id, () => { query.value = ""; filter.value = "all"; visibleLimit.value = 40; expandedLogs.value = {}; });
+watch(() => status.value.batch_id, () => { query.value = ""; filter.value = "all"; visibleLimit.value = 40; expandedLogs.value = {}; retrySelection.value = []; });
 watch([query, filter], () => { visibleLimit.value = 40; });
 watch(() => [status.value.logs, status.value.logs?.[status.value.logs.length - 1]?.m, followLogs.value, showLogs.value, batch.codexDialogOpen, logFilter.value], async () => {
   if (!followLogs.value || !showLogs.value || !batch.codexDialogOpen) return;
@@ -136,6 +142,19 @@ async function retry(email?: string) {
   try { if (isImport.value) await batch.retryImportFailed(email); else await batch.retryCodexFailed(email); }
   catch (cause) { ui.notify(cause instanceof Error ? cause.message : "重试失败", "error"); }
 }
+function toggleRetry(email: string) {
+  retrySelection.value = retrySelection.value.includes(email)
+    ? retrySelection.value.filter((item) => item !== email)
+    : [...retrySelection.value, email];
+}
+async function retrySelected() {
+  try {
+    const targets = retryTargets.value;
+    if (isImport.value) await batch.retryImportFailed(hasSelection.value ? targets : undefined);
+    else await batch.retryCodexFailed(hasSelection.value ? targets : undefined);
+    retrySelection.value = [];
+  } catch (cause) { ui.notify(cause instanceof Error ? cause.message : "重试失败", "error"); }
+}
 function history() { if (isImport.value) emit("history"); else { batch.codexDialogOpen = false; batch.openCodexHistory(); } }
 function close() { batch.codexDialogOpen = false; }
 </script>
@@ -160,13 +179,13 @@ function close() { batch.codexDialogOpen = false; }
     <div class="results-toolbar">
       <label class="search-field"><Search :size="15" /><input v-model="query" aria-label="按邮箱筛选任务结果" placeholder="搜索邮箱" type="search" /></label>
       <select v-model="filter" class="filter-select" aria-label="筛选任务结果"><option value="all">全部结果 ({{ items.length }})</option><option value="active">处理中</option><option value="success">{{ isImport ? '导入成功' : '授权并同步' }}</option><option v-if="!isImport" value="synced">补同步中转</option><option value="skipped">{{ isImport ? '沿用已有' : '中转已有 / 旧记录沿用' }}</option><option value="failed">失败</option><option value="cancelled">取消</option><option value="pending">未执行</option></select>
-      <div class="actions"><AppButton v-if="failedEmails.length" size="sm" @click="copyFailed"><Clipboard :size="13" />复制失败邮箱</AppButton><AppButton v-if="retryAvailable" size="sm" :loading="batch.codexStartBusy" @click="retry()"><RefreshCw :size="13" />只重试失败项</AppButton></div>
+      <div class="actions"><AppButton v-if="failedEmails.length" size="sm" @click="copyFailed"><Clipboard :size="13" />复制失败邮箱</AppButton><AppButton v-if="retryAvailable" size="sm" :loading="batch.codexStartBusy" :title="hasSelection ? `一次重试选中的 ${retryTargets.length} 个失败账号` : `一次重试全部 ${failedEmails.length} 个失败账号`" @click="retrySelected"><RefreshCw :size="13" />{{ hasSelection ? `重试选中（${retryTargets.length}）` : `重试全部失败（${failedEmails.length}）` }}</AppButton></div>
     </div>
     <div class="result-list">
       <p v-if="!filteredItems.length" class="empty-state">{{ items.length ? '没有匹配条件的账号' : status.running ? '正在准备账号，请稍候…' : '本批次暂无账号结果' }}</p>
       <article v-for="item in filteredItems.slice(0, visibleLimit)" :key="item.email" :class="['result-row', `result-${item.status}`]">
         <div class="result-main"><div class="result-title"><b>{{ item.email }}</b><span class="result-status">{{ label(item) }}</span></div><small v-if="item.error" class="error-text">{{ item.error }}</small><small v-else-if="item.status === 'skipped'">{{ item.relay_status === 'ready' ? '中转已有匹配凭据，未在线验证' : '旧记录仅确认持有 RT，未核对中转' }}</small><small v-else-if="item.status === 'synced'">已补齐中转 JSON，未重新授权或取号</small><small v-else-if="item.status === 'pending'">{{ status.running ? '等待空闲处理位' : '尚未执行，可重新选择后启动' }}</small><small v-else-if="item.status === 'cancelled'">本次处理已取消</small><small v-else-if="item.status === 'success'">{{ item.token_kind === 'at' ? 'AT' : 'RT' }} 已保存</small><small v-else>{{ item.message || '正在处理' }}</small><small v-if="item.relay_file" class="relay-file">中转文件：{{ item.relay_file }}</small><small v-if="item.authorization_status === 'success' && item.relay_status === 'failed'" class="relay-warning">新凭据已保存在账号库，重试只补同步，不再重复授权。</small><div v-if="!isImport && (item.attempt || item.wait_deadline)" class="stage-meta"><span v-if="item.attempt">取号 {{ item.attempt }} / {{ item.max_phone_attempts || '—' }} 次</span><span v-if="countdown(item)" class="countdown">{{ countdown(item) }}</span></div></div>
-        <div class="actions"><AppButton v-if="item.logs?.length" size="sm" :aria-expanded="!!expandedLogs[item.email]" @click="toggleLogs(item)"><ScrollText :size="13" />{{ expandedLogs[item.email] ? '收起' : item.status === 'active' ? '实时日志' : '日志' }}</AppButton><AppButton v-if="item.status === 'failed' && !status.running && (!isImport || batch.canRetryImport(item.email))" size="sm" :disabled="batch.codexStartBusy" :aria-label="`重试 ${item.email}`" @click="retry(item.email)"><RefreshCw :size="13" />{{ item.retry_action === 'sync_only' ? '补同步中转' : '重试' }}</AppButton><AppButton v-if="item.refresh_token && ['success', 'synced', 'skipped'].includes(item.status)" size="sm" :aria-label="`复制 ${item.email} 的 Token`" @click="copyToken(item)"><Check v-if="copiedKey === `codex-${item.email}`" :size="13" /><Clipboard v-else :size="13" />{{ item.token_kind === 'at' ? '复制 AT' : '复制 RT' }}</AppButton></div>
+        <div class="actions"><label v-if="item.status === 'failed' && !status.running" class="retry-check"><input type="checkbox" :checked="retrySelection.includes(item.email)" :aria-label="`选择重试 ${item.email}`" @change="toggleRetry(item.email)" />选择</label><AppButton v-if="item.logs?.length" size="sm" :aria-expanded="!!expandedLogs[item.email]" @click="toggleLogs(item)"><ScrollText :size="13" />{{ expandedLogs[item.email] ? '收起' : item.status === 'active' ? '实时日志' : '日志' }}</AppButton><AppButton v-if="item.status === 'failed' && !status.running && (!isImport || batch.canRetryImport(item.email))" size="sm" :disabled="batch.codexStartBusy" :aria-label="`重试 ${item.email}`" @click="retry(item.email)"><RefreshCw :size="13" />{{ item.retry_action === 'sync_only' ? '补同步中转' : '重试' }}</AppButton><AppButton v-if="item.refresh_token && ['success', 'synced', 'skipped'].includes(item.status)" size="sm" :aria-label="`复制 ${item.email} 的 Token`" @click="copyToken(item)"><Check v-if="copiedKey === `codex-${item.email}`" :size="13" /><Clipboard v-else :size="13" />{{ item.token_kind === 'at' ? '复制 AT' : '复制 RT' }}</AppButton></div>
         <div v-if="expandedLogs[item.email]" class="account-logs"><p v-for="(line, index) in item.logs || []" :key="index" :class="logClass(line.level)"><span class="log-time">{{ line.t }}</span>{{ line.m }}</p></div>
       </article>
       <AppButton v-if="filteredItems.length > visibleLimit" size="sm" @click="visibleLimit += 40">再显示 {{ Math.min(40, filteredItems.length - visibleLimit) }} 个账号</AppButton>
@@ -178,6 +197,7 @@ function close() { batch.codexDialogOpen = false; }
 <style scoped>
 .result-summary.with-relay { grid-template-columns: repeat(7, minmax(0, 1fr)); }
 .relay-file { overflow-wrap: anywhere; }.relay-warning { color: var(--warning); }
+.retry-check { display: inline-flex; align-items: center; gap: 5px; min-height: 36px; font-size: .72rem; color: var(--text-secondary); cursor: pointer; }
 @media(max-width:640px) { .result-summary.with-relay { grid-template-columns: repeat(3, minmax(0,1fr)); } }
 .task-head,.task-state,.actions,.results-toolbar,.log-controls,.footer-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }.task-head,.footer-actions { justify-content: space-between; width: 100%; }.task-state { color: var(--text-secondary); font-size: .78rem; }.task-state b { color: var(--text-primary); font-size: .85rem; }.state-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--success); }.state-dot.running { background: var(--accent); }.state-dot.stale { background: var(--warning); }
 .progress-track { height: 4px; background: var(--progress-track); border-radius: 10px; overflow: hidden; margin: 13px 0; }.progress-track div { height: 100%; width: 100%; background: var(--accent); transform-origin: left; transition: transform .3s ease; }

@@ -173,6 +173,9 @@ export interface ReauthProgress {
   lastStatus?: string;
   lastMessage?: string;
   items?: ReauthJobItem[];
+  /** Backend uses snake_case; these aliases keep API snapshots lossless. */
+  last_status?: string;
+  last_message?: string;
 }
 
 export interface RefreshAtProgress {
@@ -186,6 +189,12 @@ export interface RefreshAtProgress {
   stopped: number;
   jobId?: string;
   job_id?: string;
+  status?: string;
+  stage?: string;
+  items?: Record<string, unknown>[];
+  pendingCount?: number;
+  interrupted?: boolean;
+  message?: string;
 }
 
 export interface TrialProgress {
@@ -202,6 +211,8 @@ export interface TrialProgress {
   interrupted?: boolean;
   pendingCount?: number;
   message?: string;
+  status?: string;
+  stage?: string;
 }
 
 type BatchJob = Partial<RefreshAtProgress & TrialProgress> & {
@@ -218,9 +229,16 @@ function unwrapBatchJob(response: BatchProgressResponse): BatchJob {
 }
 
 function batchProgress(job: BatchJob) {
-  const jobId = job.job_id || "";
+  const jobId = String(job.job_id || job.jobId || "");
+  const status = String(job.status || "").toLowerCase();
   return {
-    running: ["queued", "running", "stopping"].includes(job.status || ""),
+    // Older workers only returned ``running``. Prefer an explicit terminal
+    // status when present, while retaining that compatibility for snapshots.
+    running: status
+      ? ["queued", "running", "stopping"].includes(status)
+      : Boolean(job.running),
+    status: status || undefined,
+    stage: String(job.stage || ""),
     total: Number(job.total || 0),
     done: Number(job.done || 0),
     current: job.current || "",
@@ -228,6 +246,9 @@ function batchProgress(job: BatchJob) {
     stopped: Number(job.stopped || 0),
     job_id: jobId,
     jobId,
+    pendingCount: Array.isArray(job.pending_keys) ? job.pending_keys.length : 0,
+    interrupted: status === "interrupted",
+    message: String(job.stage || ""),
   };
 }
 
@@ -237,6 +258,8 @@ function refreshAtProgress(response: BatchProgressResponse): RefreshAtProgress {
     ...batchProgress(job),
     refreshed: Number(job.refreshed || 0),
     unchanged: Number(job.unchanged || 0),
+    stopped: Number(job.stopped || 0),
+    items: Array.isArray(job.items) ? job.items : [],
   };
 }
 
@@ -249,6 +272,8 @@ function trialProgress(response: BatchProgressResponse): TrialProgress {
     interrupted: job.status === "interrupted",
     pendingCount: (job.pending_keys || []).length,
     message: job.stage || "",
+    status: String(job.status || "") || undefined,
+    stage: String(job.stage || ""),
   };
 }
 
@@ -372,6 +397,13 @@ export async function fetchRefreshAtProgress(jobId?: string): Promise<RefreshAtP
   return refreshAtProgress(await api<BatchProgressResponse>(`/api/accounts/refresh-at/${suffix}`));
 }
 
+export async function refreshAtStop(jobId: string): Promise<RefreshAtProgress> {
+  return refreshAtProgress(await api<BatchProgressResponse>(
+    `/api/accounts/refresh-at/${encodeURIComponent(jobId)}/stop`,
+    { method: "POST" },
+  ));
+}
+
 /* --- 试用检测 --- */
 export async function trialStart(keys: string[], allAccounts: boolean, force: boolean, concurrency: number): Promise<TrialProgress> {
   return trialProgress(await api<BatchProgressResponse>("/api/accounts/trial-eligibility", {
@@ -383,4 +415,11 @@ export async function trialStart(keys: string[], allAccounts: boolean, force: bo
 export async function fetchTrialProgress(jobId?: string): Promise<TrialProgress> {
   const suffix = jobId ? encodeURIComponent(jobId) : "progress";
   return trialProgress(await api<BatchProgressResponse>(`/api/accounts/trial-eligibility/${suffix}`));
+}
+
+export async function trialStop(jobId: string): Promise<TrialProgress> {
+  return trialProgress(await api<BatchProgressResponse>(
+    `/api/accounts/trial-eligibility/${encodeURIComponent(jobId)}/stop`,
+    { method: "POST" },
+  ));
 }

@@ -4,7 +4,7 @@ import { defineStore } from "pinia";
 import {
   codexImport, codexRun, codexStop, fetchCodexStatus, fetchReauthProgress,
   fetchRefreshAtProgress, fetchTrialProgress, passwordChangeStart, preflightCodex, reauthByEmailStart, reauthStart,
-  reauthStop, refreshAtStart, securityRepairStart, totpChangeStart, trialStart,
+  reauthStop, refreshAtStart, refreshAtStop, securityRepairStart, totpChangeStart, trialStart, trialStop,
   type CodexRunOptions, type CodexStatus, type ProtocolLoginStartResult, type ReauthProgress,
   type RefreshAtProgress, type RelayAction, type RelayStrategy, type SmsOptions, type TrialProgress,
 } from "../api/batchops";
@@ -276,16 +276,22 @@ export const useBatchOpsStore = defineStore("batchops", () => {
     return true;
   }
 
-  function failedCodexEmails(onlyEmail?: string) {
+  function failedCodexEmails(onlyEmail?: string | string[]) {
     const results = [...(codex.value.results || []), ...(codex.value.items || [])];
-    const failed = normalizedEmails(results.filter((item) => item.status === "failed" && !cancelledItem(item)
-      && !("skipped" in item && item.skipped)).map((item) => item.email));
+    const failed = normalizedEmails(results.filter((item) => {
+      const status = String(item.status || "").toLowerCase();
+      const outcome = String((item as { outcome?: string }).outcome || "").toLowerCase();
+      const relayFailed = String((item as { relay_status?: string }).relay_status || "").toLowerCase() === "failed";
+      return (status === "failed" || status === "error" || status === "failure" || outcome === "failed" || relayFailed)
+        && !cancelledItem(item)
+        && !("skipped" in item && item.skipped);
+    }).map((item) => item.email));
     if (!onlyEmail) return failed;
-    const email = String(onlyEmail || "").trim().toLowerCase();
-    return failed.includes(email) ? [email] : [];
+    const requested = Array.isArray(onlyEmail) ? normalizedEmails(onlyEmail) : [String(onlyEmail).trim().toLowerCase()];
+    return requested.filter((email) => failed.includes(email));
   }
 
-  async function retryCodexFailed(onlyEmail?: string) {
+  async function retryCodexFailed(onlyEmail?: string | string[]) {
     if (codex.value.mode === "import") throw new Error("此批次为账号导入，请使用导入重试");
     if (codex.value.running || codexStartBusy.value) throw new Error("请等待当前任务结束后重试");
     const emails = failedCodexEmails(onlyEmail);
@@ -336,14 +342,14 @@ export const useBatchOpsStore = defineStore("batchops", () => {
       });
   }
 
-  function canRetryImport(onlyEmail?: string): boolean {
+  function canRetryImport(onlyEmail?: string | string[]): boolean {
     if (codex.value.mode !== "import" || codex.value.running || codexStartBusy.value) return false;
     const emails = failedCodexEmails(onlyEmail);
     return emails.length > 0 && emails.every((email) => lastImportLines.value.has(email));
   }
 
   /** 重试导入批次中的失败账号（用缓存的原始凭据行） */
-  async function retryImportFailed(onlyEmail?: string) {
+  async function retryImportFailed(onlyEmail?: string | string[]) {
     if (codex.value.mode !== "import") throw new Error("此批次为接码任务，请使用接码重试");
     if (codex.value.running || codexStartBusy.value) throw new Error("请等待当前任务结束后重试");
     const emails = failedCodexEmails(onlyEmail);
@@ -363,35 +369,71 @@ export const useBatchOpsStore = defineStore("batchops", () => {
     running: false, total: 0, done: 0, success: 0, failed: 0, items: [],
   });
   const reauthDialogOpen = ref(false);
+  const reauthConnection = ref<"connected" | "reconnecting" | "offline">("connected");
+  const reauthLastUpdated = ref(0);
+  const reauthError = ref("");
   let reauthTimer: ReturnType<typeof setInterval> | null = null;
+  let reauthPolling = false;
+  let reauthFailures = 0;
+  let reauthGeneration = 0;
 
   function applyReauth(job: ReauthProgress | null | undefined) {
     if (!job) {
       reauth.running = false;
       return;
     }
-    Object.assign(reauth, job, { running: ["queued", "running", "stopping"].includes(String(job.status || (job.running ? "running" : ""))) });
+    const status = String(job.status || "").toLowerCase();
+    Object.assign(reauth, job, {
+      // Keep the backend's snake_case diagnostics available to components
+      // using the existing camelCase fields.
+      lastStatus: job.lastStatus || job.last_status || "",
+      lastMessage: job.lastMessage || job.last_message || "",
+      running: status ? ["queued", "running", "stopping"].includes(status) : Boolean(job.running),
+      stopping: Boolean(job.stopping || status === "stopping"),
+    });
+    reauthLastUpdated.value = Date.now();
+    reauthConnection.value = "connected";
+    reauthFailures = 0;
+    reauthError.value = "";
   }
 
   function stopReauthPolling() {
+    reauthGeneration += 1;
     if (reauthTimer) {
       clearInterval(reauthTimer);
       reauthTimer = null;
+    }
+    reauthPolling = false;
+  }
+
+  async function refreshReauthProgress(generation = reauthGeneration) {
+    if (reauthPolling) return;
+    if (generation !== reauthGeneration) return;
+    reauthPolling = true;
+    try {
+      const { job } = await fetchReauthProgress();
+      if (generation !== reauthGeneration) return;
+      applyReauth(job);
+      if (!reauth.running) stopReauthPolling();
+    } catch (error) {
+      reauthFailures += 1;
+      reauthConnection.value = reauthFailures >= 3 ? "offline" : "reconnecting";
+      reauthError.value = error instanceof Error ? error.message : "重新登录进度暂时不可用，正在重试";
+    } finally {
+      reauthPolling = false;
     }
   }
 
   function startReauthPolling(onFinished?: () => void) {
     stopReauthPolling();
+    const generation = reauthGeneration;
+    reauthConnection.value = "connected";
+    reauthError.value = "";
     reauthTimer = setInterval(async () => {
-      try {
-        const { job } = await fetchReauthProgress();
-        applyReauth(job);
-        if (!reauth.running) {
-          stopReauthPolling();
-          onFinished?.();
-        }
-      } catch {
+      await refreshReauthProgress(generation);
+      if (!reauth.running) {
         stopReauthPolling();
+        onFinished?.();
       }
     }, 1500);
   }
@@ -421,6 +463,16 @@ export const useBatchOpsStore = defineStore("batchops", () => {
     return value;
   }
 
+  /** Reconnect to a running reauth batch after a transient network failure. */
+  async function restoreReauth(): Promise<boolean> {
+    await refreshReauthProgress();
+    if (reauth.running) {
+      reauthDialogOpen.value = true;
+      startReauthPolling(onFinishedRefresh);
+    }
+    return reauth.running;
+  }
+
   /** 重连后台正在运行的 reauth 批次（如果有） */
   async function attachReauthIfRunning(): Promise<boolean> {
     try {
@@ -437,91 +489,216 @@ export const useBatchOpsStore = defineStore("batchops", () => {
 
   async function stopReauthBatch() {
     const jobId = reauth.job_id || reauth.jobId;
-    if (jobId) await reauthStop(String(jobId));
+    if (!jobId || !reauth.running) return false;
+    const result = await reauthStop(String(jobId));
+    // Mark stopping immediately; the next poll will reconcile the terminal
+    // state and prevents a second click from issuing duplicate stop requests.
+    Object.assign(reauth, {
+      status: "stopping",
+      running: true,
+      stopping: true,
+      ...(result && typeof result === "object" ? result : {}),
+    });
+    startReauthPolling(onFinishedRefresh);
+    return true;
   }
 
   /* --- 刷新 AT --- */
   const refreshAt = reactive<RefreshAtProgress>({
     running: false, total: 0, done: 0, refreshed: 0, unchanged: 0, failed: 0, stopped: 0,
   });
+  const refreshAtDialogOpen = ref(false);
+  const refreshAtConnection = ref<"connected" | "reconnecting" | "offline">("connected");
+  const refreshAtLastUpdated = ref(0);
+  const refreshAtError = ref("");
+  let refreshAtFailures = 0;
   let refreshAtTimer: ReturnType<typeof setInterval> | null = null;
+  let refreshAtPolling = false;
+  let refreshAtGeneration = 0;
 
   function stopRefreshAtPolling() {
+    refreshAtGeneration += 1;
     if (refreshAtTimer) {
       clearInterval(refreshAtTimer);
       refreshAtTimer = null;
+    }
+    refreshAtPolling = false;
+  }
+
+  async function refreshRefreshAtProgress(generation = refreshAtGeneration) {
+    if (refreshAtPolling) return;
+    if (generation !== refreshAtGeneration) return;
+    refreshAtPolling = true;
+    try {
+      const progress = await fetchRefreshAtProgress(refreshAt.job_id || refreshAt.jobId);
+      if (generation !== refreshAtGeneration || !refreshAtTimer) return;
+      Object.assign(refreshAt, progress);
+      refreshAtLastUpdated.value = Date.now();
+      refreshAtConnection.value = "connected";
+      refreshAtFailures = 0;
+      refreshAtError.value = "";
+      if (!refreshAt.running) {
+        stopRefreshAtPolling();
+        onFinishedRefresh();
+      }
+    } catch (error) {
+      refreshAtFailures += 1;
+      refreshAtConnection.value = refreshAtFailures >= 3 ? "offline" : "reconnecting";
+      refreshAtError.value = error instanceof Error ? error.message : "刷新 AT 进度暂时不可用，正在重试";
+    } finally {
+      refreshAtPolling = false;
     }
   }
 
   function startRefreshAtPolling() {
     stopRefreshAtPolling();
-    const jobId = refreshAt.job_id || refreshAt.jobId;
-    let polling = false;
-    const timer = setInterval(async () => {
-      if (polling) return;
-      polling = true;
-      try {
-        const progress = await fetchRefreshAtProgress(jobId);
-        if (refreshAtTimer !== timer) return;
-        Object.assign(refreshAt, progress);
-        if (!refreshAt.running) {
-          stopRefreshAtPolling();
-          onFinishedRefresh();
-        }
-      } catch {
-        if (refreshAtTimer === timer) stopRefreshAtPolling();
-      } finally {
-        polling = false;
-      }
-    }, 1500);
+    const generation = refreshAtGeneration;
+    refreshAtConnection.value = "connected";
+    refreshAtError.value = "";
+    const timer = setInterval(async () => { await refreshRefreshAtProgress(generation); }, 1500);
     refreshAtTimer = timer;
+    // The POST response already contains the queued state; the first poll is
+    // intentionally left to the timer so callers can finish rendering before
+    // another request is issued.
   }
 
   async function startRefreshAt(keys: string[], allAccounts: boolean, concurrency: number) {
+    stopRefreshAtPolling();
+    refreshAtDialogOpen.value = true;
+    refreshAtConnection.value = "connected";
+    refreshAtError.value = "";
     Object.assign(refreshAt, await refreshAtStart(keys, allAccounts, concurrency));
     startRefreshAtPolling();
+  }
+
+  async function stopRefreshAt(): Promise<boolean> {
+    const jobId = String(refreshAt.job_id || refreshAt.jobId || "");
+    if (!jobId || !refreshAt.running) return false;
+    try {
+      Object.assign(refreshAt, await refreshAtStop(jobId));
+      startRefreshAtPolling();
+      return true;
+    } catch (error) {
+      refreshAtError.value = error instanceof Error ? error.message : "停止刷新 AT 失败";
+      throw error;
+    }
+  }
+
+  async function restoreRefreshAt(): Promise<boolean> {
+    try {
+      const progress = await fetchRefreshAtProgress();
+      Object.assign(refreshAt, progress);
+      refreshAtLastUpdated.value = Date.now();
+      if (refreshAt.running) {
+        refreshAtDialogOpen.value = true;
+        startRefreshAtPolling();
+      }
+      return refreshAt.running;
+    } catch (error) {
+      refreshAtConnection.value = "reconnecting";
+      refreshAtError.value = error instanceof Error ? error.message : "刷新 AT 进度暂时不可用";
+      return false;
+    }
   }
 
   /* --- 试用检测 --- */
   const trial = reactive<TrialProgress>({
     running: false, total: 0, done: 0, eligible: 0, ineligible: 0, failed: 0, stopped: 0,
   });
+  const trialDialogOpen = ref(false);
+  const trialConnection = ref<"connected" | "reconnecting" | "offline">("connected");
+  const trialLastUpdated = ref(0);
+  const trialError = ref("");
+  let trialFailures = 0;
   let trialTimer: ReturnType<typeof setInterval> | null = null;
+  let trialPolling = false;
+  let trialGeneration = 0;
 
   function stopTrialPolling() {
+    trialGeneration += 1;
     if (trialTimer) {
       clearInterval(trialTimer);
       trialTimer = null;
+    }
+    trialPolling = false;
+  }
+
+  async function refreshTrialProgress(generation = trialGeneration) {
+    if (trialPolling) return;
+    if (generation !== trialGeneration) return;
+    trialPolling = true;
+    try {
+      const progress = await fetchTrialProgress(trial.job_id || trial.jobId);
+      if (generation !== trialGeneration || !trialTimer) return;
+      Object.assign(trial, progress);
+      trialLastUpdated.value = Date.now();
+      trialConnection.value = "connected";
+      trialFailures = 0;
+      trialError.value = "";
+      if (!trial.running) {
+        stopTrialPolling();
+        onFinishedRefresh();
+      }
+    } catch (error) {
+      trialFailures += 1;
+      trialConnection.value = trialFailures >= 3 ? "offline" : "reconnecting";
+      trialError.value = error instanceof Error ? error.message : "试用检测进度暂时不可用，正在重试";
+    } finally {
+      trialPolling = false;
     }
   }
 
   function startTrialPolling() {
     stopTrialPolling();
-    const jobId = trial.job_id || trial.jobId;
-    let polling = false;
-    const timer = setInterval(async () => {
-      if (polling) return;
-      polling = true;
-      try {
-        const progress = await fetchTrialProgress(jobId);
-        if (trialTimer !== timer) return;
-        Object.assign(trial, progress);
-        if (!trial.running) {
-          stopTrialPolling();
-          onFinishedRefresh();
-        }
-      } catch {
-        if (trialTimer === timer) stopTrialPolling();
-      } finally {
-        polling = false;
-      }
-    }, 1500);
+    const generation = trialGeneration;
+    trialConnection.value = "connected";
+    trialError.value = "";
+    const timer = setInterval(async () => { await refreshTrialProgress(generation); }, 1500);
     trialTimer = timer;
   }
 
   async function startTrial(keys: string[], allAccounts: boolean, force: boolean, concurrency: number) {
+    stopTrialPolling();
+    trialDialogOpen.value = true;
+    trialConnection.value = "connected";
+    trialError.value = "";
     Object.assign(trial, await trialStart(keys, allAccounts, force, concurrency));
     startTrialPolling();
+  }
+
+  async function stopTrial(): Promise<boolean> {
+    const jobId = String(trial.job_id || trial.jobId || "");
+    if (!jobId || !trial.running) return false;
+    try {
+      Object.assign(trial, await trialStop(jobId));
+      startTrialPolling();
+      return true;
+    } catch (error) {
+      trialError.value = error instanceof Error ? error.message : "停止试用检测失败";
+      throw error;
+    }
+  }
+
+  async function restoreTrial(): Promise<boolean> {
+    try {
+      const progress = await fetchTrialProgress();
+      Object.assign(trial, progress);
+      trialLastUpdated.value = Date.now();
+      if (trial.running) {
+        trialDialogOpen.value = true;
+        startTrialPolling();
+      }
+      return trial.running;
+    } catch (error) {
+      trialConnection.value = "reconnecting";
+      trialError.value = error instanceof Error ? error.message : "试用检测进度暂时不可用";
+      return false;
+    }
+  }
+
+  /** Restore all background account jobs after mounting the account page. */
+  async function restoreBackgroundBatches(): Promise<void> {
+    await Promise.allSettled([restoreReauth(), restoreRefreshAt(), restoreTrial()]);
   }
 
   /* --- 批次完成后的账号列表刷新回调（由 accounts 视图注入） --- */
@@ -540,9 +717,12 @@ export const useBatchOpsStore = defineStore("batchops", () => {
     lastImportLines, lastImportOptions, canRetryImport,
     openCodexStart, openCodexHistory, openCodexDialog, openCodexDialogIfRunning, restoreCodex, refreshCodexStatus,
     runCodex, retryCodexFailed, stopCodex, startImport, retryImportFailed, stopCodexPolling,
-    reauth, reauthDialogOpen, startReauthBatch, startProtocolLogin, attachReauthIfRunning, stopReauthBatch, stopReauthPolling,
-    refreshAt, startRefreshAt, stopRefreshAtPolling,
-    trial, startTrial, stopTrialPolling,
+    reauth, reauthDialogOpen, reauthConnection, reauthLastUpdated, reauthError,
+    startReauthBatch, startProtocolLogin, restoreReauth, attachReauthIfRunning, refreshReauthProgress, stopReauthBatch, stopReauthPolling,
+    refreshAt, refreshAtDialogOpen, refreshAtConnection, refreshAtLastUpdated, refreshAtError,
+    startRefreshAt, restoreRefreshAt, refreshRefreshAtProgress, stopRefreshAt, stopRefreshAtPolling,
+    trial, trialDialogOpen, trialConnection, trialLastUpdated, trialError,
+    startTrial, restoreTrial, refreshTrialProgress, stopTrial, stopTrialPolling, restoreBackgroundBatches,
     setOnFinished, setOnCodexFinished,
   };
 });

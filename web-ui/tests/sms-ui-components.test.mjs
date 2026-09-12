@@ -105,6 +105,25 @@ test("SMS retry uses the SMS handler; import retries require cached credentials"
   h.dispose();
 });
 
+test("SMS retry can submit a selected subset of failed accounts in one batch", async () => {
+  const selected = [];
+  const h = component("CodexLiveDialog", ["toggleRetry", "retrySelected", "retryTargets", "hasSelection"], { task: {
+    codex: { mode: "codex", running: false, results: [
+      { email: "a@example.test", status: "failed" },
+      { email: "b@example.test", status: "failed" },
+      { email: "c@example.test", status: "success" },
+    ], items: [], logs: [] },
+    retryCodexFailed: async (emails) => selected.push(emails),
+  } });
+  h.toggleRetry("a@example.test");
+  h.toggleRetry("b@example.test");
+  assert.equal(h.hasSelection.value, true);
+  assert.deepEqual([...h.retryTargets.value], ["a@example.test", "b@example.test"]);
+  await h.retrySelected();
+  assert.equal(JSON.stringify(selected), JSON.stringify([["a@example.test", "b@example.test"]]));
+  h.dispose();
+});
+
 function preflightResult(overrides = {}) {
   return { ok: true, total: 1, eligible: 1, skipped: 0, missing_credentials: [], not_found: [], deactivated: [], limit: 200, configured: true, emails: ["a@example.test"], settings: { provider: "smsbower", provider_label: "SMSBower", configured: true, enabled: true, country_order: "6, 4", max_price: "0.20", max_phone_attempts: 2, timeout_seconds: 90, price_cap_supported: true }, ...overrides };
 }

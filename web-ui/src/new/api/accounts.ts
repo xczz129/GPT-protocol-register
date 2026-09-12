@@ -72,6 +72,8 @@ export interface HealthProgress {
   current: string;
   message: string;
   interrupted: boolean;
+  startedAt?: string;
+  finishedAt?: string;
   workers: number;
   requestedWorkers: number;
   updates: Record<string, { health_status?: string; status?: string }>;
@@ -83,18 +85,61 @@ export function fetchAccountsPage(limit: number, offset: number): Promise<Accoun
 
 /* --- 测活 --- */
 export function startHealthCheck(keys: string[], deleteAll: boolean, workers: number) {
-  return api("/api/accounts/health", {
+  return api<Record<string, unknown>>("/api/accounts/health", {
     method: "POST",
     body: jsonBody({ keys, delete_all: deleteAll, workers }),
   });
 }
 
 export function resumeHealthCheck(workers: number) {
-  return api("/api/accounts/health/resume", { method: "POST", body: jsonBody({ workers }) });
+  return api<Record<string, unknown>>("/api/accounts/health/resume", { method: "POST", body: jsonBody({ workers }) });
 }
 
-export function fetchHealthProgress(includeUpdates = false): Promise<HealthProgress> {
-  return api<HealthProgress>(`/api/accounts/health/progress?include_updates=${includeUpdates}`);
+const emptyHealthProgress = (): HealthProgress => ({
+  running: false, done: 0, total: 0, actualTotal: 0, requested: 0, checked: 0,
+  usable: 0, alive: 0, limited: 0, invalid: 0, invalidOther: 0,
+  reauthRequired: 0, error: 0, skippedKnownDeactivated: 0, pendingCount: 0,
+  current: "", message: "", interrupted: false, workers: 0, requestedWorkers: 0,
+  updates: {},
+});
+
+/** Normalize the snake_case response used by the Python route in one place.
+ * Keeping this at the API boundary prevents a transient response from making
+ * the progress component disappear or showing NaN/negative percentages. */
+export function normalizeHealthProgress(raw: Record<string, unknown> | null | undefined): HealthProgress {
+  const value = raw || {};
+  const number = (snake: string, camel: string, fallback = 0) => {
+    const n = Number(value[snake] ?? value[camel] ?? fallback);
+    return Number.isFinite(n) ? Math.max(0, n) : fallback;
+  };
+  const actualTotal = number("actual_total", "actualTotal", number("total", "total"));
+  const requested = number("requested", "requested");
+  const total = Math.max(actualTotal, number("total", "total"));
+  const done = Math.min(total, number("done", "done", number("checked", "checked")));
+  const updates = value.updates && typeof value.updates === "object" ? value.updates as HealthProgress["updates"] : {};
+  return {
+    ...emptyHealthProgress(),
+    ...value,
+    running: Boolean(value.running),
+    done, total, actualTotal, requested,
+    checked: Math.min(total, number("checked", "checked", done)),
+    usable: number("usable", "usable"), alive: number("alive", "alive"),
+    limited: number("limited", "limited"), invalid: number("invalid", "invalid"),
+    invalidOther: number("invalid_other", "invalidOther"),
+    reauthRequired: number("reauth_required", "reauthRequired"),
+    error: number("error", "error"),
+    skippedKnownDeactivated: number("skipped_known_deactivated", "skippedKnownDeactivated"),
+    pendingCount: number("pending_count", "pendingCount"),
+    workers: number("workers", "workers"), requestedWorkers: number("requested_workers", "requestedWorkers"),
+    current: String(value.current || ""), message: String(value.message || ""),
+    startedAt: String(value.started_at || value.startedAt || ""), finishedAt: String(value.finished_at || value.finishedAt || ""),
+    interrupted: Boolean(value.interrupted), updates,
+  };
+}
+
+export function fetchHealthProgress(includeUpdates = false, signal?: AbortSignal): Promise<HealthProgress> {
+  return api<Record<string, unknown>>(`/api/accounts/health/progress?include_updates=${includeUpdates}`, signal ? { signal } : {})
+    .then(normalizeHealthProgress);
 }
 
 /* --- 删除 --- */
