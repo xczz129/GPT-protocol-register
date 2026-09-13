@@ -36,6 +36,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "mailboxes": "",
             },
             {
+                "type": "smsbower_mail",
+                "enable": False,
+                "register_child": True,
+                "label": "SMSBower Mail",
+                # Mail API origin; endpoint paths are appended by the provider.
+                "api_base": "https://smsbower.page",
+                "api_key": "",
+                # OpenAI / ChatGPT mail service code.
+                "service": "dr",
+                # Purchase attempts follow this order when the first domain is out of stock.
+                "domains": ["gmail.com", "icloud.com"],
+                # Empty means that the provider's current price is accepted.
+                "max_price": "",
+                "capacity": 0,
+                "mailboxes": "",
+            },
+            {
                 "type": "maddy_webui",
                 "enable": False,
                 "label": "Maddy 邮箱",
@@ -64,6 +81,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         ],
         "request_timeout": 30,
         "wait_timeout": 90,
+        "smsbower_wait_timeout": 180,
         "wait_interval": 3,
         "icloud_resync_interval": 15,
         "resend_after": 45,

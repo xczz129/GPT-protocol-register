@@ -22,17 +22,24 @@ FASTMAIL_PROVIDER_TYPES = {
     "mailcode",
     "mailcode_api",
 }
+SMSBOWER_MAIL_PROVIDER_TYPES = {
+    "smsbower_mail",
+    "smsbower_email",
+    "sms_bower_mail",
+}
 CANONICAL_PROVIDER_TYPES = {
     "outlook_token",
     "icloud_api",
     "maddy_webui",
     "fastmail_api",
+    "smsbower_mail",
 }
 SUPPORTED_PROVIDER_TYPES = (
     OUTLOOK_PROVIDER_TYPES
     | ICLOUD_PROVIDER_TYPES
     | MADDY_PROVIDER_TYPES
     | FASTMAIL_PROVIDER_TYPES
+    | SMSBOWER_MAIL_PROVIDER_TYPES
 )
 
 
@@ -145,6 +152,8 @@ def normalize_provider_type(raw: str) -> str:
         return "maddy_webui"
     if ptype in FASTMAIL_PROVIDER_TYPES:
         return "fastmail_api"
+    if ptype in SMSBOWER_MAIL_PROVIDER_TYPES:
+        return "smsbower_mail"
     return ptype
 
 

@@ -94,6 +94,31 @@ class PhoneRequiredSkipped(ImportErrorBase):
     pass
 
 
+class AuthSessionRestartRequired(ImportErrorBase):
+    """The auth flow lost its server-side sign-in session.
+
+    This is a session lifecycle failure rather than a bad password, phone
+    number, or OTP.  The current ProtocolClient must be closed and the whole
+    login flow restarted with a fresh client and PKCE state.
+    """
+
+    pass
+
+
+def _is_stale_signin_session_error(value: Any) -> bool:
+    """Recognize the auth edge's stale sign-in-session response."""
+    text = str(value or "").lower().replace("_", "-")
+    return any(
+        marker in text
+        for marker in (
+            "sign-in session is no longer valid",
+            "sign in session is no longer valid",
+            "signin session is no longer valid",
+            "sign-in-session-is-no-longer-valid",
+        )
+    )
+
+
 def _auth_step_info(value: Any) -> tuple[str, str]:
     """Return the next URL and page type from an auth JSON response.
 
@@ -1494,6 +1519,10 @@ class ImportJobManager:
                 client.navigate(nav_url)
                 job.add_log("已进入手机验证页面")
             except Exception as exc:
+                if _is_stale_signin_session_error(exc):
+                    raise AuthSessionRestartRequired(
+                        "sign-in session is no longer valid; restarting authorization session"
+                    ) from exc
                 job.add_log(f"进入手机验证页面失败（{exc}）", "warning")
         if sms_client is not None:
             job.add_log(
@@ -1594,9 +1623,17 @@ class ImportJobManager:
                     job.add_log("手机号已接受，开始轮询短信")
             except Exception as exc:
                 message = str(exc)
-                if activation and sms_client:
-                    sms_client.cancel(activation)
+                self._cancel_activation(sms_client, activation)
                 self._check_cancel(job)
+                if _is_stale_signin_session_error(message):
+                    # The add-phone endpoint is stateful.  Once the auth edge
+                    # invalidates the sign-in session, retrying a number or
+                    # OTP against this client can never recover it.  Bubble a
+                    # dedicated signal so _run_job closes this client and
+                    # starts a completely fresh ProtocolClient flow.
+                    raise AuthSessionRestartRequired(
+                        "sign-in session is no longer valid; restarting authorization session"
+                    ) from exc
                 if "invalid_auth_step" in message:
                     job.add_log("服务端已完成手机号步骤，继续授权")
                     job.phone_required = False
@@ -1641,9 +1678,12 @@ class ImportJobManager:
             try:
                 client.submit_phone_otp(code)
             except Exception as exc:
-                if activation and sms_client:
-                    sms_client.cancel(activation)
+                self._cancel_activation(sms_client, activation)
                 self._check_cancel(job)
+                if _is_stale_signin_session_error(exc):
+                    raise AuthSessionRestartRequired(
+                        "sign-in session is no longer valid; restarting authorization session"
+                    ) from exc
                 job.add_log(f"短信验证码验证失败：{exc}", "warning")
                 if automatic and attempts < settings.max_phone_attempts:
                     continue
@@ -1661,7 +1701,11 @@ class ImportJobManager:
                 code = self._wait_input(job, "sms_code")
                 try:
                     client.submit_phone_otp(code)
-                except Exception:
+                except Exception as exc:
+                    if _is_stale_signin_session_error(exc):
+                        raise AuthSessionRestartRequired(
+                            "sign-in session is no longer valid; restarting authorization session"
+                        ) from exc
                     sms_client = None
                     pending_phone = self._wait_input(job, "phone")
                     continue
@@ -1842,6 +1886,28 @@ class ImportJobManager:
             )
             with self._lock:
                 self._persist_jobs_locked()
+        except AuthSessionRestartRequired as exc:
+            # A stale sign-in session cannot be repaired by retrying the
+            # current phone/OTP step.  Let the finally block close the old
+            # client, then recursively run the complete flow with a fresh
+            # ProtocolClient (new cookies, device id, PKCE state).
+            if job.network_retries < 3:
+                job.network_retries += 1
+                job.status = "queued"
+                job.step = "queued"
+                job.progress = 0
+                job.error = redact_log(str(exc))
+                job.waiting_for = ""
+                job.add_log(
+                    f"登录会话已失效，将关闭旧会话并全新授权重试（第 {job.network_retries}/3 次）",
+                    "warning",
+                )
+                self.store.update(job.account_id, status="queued", last_error=job.error)
+                with self._lock:
+                    self._persist_jobs_locked()
+                retry_requested = True
+            else:
+                self._fail_job(job, str(exc))
         except PhoneRequiredSkipped as exc:
             with self._lock:
                 job.status = "skipped_phone"

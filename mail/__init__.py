@@ -6,6 +6,7 @@ Supported:
   - icloud_api:    email----api_key  (https://icloud.xbovo.online Hide My Email API)
   - maddy_webui:   auto-created maddy mailboxes via maddy-webui automation API
   - fastmail_api:  server-managed Fastmail alias pool via mailcode-api
+  - smsbower_mail: purchased temporary Gmail/iCloud mailboxes via SMSBower
 """
 
 from __future__ import annotations
@@ -15,12 +16,15 @@ import ipaddress
 import imaplib
 import json
 import logging
+import math
 import os
+import random
 import re
 import secrets
 import string
 import time
 import warnings
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from email import message_from_bytes, policy
 from email.header import decode_header, make_header
@@ -37,6 +41,7 @@ from mail.parsing import (
     CANONICAL_PROVIDER_TYPES,
     ICLOUD_PROVIDER_TYPES,
     OUTLOOK_PROVIDER_TYPES,
+    SMSBOWER_MAIL_PROVIDER_TYPES,
     SUPPORTED_PROVIDER_TYPES,
     base_mailbox_address,
     extract_code as _extract_code,
@@ -145,6 +150,36 @@ _FASTMAIL_ACQUIRE_ROTATION_LOCK = Lock()
 _FASTMAIL_ACQUIRE_ROTATION = 0
 _FASTMAIL_CAPACITY_CACHE_LOCK = Lock()
 _FASTMAIL_CAPACITY_CACHE: dict[tuple[str, str], tuple[float, dict[str, int]]] = {}
+
+SMSBOWER_MAIL_DEFAULT_BASE = "https://smsbower.page"
+SMSBOWER_MAIL_DEFAULT_SERVICE = "dr"
+SMSBOWER_MAIL_DOMAINS = {"gmail.com", "icloud.com"}
+SMSBOWER_MAIL_PENDING_ERRORS = (
+    "code has not been received yet",
+    "code not received",
+    "wait for code",
+    "waiting for code",
+)
+SMSBOWER_MAIL_TERMINAL_NOT_FOUND_ERRORS = (
+    "no activation found",
+    "already canceled",
+    "bad actual activation status",
+)
+SMSBOWER_MAIL_CAPACITY_CACHE_TTL = 40.0
+SMSBOWER_MAIL_UNCERTAIN_ACTIVATION_BLOCK_SECONDS = 5 * 60
+SMSBOWER_MAIL_MIN_WAIT_SECONDS = 180.0
+_SMSBOWER_MAIL_CAPACITY_CACHE_LOCK = Lock()
+_SMSBOWER_MAIL_CAPACITY_CACHE: dict[
+    tuple[str, str, str, tuple[str, ...], str], tuple[float, dict[str, Any]]
+] = {}
+_SMSBOWER_MAIL_PROVIDER_LOCKS_GUARD = Lock()
+_SMSBOWER_MAIL_PROVIDER_LOCKS: dict[tuple[str, str, str], RLock] = {}
+_SMSBOWER_MAIL_ACTIVATION_BREAKERS: dict[
+    tuple[str, str, str], tuple[float, str]
+] = {}
+_SMSBOWER_MAIL_PAIR_GUARD = RLock()
+_SMSBOWER_MAIL_ACTIVE_PAIRS: set[str] = set()
+_SMSBOWER_MAIL_PAIR_RETRIES: dict[str, dict[str, Any]] = {}
 
 
 def _maddy_blocked_domains(entry: dict[str, Any] | None = None) -> set[str]:
@@ -356,6 +391,15 @@ def _entry_available(entry: dict[str, Any] | None) -> bool:
     return True
 
 
+def _has_pending_smsbower_settlement(entry: dict[str, Any] | None) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    return bool(
+        entry.get("smsbower_activation_outcome_unknown")
+        or entry.get("smsbower_pending_status") in {2, 3, "2", "3"}
+    )
+
+
 def _set_state(address: str, state: str, reason: str = "") -> None:
     target = str(address or "").strip().lower()
     if not target:
@@ -392,6 +436,8 @@ def _release_state(address: str, *, any_state: bool = False) -> None:
             store = _load_state_unlocked()
             entry = store.get(target)
             if not isinstance(entry, dict):
+                return
+            if _has_pending_smsbower_settlement(entry):
                 return
             st = str(entry.get("state") or "")
             if st == "in_use":
@@ -520,11 +566,87 @@ class FastmailApiError(RuntimeError):
     pass
 
 
+class SmsBowerMailError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        business_error: str = "",
+        activation_outcome_uncertain: bool = False,
+        activation_id: str = "",
+        activation_address: str = "",
+    ):
+        super().__init__(message)
+        self.business_error = str(business_error or "").strip()
+        self.activation_outcome_uncertain = bool(activation_outcome_uncertain)
+        self.activation_id = str(activation_id or "").strip()
+        self.activation_address = str(activation_address or "").strip().lower()
+
+
 def _fastmail_capacity_cache_key(api_base: str, admin_key: str) -> tuple[str, str]:
     return (
         str(api_base or "").strip().rstrip("/").lower(),
         hashlib.sha256(str(admin_key or "").encode("utf-8")).hexdigest(),
     )
+
+
+def _smsbower_mail_capacity_cache_key(
+    api_base: str,
+    api_key: str,
+    service: str,
+    domains: list[str],
+    max_price: str,
+) -> tuple[str, str, str, tuple[str, ...], str]:
+    return (
+        str(api_base or "").strip().rstrip("/").lower(),
+        hashlib.sha256(str(api_key or "").encode("utf-8")).hexdigest(),
+        str(service or "").strip().lower(),
+        tuple(str(domain or "").strip().lower() for domain in domains),
+        str(max_price or "").strip(),
+    )
+
+
+def _smsbower_mail_provider_identity(
+    api_base: str,
+    api_key: str,
+    service: str,
+) -> tuple[str, str, str]:
+    return (
+        str(api_base or "").strip().rstrip("/").lower(),
+        str(service or "").strip().lower(),
+        hashlib.sha256(str(api_key or "").encode("utf-8")).hexdigest(),
+    )
+
+
+def _smsbower_mail_provider_lock(
+    api_base: str,
+    api_key: str,
+    service: str,
+) -> RLock:
+    identity = _smsbower_mail_provider_identity(api_base, api_key, service)
+    with _SMSBOWER_MAIL_PROVIDER_LOCKS_GUARD:
+        return _SMSBOWER_MAIL_PROVIDER_LOCKS.setdefault(identity, RLock())
+
+
+def _smsbower_settlement_age_seconds(entry: dict[str, Any]) -> float:
+    raw = str(
+        entry.get("smsbower_settlement_started_at")
+        or entry.get("smsbower_settlement_updated_at")
+        or entry.get("updated_at")
+        or ""
+    ).strip()
+    if not raw:
+        return 0.0
+    try:
+        recorded = datetime.fromisoformat(raw)
+        if recorded.tzinfo is None:
+            recorded = recorded.replace(tzinfo=timezone.utc)
+        return max(
+            0.0,
+            (datetime.now(timezone.utc) - recorded.astimezone(timezone.utc)).total_seconds(),
+        )
+    except Exception:
+        return 0.0
 
 
 def _icloud_message_for_code(raw: Any) -> dict[str, Any]:
@@ -2758,10 +2880,1622 @@ class FastmailApiProvider:
         return messages
 
 
+class SmsBowerMailProvider:
+    """Purchased temporary mailboxes from SMSBower's mail API.
+
+    ``api_base`` is an origin (for example ``https://smsbower.page``), not the
+    phone API's ``handler_api.php`` URL. Mail activation statuses are a
+    separate protocol: 2 cancels, 3 completes, and 5 requests the next code.
+    """
+
+    name = "smsbower_mail"
+
+    def __init__(self, entry: dict, conf: dict):
+        self.conf = conf
+        self.register_child = str(entry.get("register_child", True)).strip().lower() not in {
+            "false", "0", "no", "off", "none", "",
+        }
+        self.provider_ref = str(entry.get("provider_ref") or "")
+        self.label = str(
+            entry.get("label") or self.provider_ref or "SMSBower Mail"
+        )
+        self.api_base = self._normalize_api_base(
+            entry.get("api_base") or entry.get("base_url")
+        )
+        self.api_key = self._resolve_api_key(entry)
+        self.service = str(
+            entry.get("service") or SMSBOWER_MAIL_DEFAULT_SERVICE
+        ).strip().lower()
+        if not self.service:
+            self.service = SMSBOWER_MAIL_DEFAULT_SERVICE
+        configured_domains = entry.get("domains")
+        if configured_domains in (None, "", []):
+            configured_domains = entry.get("domain") or "gmail.com"
+        self.domains = self._normalize_domains(configured_domains)
+        self.domain = self.domains[0]
+        self.max_price = self._normalize_max_price(
+            entry.get("max_price")
+            if entry.get("max_price") not in (None, "")
+            else entry.get("maxPrice")
+        )
+        try:
+            requested_wait = float(
+                conf.get("smsbower_wait_timeout")
+                or SMSBOWER_MAIL_MIN_WAIT_SECONDS
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "mail.smsbower_wait_timeout must be a positive number"
+            ) from error
+        if not math.isfinite(requested_wait) or requested_wait <= 0:
+            raise ValueError("mail.smsbower_wait_timeout must be a positive number")
+        self.wait_timeout = max(
+            SMSBOWER_MAIL_MIN_WAIT_SECONDS,
+            requested_wait,
+        )
+        self.session = _http_session()
+
+    @staticmethod
+    def _normalize_api_base(raw: Any) -> str:
+        value = str(raw or SMSBOWER_MAIL_DEFAULT_BASE).strip().rstrip("/")
+        if not value:
+            value = SMSBOWER_MAIL_DEFAULT_BASE
+        if "://" not in value:
+            value = f"https://{value}"
+        parsed = urlparse(value)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("SMSBower Mail api_base must be an HTTP(S) origin")
+        path = parsed.path.rstrip("/")
+        for marker in ("/api/mail", "/stubs/handler_api.php"):
+            index = path.lower().find(marker.lower())
+            if index >= 0:
+                path = path[:index].rstrip("/")
+                break
+        return f"{parsed.scheme.lower()}://{parsed.netloc}{path}"
+
+    @staticmethod
+    def _normalize_domain(raw: Any) -> str:
+        value = str(raw or "").strip().lower()
+        aliases = {
+            "gmail": "gmail.com",
+            "google": "gmail.com",
+            "googlemail": "gmail.com",
+            "googlemail.com": "gmail.com",
+            "icloud": "icloud.com",
+            "apple": "icloud.com",
+        }
+        value = aliases.get(value, value)
+        if value not in SMSBOWER_MAIL_DOMAINS:
+            choices = ", ".join(sorted(SMSBOWER_MAIL_DOMAINS))
+            raise ValueError(
+                f"SMSBower Mail domain must be one of: {choices}"
+            )
+        return value
+
+    @classmethod
+    def _normalize_domains(cls, raw: Any) -> list[str]:
+        if isinstance(raw, (list, tuple, set)):
+            values = list(raw)
+        else:
+            values = [
+                item
+                for item in re.split(r"[,;\s]+", str(raw or ""))
+                if item
+            ]
+        domains: list[str] = []
+        for item in values:
+            domain = cls._normalize_domain(item)
+            if domain not in domains:
+                domains.append(domain)
+        if not domains:
+            domains.append("gmail.com")
+        return domains
+
+    @staticmethod
+    def _normalize_max_price(raw: Any) -> str:
+        if raw in (None, ""):
+            return ""
+        try:
+            value = float(raw)
+        except (TypeError, ValueError) as error:
+            raise ValueError("SMSBower Mail max_price must be a positive number") from error
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("SMSBower Mail max_price must be a positive number")
+        return format(value, ".15g")
+
+    @staticmethod
+    def _resolve_api_key(entry: dict) -> str:
+        env_name = str(entry.get("api_key_env") or "").strip()
+        for raw in (
+            entry.get("api_key"),
+            entry.get("key"),
+            os.environ.get(env_name) if env_name else "",
+            os.environ.get("SMSBOWER_MAIL_API_KEY"),
+        ):
+            value = str(raw or "").strip()
+            if not value:
+                continue
+            if value in {
+                "SMSBOWER_MAIL_API_KEY",
+                "${SMSBOWER_MAIL_API_KEY}",
+            }:
+                continue
+            if value.startswith("<") and value.endswith(">"):
+                continue
+            return value
+        return ""
+
+    def close(self) -> None:
+        self.session.close()
+
+    def _safe_detail(self, value: Any) -> str:
+        text = _redact_secrets(value)
+        if self.api_key:
+            text = text.replace(self.api_key, "***")
+        return text
+
+    def _require_api_key(self) -> str:
+        if not self.api_key:
+            raise SmsBowerMailError(
+                "SMSBower Mail API key missing: configure "
+                "mail.providers[].api_key or SMSBOWER_MAIL_API_KEY"
+            )
+        return self.api_key
+
+    def _request_json(
+        self,
+        path: str,
+        *,
+        action: str,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        query = {"api_key": self._require_api_key()}
+        query.update(
+            {
+                key: value
+                for key, value in (params or {}).items()
+                if value not in (None, "")
+            }
+        )
+        try:
+            # Deliberately one request only. In particular, getActivation and
+            # setStatus are state-changing GETs and must never be blindly replayed.
+            response = self.session.get(
+                f"{self.api_base}{path}",
+                params=query,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": self.conf["user_agent"],
+                },
+                timeout=max(3.0, min(float(self.conf["request_timeout"]), 30.0)),
+            )
+        except Exception as error:
+            raise SmsBowerMailError(
+                f"SMSBower Mail {action} request failed: "
+                f"{self._safe_detail(error)}",
+                activation_outcome_uncertain=action == "getActivation",
+            ) from error
+        try:
+            data = response.json()
+        except Exception as error:
+            body = self._safe_detail(str(getattr(response, "text", ""))[:240])
+            raise SmsBowerMailError(
+                f"SMSBower Mail {action} returned invalid JSON"
+                + (f": {body}" if body else ""),
+                activation_outcome_uncertain=action == "getActivation",
+            ) from error
+        if not isinstance(data, dict):
+            raise SmsBowerMailError(
+                f"SMSBower Mail {action} returned a non-object response",
+                activation_outcome_uncertain=action == "getActivation",
+            )
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        if not 200 <= status_code < 300:
+            detail = data.get("error") or data.get("message") or data
+            raise SmsBowerMailError(
+                f"SMSBower Mail {action} HTTP {status_code}: "
+                f"{self._safe_detail(detail)[:300]}",
+                activation_outcome_uncertain=action == "getActivation",
+            )
+        return data
+
+    @staticmethod
+    def _success_flag(data: dict[str, Any]) -> bool | None:
+        if "status" not in data:
+            return None
+        status = data.get("status")
+        if status is True or status == 1:
+            return True
+        if status is False or status == 0 or status is None:
+            return False
+        value = str(status).strip().lower()
+        if value in {"1", "success", "ok", "true"}:
+            return True
+        if value in {"0", "error", "failed", "false"}:
+            return False
+        return None
+
+    def _business_error(self, action: str, data: dict[str, Any]) -> SmsBowerMailError:
+        detail = str(
+            data.get("error") or data.get("message") or "unknown API error"
+        ).strip()
+        return SmsBowerMailError(
+            f"SMSBower Mail {action} failed: {self._safe_detail(detail)[:300]}",
+            business_error=detail,
+        )
+
+    def get_mail_services_list(self) -> list[dict[str, Any]]:
+        data = self._request_json(
+            "/stubs/handler_api.php",
+            action="getMailServicesList",
+            params={"action": "getMailServicesList"},
+        )
+        if self._success_flag(data) is False:
+            raise self._business_error("getMailServicesList", data)
+        services = data.get("services")
+        if not isinstance(services, list):
+            raise SmsBowerMailError(
+                "SMSBower Mail getMailServicesList response missing services"
+            )
+        return [item for item in services if isinstance(item, dict)]
+
+    def get_price_rests(self, domain: str | None = None) -> dict[str, Any]:
+        selected_domain = self._normalize_domain(domain or self.domain)
+        data = self._request_json(
+            "/api/mail/getPriceRests",
+            action="getPriceRests",
+            params={"service": self.service, "domain": selected_domain},
+        )
+        if self._success_flag(data) is False:
+            raise self._business_error("getPriceRests", data)
+        payload = data.get("data")
+        if not isinstance(payload, dict):
+            raise SmsBowerMailError(
+                "SMSBower Mail getPriceRests response missing data"
+            )
+        return payload
+
+    @staticmethod
+    def _dict_value_casefold(data: dict[str, Any], wanted: str) -> Any:
+        wanted_lower = wanted.lower()
+        for key, value in data.items():
+            if str(key).strip().lower() == wanted_lower:
+                return value
+        return None
+
+    def availability(self, domain: str | None = None) -> dict[str, Any]:
+        selected_domain = self._normalize_domain(domain or self.domain)
+        payload = self.get_price_rests(selected_domain)
+        service_row = self._dict_value_casefold(payload, self.service)
+        if not isinstance(service_row, dict):
+            service_row = payload
+        domain_row = self._dict_value_casefold(service_row, selected_domain)
+        if not isinstance(domain_row, dict):
+            domain_row = service_row if {"price", "count"} & set(service_row) else {}
+        try:
+            count_value = float(domain_row.get("count") or 0)
+            count = max(0, int(count_value)) if math.isfinite(count_value) else 0
+        except (TypeError, ValueError, OverflowError):
+            count = 0
+        try:
+            price_value = float(domain_row.get("price"))
+            price = price_value if math.isfinite(price_value) else None
+        except (TypeError, ValueError, OverflowError):
+            price = None
+        raw_count = count
+        blocked_by_price = bool(
+            self.max_price
+            and price is not None
+            and price > float(self.max_price)
+        )
+        if blocked_by_price:
+            count = 0
+        return {
+            "service": self.service,
+            "domain": selected_domain,
+            "count": count,
+            "raw_count": raw_count,
+            "price": price,
+            "blocked_by_price": blocked_by_price,
+        }
+
+    def availability_summary(self, *, force: bool = False) -> dict[str, Any]:
+        """Return all configured-domain stock behind a short shared cache."""
+        key = _smsbower_mail_capacity_cache_key(
+            self.api_base,
+            self.api_key,
+            self.service,
+            self.domains,
+            self.max_price,
+        )
+        now = time.monotonic()
+        with _SMSBOWER_MAIL_CAPACITY_CACHE_LOCK:
+            cached = _SMSBOWER_MAIL_CAPACITY_CACHE.get(key)
+            if (
+                cached is not None
+                and not force
+                and now - cached[0] < SMSBOWER_MAIL_CAPACITY_CACHE_TTL
+            ):
+                return {
+                    **cached[1],
+                    "domains": list(cached[1].get("domains", [])),
+                    "items": [dict(item) for item in cached[1].get("items", [])],
+                }
+        items = [self.availability(domain) for domain in self.domains]
+        summary = {
+            "count": sum(max(0, int(item.get("count") or 0)) for item in items),
+            "service": self.service,
+            "domains": list(self.domains),
+            "items": [dict(item) for item in items],
+        }
+        with _SMSBOWER_MAIL_CAPACITY_CACHE_LOCK:
+            _SMSBOWER_MAIL_CAPACITY_CACHE[key] = (
+                now,
+                {**summary, "items": [dict(item) for item in items]},
+            )
+        return summary
+
+    def get_activation(self, domain: str | None = None) -> dict[str, Any]:
+        selected_domain = self._normalize_domain(domain or self.domain)
+        params: dict[str, Any] = {
+            "service": self.service,
+            "domain": selected_domain,
+        }
+        if self.max_price:
+            params["maxPrice"] = self.max_price
+        data = self._request_json(
+            "/api/mail/getActivation",
+            action="getActivation",
+            params=params,
+        )
+        if self._success_flag(data) is False:
+            raise self._business_error("getActivation", data)
+        address = str(data.get("mail") or "").strip().lower()
+        mail_id = str(data.get("mailId") or data.get("mail_id") or "").strip()
+        if "@" not in address or not mail_id:
+            raise SmsBowerMailError(
+                "SMSBower Mail getActivation response missing mail/mailId",
+                activation_outcome_uncertain=True,
+                activation_id=mail_id,
+                activation_address=address,
+            )
+        return data
+
+    def get_code(self, mail_id: str) -> str | None:
+        activation_id = str(mail_id or "").strip()
+        if not activation_id:
+            raise SmsBowerMailError("SMSBower Mail getCode missing mailId")
+        data = self._request_json(
+            "/api/mail/getCode",
+            action="getCode",
+            params={"mailId": activation_id},
+        )
+        code = str(data.get("code") or "").strip()
+        if code and self._success_flag(data) is not False:
+            return code
+        detail = str(data.get("error") or data.get("message") or "").strip()
+        if self._success_flag(data) is False and any(
+            marker in detail.lower() for marker in SMSBOWER_MAIL_PENDING_ERRORS
+        ):
+            return None
+        if self._success_flag(data) is False:
+            raise self._business_error("getCode", data)
+        return None
+
+    def get_status(self, mail_id: str) -> dict[str, Any]:
+        activation_id = str(mail_id or "").strip()
+        if not activation_id:
+            raise SmsBowerMailError("SMSBower Mail getStatus missing mailId")
+        data = self._request_json(
+            "/api/mail/getStatus",
+            action="getStatus",
+            params={"id": activation_id},
+        )
+        if self._success_flag(data) is False:
+            raise self._business_error("getStatus", data)
+        return data
+
+    def set_status(self, mail_id: str, status: int) -> dict[str, Any]:
+        activation_id = str(mail_id or "").strip()
+        if not activation_id:
+            raise SmsBowerMailError("SMSBower Mail setStatus missing activation id")
+        status_value = int(status)
+        if status_value not in {2, 3, 5}:
+            raise ValueError("SMSBower Mail status must be 2, 3, or 5")
+        data = self._request_json(
+            "/api/mail/setStatus",
+            action="setStatus",
+            params={"id": activation_id, "status": status_value},
+        )
+        if self._success_flag(data) is False:
+            raise self._business_error("setStatus", data)
+        return data
+
+    @staticmethod
+    def _mail_id(mailbox: dict[str, Any]) -> str:
+        return str(mailbox.get("mail_id") or mailbox.get("mailId") or "").strip()
+
+    def _reserve_address(
+        self,
+        address: str,
+        mail_id: str,
+        *,
+        allow_used: bool,
+    ) -> None:
+        target = str(address or "").strip().lower()
+        target_base = base_mailbox_address(target)
+        known = _known_mailbox_bindings()
+        known_match = next(
+            (
+                (bound_address, reason)
+                for bound_address, reason in known.items()
+                if base_mailbox_address(bound_address) == target_base
+            ),
+            None,
+        )
+        if known_match is not None:
+            raise SmsBowerMailError(
+                "SMSBower mailbox is already bound to a local account",
+                business_error="already_registered",
+                activation_address=target,
+                activation_id=mail_id,
+            )
+        with _mailbox_state_lock:
+            with _with_state_file_lock():
+                store = _load_state_unlocked()
+                previous = store.get(target)
+                if isinstance(previous, dict) and str(previous.get("state") or "").strip().lower() == "used":
+                    raise SmsBowerMailError(
+                        "SMSBower mailbox is already bound (local state used)",
+                        business_error="already_registered",
+                        activation_address=target,
+                        activation_id=mail_id,
+                    )
+                # A newly purchased activation must never revive an address
+                # that is already bound to an account, even when a generic
+                # caller enables allow_used for static mailbox providers.
+                if not _entry_available(previous):
+                    current = str((previous or {}).get("state") or "unavailable")
+                    raise RuntimeError(
+                        f"[{self.label}] SMSBower mailbox unavailable: "
+                        f"{target} ({current})"
+                    )
+                store[target] = {
+                    "state": "in_use",
+                    "reason": "",
+                    "_prev_state": str((previous or {}).get("state") or ""),
+                    "updated_at": datetime.now(BJ_TZ).strftime(
+                        "%Y-%m-%d %H:%M:%S%z"
+                    ),
+                    "provider": self.name,
+                    "provider_ref": self.provider_ref,
+                    "label": self.label,
+                    "api_base": self.api_base,
+                    "service": self.service,
+                    "domain": self.domain,
+                    "mail_id": mail_id,
+                }
+                _save_state_unlocked(store)
+
+    def _settlement_mailbox(
+        self,
+        address: str,
+        mail_id: str,
+        domain: str,
+    ) -> dict[str, Any]:
+        return {
+            "provider": self.name,
+            "provider_ref": self.provider_ref,
+            "address": address,
+            "login_address": address,
+            "base_address": address,
+            "label": self.label,
+            "password": "",
+            "api_base": self.api_base,
+            "service": self.service,
+            "domain": domain,
+            "domains": list(self.domains),
+            "max_price": self.max_price,
+            "mail_id": mail_id,
+            "register_child": self.register_child,
+            # Kept in memory only; persistence stores a SHA-256 fingerprint.
+            "_smsbower_api_key": self.api_key,
+        }
+
+    def _recover_pending_settlements(self) -> int:
+        """Reconcile this API identity's terminal actions before buying."""
+        with _smsbower_mail_provider_lock(
+            self.api_base,
+            self.api_key,
+            self.service,
+        ):
+            return self._recover_pending_settlements_locked()
+
+    def _recover_pending_settlements_locked(self) -> int:
+        identity = _smsbower_mail_provider_identity(
+            self.api_base,
+            self.api_key,
+            self.service,
+        )
+        _flush_smsbower_pair_retry_intents(identity)
+        breaker = _SMSBOWER_MAIL_ACTIVATION_BREAKERS.get(identity)
+        if breaker:
+            created_at, breaker_detail = breaker
+            if time.time() - created_at < SMSBOWER_MAIL_UNCERTAIN_ACTIVATION_BLOCK_SECONDS:
+                raise SmsBowerMailError(
+                    "SMSBower Mail purchases are blocked after an uncertain "
+                    f"activation: {breaker_detail}",
+                    activation_outcome_uncertain=True,
+                )
+            _SMSBOWER_MAIL_ACTIVATION_BREAKERS.pop(identity, None)
+
+        pending: list[tuple[str, dict[str, Any]]] = []
+        ambiguous: list[str] = []
+        for address, raw_entry in _load_state().items():
+            if not isinstance(raw_entry, dict) or not _has_pending_smsbower_settlement(
+                raw_entry
+            ):
+                continue
+            entry = dict(raw_entry)
+            with _SMSBOWER_MAIL_PAIR_GUARD:
+                if str(entry.get("smsbower_pair_id") or "") in _SMSBOWER_MAIL_ACTIVE_PAIRS:
+                    # A later worker buying another activation must not close
+                    # the first worker's still-running primary/child lease.
+                    continue
+            pending_base = str(
+                entry.get("smsbower_pending_api_base") or entry.get("api_base") or ""
+            ).strip().rstrip("/").lower()
+            pending_service = str(
+                entry.get("smsbower_pending_service") or entry.get("service") or ""
+            ).strip().lower()
+            pending_hash = str(entry.get("smsbower_pending_key_hash") or "").strip()
+            pending_ref = str(
+                entry.get("smsbower_pending_provider_ref")
+                or entry.get("provider_ref")
+                or ""
+            )
+            # Older state entries only had provider_ref. Treat missing endpoint
+            # fields as wildcards so the exact legacy owner can reconcile them;
+            # a different provider_ref remains ambiguous and blocks purchases.
+            same_endpoint = (
+                (not pending_base or pending_base == identity[0])
+                and (not pending_service or pending_service == identity[1])
+            )
+            if pending_hash:
+                if same_endpoint and pending_hash == identity[2]:
+                    pending.append((address, entry))
+                continue
+            if same_endpoint and pending_ref == self.provider_ref:
+                pending.append((address, entry))
+            elif same_endpoint:
+                # Legacy records have no key fingerprint. A changed list index
+                # makes ownership ambiguous, so buying must remain blocked.
+                ambiguous.append(address)
+
+        if ambiguous:
+            raise SmsBowerMailError(
+                "SMSBower Mail has pending settlements with ambiguous provider "
+                "identity after configuration reordering",
+                activation_outcome_uncertain=True,
+            )
+
+        recovered = 0
+        for address, state_entry in pending:
+            if state_entry.get("smsbower_activation_outcome_unknown"):
+                detail = str(
+                    state_entry.get("smsbower_settlement_error")
+                    or "getActivation outcome is unknown and no mailId was returned"
+                )[:300]
+                age = _smsbower_settlement_age_seconds(state_entry)
+                created_at = time.time() - age
+                if age >= SMSBOWER_MAIL_UNCERTAIN_ACTIVATION_BLOCK_SECONDS:
+                    _update_smsbower_settlement_state(
+                        {"address": address},
+                        pending_status=None,
+                    )
+                    _SMSBOWER_MAIL_ACTIVATION_BREAKERS.pop(identity, None)
+                    recovered += 1
+                    continue
+                _SMSBOWER_MAIL_ACTIVATION_BREAKERS[identity] = (
+                    created_at,
+                    detail,
+                )
+                raise SmsBowerMailError(
+                    f"SMSBower Mail purchases are blocked after an uncertain activation: {detail}",
+                    activation_outcome_uncertain=True,
+                )
+
+            desired = int(state_entry["smsbower_pending_status"])
+            mail_id = str(
+                state_entry.get("smsbower_pending_mail_id")
+                or state_entry.get("mail_id")
+                or state_entry.get("mailId")
+                or ""
+            ).strip()
+            mailbox = {"address": address}
+            if not mail_id:
+                detail = "pending SMSBower settlement is missing mailId"
+                _update_smsbower_settlement_state(
+                    mailbox,
+                    pending_status=desired,
+                    error=detail,
+                )
+                raise SmsBowerMailError(
+                    detail,
+                    activation_outcome_uncertain=True,
+                )
+            try:
+                status_result = self.get_status(mail_id)
+                status_data = (
+                    status_result.get("data")
+                    if isinstance(status_result.get("data"), dict)
+                    else {}
+                )
+                remote_status = int(status_data.get("status"))
+                if remote_status in {2, 3}:
+                    if remote_status != desired:
+                        logger.warning(
+                            "[%s] activation %s already ended with status %s "
+                            "instead of pending status %s; no transition attempted",
+                            self.name,
+                            mail_id,
+                            remote_status,
+                            desired,
+                        )
+                elif remote_status in {1, 5}:
+                    self.set_status(mail_id, desired)
+                else:
+                    raise SmsBowerMailError(
+                        "SMSBower Mail getStatus returned unsupported activation "
+                        f"status {remote_status}"
+                    )
+            except Exception as error:
+                detail = self._safe_detail(error)[:300]
+                if (
+                    _smsbower_settlement_age_seconds(state_entry)
+                    >= SMSBOWER_MAIL_UNCERTAIN_ACTIVATION_BLOCK_SECONDS
+                    and any(
+                        marker in detail.lower()
+                        for marker in SMSBOWER_MAIL_TERMINAL_NOT_FOUND_ERRORS
+                    )
+                ):
+                    logger.warning(
+                        "[%s] clearing stale activation %s after terminal/not-found "
+                        "response: %s",
+                        self.name,
+                        mail_id,
+                        detail,
+                    )
+                    _update_smsbower_settlement_state(
+                        mailbox,
+                        pending_status=None,
+                    )
+                    _complete_smsbower_pair_recovery(address, state_entry, desired)
+                    recovered += 1
+                    continue
+                _update_smsbower_settlement_state(
+                    mailbox,
+                    pending_status=desired,
+                    error=detail,
+                )
+                raise SmsBowerMailError(
+                    "SMSBower Mail has an unresolved terminal activation: "
+                    f"{detail}",
+                    activation_outcome_uncertain=True,
+                ) from error
+            _update_smsbower_settlement_state(mailbox, pending_status=None)
+            _complete_smsbower_pair_recovery(
+                address, state_entry, remote_status if remote_status in {2, 3} else desired,
+            )
+            recovered += 1
+        return recovered
+
+    def create_mailbox(
+        self,
+        username: str | None = None,
+        *,
+        allow_used: bool = False,
+    ) -> dict[str, Any]:
+        requested = str(username or "").strip()
+        if requested:
+            raise RuntimeError(
+                f"[{self.label}] SMSBower Mail cannot allocate a requested "
+                "address; leave the fixed email empty"
+            )
+        with _smsbower_mail_provider_lock(
+            self.api_base,
+            self.api_key,
+            self.service,
+        ):
+            self._recover_pending_settlements_locked()
+            return self._create_mailbox_locked(allow_used=allow_used)
+
+    def _create_mailbox_locked(self, *, allow_used: bool) -> dict[str, Any]:
+        activation: dict[str, Any] | None = None
+        selected_domain = ""
+        last_error: SmsBowerMailError | None = None
+        for domain in self.domains:
+            try:
+                activation = self.get_activation(domain)
+                selected_domain = domain
+                break
+            except SmsBowerMailError as error:
+                if error.activation_id:
+                    cancel_error: Exception | None = None
+                    try:
+                        self.set_status(error.activation_id, 2)
+                    except Exception as caught:
+                        cancel_error = caught
+                        detail = self._safe_detail(caught)[:300]
+                        try:
+                            _record_smsbower_pending_activation(
+                                self,
+                                mail_id=error.activation_id,
+                                domain=domain,
+                                detail=detail,
+                            )
+                        except Exception as journal_error:
+                            identity = _smsbower_mail_provider_identity(
+                                self.api_base,
+                                self.api_key,
+                                self.service,
+                            )
+                            breaker_detail = (
+                                "partial activation cancellation and local journal "
+                                "both failed: "
+                                f"{self._safe_detail(journal_error)[:220]}"
+                            )
+                            _SMSBOWER_MAIL_ACTIVATION_BREAKERS[identity] = (
+                                time.time(),
+                                breaker_detail,
+                            )
+                            logger.error("[%s] %s", self.name, breaker_detail)
+                    if cancel_error is not None:
+                        raise SmsBowerMailError(
+                            "SMSBower Mail returned an invalid activation payload "
+                            "and cancellation could not be confirmed: "
+                            f"{self._safe_detail(cancel_error)[:220]}",
+                            activation_outcome_uncertain=True,
+                            activation_id=error.activation_id,
+                            activation_address=error.activation_address,
+                        ) from cancel_error
+                    raise SmsBowerMailError(
+                        f"{self._safe_detail(error)}; activation was canceled",
+                        business_error=error.business_error,
+                        activation_id=error.activation_id,
+                        activation_address=error.activation_address,
+                    ) from error
+                # A business-level stock exhaustion response is definitive and
+                # safe to continue from. Transport/JSON/balance failures are
+                # ambiguous or global and must not trigger another purchase.
+                business_error = error.business_error.strip().lower()
+                if not (
+                    business_error == "no mails yet"
+                    or business_error.startswith("not available at this price")
+                ):
+                    if error.activation_outcome_uncertain:
+                        detail = self._safe_detail(error)[:300]
+                        identity = _smsbower_mail_provider_identity(
+                            self.api_base,
+                            self.api_key,
+                            self.service,
+                        )
+                        _SMSBOWER_MAIL_ACTIVATION_BREAKERS[identity] = (
+                            time.time(),
+                            detail,
+                        )
+                        try:
+                            _record_smsbower_activation_breaker(self, detail)
+                        except Exception as journal_error:
+                            logger.error(
+                                "[%s] failed to persist uncertain activation breaker: %s",
+                                self.name,
+                                self._safe_detail(journal_error)[:220],
+                            )
+                    raise
+                last_error = error
+        if activation is None:
+            raise last_error or SmsBowerMailError(
+                "SMSBower Mail has no available mailboxes"
+            )
+        address = str(activation.get("mail") or "").strip().lower()
+        mail_id = str(
+            activation.get("mailId") or activation.get("mail_id") or ""
+        ).strip()
+        mailbox = self._settlement_mailbox(address, mail_id, selected_domain)
+        returned_domain = address.rsplit("@", 1)[-1] if "@" in address else ""
+        if returned_domain != selected_domain:
+            cancel_error: Exception | None = None
+            try:
+                self.set_status(mail_id, 2)
+            except Exception as error:
+                cancel_error = error
+                logger.warning(
+                    "[%s] failed to cancel wrong-domain activation %s: %s",
+                    self.name,
+                    mail_id,
+                    self._safe_detail(error),
+                )
+                try:
+                    _update_smsbower_settlement_state(
+                        mailbox,
+                        pending_status=2,
+                        error=self._safe_detail(error),
+                    )
+                except Exception as journal_error:
+                    identity = _smsbower_mail_provider_identity(
+                        self.api_base,
+                        self.api_key,
+                        self.service,
+                    )
+                    _SMSBOWER_MAIL_ACTIVATION_BREAKERS[identity] = (
+                        time.time(),
+                        "activation cancellation and local journal both failed: "
+                        f"{self._safe_detail(journal_error)[:220]}",
+                    )
+            raise SmsBowerMailError(
+                "SMSBower Mail getActivation returned domain "
+                f"{returned_domain or '?'} instead of {selected_domain}",
+                activation_outcome_uncertain=cancel_error is not None,
+            )
+        try:
+            original_domain = self.domain
+            self.domain = selected_domain
+            try:
+                self._reserve_address(address, mail_id, allow_used=allow_used)
+            finally:
+                self.domain = original_domain
+        except Exception as reserve_error:
+            cancel_error: Exception | None = None
+            try:
+                self.set_status(mail_id, 2)
+            except Exception as error:
+                cancel_error = error
+                logger.warning(
+                    "[%s] failed to cancel unreserved activation %s: %s",
+                    self.name,
+                    mail_id,
+                    self._safe_detail(error),
+                )
+            if cancel_error is not None:
+                try:
+                    _update_smsbower_settlement_state(
+                        mailbox,
+                        pending_status=2,
+                        error=self._safe_detail(cancel_error),
+                    )
+                except Exception as journal_error:
+                    identity = _smsbower_mail_provider_identity(
+                        self.api_base,
+                        self.api_key,
+                        self.service,
+                    )
+                    _SMSBOWER_MAIL_ACTIVATION_BREAKERS[identity] = (
+                        time.time(),
+                        "activation cancellation and local journal both failed: "
+                        f"{self._safe_detail(journal_error)[:220]}",
+                    )
+                raise SmsBowerMailError(
+                    "SMSBower Mail activation was acquired but local "
+                    "reservation and cancellation both failed",
+                    activation_outcome_uncertain=True,
+                ) from reserve_error
+            raise
+        return mailbox
+
+    @staticmethod
+    def _sleep_until_next_poll(seconds: float, stop_check=None) -> bool:
+        ticks = max(1, int(max(0.2, seconds) * 5))
+        for _ in range(ticks):
+            if callable(stop_check) and stop_check():
+                return False
+            time.sleep(0.2)
+        return True
+
+    @staticmethod
+    def _jittered_poll_delay(seconds: float) -> float:
+        try:
+            base = float(seconds)
+        except (TypeError, ValueError):
+            base = 3.0
+        return max(0.2, base + random.uniform(-0.35, 0.35))
+
+    def wait_for_code(
+        self,
+        mailbox: dict[str, Any],
+        stop_check=None,
+    ) -> str | None:
+        started = time.monotonic()
+        lease = _smsbower_pair_lease(mailbox)
+        with lease["lock"] if lease is not None else nullcontext():
+            if lease is not None and lease.get("finalized"):
+                raise SmsBowerMailError("SMSBower pair lease is already finalized")
+            mailbox["_smsbower_wait_cancelled"] = False
+            mailbox["_smsbower_wait_timed_out"] = False
+            wait_id = secrets.token_hex(16)
+            mailbox["_smsbower_otp_wait_id"] = wait_id
+            if lease is not None:
+                for name in _SMSBOWER_SHARED_CODE_FIELDS:
+                    if name in lease:
+                        mailbox[name] = lease[name]
+            try:
+                code = self._wait_for_code_inner(mailbox, stop_check=stop_check)
+            finally:
+                if lease is not None:
+                    for name in _SMSBOWER_SHARED_CODE_FIELDS:
+                        if name in mailbox:
+                            lease[name] = mailbox[name]
+                        else:
+                            lease.pop(name, None)
+            if code or not mailbox.get("_smsbower_wait_cancelled"):
+                from common.mail_registration_metrics import record_otp_wait
+
+                record_otp_wait(
+                    mailbox.get("_registration_metric_attempt_id"),
+                    wait_id,
+                    max(0.0, time.monotonic() - started),
+                    received=bool(code),
+                )
+                mailbox["_smsbower_wait_timed_out"] = not bool(code)
+                if not code and mailbox.get("_registration_outcome") != "already_registered":
+                    mailbox["_registration_outcome"] = "otp_timeout"
+            return code
+
+    def _wait_for_code_inner(
+        self,
+        mailbox: dict[str, Any],
+        stop_check=None,
+    ) -> str | None:
+        mail_id = self._mail_id(mailbox)
+        if not mail_id:
+            raise SmsBowerMailError("SMSBower mailbox missing mailId")
+        if callable(stop_check) and stop_check():
+            mailbox["_smsbower_wait_cancelled"] = True
+            return None
+        try:
+            delivered = max(0, int(mailbox.get("_smsbower_codes_delivered") or 0))
+        except (TypeError, ValueError):
+            delivered = 0
+        try:
+            next_requests = max(
+                0, int(mailbox.get("_smsbower_next_code_requests") or 0)
+            )
+        except (TypeError, ValueError):
+            next_requests = 0
+        if delivered > next_requests:
+            # setStatus is state-changing. Record the attempt before sending so
+            # a lost response cannot make a later wait blindly replay it.
+            mailbox["_smsbower_next_code_requests"] = delivered
+            try:
+                self.set_status(mail_id, 5)
+            except Exception as error:
+                mailbox["_smsbower_next_code_request_error"] = self._safe_detail(
+                    error
+                )[:300]
+                raise
+            mailbox.pop("_smsbower_next_code_request_error", None)
+
+        mailbox.pop("_last_code_wait_error", None)
+        mailbox["_code_wait_attempts"] = 0
+        deadline = time.monotonic() + self.wait_timeout
+        attempt = 0
+        while time.monotonic() < deadline:
+            if callable(stop_check) and stop_check():
+                mailbox["_smsbower_wait_cancelled"] = True
+                return None
+            attempt += 1
+            mailbox["_code_wait_attempts"] = attempt
+            try:
+                code = self.get_code(mail_id)
+            except SmsBowerMailError as error:
+                detail = str(error)
+                mailbox["_last_code_wait_error"] = detail[:300]
+                hard = any(
+                    marker in detail.lower()
+                    for marker in (
+                        "api key",
+                        "unauthorized",
+                        "activation is already canceled",
+                        "no activation found",
+                        "pass mail id",
+                        "http 401",
+                        "http 403",
+                    )
+                )
+                if hard:
+                    raise
+                logger.warning(
+                    "[%s] code poll #%d failed for %s: %s",
+                    self.name,
+                    attempt,
+                    mailbox.get("address", "?"),
+                    self._safe_detail(detail)[:200],
+                )
+                if not self._sleep_until_next_poll(
+                    self._jittered_poll_delay(self.conf["wait_interval"]),
+                    stop_check,
+                ):
+                    mailbox["_smsbower_wait_cancelled"] = True
+                    return None
+                continue
+
+            if code:
+                if not re.fullmatch(r"\d{6}", code):
+                    mailbox["_last_code_wait_error"] = (
+                        "SMSBower Mail returned a non-6-digit code"
+                    )
+                elif code == str(mailbox.get("_smsbower_last_code") or "") or code in (
+                    mailbox.get("_smsbower_seen_codes") or []
+                ):
+                    mailbox["_last_code_wait_error"] = (
+                        "SMSBower Mail is still returning the previous code"
+                    )
+                else:
+                    mailbox["_smsbower_last_code"] = code
+                    mailbox["_smsbower_codes_delivered"] = delivered + 1
+                    mailbox["_smsbower_seen_codes"] = [
+                        *(mailbox.get("_smsbower_seen_codes") or []), code
+                    ][-64:]
+                    mailbox.pop("_last_code_wait_error", None)
+                    return code
+            if not self._sleep_until_next_poll(
+                self._jittered_poll_delay(self.conf["wait_interval"]),
+                stop_check,
+            ):
+                mailbox["_smsbower_wait_cancelled"] = True
+                return None
+        return None
+
+
+_SMSBOWER_SHARED_CODE_FIELDS = (
+    "_smsbower_codes_delivered", "_smsbower_next_code_requests",
+    "_smsbower_last_code", "_smsbower_seen_codes",
+    "_smsbower_next_code_request_error",
+)
+
+
+def _smsbower_pair_lease(mailbox: dict[str, Any]) -> dict[str, Any] | None:
+    lease = mailbox.get("_smsbower_pair_state")
+    return lease if isinstance(lease, dict) and "lock" in lease and "owner" in lease else None
+
+
+def _smsbower_pair_consumed(lease: dict[str, Any]) -> bool:
+    return bool(lease.get("otp_accepted") or "success" in lease["outcomes"].values())
+
+
+def _persist_smsbower_pair_intent(lease: dict[str, Any]) -> None:
+    owner = lease["owner"]
+    owner["_smsbower_pair_id"] = lease["id"]
+    owner["_smsbower_pair_consumed"] = _smsbower_pair_consumed(lease)
+    owner["_smsbower_pair_outcomes"] = dict(lease["outcomes"])
+    owner["_smsbower_pair_accepted_roles"] = list(lease.get("accepted_roles") or [])
+    _update_smsbower_settlement_state(
+        owner, pending_status=3 if owner["_smsbower_pair_consumed"] else 2,
+    )
+
+
+def _flush_smsbower_pair_retry_intents(identity: tuple[str, str, str]) -> None:
+    with _SMSBOWER_MAIL_PAIR_GUARD:
+        retries = [lease for lease in _SMSBOWER_MAIL_PAIR_RETRIES.values() if lease["identity"] == identity]
+    for lease in retries:
+        try:
+            _persist_smsbower_pair_intent(lease)
+        except Exception as error:
+            raise SmsBowerMailError(
+                "SMSBower pair settlement journal is unavailable; purchases are paused",
+                activation_outcome_uncertain=True,
+            ) from error
+
+
+def _restore_smsbower_pair_states_after_recovery(
+    address: str, entry: dict[str, Any], remote_status: int
+) -> None:
+    if not entry.get("smsbower_pair_id"):
+        return
+    outcomes = entry.get("smsbower_pair_outcomes") or {}
+    accepted = set(entry.get("smsbower_pair_accepted_roles") or [])
+    for role in {"primary", *outcomes, *accepted} & {"primary", "child"}:
+        target = address if role == "primary" else split_mailbox_address(address)
+        outcome = outcomes.get(role, "cancelled")
+        if role in accepted or outcome in {"success", "already_registered"} or (role == "primary" and remote_status == 3):
+            _set_state(target, "used", outcome if outcome != "cancelled" else "activation_complete")
+        elif outcome == "cancelled":
+            _release_state(target, any_state=True)
+        else:
+            _set_state(target, "failed", str(outcome))
+
+
+def _complete_smsbower_pair_recovery(address: str, entry: dict[str, Any], terminal_status: int) -> None:
+    _restore_smsbower_pair_states_after_recovery(address, entry, terminal_status)
+    pair_id = str(entry.get("smsbower_pair_id") or "")
+    with _SMSBOWER_MAIL_PAIR_GUARD:
+        recovered_lease = _SMSBOWER_MAIL_PAIR_RETRIES.pop(pair_id, None)
+    if recovered_lease is not None:
+        recovered_lease["settled"] = True
+        recovered_lease["owner"]["_smsbower_terminal_status"] = terminal_status
+
+
+def prepare_smsbower_pair(primary: dict[str, Any]) -> None:
+    """Own one purchased activation until its primary and optional child finish.
+
+    The runtime lease is deliberately private/non-serializable; persistent
+    state contains only a lease ID, provider fingerprint and terminal intent.
+    Registering it before writing intent prevents concurrent purchases from
+    recovering a mailbox still owned by this process.
+    """
+    if normalize_provider_type(str(primary.get("provider") or "")) != "smsbower_mail":
+        raise ValueError("A SMSBower pair requires a SMSBower mailbox")
+    if _smsbower_pair_lease(primary) is not None:
+        return
+    address = str(primary.get("address") or "").strip().lower()
+    mail_id = SmsBowerMailProvider._mail_id(primary)
+    if not address or not mail_id:
+        raise SmsBowerMailError("SMSBower pair requires address and mailId")
+    identity = _smsbower_mail_provider_identity(
+        str(primary.get("api_base") or SMSBOWER_MAIL_DEFAULT_BASE),
+        str(primary.get("_smsbower_api_key") or ""),
+        str(primary.get("service") or SMSBOWER_MAIL_DEFAULT_SERVICE),
+    )
+    with _smsbower_mail_provider_lock(*(
+        str(primary.get(name) or default)
+        for name, default in (("api_base", SMSBOWER_MAIL_DEFAULT_BASE), ("_smsbower_api_key", ""),
+                              ("service", SMSBOWER_MAIL_DEFAULT_SERVICE))
+    )):
+        owner = dict(primary, address=address)
+        pair_id = str(primary.get("_smsbower_pair_id") or secrets.token_hex(16))
+        if not re.fullmatch(r"[a-zA-Z0-9_-]{1,128}", pair_id):
+            raise ValueError("Invalid SMSBower pair identity")
+        lease = {
+            "id": pair_id, "lock": RLock(), "owner": owner, "identity": identity,
+            "outcomes": {}, "addresses": {"primary": address},
+            "otp_accepted": bool(primary.get("_otp_accepted_by_server")),
+            "accepted_roles": ["primary"] if primary.get("_otp_accepted_by_server") else [],
+            "finalized": False, "settled": False,
+        }
+        for name in _SMSBOWER_SHARED_CODE_FIELDS:
+            if name in primary:
+                lease[name] = primary[name]
+        with _SMSBOWER_MAIL_PAIR_GUARD:
+            if pair_id in _SMSBOWER_MAIL_ACTIVE_PAIRS or pair_id in _SMSBOWER_MAIL_PAIR_RETRIES:
+                raise SmsBowerMailError("SMSBower pair identity is already owned")
+            _SMSBOWER_MAIL_ACTIVE_PAIRS.add(pair_id)
+        primary["_smsbower_pair_id"] = pair_id
+        primary["_smsbower_pair_role"] = "primary"
+        primary["_smsbower_pair_state"] = lease
+        try:
+            _persist_smsbower_pair_intent(lease)
+        except Exception:
+            with _SMSBOWER_MAIL_PAIR_GUARD:
+                _SMSBOWER_MAIL_ACTIVE_PAIRS.discard(pair_id)
+                _SMSBOWER_MAIL_PAIR_RETRIES[pair_id] = lease
+            raise
+
+
+def create_smsbower_child(primary: dict[str, Any]) -> dict[str, Any]:
+    """Derive one fresh split identity while sharing its activation's code cursor."""
+    lease = _smsbower_pair_lease(primary)
+    if lease is None:
+        raise SmsBowerMailError("SMSBower pair has not been prepared")
+    with lease["lock"]:
+        if lease["finalized"]:
+            raise SmsBowerMailError("SMSBower pair lease is already finalized")
+        existing = primary.get("_smsbower_child_mailbox")
+        if isinstance(existing, dict) and _smsbower_pair_lease(existing) is lease:
+            return existing
+        original = str(primary.get("base_address") or primary.get("address") or "").strip().lower()
+        address = split_mailbox_address(original)
+        if address == str(primary.get("address") or "").strip().lower():
+            raise SmsBowerMailError("SMSBower child address must differ from its primary")
+        # Copy only provider/config fields. Browser guards, identity markers,
+        # accepted-code flags, OTP boundaries and metrics belong to one account.
+        child = {key: value for key, value in primary.items() if not key.startswith("_")}
+        child.update({
+            "address": address, "base_address": original,
+            "login_address": str(primary.get("login_address") or original),
+            "password": "", "_smsbower_api_key": primary.get("_smsbower_api_key", ""),
+            "_smsbower_pair_id": lease["id"], "_smsbower_pair_role": "child",
+            "_smsbower_pair_state": lease,
+            "_registration_metrics_defer_terminal": bool(primary.get("_registration_metrics_defer_terminal")),
+        })
+        for name in _SMSBOWER_SHARED_CODE_FIELDS:
+            if name in lease:
+                child[name] = lease[name]
+        known = _known_mailbox_bindings()
+        # Check and reserve under the same state lock. An occupied alias must
+        # never enter this lease, or its finalizer could release another job's
+        # reservation. Only this exact alias proves the child already exists;
+        # the newly-created primary being in the account DB is expected.
+        with _mailbox_state_lock:
+            with _with_state_file_lock():
+                store = _load_state_unlocked()
+                entry = store.get(address) if isinstance(store.get(address), dict) else {}
+                current = str(entry.get("state") or "").strip().lower()
+                registered = address in known or current == "used"
+                if registered:
+                    if current != "used":
+                        store[address] = {
+                            **entry, "state": "used", "reason": "already_registered",
+                            "updated_at": datetime.now(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S%z"),
+                        }
+                        _save_state_unlocked(store)
+                else:
+                    if current not in {"", "available"} or _has_pending_smsbower_settlement(entry):
+                        raise SmsBowerMailError("SMSBower child mailbox is unavailable or already reserved")
+                    store[address] = {
+                        **entry, "state": "in_use", "reason": "",
+                        "updated_at": datetime.now(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S%z"),
+                        "provider": "smsbower_mail",
+                    }
+                    _save_state_unlocked(store)
+        lease["addresses"]["child"] = address
+        if registered:
+            child["_registration_outcome"] = "already_registered"
+            lease["outcomes"]["child"] = "already_registered"
+            _persist_smsbower_pair_intent(lease)
+        primary["_smsbower_child_mailbox"] = child
+        return child
+
+
+def mark_smsbower_otp_accepted(mailbox: dict[str, Any]) -> None:
+    """Journal consumption immediately after the authentication server accepts OTP."""
+    mailbox["_otp_accepted_by_server"] = True
+    if normalize_provider_type(str(mailbox.get("provider") or "")) != "smsbower_mail":
+        return
+    lease = _smsbower_pair_lease(mailbox)
+    if lease is not None:
+        with lease["lock"]:
+            if not lease["finalized"]:
+                lease["otp_accepted"] = True
+                role = str(mailbox.get("_smsbower_pair_role") or "primary")
+                if role not in lease["accepted_roles"]:
+                    lease["accepted_roles"].append(role)
+                _persist_smsbower_pair_intent(lease)
+
+
+def _mail_registration_outcome(mailbox: dict[str, Any], success: bool, error: Any = None) -> str:
+    marker = str(mailbox.get("_registration_outcome") or "").lower()
+    reason = str(error or "").strip().lower()
+    if marker == "already_registered" or any(part in reason for part in (
+        "already_registered", "user_already_exists", "username_already_exists", "password_reset_required",
+    )):
+        return "already_registered"
+    if success and not reason:
+        return "success"
+    if reason in {"cancelled", "cancellederror", "stop requested", "partial_registration_otp_already_sent"} or "stop requested" in reason:
+        return "cancelled"
+    if mailbox.get("_smsbower_wait_timed_out") or any(part in reason for part in (
+        "验证码超时", "otp_timeout", "verification code timeout", "email code timeout",
+    )):
+        return "otp_timeout"
+    return "other_failed"
+
+
+def _record_mail_registration_outcome(mailbox: dict[str, Any], outcome: str) -> None:
+    if not mailbox.get("_registration_metrics_defer_terminal"):
+        from common.mail_registration_metrics import finish_attempt
+
+        finish_attempt(mailbox.get("_registration_metric_attempt_id"), outcome)
+
+
+def _defer_smsbower_pair_result(mailbox: dict[str, Any], outcome: str, *, consumed: bool = False) -> bool:
+    lease = _smsbower_pair_lease(mailbox)
+    if lease is None:
+        return False
+    with lease["lock"]:
+        if lease["finalized"]:
+            return True
+        role = str(mailbox.get("_smsbower_pair_role") or "primary")
+        if lease["outcomes"].get(role) not in {"success", "already_registered"}:
+            lease["outcomes"][role] = outcome
+        lease["otp_accepted"] = bool(lease["otp_accepted"] or mailbox.get("_otp_accepted_by_server") or consumed)
+        if (mailbox.get("_otp_accepted_by_server") or consumed) and role not in lease["accepted_roles"]:
+            lease["accepted_roles"].append(role)
+        _persist_smsbower_pair_intent(lease)
+        _set_state(str(mailbox.get("address") or ""),
+                   "used" if outcome in {"success", "already_registered"} or role in lease["accepted_roles"] else "failed", outcome)
+        return True
+
+
+def finalize_smsbower_pair(
+    primary: dict[str, Any], *, primary_success: bool, child_success: bool = False
+) -> None:
+    """Send a single activation terminal status after both branches are done.
+
+    Failed persistence/remote requests keep their intent for the existing
+    recovery path. Removing the live lease never drops that retry information.
+    """
+    lease = _smsbower_pair_lease(primary)
+    if lease is None:
+        return
+    owner = lease["owner"]
+    with lease["lock"], _smsbower_mail_provider_lock(
+        str(owner.get("api_base") or SMSBOWER_MAIL_DEFAULT_BASE),
+        str(owner.get("_smsbower_api_key") or ""),
+        str(owner.get("service") or SMSBOWER_MAIL_DEFAULT_SERVICE),
+    ):
+        if lease["settled"]:
+            return
+        if primary_success:
+            lease["outcomes"]["primary"] = "success"
+        if child_success:
+            lease["outcomes"]["child"] = "success"
+        lease["otp_accepted"] = bool(lease["otp_accepted"] or primary.get("_otp_accepted_by_server"))
+        if primary.get("_otp_accepted_by_server") and "primary" not in lease["accepted_roles"]:
+            lease["accepted_roles"].append("primary")
+        try:
+            _persist_smsbower_pair_intent(lease)
+            desired = 3 if _smsbower_pair_consumed(lease) else 2
+            lease["settled"] = _set_smsbower_mailbox_status(owner, desired)
+            if lease["settled"]:
+                for role, address in lease["addresses"].items():
+                    outcome = lease["outcomes"].get(role, "cancelled")
+                    if outcome == "cancelled" and role not in lease["accepted_roles"]:
+                        _release_state(address, any_state=True)
+                    else:
+                        _set_state(address, "used" if outcome in {"success", "already_registered"} or role in lease["accepted_roles"] else "failed", outcome)
+        except Exception as error:
+            logger.warning("[smsbower_mail] pair finalization pending (%s)", type(error).__name__)
+        finally:
+            lease["finalized"] = True
+            with _SMSBOWER_MAIL_PAIR_GUARD:
+                _SMSBOWER_MAIL_ACTIVE_PAIRS.discard(lease["id"])
+                if lease["settled"]:
+                    _SMSBOWER_MAIL_PAIR_RETRIES.pop(lease["id"], None)
+                else:
+                    _SMSBOWER_MAIL_PAIR_RETRIES[lease["id"]] = lease
+
+
+def _update_smsbower_settlement_state(
+    mailbox: dict[str, Any],
+    *,
+    pending_status: int | None,
+    error: str = "",
+) -> None:
+    """Persist settlement intent without copying the API key to disk."""
+    address = str(mailbox.get("address") or "").strip().lower()
+    if not address:
+        return
+    with _mailbox_state_lock:
+        with _with_state_file_lock():
+            store = _load_state_unlocked()
+            entry = store.get(address)
+            now_text = datetime.now(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S%z")
+            if not isinstance(entry, dict):
+                if pending_status is None:
+                    return
+                entry = {
+                    "state": "failed",
+                    "reason": "SMSBower terminal settlement pending",
+                    "updated_at": now_text,
+                    "provider": "smsbower_mail",
+                }
+                store[address] = entry
+            if pending_status is None:
+                was_unknown = bool(
+                    entry.get("smsbower_activation_outcome_unknown")
+                )
+                for key in (
+                    "smsbower_pending_status",
+                    "smsbower_pending_mail_id",
+                    "smsbower_pending_provider_ref",
+                    "smsbower_pending_api_base",
+                    "smsbower_pending_service",
+                    "smsbower_pending_domain",
+                    "smsbower_pending_key_hash",
+                    "smsbower_activation_outcome_unknown",
+                    "smsbower_settlement_error",
+                    "smsbower_settlement_started_at",
+                    "smsbower_settlement_updated_at",
+                    "smsbower_pair_id",
+                    "smsbower_pair_consumed",
+                    "smsbower_pair_outcomes",
+                    "smsbower_pair_accepted_roles",
+                ):
+                    entry.pop(key, None)
+                if (
+                    was_unknown and address.startswith("__smsbower_unknown__:")
+                ) or address.startswith("__smsbower_pending__:"):
+                    store.pop(address, None)
+            else:
+                entry["smsbower_pending_status"] = int(pending_status)
+                if mailbox.get("_smsbower_pair_id"):
+                    entry["smsbower_pair_id"] = str(mailbox["_smsbower_pair_id"])
+                    entry["smsbower_pair_consumed"] = bool(mailbox.get("_smsbower_pair_consumed"))
+                    entry["smsbower_pair_outcomes"] = dict(mailbox.get("_smsbower_pair_outcomes") or {})
+                    entry["smsbower_pair_accepted_roles"] = list(mailbox.get("_smsbower_pair_accepted_roles") or [])
+                mail_id = SmsBowerMailProvider._mail_id(mailbox)
+                if mail_id:
+                    entry["smsbower_pending_mail_id"] = mail_id
+                entry["smsbower_pending_provider_ref"] = str(
+                    mailbox.get("provider_ref") or ""
+                )
+                entry["smsbower_pending_api_base"] = str(
+                    mailbox.get("api_base") or ""
+                ).strip().rstrip("/").lower()
+                entry["smsbower_pending_service"] = str(
+                    mailbox.get("service") or SMSBOWER_MAIL_DEFAULT_SERVICE
+                ).strip().lower()
+                entry["smsbower_pending_domain"] = str(
+                    mailbox.get("domain") or ""
+                ).strip().lower()
+                api_key = str(mailbox.get("_smsbower_api_key") or "")
+                if api_key:
+                    entry["smsbower_pending_key_hash"] = hashlib.sha256(
+                        api_key.encode("utf-8")
+                    ).hexdigest()
+                entry["smsbower_settlement_error"] = str(error or "")[:300]
+                entry.setdefault(
+                    "smsbower_settlement_started_at",
+                    str(
+                        entry.get("smsbower_settlement_updated_at")
+                        or entry.get("updated_at")
+                        or now_text
+                    ),
+                )
+                entry["smsbower_settlement_updated_at"] = now_text
+            _save_state_unlocked(store)
+
+
+def _record_smsbower_pending_activation(
+    provider: SmsBowerMailProvider,
+    *,
+    mail_id: str,
+    domain: str,
+    detail: str,
+) -> None:
+    """Journal a known activation whose malformed address cannot key state."""
+    identity = _smsbower_mail_provider_identity(
+        provider.api_base,
+        provider.api_key,
+        provider.service,
+    )
+    digest = hashlib.sha256(
+        "|".join((*identity, str(mail_id or "").strip())).encode("utf-8")
+    ).hexdigest()[:24]
+    mailbox = provider._settlement_mailbox(
+        f"__smsbower_pending__:{digest}",
+        str(mail_id or "").strip(),
+        domain,
+    )
+    _update_smsbower_settlement_state(
+        mailbox,
+        pending_status=2,
+        error=provider._safe_detail(detail)[:300],
+    )
+
+
+def _record_smsbower_activation_breaker(
+    provider: SmsBowerMailProvider,
+    detail: str,
+) -> None:
+    """Persist a short safety breaker when getActivation returned no mailId."""
+    identity = _smsbower_mail_provider_identity(
+        provider.api_base,
+        provider.api_key,
+        provider.service,
+    )
+    digest = hashlib.sha256("|".join(identity).encode("utf-8")).hexdigest()[:24]
+    key = f"__smsbower_unknown__:{digest}"
+    safe_detail = provider._safe_detail(detail)[:300]
+    now_text = datetime.now(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S%z")
+    with _mailbox_state_lock:
+        with _with_state_file_lock():
+            store = _load_state_unlocked()
+            store[key] = {
+                "state": "failed",
+                "reason": "SMSBower getActivation outcome unknown",
+                "updated_at": now_text,
+                "smsbower_activation_outcome_unknown": True,
+                "smsbower_pending_provider_ref": provider.provider_ref,
+                "smsbower_pending_api_base": identity[0],
+                "smsbower_pending_service": identity[1],
+                "smsbower_pending_key_hash": identity[2],
+                "smsbower_settlement_error": safe_detail,
+                "smsbower_settlement_started_at": now_text,
+                "smsbower_settlement_updated_at": now_text,
+            }
+            _save_state_unlocked(store)
+
+
+def _set_smsbower_mailbox_status(mailbox: dict[str, Any], status: int) -> bool:
+    """Best-effort one-shot activation finalization used by flow cleanup."""
+    api_key = str(mailbox.get("_smsbower_api_key") or "").strip()
+    api_base = str(mailbox.get("api_base") or SMSBOWER_MAIL_DEFAULT_BASE)
+    service = str(mailbox.get("service") or SMSBOWER_MAIL_DEFAULT_SERVICE)
+    with _smsbower_mail_provider_lock(api_base, api_key, service):
+        return _set_smsbower_mailbox_status_locked(mailbox, status)
+
+
+def _set_smsbower_mailbox_status_locked(
+    mailbox: dict[str, Any],
+    status: int,
+) -> bool:
+    mail_id = SmsBowerMailProvider._mail_id(mailbox)
+    api_key = str(mailbox.get("_smsbower_api_key") or "").strip()
+    status_value = int(status)
+    terminal = status_value in {2, 3}
+    existing_terminal = mailbox.get("_smsbower_terminal_status")
+    if terminal and existing_terminal in {2, 3}:
+        if existing_terminal != status_value:
+            logger.warning(
+                "[smsbower_mail] activation %s already ended with status %s; "
+                "ignored conflicting status %s",
+                mail_id or "?",
+                existing_terminal,
+                status_value,
+            )
+        mailbox.pop("_smsbower_pending_terminal_status", None)
+        mailbox.pop("_smsbower_settlement_error", None)
+        _update_smsbower_settlement_state(mailbox, pending_status=None)
+        return True
+    if terminal:
+        mailbox["_smsbower_pending_terminal_status"] = status_value
+        _update_smsbower_settlement_state(
+            mailbox,
+            pending_status=status_value,
+        )
+    if not mail_id or not api_key:
+        detail = "missing mailId/API key"
+        mailbox["_smsbower_settlement_error"] = detail
+        if terminal:
+            _update_smsbower_settlement_state(
+                mailbox,
+                pending_status=status_value,
+                error=detail,
+            )
+        logger.warning(
+            "[smsbower_mail] activation finalization skipped: missing mailId/API key"
+        )
+        return False
+    entry = {
+        "type": "smsbower_mail",
+        "provider_ref": mailbox.get("provider_ref"),
+        "label": mailbox.get("label"),
+        "api_base": mailbox.get("api_base"),
+        "api_key": api_key,
+        "service": mailbox.get("service"),
+        "domains": [mailbox.get("domain") or "gmail.com"],
+        "max_price": mailbox.get("max_price"),
+    }
+    conf = _make_config({})
+    conf["request_timeout"] = 10.0
+    provider = SmsBowerMailProvider(entry, conf)
+    try:
+        provider.set_status(mail_id, status_value)
+    except Exception as error:
+        detail = provider._safe_detail(error)[:300]
+        mailbox["_smsbower_settlement_error"] = detail
+        if terminal:
+            _update_smsbower_settlement_state(
+                mailbox,
+                pending_status=status_value,
+                error=detail,
+            )
+        logger.warning(
+            "[smsbower_mail] setStatus=%s failed for activation %s: %s",
+            status,
+            mail_id,
+            detail,
+        )
+        return False
+    finally:
+        provider.close()
+    mailbox.pop("_smsbower_settlement_error", None)
+    mailbox.pop("_smsbower_pending_terminal_status", None)
+    if terminal:
+        mailbox["_smsbower_terminal_status"] = status_value
+        _update_smsbower_settlement_state(mailbox, pending_status=None)
+    return True
+
+
 def _make_config(mail_config: dict) -> dict:
     return {
         "request_timeout": float(mail_config.get("request_timeout") or 30),
         "wait_timeout": float(mail_config.get("wait_timeout") or 90),
+        "smsbower_wait_timeout": float(
+            mail_config.get("smsbower_wait_timeout")
+            or SMSBOWER_MAIL_MIN_WAIT_SECONDS
+        ),
         "wait_interval": float(mail_config.get("wait_interval") or 3),
         "wait_chunk": float(mail_config.get("wait_chunk") or 30),
         "icloud_resync_interval": float(
@@ -2793,6 +4527,8 @@ def _iter_provider_entries(
         want = "icloud_api"
     elif want in {"fastmail", "mailcode"}:
         want = "fastmail_api"
+    elif want in {"smsbower_email", "sms_bower_mail"}:
+        want = "smsbower_mail"
     elif want in {"auto", "any", "all", ""}:
         want = ""
 
@@ -2823,6 +4559,8 @@ def _build_provider(entry: dict, conf: dict):
         return MaddyWebuiProvider(entry, conf)
     if ptype == "fastmail_api":
         return FastmailApiProvider(entry, conf)
+    if ptype == "smsbower_mail":
+        return SmsBowerMailProvider(entry, conf)
     raise RuntimeError(f"Unsupported mail provider type: {entry.get('type')}")
 
 
@@ -2930,6 +4668,8 @@ def reconcile_registered_mailbox_states(
             pool = parse_icloud_credentials(lines)
         elif ptype == "maddy_webui":
             pool = parse_domain_mailboxes(lines)
+        elif ptype == "smsbower_mail":
+            pool = []
         else:
             pool = parse_outlook_credentials(lines)
         configured.update(
@@ -3163,6 +4903,45 @@ def count_pool_capacity(
             stats["total_slots"] = int(stats["total_slots"]) + total
             stats["primary_available"] = int(stats["primary_available"]) + available
             continue
+        elif ptype == "smsbower_mail":
+            # Activations are allocated dynamically and cannot satisfy a fixed
+            # address request. getPriceRests is the authoritative live stock.
+            if requested:
+                continue
+            try:
+                fallback_capacity = max(0, int(entry.get("capacity") or 0))
+            except (TypeError, ValueError):
+                fallback_capacity = 0
+            conf = _make_config(mail_config)
+            conf["request_timeout"] = min(
+                float(conf.get("request_timeout") or 30), 6.0
+            )
+            smsbower_provider = SmsBowerMailProvider(entry, conf)
+            try:
+                summary = smsbower_provider.availability_summary()
+                dynamic_capacity = max(
+                    0, int(summary.get("count") or 0)
+                )
+            except Exception as error:
+                logger.warning(
+                    "[smsbower_mail] getPriceRests failed; using configured "
+                    "capacity=%d: %s",
+                    fallback_capacity,
+                    smsbower_provider._safe_detail(error)[:200],
+                )
+                dynamic_capacity = fallback_capacity
+            finally:
+                smsbower_provider.close()
+            stats["total"] = int(stats["total"]) + dynamic_capacity
+            slots_per_mailbox = 2 if smsbower_provider.register_child else 1
+            stats["total_slots"] = int(stats["total_slots"]) + dynamic_capacity * slots_per_mailbox
+            stats["primary_available"] = (
+                int(stats["primary_available"]) + dynamic_capacity
+            )
+            if smsbower_provider.register_child:
+                stats["split_available"] = int(stats["split_available"]) + dynamic_capacity
+                stats["split_total"] = int(stats["split_total"]) + dynamic_capacity
+            continue
         else:
             pool = parse_outlook_credentials(lines)
         for item in pool:
@@ -3326,6 +5105,7 @@ def create_mailbox(
       - "icloud" / "icloud_api"
       - "maddy" / "maddy_webui"
       - "fastmail" / "fastmail_api"
+      - "smsbower_mail" / "smsbower_email"
     """
     entries = _iter_provider_entries(mail_config, provider_type=provider_type)
     if not entries:
@@ -3333,7 +5113,7 @@ def create_mailbox(
         raise RuntimeError(
             f"No mail provider found for type={want!r}. "
             f"Enable outlook_token, icloud_api, maddy_webui, "
-            f"or fastmail_api under mail.providers"
+            f"fastmail_api, or smsbower_mail under mail.providers"
         )
 
     conf = _make_config(mail_config)
@@ -3386,11 +5166,21 @@ def create_mailbox(
             mark_mailbox_code_boundary(mailbox, grace_seconds=0)
             return mailbox
         except RuntimeError as error:
+            if (
+                isinstance(error, SmsBowerMailError)
+                and (error.activation_outcome_uncertain or error.business_error == "already_registered")
+            ):
+                raise
             last_error = str(error)
             continue
         except Exception as error:
             # 网络层等非 RuntimeError 异常同样换下一个 provider，
             # 避免单个 provider 内部状态（已写 in_use）外泄成未释放预约
+            if (
+                isinstance(error, SmsBowerMailError)
+                and (error.activation_outcome_uncertain or error.business_error == "already_registered")
+            ):
+                raise
             last_error = str(error)
             continue
         finally:
@@ -3547,11 +5337,31 @@ def mark_mailbox_result(
     address = str(mailbox.get("address") or "").strip()
     if not address:
         return
-    if success:
+    if provider == "smsbower_mail":
+        outcome = _mail_registration_outcome(mailbox, success, error)
+        mailbox["_registration_outcome"] = outcome
+        _record_mail_registration_outcome(mailbox, outcome)
+        if _defer_smsbower_pair_result(mailbox, outcome, consumed=success and outcome != "already_registered"):
+            return
+    if success and (provider != "smsbower_mail" or outcome != "already_registered"):
+        if provider == "smsbower_mail":
+            _set_smsbower_mailbox_status(mailbox, 3)
         _set_state(address, "used")
         return
     reason = str(error or "").strip()
     reason_l = reason.lower()
+    if provider == "smsbower_mail":
+        desired = 3 if mailbox.get("_otp_accepted_by_server") else 2
+        if not _set_smsbower_mailbox_status(mailbox, desired):
+            _set_state(
+                address,
+                "used" if outcome == "already_registered" or mailbox.get("_otp_accepted_by_server") else "failed",
+                str(mailbox.get("_smsbower_settlement_error") or "")[:300],
+            )
+            return
+        if outcome == "already_registered" or mailbox.get("_otp_accepted_by_server"):
+            _set_state(address, "used", outcome)
+            return
     # cancel / stop must always free the mailbox immediately
     if reason_l in {"cancelled", "stop requested", "cancellederror"} or "stop requested" in reason_l:
         _release_state(address, any_state=True)
@@ -3621,7 +5431,16 @@ def mark_mailbox_result(
         _release_state(address, any_state=True)
         print(f"  [mail] released (transient): {address}")
     elif (
-        isinstance(error, (OutlookTokenError, ICloudApiError, MaddyWebuiError, FastmailApiError))
+        isinstance(
+            error,
+            (
+                OutlookTokenError,
+                ICloudApiError,
+                MaddyWebuiError,
+                FastmailApiError,
+                SmsBowerMailError,
+            ),
+        )
         or "OutlookToken refresh" in reason
         or "iCloud API error" in reason
         or "Maddy WebUI" in reason
@@ -3645,6 +5464,22 @@ def release_mailbox(mailbox: dict) -> None:
     if provider not in CANONICAL_PROVIDER_TYPES:
         return
     address = str(mailbox.get("address") or "")
+    if provider == "smsbower_mail":
+        outcome = _mail_registration_outcome(mailbox, False, "cancelled")
+        mailbox["_registration_outcome"] = outcome
+        _record_mail_registration_outcome(mailbox, outcome)
+        if _defer_smsbower_pair_result(mailbox, outcome):
+            return
+        if not _set_smsbower_mailbox_status(mailbox, 3 if mailbox.get("_otp_accepted_by_server") else 2):
+            _set_state(
+                address,
+                "used" if outcome == "already_registered" or mailbox.get("_otp_accepted_by_server") else "failed",
+                str(mailbox.get("_smsbower_settlement_error") or "")[:300],
+            )
+            return
+        if outcome == "already_registered" or mailbox.get("_otp_accepted_by_server"):
+            _set_state(address, "used", outcome)
+            return
     _release_state(address)
     if provider == "fastmail_api":
         print(f"  [mail] released local reservation; Fastmail alias retained: {address}")
@@ -3658,6 +5493,8 @@ def release_all_in_use(*, include_failed: bool = True) -> int:
             reset = 0
             for email, entry in list(store.items()):
                 if not isinstance(entry, dict):
+                    continue
+                if _has_pending_smsbower_settlement(entry):
                     continue
                 st = str(entry.get("state") or "")
                 if st == "in_use" or (include_failed and st == "failed"):
@@ -3681,6 +5518,8 @@ def release_failed_mailboxes(*, include_stale_in_use: bool = True) -> int:
             reset = 0
             for email, entry in list(store.items()):
                 if not isinstance(entry, dict):
+                    continue
+                if _has_pending_smsbower_settlement(entry):
                     continue
                 state = str(entry.get("state") or "").strip().lower()
                 if state == "failed" or (
@@ -3718,7 +5557,7 @@ def update_mailbox_states(
                     state = str((entry or {}).get("state") or "") if isinstance(entry, dict) else ""
                     if (not wanted or email.lower() in wanted) and (
                         not allowed_states or state.lower() in allowed_states
-                    ):
+                    ) and not _has_pending_smsbower_settlement(entry):
                         store.pop(email, None)
                         changed += 1
             elif command in {"failed", "cooldown", "used", "token_invalid"}:
@@ -3755,6 +5594,7 @@ def release_stale_in_use() -> int:
                 if isinstance(entry, dict)
                 and str(entry.get("state") or "") == "in_use"
                 and _entry_available(entry)
+                and not _has_pending_smsbower_settlement(entry)
             ]
             for email in stale:
                 store.pop(email, None)

@@ -9,6 +9,14 @@ export interface MailStatus {
   total?: number;
   available?: number;
   split_available?: number;
+  providers?: MailProviderStatus[];
+}
+
+export interface MailProviderStatus {
+  type: string;
+  register_child?: boolean;
+  total?: number;
+  available?: number;
 }
 
 export interface AccountsStatus {

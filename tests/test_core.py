@@ -983,7 +983,7 @@ class ProxyTests(unittest.TestCase):
                 ) from error
             upstream_port = server.sockets[0].getsockname()[1]
             bridge = await AuthenticatedProxyBridge.start_for(
-                f"http://bridge-user:bridge-pass@127.0.0.1:{upstream_port}"
+                f"http://fixture-user:fixture-pass@127.0.0.1:{upstream_port}"
             )
             self.assertIsNotNone(bridge)
             bridge_port = int(bridge.url.rsplit(":", 1)[1])
@@ -1006,7 +1006,7 @@ class ProxyTests(unittest.TestCase):
             return captured["head"]
 
         head = asyncio.run(scenario())
-        expected = base64.b64encode(b"bridge-user:bridge-pass").decode("ascii")
+        expected = base64.b64encode(b"fixture-user:fixture-pass").decode("ascii")
         self.assertIn(f"Proxy-Authorization: Basic {expected}", head)
 
     def test_proxy_mode_selects_single_url_without_reading_pool(self):
@@ -1225,12 +1225,12 @@ class ProxyFormatTests(unittest.TestCase):
         # 代理商地域参数带空格（如德国 Brandenburg 的 Bernau bei Berlin）
         # 时，凭据必须 percent-encode，否则 curl 报错 5。
         normalized = normalize_proxy_url(
-            "sg.cliproxy.io:3010:gaiv1166199-region-DE-st-Brandenburg-city-Bernau bei Berlin-sid-ucgNn6yf-t-5:123REDACTED-DOMAIN-API-PASSWORD"
+            "sg.cliproxy.io:3010:fixture-user-region-DE-st-Brandenburg-city-Bernau bei Berlin-sid-ucgNn6yf-t-5:fixture-pass"
         )
         self.assertNotIn(" ", normalized)
         self.assertEqual(
             normalized,
-            "http://gaiv1166199-region-DE-st-Brandenburg-city-Bernau%20bei%20Berlin-sid-ucgNn6yf-t-5:123REDACTED-DOMAIN-API-PASSWORD@sg.cliproxy.io:3010",
+            "http://fixture-user-region-DE-st-Brandenburg-city-Bernau%20bei%20Berlin-sid-ucgNn6yf-t-5:fixture-pass@sg.cliproxy.io:3010",
         )
         # 已编码的输入保持稳定，不二次编码。
         self.assertEqual(normalize_proxy_url(normalized), normalized)
@@ -1238,8 +1238,8 @@ class ProxyFormatTests(unittest.TestCase):
         self.assertEqual(country_code_from_proxy(normalized), "DE")
         # 直贴完整 URL 且 userinfo 带空格时同样修复。
         self.assertEqual(
-            normalize_proxy_url("http://user name:pass word@host:8080"),
-            "http://user%20name:pass%20word@host:8080",
+            normalize_proxy_url("http://fixture user:fixture pass@host:8080"),
+            "http://fixture%20user:fixture%20pass@host:8080",
         )
 
     def test_flaresolverr_solution_filters_foreign_cookies(self):
@@ -8152,9 +8152,10 @@ class ProtocolAndHealthTests(unittest.TestCase):
         registrar._enroll_totp.assert_not_called()
         mailbox_result.assert_called_once_with(
             mailbox,
-            success=False,
+            success=True,
             error=unittest.mock.ANY,
         )
+        self.assertTrue(mailbox["_otp_accepted_by_server"])
 
     def test_protocol_registration_callback_still_adds_password(self):
         from register.protocol import PlatformRegistrar
@@ -8374,9 +8375,62 @@ class ProtocolAndHealthTests(unittest.TestCase):
         registrar._enroll_totp.assert_not_called()
         mailbox_result.assert_called_once_with(
             mailbox,
-            success=False,
+            success=True,
             error=unittest.mock.ANY,
         )
+        self.assertTrue(mailbox["_otp_accepted_by_server"])
+
+    def test_protocol_registration_cancel_after_otp_marks_mailbox_consumed(self):
+        from register.protocol import PlatformRegistrar, _STOP_CHECK
+        from register.sessions import JobCancelled
+
+        stopped = {"value": False}
+        registrar = PlatformRegistrar.__new__(PlatformRegistrar)
+        registrar.proxy = ""
+        registrar.device_id = "device-fixture"
+        registrar.fingerprint = {}
+        registrar._log_identity = MagicMock()
+        registrar._complete_chatgpt_session = MagicMock(return_value={
+            "final_url": "https://auth.openai.com/create-account/password",
+        })
+        registrar._set_registration_password = MagicMock(
+            return_value="Aa1!cancelled-after-otp"
+        )
+
+        def accept_otp(*_args, **_kwargs):
+            stopped["value"] = True
+            return {
+                "continue_url": "https://auth.openai.com/about-you",
+                "page": {"type": "about_you"},
+            }
+
+        registrar._validate_otp = MagicMock(side_effect=accept_otp)
+        mailbox = {
+            "address": "cancelled@example.com",
+            "label": "fixture",
+            "provider": "smsbower_mail",
+        }
+
+        stop_token = _STOP_CHECK.set(lambda: stopped["value"])
+        try:
+            with (
+                patch("register.protocol_registrar.create_mailbox", return_value=mailbox),
+                patch("register.protocol_registrar.wait_for_code", return_value="123456"),
+                patch("register.protocol_registrar.mark_mailbox_result") as mailbox_result,
+                patch("register.protocol_registrar._random_password", return_value="generated"),
+                patch("register.protocol_registrar.step"),
+            ):
+                with self.assertRaisesRegex(JobCancelled, "stop requested"):
+                    registrar.register(1)
+        finally:
+            _STOP_CHECK.reset(stop_token)
+
+        mailbox_result.assert_called_once_with(
+            mailbox,
+            success=True,
+            error="partial_registration_otp_already_sent",
+        )
+        self.assertTrue(mailbox["_otp_accepted_by_server"])
 
     def test_create_account_returns_recoverable_auth_step_error(self):
         from register.protocol import PlatformRegistrar
@@ -9985,6 +10039,48 @@ class ProtocolAndHealthTests(unittest.TestCase):
         self.assertEqual(assigned, emails)
         self.assertEqual([item["email"] for item in result], emails)
 
+    def test_browser_batch_dispatches_dynamic_capacity_after_static_addresses(self):
+        from register.batch import run_register
+
+        assigned: list[str | None] = []
+
+        async def registered(index, _total, _playwright, **kwargs):
+            assigned.append(kwargs["fixed_email"])
+            email = kwargs["fixed_email"] or f"dynamic-{index}@example.com"
+            return {"email": email, "access_token": f"token-{index}"}
+
+        with (
+            patch(
+                "register.batch.count_pool_capacity",
+                return_value={
+                    "available": 3,
+                    "total": 3,
+                    "emails": ["static@example.com"],
+                },
+            ),
+            patch("register.batch.release_stale_in_use", return_value=0),
+            patch(
+                "register.batch.register_one",
+                new=AsyncMock(side_effect=registered),
+            ) as browser_register,
+        ):
+            result = asyncio.run(
+                run_register(
+                    {
+                        "registration": {
+                            "engine": "browser",
+                            "max_transient_retries": 0,
+                        }
+                    },
+                    total=3,
+                    concurrency=1,
+                )
+            )
+
+        self.assertEqual(browser_register.await_count, 3)
+        self.assertEqual(assigned, ["static@example.com", "", ""])
+        self.assertEqual(len(result), 3)
+
     def test_browser_alias_pairs_wait_for_both_complete_before_next_pair(self):
         from register.batch import run_register
 
@@ -10490,6 +10586,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
                 return result
 
             progress = []
+            completions = []
             with (
                 patch("common.account_health.check_account", side_effect=checked) as check_one,
                 patch("common.account_health.update_account_record_fields", side_effect=persist_fields) as persist,
@@ -10498,6 +10595,9 @@ class ProtocolAndHealthTests(unittest.TestCase):
                     records=records,
                     workers=2,
                     path=path,
+                    completion_callback=lambda done, _total, item: completions.append(
+                        (done, item["email"], list(persisted))
+                    ),
                     progress_callback=lambda done, _total, item: progress.append(
                         (done, item["email"], list(persisted))
                     ),
@@ -10514,6 +10614,10 @@ class ProtocolAndHealthTests(unittest.TestCase):
         self.assertEqual(len(progress), 2)
         for _done, email, visible_at_callback in progress:
             self.assertIn(email, visible_at_callback)
+        self.assertEqual(len(completions), 2)
+        # Completion notifications are emitted as soon as probe futures
+        # finish, before the two-row persistence batch is flushed.
+        self.assertTrue(all(not visible_at_callback for _, _, visible_at_callback in completions))
 
     def test_account_health_progress_updates_realtime_counts(self):
         import web_app

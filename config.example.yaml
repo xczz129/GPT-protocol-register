@@ -29,6 +29,27 @@ mail:
       mailboxes: |
         mailbox@example.com----YOUR_API_KEY
 
+    # ---------- SMSBower 临时邮箱（注册时按需购买）----------
+    - type: smsbower_mail
+      enable: false
+      # 主号成功后注册一个 +split 子号；任务数量包含主号和子号。
+      # 此渠道并发最低 2 且为偶数；开启子号时任务数量也须为偶数。
+      register_child: true
+      label: SMSBower Mail
+      # 也可留空并设置环境变量 SMSBOWER_MAIL_API_KEY
+      api_base: https://smsbower.page
+      api_key: ""
+      # OpenAI / ChatGPT 邮件服务代码
+      service: dr
+      # 按以下顺序尝试；也可以只保留其中一种邮箱
+      domains:
+        - gmail.com
+        - icloud.com
+      # 单个邮箱最高价；留空表示不限价
+      max_price: ""
+      capacity: 0
+      mailboxes: ""
+
     # ---------- 域名邮箱（Freemail 兼容 API，自动创建）----------
     - type: domain_api
       enable: false
@@ -80,6 +101,8 @@ mail:
 
   request_timeout: 30
   wait_timeout: 90
+  # SMSBower 邮箱官方激活窗口约 3 分钟；低于 180 秒会自动提升到 180。
+  smsbower_wait_timeout: 180
   wait_interval: 3
   icloud_resync_interval: 15
 

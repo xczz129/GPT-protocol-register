@@ -12,13 +12,16 @@ import AppTag from "../../components/ui/AppTag.vue";
 import TaskForm from "./TaskForm.vue";
 import { useTasksStore } from "../../stores/tasks";
 import { useGroupsStore } from "../../stores/groups";
+import { useStatusStore } from "../../stores/status";
 import { useUiStore } from "../../stores/ui";
 import { useConfirm } from "../../composables/useConfirm";
 import { useCopy } from "../../composables/useCopy";
 import type { TaskCard } from "../../api/tasks";
+import type { MailProviderStatus } from "../../api/types";
 
 const tasks = useTasksStore();
 const groups = useGroupsStore();
+const status = useStatusStore();
 const ui = useUiStore();
 const confirm = useConfirm();
 const { copiedKey, copyText } = useCopy();
@@ -40,6 +43,9 @@ const jobDone = computed(
 );
 const jobPercent = computed(() =>
   tasks.job.total ? Math.round((jobDone.value * 100) / tasks.job.total) : 0,
+);
+const smsbowerMail = computed<MailProviderStatus>(() =>
+  (status.panel.mail?.providers || []).find((item) => item.type === "smsbower_mail") || { type: "smsbower_mail" },
 );
 
 function toggleExpand(id: string) {
@@ -148,6 +154,12 @@ onBeforeUnmount(() => {
 <template>
   <div class="tasks-page">
     <TaskForm />
+
+    <section class="pool-summary glass-panel" aria-label="邮箱池状态">
+      <span class="pool-summary-title">邮箱池</span>
+      <span class="pool-summary-item">总可用 <b>{{ status.panel.mail?.available ?? "—" }}</b></span>
+      <span class="pool-summary-item featured">SMSBower <b>{{ smsbowerMail.available ?? 0 }}</b> / {{ smsbowerMail.total ?? 0 }}</span>
+    </section>
 
     <!-- 运行控制条 -->
     <section v-if="tasks.job.running || tasks.job.total" class="job-panel glass-panel">
@@ -268,6 +280,51 @@ onBeforeUnmount(() => {
   font-size: 0.95rem;
   font-weight: 600;
   color: var(--text-primary);
+}
+
+.pool-summary {
+  min-height: 42px;
+  padding: 9px 14px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  color: var(--text-muted);
+  font-size: 0.74rem;
+}
+
+.pool-summary-title {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.pool-summary-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.pool-summary-item b {
+  color: var(--text-primary);
+  font-size: 0.82rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.pool-summary-item.featured {
+  margin-left: auto;
+  color: var(--accent);
+}
+
+@media (max-width: 480px) {
+  .pool-summary {
+    flex-wrap: wrap;
+    gap: 5px 12px;
+  }
+
+  .pool-summary-item.featured {
+    width: 100%;
+    margin-left: 0;
+  }
 }
 
 /* --- 运行控制 --- */

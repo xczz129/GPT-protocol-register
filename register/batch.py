@@ -31,6 +31,13 @@ from proxy_util import (
 )
 from register.sessions import JobCancelled, _default_stop_check
 from register.scheduling import build_registration_waves
+from register.mail_channel_options import (
+    is_smsbower_selected,
+    needs_dynamic_mail_coordinator,
+    smsbower_child_enabled,
+    validate_smsbower_job,
+)
+from register.smsbower_batch import run_dynamic_mail_groups
 from register.flow import register_one
 from register.protocol import repair_security_one
 from register.protocol_runtime import ProtocolRuntimeSettings
@@ -286,6 +293,7 @@ async def run_register(
         concurrency if concurrency is not None else reg_cfg.get("threads") or 1
     )
     conc = max(1, conc)
+    validate_smsbower_job(mail_config, provider_type, n, conc, fixed_email=fixed_email)
     timeout = int(reg_cfg.get("timeout") or REGISTER_TIMEOUT)
     max_retries = int(reg_cfg.get("max_transient_retries") or 2)
 
@@ -375,6 +383,12 @@ async def run_register(
             print(f"  [调度] 可用邮箱={available}/{pool_total}  总数={n}  并发={conc}")
 
     print("=" * 50)
+    if not fixed_email and is_smsbower_selected(provider_type):
+        if smsbower_child_enabled(mail_config):
+            n -= n % 2
+            if n < 2:
+                return []
+        conc = max(2, conc - conc % 2)
     engine_label = "GPT 会话内混合注册" if hybrid_mode else "GPT 全程指纹浏览器注册"
     print(f"  {engine_label}  总数={n} 并发={conc}  邮箱类型={mail_type}")
     if hybrid_mode:
@@ -401,7 +415,13 @@ async def run_register(
     # failure releases the persistent mailbox state, so allocating afresh on
     # every task would repeatedly select the first address when concurrency=1.
     planned_emails = available_emails[:n] if (not fixed_email or fixed_alias_batch) else []
-    schedule_emails = planned_emails or [str(fixed_email or "")] * n
+    if fixed_email and not fixed_alias_batch:
+        schedule_emails = [str(fixed_email)] * n
+    else:
+        # Dynamic providers contribute capacity without returning addresses up
+        # front. Keep one empty slot for every such task so create_mailbox()
+        # can allocate it at execution time.
+        schedule_emails = planned_emails + [""] * (n - len(planned_emails))
     task_waves = build_registration_waves(
         schedule_emails,
         conc,
@@ -473,10 +493,10 @@ async def run_register(
                 raise JobCancelled("stop requested")
             await asyncio.sleep(min(0.25, end - time.monotonic()))
 
-    async def _wait_if_paused(index: int) -> None:
+    async def _wait_if_paused(index: int, stop_override=None) -> None:
         logged = False
         while _paused():
-            if _stop() or (cancel_event is not None and cancel_event.is_set()):
+            if (callable(stop_override) and stop_override()) or _stop() or (cancel_event is not None and cancel_event.is_set()):
                 raise JobCancelled("stop requested")
             if not logged:
                 emit_task(index, "paused", step="任务派发已暂停")
@@ -492,20 +512,22 @@ async def run_register(
             i: int,
             start_barrier: asyncio.Barrier | None = None,
             paired_alias: bool = False,
+            mailbox_override: dict[str, Any] | None = None,
         ):
             async with sem:
+                cancellation = (mailbox_override or {}).get("_registration_cancel_event")
+                def task_stopped() -> bool:
+                    return bool(_stop()) or bool(cancel_event is not None and cancel_event.is_set()) or bool(cancellation is not None and cancellation.is_set())
                 task_group_id = (
                     str(group_plan[i - 1] or "").strip()
                     if isinstance(group_plan, list) and i <= len(group_plan)
                     else str(group_id or "").strip()
                 )
-                task_email = (
-                    planned_emails[i - 1]
-                    if i <= len(planned_emails)
-                    else fixed_email
-                )
+                task_email = schedule_emails[i - 1]
+                if mailbox_override is not None:
+                    task_email = str(mailbox_override.get("address") or "")
                 try:
-                    await _wait_if_paused(i)
+                    await _wait_if_paused(i, task_stopped)
                 except JobCancelled:
                     emit_task(i, "cancelled", step="暂停期间收到停止请求")
                     return
@@ -531,7 +553,7 @@ async def run_register(
                     emit_task(i, "failed", group_id=task_group_id, step="当前代理被限频，已跳过")
                     return
                 emit_task(i, "queued", group_id=task_group_id, step="等待执行")
-                if _stop() or (cancel_event is not None and cancel_event.is_set()):
+                if task_stopped():
                     print(f"  #{i} 已跳过（已请求停止）")
                     emit_task(i, "cancelled", step="已跳过（已请求停止）")
                     return
@@ -543,14 +565,15 @@ async def run_register(
                         emit_task(i, "cancelled", step="已跳过（已请求停止）")
                         return
                 record = None
+                skipped = False
                 security_completion_failed = False
                 for attempt in range(proxy_retry_limit + 1):
                     try:
-                        await _wait_if_paused(i)
+                        await _wait_if_paused(i, task_stopped)
                     except JobCancelled:
                         emit_task(i, "cancelled", step="暂停期间收到停止请求")
                         break
-                    if _stop() or (cancel_event is not None and cancel_event.is_set()):
+                    if task_stopped():
                         print(f"  #{i} 停止于第 {attempt + 1} 次尝试前")
                         emit_task(i, "cancelled", step=f"停止于第 {attempt + 1} 次尝试前")
                         break
@@ -573,7 +596,9 @@ async def run_register(
                     def attempt_event(
                         event_index: int, status: str | None = None, **fields: Any
                     ) -> None:
-                        nonlocal attempt_error
+                        nonlocal attempt_error, skipped
+                        if status == "skipped":
+                            skipped = True
                         detail = str(fields.get("error") or "").strip()
                         if detail:
                             attempt_error = detail.lower()
@@ -607,12 +632,13 @@ async def run_register(
                             provider_type=provider_type,
                             timeout=timeout,
                             keep_on_fail=keep_on_fail,
-                            stop_check=_stop,
+                            stop_check=task_stopped,
                             task_event=attempt_event,
                             c2a_config=c2a_cfg,
                             group_id=task_group_id,
                             hybrid_mode=hybrid_mode,
                             defer_success_event=post_security,
+                            **({"mailbox_override": mailbox_override} if mailbox_override is not None else {}),
                         )
                         if record and post_security:
                             email_value = str(record.get("email") or "").strip()
@@ -651,11 +677,12 @@ async def run_register(
                                         str(record.get("provider_type") or "").strip()
                                         or provider_type
                                     ),
-                                    stop_check=_stop,
+                                    stop_check=task_stopped,
                                     task_event=attempt_event,
                                     proxy_config=proxy_cfg,
                                     partial_sink=persist_security_partial,
                                     protocol_runtime=runtime,
+                                    **({"mailbox_override": mailbox_override} if mailbox_override is not None else {}),
                                 )
                                 record.update(security_fields)
                                 security_missing = []
@@ -739,6 +766,11 @@ async def run_register(
                             print(f"  #{i} 邮箱池已空，停止重试")
                             break
                     if record:
+                        if mailbox_override is not None and mailbox_override.get("provider") == "smsbower_mail":
+                            record.update(mailbox_role=str(mailbox_override.get("_smsbower_pair_role") or "primary"),
+                                          mailbox_base_address=str(mailbox_override.get("base_address") or mailbox_override.get("address") or ""),
+                                          mailbox_pair_id=str(mailbox_override.get("_smsbower_pair_id") or ""))
+                            record = upsert_account_record(record, ACCOUNTS_FILE)
                         em = ""
                         try:
                             em = str((record or {}).get("email") or "")
@@ -754,7 +786,15 @@ async def run_register(
                         break
                     if security_completion_failed:
                         break
-                    if _stop() or (cancel_event is not None and cancel_event.is_set()):
+                    if skipped:
+                        break
+                    if mailbox_override is not None and mailbox_override.get("provider") == "smsbower_mail" and (
+                        mailbox_override.get("_registration_identity_created")
+                        or mailbox_override.get("_smsbower_terminal_status")
+                        or mailbox_override.get("_registration_outcome") in {"already_registered", "otp_timeout"}
+                    ):
+                        break
+                    if task_stopped():
                         break
                     alias_pinned = fixed_alias_batch or paired_alias
                     if alias_pinned and not alias_proxy_retryable(attempt_error):
@@ -809,12 +849,17 @@ async def run_register(
                         except JobCancelled:
                             break
                 results[i - 1] = record
-                if not record and not (
-                    _stop() or (cancel_event is not None and cancel_event.is_set())
-                ):
+                if not record and not skipped and not task_stopped():
                     emit_task(i, "failed", step="任务失败")
 
+        dynamic_indices = {
+            index for index in range(1, n + 1)
+            if not schedule_emails[index - 1] and needs_dynamic_mail_coordinator(mail_config, provider_type)
+        }
         for wave_number, (indices, is_alias_pair) in enumerate(task_waves, start=1):
+            indices = [index for index in indices if index not in dynamic_indices]
+            if not indices:
+                continue
             if _stop() or (cancel_event is not None and cancel_event.is_set()):
                 break
             if is_alias_pair and wave_number > 1:
@@ -860,6 +905,18 @@ async def run_register(
                         pass
                     except Exception:
                         pass
+
+        if dynamic_indices and not (_stop() or (cancel_event is not None and cancel_event.is_set())):
+            async def run_allocated(index: int, mailbox: dict[str, Any]) -> None:
+                await run_one(index, paired_alias=True, mailbox_override=mailbox)
+
+            def emit_dynamic(index: int, status: str, **fields: Any) -> None:
+                task_group = str(group_plan[index - 1]) if isinstance(group_plan, list) and index <= len(group_plan) else str(group_id or "")
+                emit_task(index, status, group_id=task_group, **fields)
+
+            await run_dynamic_mail_groups(sorted(dynamic_indices), concurrency=conc, mail_config=mail_config, provider_type=provider_type,
+                                          run_account=run_allocated, result_at=lambda index: results[index - 1], emit=emit_dynamic,
+                                          stop_check=lambda: bool(_stop()) or bool(cancel_event is not None and cancel_event.is_set()), pause_check=_paused)
 
     ok = [r for r in results if r]
     if _stop() or (cancel_event is not None and cancel_event.is_set()):

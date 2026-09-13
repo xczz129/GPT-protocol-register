@@ -405,10 +405,18 @@ export async function refreshAtStop(jobId: string): Promise<RefreshAtProgress> {
 }
 
 /* --- 试用检测 --- */
-export async function trialStart(keys: string[], allAccounts: boolean, force: boolean, concurrency: number): Promise<TrialProgress> {
+export type TrialChannel = "v4" | "nerver";
+
+export async function trialStart(
+  keys: string[],
+  allAccounts: boolean,
+  force: boolean,
+  concurrency: number,
+  channel: TrialChannel = "v4",
+): Promise<TrialProgress> {
   return trialProgress(await api<BatchProgressResponse>("/api/accounts/trial-eligibility", {
     method: "POST",
-    body: jsonBody({ keys, all_accounts: allAccounts, force, concurrency }),
+    body: jsonBody({ keys, all_accounts: allAccounts, force, concurrency, channel: channel === "nerver" ? "nerver" : "v4" }),
   }));
 }
 

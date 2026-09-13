@@ -15,13 +15,21 @@ from common.proxy_clearance import clearance_error, refresh_clearance
 from common.session_export import build_account_record, parse_jwt_payload
 from common.totp import totp_code
 from common.team_workspace import select_team_workspace, validate_team_session, workspace_entries
+from common.mail_registration_metrics import begin_attempt
 from register.sessions import JobCancelled
-from mail import mark_mailbox_code_boundary, mark_mailbox_result, release_mailbox
+from mail import mark_mailbox_code_boundary, mark_mailbox_result, mark_smsbower_otp_accepted, release_mailbox
 from mail.parsing import CANONICAL_PROVIDER_TYPES, normalize_provider_type
 from proxy_util import proxy_brief
 from register.protocol_pkce import generate_pkce as _generate_pkce
 from register.protocol_sentinel import build_sentinel_with_so_token
 from register.protocol_runtime import current_runtime_settings
+from register.registration_outcome import (
+    RegisteredEmailDetected,
+    is_duplicate_registration_error,
+    registration_auth_state,
+    reject_registered_mailbox,
+    requires_fresh_registration,
+)
 
 from register.protocol_context import (
     PasswordResetRequired,
@@ -333,6 +341,7 @@ class PlatformRegistrar:
         *,
         start_only: bool = False,
         post_login_action: str = "",
+        registration_password_flow: bool = False,
     ) -> dict[str, Any]:
         """Finish the registered identity through ChatGPT NextAuth.
 
@@ -462,12 +471,13 @@ class PlatformRegistrar:
             "screen_hint": "login_or_signup",
             "login_hint": email,
         }
-        if str(password or "").strip():
+        if registration_password_flow or str(password or "").strip():
             # A login_hint identifies the account but does not require the
             # password connection.  Without this hint some existing accounts
             # are routed into email OTP and password/verify then fails with
             # invalid_state even though a password is stored locally.
             signin_params.update({"connection": "password", "max_age": "0"})
+        if str(password or "").strip():
             # ChatGPT uses the same NextAuth transaction for account
             # maintenance actions.  Keep this opt-in so registration and
             # ordinary credential login retain their existing query shape.
@@ -581,6 +591,11 @@ class PlatformRegistrar:
                 )
         final_url = str(getattr(authorize_response, "url", "") or "")
         auth_error = _auth_error_details_from_url(final_url)
+        if registration_password_flow and (
+            is_duplicate_registration_error(_response_json(authorize_response))
+            or is_duplicate_registration_error(auth_error)
+        ):
+            raise RegisteredEmailDetected("duplicate_identity_response", email=email)
         if (
             authorize_response is None
             or authorize_response.status_code >= 400
@@ -620,6 +635,7 @@ class PlatformRegistrar:
                 "authorize_url": authorize_url,
                 "final_url": final_url,
                 "device_id": self.device_id,
+                "page": _response_json(authorize_response).get("page") or {},
             }
 
         return self._read_chatgpt_session(email, password, index)
@@ -2451,6 +2467,7 @@ class PlatformRegistrar:
                         index,
                         allow_sentinel_retry=True,
                     )
+                    mark_smsbower_otp_accepted(mailbox)
                     break
                 except RuntimeError as error:
                     if (
@@ -2860,11 +2877,49 @@ class PlatformRegistrar:
             "mailbox_provider_ref": str(mailbox.get("provider_ref") or ""),
         }
 
+    def _check_fresh_registration(
+        self,
+        email: str,
+        mailbox: dict[str, Any],
+        initial_state: dict[str, Any],
+        index: int,
+    ) -> None:
+        """Stop purchased existing identities before password, OTP or login actions."""
+        if not requires_fresh_registration(mailbox):
+            return
+        state_data = initial_state if isinstance(initial_state, dict) else {}
+        if is_duplicate_registration_error(state_data):
+            reject_registered_mailbox(mailbox, "duplicate_identity_response")
+        continue_url, page_type = _auth_step_details(state_data)
+        route_url = str(continue_url or state_data.get("final_url") or "")
+        state = registration_auth_state(route_url, page_type)
+        if state == "existing":
+            reject_registered_mailbox(mailbox, "existing_password_login_route")
+        if state != "signup":
+            # Some NextAuth responses stop at the email identifier step. With
+            # the password connection selected, this only routes the identity;
+            # it does not verify a password or request passwordless OTP.
+            state_data = self._authorize_continue_login(
+                email, index, passwordless=False, restart_invalid_state=False,
+            )
+            if is_duplicate_registration_error(state_data):
+                reject_registered_mailbox(mailbox, "duplicate_identity_response")
+            continue_url, page_type = _auth_step_details(state_data)
+            state = registration_auth_state(continue_url, page_type)
+            if state == "existing":
+                reject_registered_mailbox(mailbox, "existing_password_login_route")
+            if state != "signup":
+                raise RuntimeError("registration_password_route_unavailable")
+            if continue_url:
+                self._navigate_auth_step(continue_url, f"{auth_base}/log-in", index)
+        step(index, "邮箱检测为新账号，继续设置密码并注册")
+
     def register(
         self,
         index: int,
         *,
         partial_sink: Callable[[dict[str, Any]], None] | None = None,
+        mailbox_override: dict[str, Any] | None = None,
     ) -> dict:
         def ensure_running() -> None:
             if _STOP_CHECK.get()():
@@ -2873,11 +2928,17 @@ class PlatformRegistrar:
         ensure_running()
         self._log_identity(index)
         step(index, "开始创建邮箱")
-        mailbox = create_mailbox(_FIXED_EMAIL.get(), register_proxy=self.proxy)
+        mailbox = (
+            mailbox_override
+            if mailbox_override is not None
+            else create_mailbox(_FIXED_EMAIL.get(), register_proxy=self.proxy)
+        )
         email = str(mailbox.get("address") or "").strip()
         if not email:
             release_mailbox(mailbox)
             raise RuntimeError("邮箱服务未返回 address")
+        if requires_fresh_registration(mailbox):
+            begin_attempt(mailbox)
         label = str(mailbox.get("label") or "")
         step(index, f"邮箱创建完成[{label}]: {email}")
         try:
@@ -2924,18 +2985,23 @@ class PlatformRegistrar:
             mark_mailbox_code_boundary(mailbox)
             mailbox["_registration_auth_started"] = True
             ensure_running()
-            self._complete_chatgpt_session(
+            initial_auth_state = self._complete_chatgpt_session(
                 email,
                 "",
                 index,
                 start_only=True,
+                **({"registration_password_flow": True} if requires_fresh_registration(mailbox) else {}),
             )
             ensure_running()
+            self._check_fresh_registration(email, mailbox, initial_auth_state, index)
             registration_password_result = self._set_registration_password(
                 email,
                 password_candidate,
                 index,
             )
+            # Later recovery may legitimately see the login route for the
+            # identity just created by this transaction. Never reclassify it.
+            mailbox["_registration_identity_created"] = True
             # user/register returns the next auth step rather than the
             # password itself. Keep the generated credential locally, then
             # follow email-otp/send in the same session before validating OTP.
@@ -2981,6 +3047,7 @@ class PlatformRegistrar:
                         index,
                         allow_sentinel_retry=True,
                     )
+                    mark_smsbower_otp_accepted(mailbox)
                     break
                 except RuntimeError as error:
                     if _is_wrong_email_otp_error(error) and otp_attempt + 1 < max_otp_attempts:
@@ -3075,13 +3142,14 @@ class PlatformRegistrar:
                 tokens = self._read_chatgpt_session(email, password, index)
                 ensure_running()
                 mailbox["_post_registration_otp_fallback"] = code
-                password = self._complete_post_registration_password(
-                    email,
-                    password_candidate,
-                    mailbox,
-                    index,
-                    skip_existing_password=True,
-                )
+                if not requires_fresh_registration(mailbox):
+                    password = self._complete_post_registration_password(
+                        email,
+                        password_candidate,
+                        mailbox,
+                        index,
+                        skip_existing_password=True,
+                    )
                 if registration_trace is not None:
                     registration_trace.set_secrets(password)
                 _add_task_event_secrets(password)
@@ -3134,16 +3202,21 @@ class PlatformRegistrar:
             if mailbox.get("_registration_auth_started"):
                 mark_mailbox_result(
                     mailbox,
-                    success=False,
+                    success=bool(mailbox.get("_otp_accepted_by_server")),
                     error="partial_registration_otp_already_sent",
                 )
             else:
                 release_mailbox(mailbox)
             raise
+        except RegisteredEmailDetected:
+            mailbox["_registration_outcome"] = RegisteredEmailDetected.code
+            mark_mailbox_result(mailbox, success=False, error=RegisteredEmailDetected.code)
+            step(index, "邮箱已被注册，已跳过并取消本次注册", "yellow")
+            raise
         except PasswordResetRequired as error:
             mark_mailbox_result(
                 mailbox,
-                success=False,
+                success=bool(mailbox.get("_otp_accepted_by_server")),
                 error=PasswordResetRequired.code,
             )
             step(
@@ -3153,7 +3226,20 @@ class PlatformRegistrar:
             )
             raise
         except Exception as error:
-            mark_mailbox_result(mailbox, success=False, error=error)
+            if (
+                requires_fresh_registration(mailbox)
+                and not mailbox.get("_registration_identity_created")
+                and is_duplicate_registration_error(error)
+            ):
+                mailbox["_registration_outcome"] = RegisteredEmailDetected.code
+                mark_mailbox_result(mailbox, success=False, error=RegisteredEmailDetected.code)
+                step(index, "邮箱已被注册，已跳过并取消本次注册", "yellow")
+                raise RegisteredEmailDetected("duplicate_identity_error", email=email) from error
+            mark_mailbox_result(
+                mailbox,
+                success=bool(mailbox.get("_otp_accepted_by_server")),
+                error=error,
+            )
             raise
         mark_mailbox_result(mailbox, success=True)
         final_state = (

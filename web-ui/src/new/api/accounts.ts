@@ -55,6 +55,7 @@ export interface AccountsPage {
 
 export interface HealthProgress {
   running: boolean;
+  channel: "v4" | "nerver";
   done: number;
   total: number;
   actualTotal: number;
@@ -84,19 +85,19 @@ export function fetchAccountsPage(limit: number, offset: number): Promise<Accoun
 }
 
 /* --- 测活 --- */
-export function startHealthCheck(keys: string[], deleteAll: boolean, workers: number) {
+export function startHealthCheck(keys: string[], deleteAll: boolean, workers: number, channel: "v4" | "nerver" = "v4") {
   return api<Record<string, unknown>>("/api/accounts/health", {
     method: "POST",
-    body: jsonBody({ keys, delete_all: deleteAll, workers }),
+    body: jsonBody({ keys, delete_all: deleteAll, workers, channel }),
   });
 }
 
-export function resumeHealthCheck(workers: number) {
-  return api<Record<string, unknown>>("/api/accounts/health/resume", { method: "POST", body: jsonBody({ workers }) });
+export function resumeHealthCheck(workers: number, channel: "v4" | "nerver" = "v4") {
+  return api<Record<string, unknown>>("/api/accounts/health/resume", { method: "POST", body: jsonBody({ workers, channel }) });
 }
 
 const emptyHealthProgress = (): HealthProgress => ({
-  running: false, done: 0, total: 0, actualTotal: 0, requested: 0, checked: 0,
+  running: false, channel: "v4", done: 0, total: 0, actualTotal: 0, requested: 0, checked: 0,
   usable: 0, alive: 0, limited: 0, invalid: 0, invalidOther: 0,
   reauthRequired: 0, error: 0, skippedKnownDeactivated: 0, pendingCount: 0,
   current: "", message: "", interrupted: false, workers: 0, requestedWorkers: 0,
@@ -121,6 +122,7 @@ export function normalizeHealthProgress(raw: Record<string, unknown> | null | un
     ...emptyHealthProgress(),
     ...value,
     running: Boolean(value.running),
+    channel: value.channel === "nerver" ? "nerver" : "v4",
     done, total, actualTotal, requested,
     checked: Math.min(total, number("checked", "checked", done)),
     usable: number("usable", "usable"), alive: number("alive", "alive"),

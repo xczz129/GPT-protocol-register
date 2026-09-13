@@ -19,6 +19,7 @@ import type { BatchKind } from "./BatchStartDialog.vue";
 
 const emit = defineEmits<{
   startBatch: [kind: BatchKind];
+  startHealth: [keys: string[]];
   codex: [];
 }>();
 
@@ -45,11 +46,8 @@ async function run(action: () => Promise<unknown>) {
 }
 
 function healthSelected() {
-  run(async () => {
-    await accounts.startHealth(accounts.selectedKeys, false, 20);
-    ui.notify(`已开始测活 ${count.value} 个账号`, "success");
-    accounts.clearSelection();
-  });
+  if (accounts.health.running || !accounts.selectedKeys.length) return;
+  emit("startHealth", [...accounts.selectedKeys]);
 }
 
 function copyTokens() {
@@ -139,7 +137,7 @@ function openStart(kind: BatchKind) {
       <span class="batch-count">已选 <b>{{ count }}</b> 个账号</span>
 
       <div class="batch-actions">
-        <AppButton variant="primary" size="sm" :disabled="busy" @click="healthSelected">
+        <AppButton variant="primary" size="sm" :disabled="busy || accounts.health.running" @click="healthSelected">
           <Activity :size="14" /><span>测活</span>
         </AppButton>
         <AppButton variant="ghost" size="sm" :disabled="busy || batch.codex.running || batch.codexStartBusy" title="设置选中账号的接码参数并预检" aria-label="设置选中账号的接码任务" @click="codexSelected">

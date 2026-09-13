@@ -48,12 +48,13 @@ async function resume() {
 
     <div class="health-stats">
       <span v-if="health.current">当前：{{ health.current }}</span>
+      <span>渠道 {{ health.channel === "nerver" ? "nerver" : "v4" }}</span>
       <span>请求 {{ health.requested || 0 }}</span>
       <span>实际检测 {{ health.checked ?? health.done ?? 0 }}</span>
       <span>跳过已封号 {{ health.skippedKnownDeactivated || 0 }}</span>
       <span class="ok">可用 {{ health.usable ?? health.alive ?? 0 }}</span>
       <span class="warn">待续期 {{ health.reauthRequired || 0 }}</span>
-      <span class="err">失效 {{ (health.invalid || 0) + (health.invalidOther || 0) }}</span>
+      <span class="err">失效 {{ health.invalid || 0 }}</span>
       <span class="err">错误 {{ health.error || 0 }}</span>
     </div>
   </section>

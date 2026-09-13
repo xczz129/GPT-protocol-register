@@ -6,7 +6,7 @@ import {
   fetchRefreshAtProgress, fetchTrialProgress, passwordChangeStart, preflightCodex, reauthByEmailStart, reauthStart,
   reauthStop, refreshAtStart, refreshAtStop, securityRepairStart, totpChangeStart, trialStart, trialStop,
   type CodexRunOptions, type CodexStatus, type ProtocolLoginStartResult, type ReauthProgress,
-  type RefreshAtProgress, type RelayAction, type RelayStrategy, type SmsOptions, type TrialProgress,
+  type RefreshAtProgress, type RelayAction, type RelayStrategy, type SmsOptions, type TrialChannel, type TrialProgress,
 } from "../api/batchops";
 
 export const useBatchOpsStore = defineStore("batchops", () => {
@@ -657,12 +657,18 @@ export const useBatchOpsStore = defineStore("batchops", () => {
     trialTimer = timer;
   }
 
-  async function startTrial(keys: string[], allAccounts: boolean, force: boolean, concurrency: number) {
+  async function startTrial(
+    keys: string[],
+    allAccounts: boolean,
+    force: boolean,
+    concurrency: number,
+    channel: TrialChannel = "v4",
+  ) {
     stopTrialPolling();
     trialDialogOpen.value = true;
     trialConnection.value = "connected";
     trialError.value = "";
-    Object.assign(trial, await trialStart(keys, allAccounts, force, concurrency));
+    Object.assign(trial, await trialStart(keys, allAccounts, force, concurrency, channel));
     startTrialPolling();
   }
 

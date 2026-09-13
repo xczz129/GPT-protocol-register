@@ -149,7 +149,7 @@ export const useAccountsStore = defineStore("accounts", () => {
 
   /* --- 测活进度 --- */
   const health = shallowRef<HealthProgress>({
-    running: false, done: 0, total: 0, actualTotal: 0, requested: 0, checked: 0,
+    running: false, channel: "v4", done: 0, total: 0, actualTotal: 0, requested: 0, checked: 0,
     usable: 0, alive: 0, limited: 0, invalid: 0, invalidOther: 0, reauthRequired: 0,
     error: 0, skippedKnownDeactivated: 0, pendingCount: 0, current: "", message: "",
     interrupted: false, workers: 0, requestedWorkers: 0, updates: {},
@@ -178,7 +178,9 @@ export const useAccountsStore = defineStore("accounts", () => {
 
   function scheduleHealthPoll() {
     clearHealthTimer();
-    if (!healthMonitoring || healthSubmitting.value) return;
+    // The health POST remains open until the whole check finishes. Progress
+    // must keep polling while that request is pending.
+    if (!healthMonitoring) return;
     const generation = healthGeneration;
     const delay = Math.min(10000, healthFailures ? 1000 * (2 ** Math.min(healthFailures - 1, 3)) : 700);
     healthTimer = setTimeout(() => {
@@ -265,20 +267,35 @@ export const useAccountsStore = defineStore("accounts", () => {
       await start();
       healthAwaitingStart = false;
       await requestHealthProgress(generation);
+    } catch (error) {
+      // A rejected POST may mean the server refused to start, or only that
+      // its response was lost while the worker keeps running. Reconcile with
+      // a fresh GET and stop ignoring the previous idle snapshot. Invalidate
+      // any GET sent before the rejection so it cannot undo that result.
+      healthAwaitingStart = false;
+      if (generation === healthGeneration) {
+        healthGeneration += 1;
+        clearHealthTimer();
+        healthInFlight?.controller.abort();
+        await requestHealthProgress(healthGeneration);
+      }
+      throw error;
     } finally {
       healthSubmitting.value = false;
       if (healthMonitoring) scheduleHealthPoll();
     }
   }
 
-  async function startHealth(keys: string[], deleteAll: boolean, workers = 20) {
+  async function startHealth(keys: string[], deleteAll: boolean, workers = 20, channel: "v4" | "nerver" = "v4") {
     const requested = deleteAll ? Math.max(activeCount.value, 1) : Math.max(keys.length, 1);
-    await launchHealth(() => startHealthCheck(keys, deleteAll, workers), requested, workers);
+    health.value = { ...health.value, channel };
+    await launchHealth(() => startHealthCheck(keys, deleteAll, workers, channel), requested, workers);
   }
 
-  async function resumeHealth(workers = 20) {
+  async function resumeHealth(workers = 20, channel: "v4" | "nerver" = health.value.channel) {
     const requested = Math.max(health.value.pendingCount, 1);
-    await launchHealth(() => resumeHealthCheck(workers), requested, workers);
+    health.value = { ...health.value, channel };
+    await launchHealth(() => resumeHealthCheck(workers, channel), requested, workers);
   }
 
   /* --- 删除后同步 --- */

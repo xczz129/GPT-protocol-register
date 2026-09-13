@@ -1,5 +1,6 @@
 /* --- 运维域 API：实时日志、运行统计、自动维护、备份恢复、回收站、接码设置 --- */
 import { api, apiUrl, jsonBody } from "./client";
+import type { MailRegistrationStats } from "../../shared/mailRegistration";
 
 /* --- 实时日志 --- */
 export function fetchLogs(params: { limit?: number; q?: string; level?: string } = {}): Promise<{ lines: string[] }> {
@@ -79,6 +80,7 @@ export interface BackupSchedule {
 
 export interface OperationsPayload {
   metrics: OperationsMetrics;
+  mail_registration?: MailRegistrationStats;
   mail: OperationsMail;
   accounts: OperationsAccounts;
   maintenance: MaintenanceSettings;

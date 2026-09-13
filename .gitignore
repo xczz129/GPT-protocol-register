@@ -49,7 +49,6 @@ data/panel_operations.json
 data/account_groups.json
 data/account_trash.json
 web-ui/node_modules/
-web/static/vue/assets/
 
 # process/runtime noise
 *.log

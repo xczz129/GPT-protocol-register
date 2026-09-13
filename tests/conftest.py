@@ -20,10 +20,15 @@ import pytest
 # 任务检查点(测活/检测试用/接码的重启恢复文件)必须与生产数据隔离:
 # 在任何被测模块导入 task_checkpoint 之前重定向到临时目录。
 os.environ.setdefault("TASK_CHECKPOINT_DIR", tempfile.mkdtemp(prefix="task-ckpt-"))
+os.environ.setdefault(
+    "MAIL_REGISTRATION_METRICS_DB",
+    os.path.join(tempfile.mkdtemp(prefix="mail-metrics-"), "metrics.sqlite3"),
+)
 
 
 @pytest.fixture(autouse=True)
 def _isolate_default_operation_log(tmp_path, monkeypatch):
+    monkeypatch.setenv("MAIL_REGISTRATION_METRICS_DB", str(tmp_path / "mail_metrics.sqlite3"))
     from common import account_operation_log as oplog
 
     original = oplog.append_operation_event

@@ -16,6 +16,8 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from common.mail_registration_metrics import get_summary as mail_registration_summary
+
 router = APIRouter()
 
 
@@ -634,6 +636,9 @@ async def operations():
         if not isinstance(payload, dict):
             payload = {}
         payload["metrics"] = _state()._current_operations_metrics()
+        # Independent durable counters must advance while the broader ops
+        # response is cached, just like the live worker metrics above.
+        payload["mail_registration"] = mail_registration_summary()
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         cache_status = _state().PANEL_RESPONSE_CACHE.status()
         return Response(
@@ -647,6 +652,13 @@ async def operations():
         )
 
     return await asyncio.to_thread(_response)
+
+
+@router.get("/api/operations/mail-registration-stats")
+async def mail_registration_stats(provider: str = "smsbower_mail"):
+    if provider != "smsbower_mail":
+        raise HTTPException(400, "邮箱注册统计仅支持 SMSBower 渠道")
+    return await asyncio.to_thread(mail_registration_summary, provider)
 
 
 class UiSettingsUpdate(BaseModel):

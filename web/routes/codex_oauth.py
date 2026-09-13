@@ -21,7 +21,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -297,6 +297,12 @@ class _SmsCancelled(RuntimeError):
     pass
 
 
+class _SmsAuthSessionExpired(RuntimeError):
+    """The current OAuth client cannot continue its sign-in session."""
+
+    pass
+
+
 def _launch_batch(target, args: tuple, *, batch_id: str, stop_event: threading.Event, name: str) -> None:
     try:
         threading.Thread(target=target, args=args, name=name, daemon=True).start()
@@ -430,6 +436,37 @@ def _phone_requirement(data: Any) -> tuple:
     if "workspace" in page_type.lower() or "consent" in page_type.lower():
         return False, page_type
     return None, step
+
+
+def _phone_navigation_url(*responses: Any) -> str:
+    """Read the actual MFA navigation hint, never its human-readable reason."""
+    for data in responses:
+        if not isinstance(data, dict):
+            continue
+        page = data.get("page") if isinstance(data.get("page"), dict) else {}
+        payload = page.get("payload") if isinstance(page.get("payload"), dict) else {}
+        for value in (data.get("continue_url"), payload.get("url")):
+            raw = str(value or "").strip()
+            if not raw:
+                continue
+            target = urljoin("https://auth.openai.com/", raw)
+            parsed = urlparse(target)
+            if parsed.scheme == "https" and parsed.netloc.lower() == "auth.openai.com":
+                return target
+    return "https://auth.openai.com/add-phone"
+
+
+def _signin_session_expired(error: BaseException | str) -> bool:
+    text = str(error or "").lower().replace("_", "-")
+    return any(
+        marker in text
+        for marker in (
+            "sign-in session is no longer valid",
+            "sign in session is no longer valid",
+            "signin session is no longer valid",
+            "sign-in-session-is-no-longer-valid",
+        )
+    )
 
 
 def _known_sms_country(value: str) -> bool:
@@ -732,6 +769,9 @@ _MFA_CODE_RETRIES = 3
 # Route/TLS failures are independent from the paid phone-number budget.  A
 # single configured phone attempt must still get a few fresh HTTP sessions.
 _NETWORK_RETRIES = 3
+# Two consecutive stale sign-in sessions are enough evidence to stop this
+# account.  They must not consume a large operator-configured number budget.
+_SESSION_FAILURE_LIMIT = 2
 
 
 def _mfa_code_error(error: BaseException | str) -> bool:
@@ -867,7 +907,8 @@ def _process_one(
     last_error = ""
     mfa_code_failures = 0
     network_failures = 0
-    for attempt in range(1, rounds + _NETWORK_RETRIES + 1 + _MFA_CODE_RETRIES):
+    session_failures = 0
+    for attempt in range(1, rounds + _NETWORK_RETRIES + 1 + _MFA_CODE_RETRIES + _SESSION_FAILURE_LIMIT):
         if stop_event.is_set():
             raise _SmsCancelled("任务已停止")
         # 接码流程不再走注册代理,统一本地直连
@@ -898,6 +939,9 @@ def _process_one(
                 mfa_data = {}
             if not isinstance(mfa_data, dict):
                 mfa_data = {}
+            if not mfa_data:
+                fallback_data = getattr(client, "last_auth_response", None)
+                mfa_data = dict(fallback_data) if isinstance(fallback_data, dict) else {}
             phone_used = ""
             phone_required, reason = _phone_requirement(mfa_data)
             if phone_required is True:
@@ -906,13 +950,21 @@ def _process_one(
                     raise RuntimeError("需要手机验证,但接码未启用或未配置")
                 # OpenAI 2026-09 起校验页面导航:先进入 add-phone 页面,
                 # 否则 add-phone/send 直接 409 session invalid
-                nav_url = str(reason or "").strip()
-                if nav_url.startswith("http"):
-                    try:
-                        client.navigate(nav_url)
-                        log("已进入手机验证页面")
-                    except Exception as exc:
-                        log(f"进入手机验证页面失败({str(exc)[:100]})", "warning")
+                nav_url = _phone_navigation_url(
+                    mfa_data, getattr(client, "last_auth_response", None)
+                )
+                stage("phone_navigation", "正在进入手机验证页面")
+                try:
+                    client.navigate(nav_url)
+                except Exception as exc:
+                    # Navigation establishes the server-side phone auth step.
+                    # Buying a number after it fails only spends the phone
+                    # budget against a session that cannot accept that number.
+                    log(f"手机验证页面导航失败，未获取号码: {str(exc)[:160]}", "warning")
+                    if _signin_session_expired(exc):
+                        raise _SmsAuthSessionExpired(str(exc)) from exc
+                    raise RuntimeError(f"phone_navigation_failed: {exc}") from exc
+                log("已进入手机验证页面")
                 # MFA/login retries do not grant extra paid number attempts.
                 if len(phone_attempts) >= rounds:
                     raise RuntimeError(f"已达到最多 {rounds} 次取号上限")
@@ -964,20 +1016,34 @@ def _process_one(
                 except Exception as exc:
                     last_error = str(exc)
                     cancelled = stop_event.is_set() or isinstance(exc, _SmsCancelled)
+                    stale_session = isinstance(exc, _SmsAuthSessionExpired) or _signin_session_expired(exc)
                     # Successful phone verification remains successful even if
                     # the provider's finish request subsequently fails.
                     if phone_attempt["result"] != "success":
-                        phone_attempt["result"] = "cancelled" if cancelled else "failed"
+                        phone_attempt["result"] = (
+                            "cancelled" if cancelled else ("session_invalid" if stale_session else "failed")
+                        )
                     # 号码不可用:取消激活,会话作废,由外层重新登录换号。
                     try:
                         sms.cancel(activation)
-                        log("号码已取消,重新登录换号", "warning")
+                        log(
+                            "登录会话已失效，当前号码已取消，准备重建授权会话"
+                            if stale_session else "号码已取消,重新登录换号",
+                            "warning",
+                        )
                     except Exception:
-                        log("号码取消失败(继续换号)", "warning")
-                    log(f"号码 {activation.phone} 失败: {last_error[:200]}", "warning")
+                        log(
+                            "登录会话已失效，当前号码取消失败，请核对供应商记录"
+                            if stale_session else "号码取消失败(继续换号)",
+                            "warning",
+                        )
+                    if not stale_session:
+                        log(f"号码 {activation.phone} 失败: {last_error[:200]}", "warning")
                     _set_sms_item(email, batch_id, wait_deadline=None)
                     if cancelled:
                         raise _SmsCancelled("任务已停止") from exc
+                    if stale_session:
+                        raise _SmsAuthSessionExpired(last_error) from exc
                     if len(phone_attempts) >= rounds:
                         raise RuntimeError(f"取号 {len(phone_attempts)}/{rounds} 次均未完成: {last_error[:160]}") from exc
                     continue
@@ -1037,6 +1103,22 @@ def _process_one(
             last_error = str(exc)
             if stop_event.is_set() or isinstance(exc, _SmsCancelled):
                 raise _SmsCancelled("任务已停止") from exc
+            if isinstance(exc, _SmsAuthSessionExpired) or _signin_session_expired(exc):
+                session_failures += 1
+                if session_failures >= _SESSION_FAILURE_LIMIT:
+                    message = (
+                        f"signin_session_invalid: 连续 {session_failures} 次登录会话失效，"
+                        "已停止此账号，避免继续获取号码"
+                    )
+                    log(message, "error")
+                    raise RuntimeError(message) from exc
+                log(
+                    f"登录会话失效，关闭旧客户端后重建全新授权会话 "
+                    f"({session_failures}/{_SESSION_FAILURE_LIMIT})",
+                    "warning",
+                )
+                stage("session_retry", "登录会话失效，准备重新登录")
+                continue
             if len(phone_attempts) >= rounds:
                 raise
             if _proxy_retryable_error(exc) and network_failures < _NETWORK_RETRIES:
@@ -1793,6 +1875,113 @@ def _validate_import_identity(account: dict, candidate: dict) -> dict[str, str]:
     return identity
 
 
+def _health_failure_detail(value: Any) -> str:
+    """Return bounded health error text without exposing credentials."""
+    if isinstance(value, BaseException):
+        return str(value)[:400]
+    if not isinstance(value, dict):
+        return str(value or "")[:400]
+    return " | ".join(
+        str(value.get(key) or "").strip()
+        for key in ("health_error", "health_probe_error", "last_token_refresh_error")
+        if str(value.get(key) or "").strip()
+    )[:400]
+
+
+def _health_failure_is_explicit(value: Any) -> bool:
+    """Reject a health result that explicitly invalidates the credential."""
+    from common.account_health import AccountDeactivatedError, InvalidAccessTokenError
+    from common.account_store import account_is_deactivated
+
+    if isinstance(value, (AccountDeactivatedError, InvalidAccessTokenError)):
+        return True
+    if isinstance(value, dict):
+        state = str(value.get("health_status") or "").strip().lower()
+        if state in {"invalid", "reauth_required"} or account_is_deactivated(value):
+            return True
+    detail = _health_failure_detail(value).lower()
+    return any(
+        marker in detail
+        for marker in (
+            "account_deactivated",
+            "account deactivated",
+            "token_invalidated",
+            "token invalidated",
+            "invalid access token",
+            "invalid_access_token",
+            "oauth_refresh_http_401",
+            "nextauth_session_http_401",
+            "session ended",
+        )
+    )
+
+
+def _health_failure_is_network(value: Any) -> bool:
+    """Allow only route/edge failures to be persisted as unknown/pending."""
+    from common.account_health import HealthTransientError
+
+    if _health_failure_is_explicit(value):
+        return False
+    if isinstance(value, HealthTransientError):
+        return True
+    detail = _health_failure_detail(value).lower()
+    if not detail:
+        return False
+    # Keep this classifier deliberately narrow: a successful protocol login
+    # must not be admitted merely because an identity or token validation
+    # raised an arbitrary exception.
+    return any(
+        marker in detail
+        for marker in (
+            "curl:",
+            "proxy",
+            "tls",
+            "ssl",
+            "handshake",
+            "timed out",
+            "timeout",
+            "connection reset",
+            "connection aborted",
+            "connection closed",
+            "unexpected eof",
+            "gateway timeout",
+            "health_edge_blocked",
+            "health_http_408",
+            "health_http_425",
+            "health_http_429",
+            "health_http_500",
+            "health_http_502",
+            "health_http_503",
+            "health_http_504",
+            "nextauth_session_http_408",
+            "nextauth_session_http_425",
+            "nextauth_session_http_429",
+            "nextauth_session_http_5",
+            "nextauth_session_edge_blocked",
+            "nextauth_session_invalid_json",
+            "nextauth_session_missing_access_token",
+            "route_retry_pending",
+            "network",
+        )
+    )
+
+
+def _mark_import_health_pending(refreshed: dict, detail: str) -> dict:
+    """Preserve credentials while making an inconclusive probe explicit."""
+    pending = dict(refreshed)
+    pending.update(
+        {
+            "status": "待复测",
+            "health_status": "unknown",
+            "health_error": "",
+            "health_probe_error": str(detail or "导入后测活线路异常，待复测")[:400],
+            # An inconclusive probe is not a completed health result.
+            "health_checked_at": "",
+        }
+    )
+    return pending
+
+
 def _persist_imported_account(
     account: dict, tokens: dict, log
 ) -> dict:
@@ -1859,12 +2048,20 @@ def _persist_imported_account(
     try:
         checked = check_account(refreshed, persist=False, path=_state().ACCOUNTS_FILE)
     except Exception as exc:
-        log(f"导入后测活失败,账号仅入库标记待续期: {exc}", "warning")
-        checked = {**refreshed, "health_status": "unknown", "health_error": ""}
+        if not _health_failure_is_network(exc):
+            raise
+        detail = _health_failure_detail(exc)
+        log(f"导入后测活网络失败，账号先入库为待复测: {detail}", "warning")
+        checked = _mark_import_health_pending(refreshed, detail)
     else:
-        if _state().normalized_health_status(checked) not in {"alive", "limited"}:
-            detail = str(checked.get("health_error") or "导入后测活失败")
-            raise RuntimeError(detail[:400])
+        state = _state().normalized_health_status(checked)
+        if state not in {"alive", "limited"}:
+            if _health_failure_is_explicit(checked) or not _health_failure_is_network(checked):
+                detail = _health_failure_detail(checked) or "导入后测活失败"
+                raise RuntimeError(detail[:400])
+            detail = _health_failure_detail(checked)
+            log(f"导入后测活网络失败，账号先入库为待复测: {detail}", "warning")
+            checked = _mark_import_health_pending(checked, detail)
     _validate_import_identity(
         {"email": account["email"], "user_id": login_identity["user_id"]}, checked,
     )

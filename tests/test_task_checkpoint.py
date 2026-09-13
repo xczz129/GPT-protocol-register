@@ -105,10 +105,13 @@ class TestHealthCheckpoint:
     def test_begin_persists_running_checkpoint(
         self, ckpt_dir, web_app_mod, reset_health_state
     ):
-        web_app_mod._account_health_checkpoint_begin(["k1", "k2"], workers=5)
+        web_app_mod._account_health_checkpoint_begin(
+            ["k1", "k2"], workers=5, channel="nerver"
+        )
         ck = task_checkpoint.load_checkpoint("health_check")
         assert ck["running"] is True
         assert ck["params"]["keys"] == ["k1", "k2"]
+        assert ck["params"]["channel"] == "nerver"
         assert ck["done_keys"] == []
 
     def test_restore_interrupted(
@@ -121,7 +124,11 @@ class TestHealthCheckpoint:
                 "task_type": "health_check",
                 "running": True,
                 "completed": False,
-                "params": {"keys": ["k1", "k2", "k3"], "workers": 10},
+                "params": {
+                    "keys": ["k1", "k2", "k3"],
+                    "workers": 10,
+                    "channel": "nerver",
+                },
                 "done_keys": ["k1"],
                 "snapshot": {
                     "running": True,
@@ -141,6 +148,7 @@ class TestHealthCheckpoint:
         assert snap["interrupted"] is True
         assert snap["pending_keys"] == ["k2", "k3"]
         assert snap["pending_count"] == 2
+        assert snap["channel"] == "nerver"
         assert "服务重启" in snap["message"]
 
     def test_restore_skips_completed(
@@ -261,6 +269,46 @@ class TestTrialCheckpoint:
         assert [item["key"] for item in job["items"]] == ["k2", "k3"]
         assert job["pending_keys"] == ["k2", "k3"]
         assert [item["email"] for item in job["items"]] == ["b@x.com", "c@x.com"]
+
+    def test_stopped_job_checkpoint_remains_resumable(
+        self, ckpt_dir, reset_trial_state, monkeypatch
+    ):
+        import common.trial_eligibility_jobs as tej
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def fake_check(_record, proxy="", direct=False):
+            started.set()
+            release.wait(timeout=10)
+            raise RuntimeError("stopped in test")
+
+        monkeypatch.setattr(tej, "check_trial_eligibility", fake_check)
+        records = [
+            self._record("k1", "a@x.com"),
+            self._record("k2", "b@x.com"),
+            self._record("k3", "c@x.com"),
+        ]
+        job = tej.TRIAL_ELIGIBILITY_JOBS.start(records, concurrency=1)
+        assert started.wait(timeout=3)
+        tej.TRIAL_ELIGIBILITY_JOBS.stop(job["job_id"])
+        release.set()
+        assert tej.TRIAL_ELIGIBILITY_JOBS.wait(job["job_id"], 10)
+
+        checkpoint = task_checkpoint.load_checkpoint("trial_eligibility")
+        assert checkpoint is not None
+        assert checkpoint["running"] is False
+        assert checkpoint["completed"] is False
+        assert len(checkpoint["done_keys"]) < len(checkpoint["keys"])
+
+        with tej.TRIAL_ELIGIBILITY_JOBS.lock:
+            tej.TRIAL_ELIGIBILITY_JOBS.jobs.clear()
+            tej.TRIAL_ELIGIBILITY_JOBS.active_job_id = ""
+        tej._restore_trial_eligibility_checkpoint()
+        restored = tej.TRIAL_ELIGIBILITY_JOBS.active()
+        assert restored["status"] == "interrupted"
+        assert restored["interrupted"] is False
+        assert restored["pending_keys"]
 
     def test_interrupted_job_does_not_block_start(
         self, ckpt_dir, reset_trial_state, monkeypatch

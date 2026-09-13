@@ -176,15 +176,22 @@ class SessionRefreshJobsTest(unittest.TestCase):
             {**self._record("banned@example.com", old_exp=time.time() - 10), "is_deactivated": True},
             self._record("nosession@example.com", old_exp=time.time() - 10, session=""),
         ]
-        with patch.object(
-            sr,
-            "update_account_record_fields",
-            side_effect=lambda updates, **_k: (1, []),
+        with (
+            patch.object(
+                sr,
+                "refresh_session_via_service",
+                side_effect=sr.SessionRefreshError("synthetic refresh failure"),
+            ),
+            patch.object(
+                sr,
+                "update_account_record_fields",
+                side_effect=lambda updates, **_k: (1, []),
+            ),
         ):
             job = jobs.start(records, concurrency=1)
-        self.assertEqual(job["total"], 1)
-        self.assertEqual(job["items"][0]["email"], "ok@example.com")
-        jobs.wait(job["job_id"], 5)
+            self.assertEqual(job["total"], 1)
+            self.assertEqual(job["items"][0]["email"], "ok@example.com")
+            self.assertTrue(jobs.wait(job["job_id"], 5))
 
     def test_start_rejects_empty_selection(self):
         jobs = sr.SessionRefreshJobs()

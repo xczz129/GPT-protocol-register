@@ -25,6 +25,7 @@ def _state() -> Any:
 
 class AccountHealthRequest(BulkDeleteRequest):
     workers: int = Field(10, ge=1, le=20)
+    channel: str = "v4"
 
 
 def _normalize_channel(value: Any) -> str:
@@ -351,6 +352,7 @@ def _account_health_response(result: dict, requested: int) -> dict:
     include_rows = requested <= _state()._ACCOUNT_HEALTH_INLINE_UPDATE_LIMIT
     return {
         "ok": True,
+        "channel": result.get("channel", "v4"),
         "requested": result["requested"],
         "actual_total": result["actual_total"],
         "checked": result["checked"],
@@ -378,69 +380,130 @@ def _account_health_response(result: dict, requested: int) -> dict:
     }
 
 
-@router_health.post("/api/accounts/health")
-async def accounts_health(body: AccountHealthRequest):
+# Keep a strong reference after a request disconnects. ``asyncio.shield``
+# prevents request cancellation from cancelling the thread's task, while the
+# worker remains responsible for progress finalization and releasing its slot.
+_HEALTH_REQUEST_TASKS: set[asyncio.Task] = set()
+
+
+def _health_request_task_done(task: asyncio.Task) -> None:
+    _HEALTH_REQUEST_TASKS.discard(task)
+    if not task.cancelled():
+        # A disconnected caller no longer retrieves exceptions from the task.
+        task.exception()
+
+
+def _run_account_health_worker(
+    state: Any, *, records: list[Any], keys: list[str], workers: int,
+    channel: str,
+) -> dict[str, Any]:
     from common.account_health import check_accounts
 
+    result = None
+    message = ""
+    try:
+        result = check_accounts(
+            records=records,
+            keys=keys,
+            workers=workers,
+            channel=channel,
+            completion_callback=state._update_account_health_progress,
+            item_callback=state._mark_account_health_persisted,
+            worker_limit=state._account_health_worker_limit,
+            proxy_candidates=state._current_health_proxy_pool(),
+        )
+        return result
+    except BaseException as error:
+        message = str(error)
+        raise
+    finally:
+        try:
+            state._finish_account_health_progress(result=result, message=message)
+        finally:
+            state._ACCOUNT_HEALTH_RUN_LOCK.release()
+
+
+async def _run_account_health_batch(
+    state: Any, *, records: list[Any], keys: list[str], workers: int,
+    probe_records: list[Any], skipped_records: list[Any], channel: str = "v4",
+) -> dict[str, Any]:
+    channel = _normalize_channel(channel)
+    if not state._ACCOUNT_HEALTH_RUN_LOCK.acquire(blocking=False):
+        raise HTTPException(409, "账号测活或自动维护正在运行，请等待当前任务完成")
+    progress_started = False
+    try:
+        if state._account_health_progress_snapshot(include_updates=False).get("running"):
+            raise HTTPException(409, "账号批量测活正在运行，请等待当前任务完成")
+        state._start_account_health_progress(
+            len(probe_records),
+            workers,
+            requested=len(probe_records) + len(skipped_records),
+            skipped_known_deactivated=len(skipped_records),
+            channel=channel,
+        )
+        progress_started = True
+        state._account_health_checkpoint_begin(
+            [account_delete_key(record) for record in [*probe_records, *skipped_records]],
+            workers=workers,
+            channel=channel,
+        )
+        task = asyncio.create_task(asyncio.to_thread(
+            _run_account_health_worker,
+            state,
+            records=records,
+            keys=keys,
+            workers=workers,
+            channel=channel,
+        ))
+        _HEALTH_REQUEST_TASKS.add(task)
+        task.add_done_callback(_health_request_task_done)
+    except BaseException as error:
+        try:
+            if progress_started:
+                state._finish_account_health_progress(message=str(error))
+        finally:
+            state._ACCOUNT_HEALTH_RUN_LOCK.release()
+        raise
+    return await asyncio.shield(task)
+
+
+@router_health.post("/api/accounts/health")
+async def accounts_health(body: AccountHealthRequest):
+    state = _state()
     if not body.delete_all and not body.keys:
         raise HTTPException(400, "请选择要测活的账号，或明确使用全部测活")
     if body.delete_all:
-        records = await asyncio.to_thread(_state()._load_accounts)
+        records = await asyncio.to_thread(state._load_accounts)
         keys = []
     else:
         # 按需查询:省掉全量加载(7000+ 行)的固定秒级开销
         records_by_key = await asyncio.to_thread(
-            _state()._records_by_keys_with_fallback, body.keys
+            state._records_by_keys_with_fallback, body.keys
         )
         records = list(records_by_key.values())
         keys = body.keys
-    probe_records, skipped_records = _state().select_health_check_records(records, keys=keys)
+    probe_records, skipped_records = state.select_health_check_records(records, keys=keys)
     requested = len(probe_records) + len(skipped_records)
-    actual_total = len(probe_records)
     if not requested:
         raise HTTPException(404, "没有匹配到可测活的账号记录")
-    if _state()._account_health_progress_snapshot(include_updates=False).get("running"):
-        raise HTTPException(409, "账号批量测活正在运行，请等待当前任务完成")
-    _state()._start_account_health_progress(
-        actual_total,
-        body.workers,
-        requested=requested,
-        skipped_known_deactivated=len(skipped_records),
+    result = await _run_account_health_batch(
+        state, records=records, keys=keys, workers=body.workers,
+        probe_records=probe_records, skipped_records=skipped_records,
+        channel=_normalize_channel(body.channel),
     )
-    _state()._account_health_checkpoint_begin(
-        [account_delete_key(record) for record in [*probe_records, *skipped_records]],
-        workers=body.workers,
-    )
-    try:
-        result = await asyncio.to_thread(
-            check_accounts,
-            records=records,
-            keys=keys,
-            workers=body.workers,
-            item_callback=_state()._update_account_health_progress,
-            worker_limit=_state()._account_health_worker_limit,
-            proxy_candidates=_state()._current_health_proxy_pool(),
-        )
-    except asyncio.CancelledError:
-        _state()._finish_account_health_progress(message="测活请求已取消")
-        raise
-    except Exception as error:
-        _state()._finish_account_health_progress(message=str(error))
-        raise
-    _state()._finish_account_health_progress(result=result)
     return _account_health_response(result, requested)
 
 
 class AccountHealthResumeRequest(BaseModel):
     workers: int = Field(10, ge=1, le=20)
+    channel: str | None = None
 
 
 @router_health.post("/api/accounts/health/resume")
 async def accounts_health_resume(body: AccountHealthResumeRequest):
     """续跑被打断/已停止的测活任务(只测剩余账号)。"""
-    from common.account_health import check_accounts
-
-    snapshot = _state()._account_health_progress_snapshot(include_updates=False)
+    state = _state()
+    snapshot = state._account_health_progress_snapshot(include_updates=False)
     if snapshot.get("running"):
         raise HTTPException(409, "账号批量测活正在运行，请等待当前任务完成")
     keys = [
@@ -450,41 +513,19 @@ async def accounts_health_resume(body: AccountHealthResumeRequest):
     ]
     if not keys:
         raise HTTPException(400, "没有可续跑的账号（任务未中断或已全部完成）")
-    records = await asyncio.to_thread(_state()._load_accounts)
-    probe_records, skipped_records = _state().select_health_check_records(
+    channel = _normalize_channel(body.channel or snapshot.get("channel"))
+    records = await asyncio.to_thread(state._load_accounts)
+    probe_records, skipped_records = state.select_health_check_records(
         records, keys=keys
     )
     requested = len(probe_records) + len(skipped_records)
-    actual_total = len(probe_records)
     if not requested:
         raise HTTPException(404, "剩余账号已不在库中（可能已被删除）")
-    _state()._start_account_health_progress(
-        actual_total,
-        body.workers,
-        requested=requested,
-        skipped_known_deactivated=len(skipped_records),
+    result = await _run_account_health_batch(
+        state, records=records, keys=keys, workers=body.workers,
+        probe_records=probe_records, skipped_records=skipped_records,
+        channel=channel,
     )
-    _state()._account_health_checkpoint_begin(
-        [account_delete_key(record) for record in [*probe_records, *skipped_records]],
-        workers=body.workers,
-    )
-    try:
-        result = await asyncio.to_thread(
-            check_accounts,
-            records=records,
-            keys=keys,
-            workers=body.workers,
-            item_callback=_state()._update_account_health_progress,
-            worker_limit=_state()._account_health_worker_limit,
-            proxy_candidates=_state()._current_health_proxy_pool(),
-        )
-    except asyncio.CancelledError:
-        _state()._finish_account_health_progress(message="测活请求已取消")
-        raise
-    except Exception as error:
-        _state()._finish_account_health_progress(message=str(error))
-        raise
-    _state()._finish_account_health_progress(result=result)
     return _account_health_response(result, requested)
 
 

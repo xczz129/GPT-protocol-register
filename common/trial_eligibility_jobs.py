@@ -60,7 +60,9 @@ class TrialEligibilityJobs:
             self._checkpoint_task, interval=2.0
         )
 
-    def _checkpoint_payload(self, job_id: str, running: bool) -> dict[str, Any]:
+    def _checkpoint_payload(
+        self, job_id: str, running: bool, *, completed: bool = False,
+    ) -> dict[str, Any]:
         with self.lock:
             job = self.jobs.get(job_id) or {}
             items = job.get("items") or []
@@ -69,7 +71,10 @@ class TrialEligibilityJobs:
             "version": 1,
             "task_type": self._checkpoint_task,
             "running": bool(running),
-            "completed": not running,
+            # A stopped job is not complete: its unfinished keys must remain
+            # restorable after a service restart. Successful jobs clear the
+            # checkpoint instead of writing a completed payload.
+            "completed": bool(completed),
             "keys": [str(item.get("key") or "") for item in items],
             "emails": [str(item.get("email") or "") for item in items],
             "done_keys": sorted(self._checkpoint_done),

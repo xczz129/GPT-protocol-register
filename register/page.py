@@ -10,7 +10,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -20,6 +20,13 @@ from common.browser import react_fill, js_click
 from register.cf import _switch_cf_node
 from register.log import _log
 from register.util import ROOT as PROJECT_ROOT, _COOKIE_BTNS
+from register.registration_outcome import (
+    RegisteredEmailDetected,
+    is_duplicate_registration_error,
+    registration_auth_state,
+    reject_registered_mailbox,
+    requires_fresh_registration,
+)
 
 ROOT = PROJECT_ROOT
 
@@ -107,11 +114,96 @@ def _is_verify_url(url: str) -> bool:
 
 
 def _is_existing_account_password_url(url: str) -> bool:
-    u = (url or "").lower()
-    return (
-        any(marker in u for marker in ("/log-in/password", "/login/password", "/sign-in/password"))
-        and "create-account" not in u
-    )
+    return registration_auth_state(url) == "existing" and urlsplit(url).path.rstrip("/").lower() in {
+        "/log-in/password", "/login/password", "/sign-in/password",
+    }
+
+
+def password_registration_signin_url(url: str, email: str) -> str:
+    """Keep the browser's NextAuth transaction, selecting its password connection."""
+    parsed = urlsplit(url)
+    if parsed.scheme != "https" or parsed.netloc != "chatgpt.com" or parsed.path != "/api/auth/signin/openai":
+        return url
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query.update({
+        "connection": "password", "max_age": "0",
+        "screen_hint": "login_or_signup", "login_hint": email,
+    })
+    return urlunsplit(parsed._replace(query=urlencode(query)))
+
+
+async def install_fresh_registration_guard(context, mailbox: dict) -> None:
+    """Observe the auth API before the UI can act on an existing-account response."""
+    if not requires_fresh_registration(mailbox):
+        return
+
+    async def route_auth(route):
+        request = route.request
+        parsed = urlsplit(str(request.url or ""))
+        if parsed.netloc == "chatgpt.com":
+            await route.continue_(url=password_registration_signin_url(
+                request.url, str(mailbox.get("address") or ""),
+            ))
+            return
+        path = parsed.path.rstrip("/")
+        identity_created = bool(mailbox.get("_registration_identity_created"))
+        if identity_created:
+            await route.continue_()
+            return
+        referer = str((request.headers or {}).get("referer") or "")
+        if registration_auth_state(referer) == "existing":
+            mailbox["_registration_outcome"] = RegisteredEmailDetected.code
+        if mailbox.get("_registration_outcome") == RegisteredEmailDetected.code:
+            await route.abort("blockedbyclient")
+            return
+        if path.startswith((
+            "/api/accounts/password/", "/api/accounts/passwordless/",
+            "/api/accounts/email-otp/",
+        )) or path == "/api/accounts/create_account":
+            mailbox["_registration_guard_error"] = "registration_password_route_unavailable"
+            await route.abort("blockedbyclient")
+            return
+        if path not in {"/api/accounts/authorize/continue", "/api/accounts/user/register"}:
+            await route.continue_()
+            return
+        try:
+            response = await route.fetch(timeout=20000, max_redirects=0)
+        except Exception:
+            # A timed-out user/register may have created an identity. Never
+            # replay the same intercepted mutation or guess that it succeeded.
+            mailbox["_registration_guard_error"] = "registration_identity_response_unavailable"
+            await route.abort("failed")
+            return
+        try:
+            payload = await response.json()
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            page_state = payload.get("page") if isinstance(payload.get("page"), dict) else {}
+            state = registration_auth_state(
+                str(payload.get("continue_url") or ""), str(page_state.get("type") or ""),
+            )
+            if is_duplicate_registration_error(payload) or state == "existing":
+                mailbox["_registration_outcome"] = RegisteredEmailDetected.code
+            elif path == "/api/accounts/user/register" and 200 <= response.status < 300 and not payload.get("error"):
+                mailbox["_registration_identity_created"] = True
+        await route.fulfill(response=response)
+
+    await context.route("https://chatgpt.com/api/auth/signin/openai*", route_auth)
+    await context.route("https://auth.openai.com/api/accounts/**", route_auth)
+
+
+async def check_fresh_registration_page(page, mailbox: dict | None, *, require_signup: bool = False) -> None:
+    if not requires_fresh_registration(mailbox) or mailbox.get("_registration_identity_created"):
+        return
+    state = registration_auth_state(await _page_url(page))
+    if mailbox.get("_registration_outcome") == RegisteredEmailDetected.code or state == "existing":
+        reject_registered_mailbox(mailbox, "existing_password_login_route")
+    guard_error = str(mailbox.get("_registration_guard_error") or "")
+    if guard_error:
+        raise RuntimeError(guard_error)
+    if require_signup and state != "signup":
+        raise RuntimeError("registration_password_route_unavailable")
 
 
 def _is_auth_error_url(url: str) -> bool:
@@ -1196,7 +1288,7 @@ async def submit_email_browser_ui(page, email: str) -> str:
             pass
 
 
-async def start_nextauth_email_flow(page, email: str) -> str:
+async def start_nextauth_email_flow(page, email: str, *, password_first: bool = False) -> str:
     """Start the HAR-observed NextAuth flow inside the current browser session."""
     current = str(await _page_url(page) or "")
     if _is_auth_error_url(current):
@@ -1241,6 +1333,7 @@ async def start_nextauth_email_flow(page, email: str) -> str:
                     "auth_session_logging_id": str(uuid.uuid4()),
                     "screen_hint": "login_or_signup",
                     "login_hint": email,
+                    **({"connection": "password", "max_age": "0"} if password_first else {}),
                 }
             )
             signin_response = await asyncio.wait_for(
@@ -1273,7 +1366,7 @@ async def start_nextauth_email_flow(page, email: str) -> str:
         if result is None:
             result = await asyncio.wait_for(
                 page.evaluate(
-                    """async ({email, deviceId}) => {
+                    """async ({email, deviceId, passwordFirst}) => {
                     const csrfResp = await fetch('/api/auth/csrf', {
                         credentials: 'include',
                         headers: {'Accept': 'application/json'},
@@ -1298,6 +1391,10 @@ async def start_nextauth_email_flow(page, email: str) -> str:
                         screen_hint: 'login_or_signup',
                         login_hint: email,
                     });
+                    if (passwordFirst) {
+                        query.set('connection', 'password');
+                        query.set('max_age', '0');
+                    }
                     const body = new URLSearchParams({
                         callbackUrl: 'https://chatgpt.com/',
                         csrfToken: csrfData.csrfToken,
@@ -1324,7 +1421,7 @@ async def start_nextauth_email_flow(page, email: str) -> str:
                         url: data && typeof data.url === 'string' ? data.url : '',
                     };
                     }""",
-                    {"email": email, "deviceId": device_id},
+                    {"email": email, "deviceId": device_id, "passwordFirst": password_first},
                 ),
                 timeout=12,
             )

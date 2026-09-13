@@ -72,6 +72,14 @@ from register.protocol_runtime import (
     current_runtime_settings,
 )
 from register.scheduling import build_registration_waves
+from register.mail_channel_options import (
+    is_smsbower_selected,
+    needs_dynamic_mail_coordinator,
+    smsbower_child_enabled,
+    validate_smsbower_job,
+)
+from register.smsbower_batch import run_dynamic_mail_groups
+from register.registration_outcome import RegisteredEmailDetected
 from register.util import _append_account
 
 from register.protocol_context import (    # noqa: F401 - 兼容 re-export
@@ -235,7 +243,10 @@ def register_one(
     group_id: str = "",
     post_register_health_check: bool = False,
     protocol_runtime: ProtocolRuntimeSettings | None = None,
+    mailbox_override: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
+    if isinstance(mailbox_override, dict):
+        fixed_email = str(mailbox_override.get("address") or fixed_email or "") or None
     start = time.time()
     stop = stop_check if callable(stop_check) else (lambda: False)
     trace = RegistrationTrace(
@@ -316,8 +327,16 @@ def register_one(
         if emit_account_events:
             forwarded_task_event(index, "running", proxy=proxy_brief(proxy), step="纯协议任务启动")
         step(index, "任务启动")
-        result = registrar.register(index, partial_sink=persist_partial)
+        register_options = {"partial_sink": persist_partial}
+        if mailbox_override is not None:
+            register_options["mailbox_override"] = mailbox_override
+            trace.set_secrets(mailbox_override.get("_smsbower_api_key"))
+        result = registrar.register(index, **register_options)
         _validate_protocol_account_result(result)
+        if mailbox_override is not None and mailbox_override.get("provider") == "smsbower_mail":
+            result["mailbox_role"] = str(mailbox_override.get("_smsbower_pair_role") or "primary")
+            result["mailbox_base_address"] = str(mailbox_override.get("base_address") or mailbox_override.get("address") or "")
+            result["mailbox_pair_id"] = str(mailbox_override.get("_smsbower_pair_id") or "")
         final_device_id = str(result.get("device_id") or registrar.device_id or "").strip()
         result["protocol_initial_device_id"] = initial_device_id
         result["protocol_final_device_id"] = final_device_id
@@ -389,13 +408,13 @@ def register_one(
             secrets=tuple(result.get(key) for key in ("password", "totp_secret", "access_token", "refresh_token", "session_token")),
         )
         return result
-    except PasswordResetRequired as error:
+    except (PasswordResetRequired, RegisteredEmailDetected) as error:
         cost = time.time() - start
         with stats_lock:
             stats["done"] += 1
             stats["skipped"] += 1
         log(
-            f"任务{index} 检测到已有密码，已跳过注册，本次耗时{cost:.1f}s",
+            f"任务{index} 检测到邮箱已注册，已跳过，本次耗时{cost:.1f}s",
             "yellow",
         )
         if emit_account_events:
@@ -404,9 +423,9 @@ def register_one(
                 "skipped",
                 email=error.email or None,
                 group_id=str(group_id or "").strip(),
-                skip_reason=PasswordResetRequired.code,
+                skip_reason=error.code,
                 trace_file=trace_file_ref,
-                step="账号已有密码，已跳过；未执行密码重置",
+                step="邮箱已注册，已跳过；未登录或重置密码",
             )
         trace.finish(
             "skipped",
@@ -521,6 +540,7 @@ async def run_protocol_register(
     paused = pause_check if callable(pause_check) else (lambda: False)
     n = max(1, int(total if total is not None else reg_cfg.get("total") or 1))
     conc = max(1, int(concurrency if concurrency is not None else reg_cfg.get("threads") or 1))
+    validate_smsbower_job(mail_config, provider_type, n, conc, fixed_email=fixed_email)
     max_retries = max(0, int(reg_cfg.get("max_transient_retries") or 0))
     post_register_health_check = _truthy(
         reg_cfg.get("post_register_health_check"), False
@@ -558,6 +578,12 @@ async def run_protocol_register(
     else:
         n = min(n, available)
         conc = min(conc, n, available)
+        if is_smsbower_selected(provider_type):
+            if smsbower_child_enabled(mail_config):
+                n -= n % 2
+                if n < 2:
+                    return []
+            conc = max(2, conc - conc % 2)
 
     proxy_pool = resolve_proxy_pool(proxy_cfg)
     fallback_proxy = normalize_proxy_url(str(proxy_cfg.get("url") or "")) if proxy_cfg.get("enabled") else ""
@@ -640,7 +666,7 @@ async def run_protocol_register(
     retry_email_lock = threading.Lock()
     batch_bad_proxies: set[str] = set()
     batch_bad_proxy_lock = threading.Lock()
-    schedule_emails = planned_emails or [str(fixed_email or "")] * n
+    schedule_emails = planned_emails + [str(fixed_email or "")] * (n - len(planned_emails))
     task_waves = build_registration_waves(
         schedule_emails,
         conc,
@@ -751,10 +777,11 @@ async def run_protocol_register(
         except Exception:
             pass
 
-    async def wait_until_resumed(index: int, task_group_id: str) -> bool:
+    async def wait_until_resumed(index: int, task_group_id: str, stop_override=None) -> bool:
+        is_stopped = stop_override or stopped
         logged = False
         while paused():
-            if stopped():
+            if is_stopped():
                 return False
             if not logged and callable(task_event):
                 task_event(
@@ -772,14 +799,18 @@ async def run_protocol_register(
                 group_id=task_group_id,
                 step="任务派发已继续",
             )
-        return not stopped()
+        return not is_stopped()
 
     async def run_task(
         index: int,
         start_barrier: asyncio.Barrier | None = None,
         paired_alias: bool = False,
+        mailbox_override: dict[str, Any] | None = None,
     ) -> None:
         async with semaphore:
+            cancellation = (mailbox_override or {}).get("_registration_cancel_event")
+            def task_stopped() -> bool:
+                return stopped() or bool(cancellation is not None and cancellation.is_set())
             task_group_id = (
                 str(group_plan[index - 1] or "").strip()
                 if isinstance(group_plan, list) and index <= len(group_plan)
@@ -790,8 +821,10 @@ async def run_protocol_register(
                 if index <= len(planned_emails)
                 else fixed_email
             )
+            if mailbox_override is not None:
+                task_email = str(mailbox_override.get("address") or "") or None
 
-            if not await wait_until_resumed(index, task_group_id):
+            if not await wait_until_resumed(index, task_group_id, task_stopped):
                 persist_registration_summary(
                     status="cancelled",
                     email=task_email or "",
@@ -846,7 +879,7 @@ async def run_protocol_register(
                 try:
                     await asyncio.wait_for(start_barrier.wait(), timeout=3.0)
                 except (asyncio.TimeoutError, asyncio.BrokenBarrierError):
-                    if stopped():
+                    if task_stopped():
                         persist_registration_summary(
                             status="cancelled",
                             email=task_email or "",
@@ -862,7 +895,7 @@ async def run_protocol_register(
             dead_slot_switch_limit = 10
             dead_slot_switches = 0
             for attempt in range(proxy_retry_limit + 1 + dead_slot_switch_limit):
-                if not await wait_until_resumed(index, task_group_id):
+                if not await wait_until_resumed(index, task_group_id, task_stopped):
                     break
                 attempt_error = ""
                 (
@@ -916,7 +949,7 @@ async def run_protocol_register(
                     "proxy": proxy,
                     "fixed_email": task_email,
                     "provider_type": provider_type,
-                    "stop_check": stop,
+                    "stop_check": task_stopped,
                     "task_event": attempt_event,
                     "proxy_config": attempt_proxy_cfg,
                     "group_id": task_group_id,
@@ -928,6 +961,9 @@ async def run_protocol_register(
                 # register_one implementations source-compatible.
                 if callable(account_log_sink):
                     register_kwargs["account_log_sink"] = attempt_account_log_sink
+                if mailbox_override is not None:
+                    register_kwargs["mailbox_override"] = mailbox_override
+                    register_kwargs["provider_type"] = str(mailbox_override.get("provider") or provider_type or "")
                 record = await asyncio.to_thread(
                     register_one,
                     index,
@@ -939,6 +975,14 @@ async def run_protocol_register(
                     skipped = True
                     break
                 if record:
+                    break
+                if mailbox_override is not None and mailbox_override.get("provider") == "smsbower_mail" and (
+                    mailbox_override.get("_registration_identity_created")
+                    or mailbox_override.get("_smsbower_terminal_status")
+                    or mailbox_override.get("_registration_outcome") in {"already_registered", "otp_timeout"}
+                ):
+                    # Never create/reset a partially-created identity or reuse
+                    # a consumed/closed activation as a fresh registration.
                     break
                 proxy_failed = is_proxy_transport_error(attempt_error)
                 alias_pinned = fixed_alias_batch or paired_alias
@@ -1034,7 +1078,7 @@ async def run_protocol_register(
                 )
                 return
             if not record:
-                if stopped():
+                if task_stopped():
                     persist_registration_summary(
                         status="cancelled",
                         email=task_email or "",
@@ -1081,7 +1125,14 @@ async def run_protocol_register(
                     group_id_value=task_group_id,
                 )
 
+    dynamic_indices = {
+        index for index in range(1, n + 1)
+        if not schedule_emails[index - 1] and needs_dynamic_mail_coordinator(mail_config, provider_type)
+    }
     for wave_number, (indices, is_alias_pair) in enumerate(task_waves, start=1):
+        indices = [index for index in indices if index not in dynamic_indices]
+        if not indices:
+            continue
         if stopped():
             break
         if is_alias_pair and wave_number > 1:
@@ -1093,6 +1144,20 @@ async def run_protocol_register(
         await asyncio.gather(
             *(run_task(index, barrier, is_alias_pair) for index in indices)
         )
+    if dynamic_indices and not stopped():
+        async def run_allocated(index: int, mailbox: dict[str, Any]) -> None:
+            await run_task(index, paired_alias=True, mailbox_override=mailbox)
+
+        def emit_dynamic(index: int, status: str, **fields: Any) -> None:
+            task_group = str(group_plan[index - 1]) if isinstance(group_plan, list) and index <= len(group_plan) else str(group_id or "")
+            if callable(task_event):
+                task_event(index, status, group_id=task_group, **fields)
+            if status in {"failed", "skipped", "cancelled"}:
+                persist_registration_summary(status=status, email=str(fields.get("email") or ""), error=str(fields.get("error") or ""), step_text=str(fields.get("step") or ""), group_id_value=task_group)
+
+        await run_dynamic_mail_groups(sorted(dynamic_indices), concurrency=conc, mail_config=mail_config, provider_type=provider_type,
+                                      run_account=run_allocated, result_at=lambda index: results[index - 1], emit=emit_dynamic,
+                                      stop_check=stopped, pause_check=paused)
     return [item for item in results if item]
 
 

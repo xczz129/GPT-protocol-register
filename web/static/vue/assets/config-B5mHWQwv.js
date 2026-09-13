@@ -1,0 +1,1 @@
+import{a as e,n as t}from"./client-C3wdkiRP.js";function n(){return t(`/api/config`)}function r(n){return t(`/api/config`,{method:`PUT`,body:e({config:n})})}function i(){return t(`/api/browsers/status`)}export{n,r,i as t};

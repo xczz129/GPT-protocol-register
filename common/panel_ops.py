@@ -59,6 +59,7 @@ BACKUP_FILES = {
     "trial_eligibility_proxy_pool.json": DATA_DIR / "trial_eligibility_proxy_pool.json",
 }
 BACKUP_DB_FILES = {
+    "mail_registration_metrics.sqlite3": DATA_DIR / "mail_registration_metrics.sqlite3",
     "registered_accounts.sqlite3": DATA_DIR / "registered_accounts.sqlite3",
     "task_history.sqlite3": DATA_DIR / "task_history.sqlite3",
     "account_operation_logs.sqlite3": DATA_DIR / "account_operation_logs.sqlite3",

@@ -179,3 +179,17 @@ test("trial: restored interrupted job maps pending keys and stage, then resets t
   assert.equal(restored.pendingCount, 0);
   assert.equal(restored.message, "");
 });
+
+test("trial start forwards the selected v4 or nerver channel", async () => {
+  const h = harness();
+  h.responses.push({ ok: true, job: { job_id: "trial-nerver", status: "queued", total: 1, done: 0 } });
+  await h.store.startTrial(["key"], false, false, 4, "nerver");
+  assert.equal(h.calls.at(-1).path, "/api/accounts/trial-eligibility");
+  assert.deepEqual(JSON.parse(h.calls.at(-1).options.body), {
+    keys: ["key"], all_accounts: false, force: false, concurrency: 4, channel: "nerver",
+  });
+
+  h.responses.push({ ok: true, job: { job_id: "trial-v4", status: "queued", total: 1, done: 0 } });
+  await h.api.trialStart(["key"], false, false, 4, "unsupported");
+  assert.equal(JSON.parse(h.calls.at(-1).options.body).channel, "v4");
+});

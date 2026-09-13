@@ -212,3 +212,77 @@ def test_health_accepts_just_registered_record_before_store_user_id_backfill(db)
     assert result["health_status"] == "alive"
     assert not result.get("health_write_skipped")
     assert store.load_accounts(db)[0]["user_id"] == "user-a"
+
+
+@pytest.mark.parametrize("status,body", [
+    (408, ""), (425, ""), (429, "slow down"), (500, ""),
+    (502, "bad gateway"), (503, "unavailable"), (504, "gateway timeout"),
+    (403, "<html><title>Cloudflare challenge</title></html>"),
+])
+def test_session_refresh_transient_responses_do_not_invalidate_account(db, monkeypatch, status, body):
+    response = SimpleNamespace(status_code=status, text=body, json=lambda: {})
+    monkeypatch.setattr(health, "_protocol_session_request", Mock(return_value=response))
+    monkeypatch.setattr(health.time, "sleep", Mock())
+
+    with pytest.raises(health.HealthTransientError):
+        health.refresh_chatgpt_session_tokens(account(expired=True), force=True)
+
+    checked = health.check_account(
+        account(expired=True), persist=False, path=db,
+        proxy_candidates=["http://one.example:8080", "http://two.example:8080"],
+    )
+    assert checked["health_status"] == "error"
+    assert "nextauth_session" in checked["health_error"]
+    health.fetch_remote_account_info.assert_not_called()
+
+
+@pytest.mark.parametrize("status,payload", [
+    (401, {}), (200, {}), (400, {"error": "Your session has ended. Please log in again."}),
+])
+def test_session_refresh_keeps_genuine_session_rejections_invalid(db, monkeypatch, status, payload):
+    response = SimpleNamespace(status_code=status, text="", json=lambda: payload)
+    monkeypatch.setattr(health, "_protocol_session_request", Mock(return_value=response))
+
+    with pytest.raises(health.InvalidAccessTokenError):
+        health.refresh_chatgpt_session_tokens(account(expired=True), force=True)
+
+
+@pytest.mark.parametrize("status,payload", [(403, {"error": "forbidden"}), (404, {})])
+def test_session_refresh_other_http_errors_are_not_credential_verdicts(db, monkeypatch, status, payload):
+    response = SimpleNamespace(status_code=status, text="", json=lambda: payload)
+    monkeypatch.setattr(health, "_protocol_session_request", Mock(return_value=response))
+
+    with pytest.raises(RuntimeError) as error:
+        health.refresh_chatgpt_session_tokens(account(expired=True), force=True)
+    assert not isinstance(error.value, health.InvalidAccessTokenError)
+
+
+def test_session_refresh_invalid_json_is_transient(db, monkeypatch):
+    response = SimpleNamespace(status_code=200, text="<html>upstream error</html>", json=Mock(side_effect=ValueError("invalid JSON")))
+    monkeypatch.setattr(health, "_protocol_session_request", Mock(return_value=response))
+
+    with pytest.raises(health.HealthTransientError, match="invalid_json"):
+        health.refresh_chatgpt_session_tokens(account(expired=True), force=True)
+
+
+def test_session_refresh_unexpected_success_payload_is_not_a_session_rejection(db, monkeypatch):
+    response = SimpleNamespace(status_code=200, text="", json=lambda: {"error": "upstream_unavailable"})
+    monkeypatch.setattr(health, "_protocol_session_request", Mock(return_value=response))
+
+    with pytest.raises(health.HealthTransientError, match="missing_access_token"):
+        health.refresh_chatgpt_session_tokens(account(expired=True), force=True)
+
+
+@pytest.mark.parametrize("status", [408, 425])
+def test_health_retryable_http_responses_try_another_route(db, monkeypatch, status):
+    probe = Mock(side_effect=[RuntimeError(f"health_http_{status} /backend-api/me"), metadata()])
+    monkeypatch.setattr(health, "fetch_remote_account_info", probe)
+    monkeypatch.setattr(health.time, "sleep", Mock())
+
+    result = health.check_account(
+        account(), persist=False, path=db,
+        proxy_candidates=["http://one.example:8080", "http://two.example:8080"],
+    )
+    assert result["health_status"] == "alive"
+    assert probe.call_count == 2
+    assert len({call.args[0]["proxy"] for call in probe.call_args_list}) == 2

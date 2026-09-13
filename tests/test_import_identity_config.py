@@ -102,6 +102,86 @@ def test_matching_identity_is_persisted_with_stable_user_id(boundary, team):
     boundary.persist.assert_called_once()
 
 
+@pytest.mark.parametrize("state, detail_key, detail", [
+    ("unknown", "health_probe_error", "curl: (35) TLS connect error"),
+    ("error", "health_error", "health_http_503 /backend-api/me: unavailable"),
+])
+def test_import_persists_inconclusive_network_health_as_unknown(boundary, state, detail_key, detail):
+    boundary.check.side_effect = lambda row, **kwargs: {**row, "health_status": state, detail_key: detail}
+    saved = boundary.route._persist_imported_account(
+        {"email": "alice@example.test"}, tokens(team=False), Mock(),
+    )
+    assert saved["health_status"] == "unknown"
+    assert saved["status"] == "待复测"
+    assert saved["health_checked_at"] == ""
+    assert detail in saved["health_probe_error"]
+    assert saved["health_error"] == ""
+    boundary.persist.assert_called_once()
+
+
+def test_import_persists_network_exception_as_unknown(boundary):
+    boundary.check.side_effect = RuntimeError("curl: (35) TLS connect error")
+    saved = boundary.route._persist_imported_account(
+        {"email": "alice@example.test"}, tokens(team=False), Mock(),
+    )
+    assert saved["health_status"] == "unknown"
+    assert "TLS connect error" in saved["health_probe_error"]
+    boundary.persist.assert_called_once()
+
+
+@pytest.mark.parametrize("detail", [
+    "nextauth_session_http_408: temporary upstream response",
+    "nextauth_session_http_425: temporary upstream response",
+    "nextauth_session_http_429: temporary upstream response",
+    "nextauth_session_http_501: temporary upstream response",
+    "nextauth_session_edge_blocked_http_403",
+    "nextauth_session_invalid_json",
+    "nextauth_session_missing_access_token",
+])
+def test_import_keeps_transient_nextauth_result_pending(boundary, detail):
+    boundary.check.side_effect = lambda row, **kwargs: {**row, "health_status": "error", "health_error": detail}
+    saved = boundary.route._persist_imported_account(
+        {"email": "alice@example.test"}, tokens(team=False), Mock(),
+    )
+    assert saved["health_status"] == "unknown"
+    assert saved["health_probe_error"] == detail
+    boundary.persist.assert_called_once()
+
+
+def test_import_keeps_transient_nextauth_exception_pending(boundary):
+    from common.account_health import HealthTransientError
+
+    boundary.check.side_effect = HealthTransientError("temporary upstream response")
+    saved = boundary.route._persist_imported_account(
+        {"email": "alice@example.test"}, tokens(team=False), Mock(),
+    )
+    assert saved["health_status"] == "unknown"
+    boundary.persist.assert_called_once()
+
+
+@pytest.mark.parametrize("state, detail", [
+    ("invalid", "token invalidated (/backend-api/me)"),
+    ("invalid", "account_deactivated: confirmed by accounts"),
+    ("reauth_required", "nextauth_session_http_401: session ended"),
+])
+def test_import_still_rejects_explicit_invalid_health(boundary, state, detail):
+    boundary.check.side_effect = lambda row, **kwargs: {**row, "health_status": state, "health_error": detail}
+    with pytest.raises(RuntimeError, match="token invalidated|account_deactivated|nextauth_session_http_401"):
+        boundary.route._persist_imported_account(
+            {"email": "alice@example.test"}, tokens(team=False), Mock(),
+        )
+    boundary.persist.assert_not_called()
+
+
+def test_import_does_not_swallow_non_network_health_exception(boundary):
+    boundary.check.side_effect = RuntimeError("session_identity_user_mismatch")
+    with pytest.raises(RuntimeError, match="session_identity_user_mismatch"):
+        boundary.route._persist_imported_account(
+            {"email": "alice@example.test"}, tokens(team=False), Mock(),
+        )
+    boundary.persist.assert_not_called()
+
+
 def test_import_uses_configured_proxy_and_shared_runtime_deadline(boundary):
     boundary.cfg["proxy"] = {"enabled": True, "url": "http://proxy.example.test:8080", "mode": "single_proxy"}
     before = time.monotonic()

@@ -1,4 +1,4 @@
-/* --- 邮箱池 API：导入/列表/删除/状态/读信 + Maddy 域名 + Fastmail 池 --- */
+/* --- 邮箱池 API：导入/按需购买配置/列表/删除/状态/读信 + Maddy 域名 + Fastmail 池 --- */
 import { api, jsonBody } from "./client";
 
 export interface Mailbox {
@@ -40,7 +40,7 @@ export async function fetchMailboxes(limit = 2000): Promise<Mailbox[]> {
   return Array.isArray(data) ? data : data.items || [];
 }
 
-/* --- 导入 / 保存配置（四种渠道共用 PUT /api/mailboxes） --- */
+/* --- 导入 / 保存配置（五种邮箱渠道共用 PUT /api/mailboxes） --- */
 export function saveMailboxes(payload: Record<string, unknown>): Promise<MailSaveResult> {
   return api<MailSaveResult>("/api/mailboxes", { method: "PUT", body: jsonBody(payload) });
 }

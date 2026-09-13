@@ -64,7 +64,11 @@ def _proxy_pool_preview(cfg: dict[str, Any]) -> dict[str, Any]:
     if pool_file:
         path = Path(pool_file).expanduser()
         if not path.is_absolute():
-            path = (_state().ROOT / path).resolve()
+            path = _state().ROOT / path
+        # Canonicalize absolute paths too. Windows may expose the temp path in
+        # 8.3 form while DATA_DIR uses its long form, which would otherwise
+        # fail the containment check for the same directory.
+        path = path.resolve()
         try:
             # 读取前强制校验路径仍位于 data 目录，防止历史配置残留任意路径
             path.relative_to(_state().DATA_DIR.resolve())

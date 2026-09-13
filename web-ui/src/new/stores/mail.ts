@@ -1,4 +1,4 @@
-/* --- 邮箱池 store：四种渠道表单（Outlook/iCloud/Maddy/Fastmail）+ 已导入邮箱列表 ---
+/* --- 邮箱池 store：五种渠道表单（Outlook/iCloud/SMSBower/Maddy/Fastmail）+ 已导入邮箱列表 ---
    行为对齐旧版 fillForms/save*：配置从 /api/config 的 mail.providers 填充，
    保存后刷新列表；密钥字段留空即沿用服务器已保存值。 */
 import { reactive, ref } from "vue";
@@ -18,6 +18,14 @@ export const useMailStore = defineStore("mail", () => {
     icloudText: "",
     icloudApiBase: "https://icloud.xbovo.online",
     icloudEnable: true,
+    smsbowerEnable: false,
+    smsbowerRegisterChild: true,
+    smsbowerApiBase: "https://smsbower.page",
+    smsbowerApiKey: "",
+    smsbowerApiKeyConfigured: false,
+    smsbowerService: "dr",
+    smsbowerDomains: ["gmail.com", "icloud.com"] as string[],
+    smsbowerMaxPrice: "",
     maddyEnable: false,
     maddyApiBase: "https://120.53.232.195/api",
     maddyApiToken: "",
@@ -40,7 +48,7 @@ export const useMailStore = defineStore("mail", () => {
   const loading = ref(false);
   const loadError = ref("");
 
-  /** 从 /api/config 的 mail.providers 填充四个渠道表单（对齐旧版 fillForms） */
+  /** 从 /api/config 的 mail.providers 填充五个渠道表单（对齐旧版 fillForms） */
   async function fillForms() {
     const { config } = await fetchConfig();
     const providers = config.mail?.providers || [];
@@ -49,6 +57,7 @@ export const useMailStore = defineStore("mail", () => {
 
     const outlook = provider("outlook_token");
     const icloud = provider("icloud_api");
+    const smsbower = provider("smsbower_mail");
     const maddy = provider("maddy_webui");
     const fastmail = provider("fastmail_api");
 
@@ -57,6 +66,24 @@ export const useMailStore = defineStore("mail", () => {
     forms.icloudText = "";
     forms.icloudApiBase = String(icloud.api_base || "https://icloud.xbovo.online");
     forms.icloudEnable = icloud.enable !== false;
+
+    forms.smsbowerEnable = smsbower.enable === true;
+    forms.smsbowerRegisterChild = smsbower.register_child !== false;
+    forms.smsbowerApiBase = String(smsbower.api_base || "https://smsbower.page");
+    const smsbowerMasked = String(smsbower.api_key_masked || "");
+    const smsbowerReturned = String(smsbower.api_key || "");
+    forms.smsbowerApiKey = "";
+    forms.smsbowerApiKeyConfigured = Boolean(
+      smsbower.has_api_key || smsbowerMasked || smsbowerReturned,
+    );
+    forms.smsbowerService = String(smsbower.service || "dr");
+    const domainSource = Array.isArray(smsbower.domains)
+      ? smsbower.domains as unknown[]
+      : smsbower.domain ? [smsbower.domain] : [];
+    const configuredDomains = [...new Set(domainSource.map((domain) => String(domain).trim().toLowerCase()))]
+      .filter((domain) => ["gmail.com", "icloud.com"].includes(domain));
+    forms.smsbowerDomains = configuredDomains.length ? configuredDomains : ["gmail.com", "icloud.com"];
+    forms.smsbowerMaxPrice = smsbower.max_price == null ? "" : String(smsbower.max_price);
 
     forms.maddyEnable = maddy.enable === true;
     forms.maddyApiBase = String(maddy.api_base || "https://120.53.232.195/api");
@@ -96,6 +123,12 @@ export const useMailStore = defineStore("mail", () => {
     return value && !isMaskedSecret(value) ? { api_key: value } : {};
   }
 
+  /** SMSBower 密钥 payload：脱敏值和空值都不得写回配置。 */
+  function smsbowerKeyPayload(): Record<string, string> {
+    const value = forms.smsbowerApiKey.trim();
+    return value && !isMaskedSecret(value) ? { api_key: value } : {};
+  }
+
   async function saveOutlook(): Promise<MailSaveResult> {
     const result = await saveMailboxes({
       provider_type: "outlook_token", mailboxes: forms.outlookText, mode: forms.outlookMode, append: true,
@@ -114,6 +147,34 @@ export const useMailStore = defineStore("mail", () => {
     });
     if (result.ok !== false) {
       forms.icloudText = "";
+      await load();
+    }
+    return result;
+  }
+
+  async function saveSmsbower(): Promise<MailSaveResult> {
+    if (!forms.smsbowerDomains.length) throw new Error("请至少选择一个 SMSBower 邮箱域名");
+    const service = forms.smsbowerService.trim();
+    if (!service) throw new Error("请输入 SMSBower 服务代码");
+    const maxPrice = String(forms.smsbowerMaxPrice || "").trim();
+    if (maxPrice && (!/^\d+(?:\.\d+)?$/.test(maxPrice) || Number(maxPrice) <= 0)) {
+      throw new Error("SMSBower 最高价必须是大于 0 的金额，留空表示不限价");
+    }
+    const keyPayload = smsbowerKeyPayload();
+    const result = await saveMailboxes({
+      provider_type: "smsbower_mail", mailboxes: "",
+      ...(forms.smsbowerApiBase.trim() ? { api_base: forms.smsbowerApiBase.trim() } : {}),
+      ...keyPayload,
+      enable: forms.smsbowerEnable,
+      register_child: forms.smsbowerRegisterChild,
+      service,
+      domains: [...forms.smsbowerDomains],
+      max_price: maxPrice,
+      append: true,
+    });
+    if (result.ok !== false) {
+      if (Object.keys(keyPayload).length) forms.smsbowerApiKeyConfigured = true;
+      forms.smsbowerApiKey = "";
       await load();
     }
     return result;
@@ -206,7 +267,7 @@ export const useMailStore = defineStore("mail", () => {
   return {
     forms, mailboxes, loading, loadError,
     fillForms, load,
-    saveOutlook, saveIcloud, loadMaddyDomains, saveMaddy, loadFastmailPool, saveFastmail,
+    saveOutlook, saveIcloud, saveSmsbower, loadMaddyDomains, saveMaddy, loadFastmailPool, saveFastmail,
     remove, setState,
   };
 });

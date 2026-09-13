@@ -4,7 +4,7 @@ import { api, jsonBody } from "../api.js";
 import AppPager from "./AppPager.vue";
 
 const props = defineProps({ forms: { type: Object, required: true }, mailboxes: { type: Array, default: () => [] }, progress: { type: Object, default: () => ({ items: [] }) }, busy: Boolean });
-const emit = defineEmits(["save-outlook", "save-icloud", "save-maddy", "save-fastmail", "load-maddy-domains", "load-fastmail-accounts", "refresh", "delete", "state"]);
+const emit = defineEmits(["save-outlook", "save-icloud", "save-smsbower", "save-maddy", "save-fastmail", "load-maddy-domains", "load-fastmail-accounts", "refresh", "delete", "state"]);
 const query = ref("");
 const provider = ref("auto");
 const stateFilter = ref("all");
@@ -28,6 +28,7 @@ watch([query, provider], () => { page.value = 1; selected.value = []; });
 function mailboxKey(item) { return `${item.provider_type}:${item.email}`; }
 function providerName(item) {
   if (item.provider_type === "icloud_api") return "iCloud";
+  if (item.provider_type === "smsbower_mail") return "SMSBower";
   if (item.provider_type === "maddy_webui") return "Maddy";
   if (item.provider_type === "fastmail_api") return "Fastmail";
   return "Outlook";
@@ -129,7 +130,7 @@ onBeforeUnmount(stopMessagePolling);
 
 <template>
   <section class="card">
-    <div class="card-h"><div><h2>批量导入邮箱</h2><p class="subtle">每次提交都会追加到邮箱池；同邮箱的新凭证会更新旧凭证。</p></div></div>
+    <div class="card-h"><div><h2>邮箱来源配置</h2><p class="subtle">导入已有邮箱，或配置注册时按需购买的临时邮箱。</p></div></div>
     <div class="split">
       <div class="panel-soft">
         <div class="task-title-row"><div><h3>批量导入 Outlook</h3><p class="hint">email----password----client_id----refresh_token</p></div><label class="compact">取码模式<select v-model="forms.outlookMode"><option value="imap">IMAP</option><option value="graph">Graph</option><option value="auto">Auto</option></select></label></div>
@@ -141,6 +142,31 @@ onBeforeUnmount(stopMessagePolling);
         <label class="label-line">API Base<input v-model="forms.icloudApiBase" type="text" /></label>
         <textarea v-model="forms.icloudText" rows="12" spellcheck="false" placeholder="user@icloud.com----alias_key"></textarea>
         <div class="actions"><button class="primary" :disabled="busy || !forms.icloudText.trim()" @click="emit('save-icloud')">导入 iCloud</button></div>
+      </div>
+      <div class="panel-soft">
+        <div class="task-title-row"><div><h3>SMSBower 临时邮箱</h3><p class="hint">注册时按需购买，可选择 Gmail 或 iCloud 域名。</p></div><label class="checkline"><input v-model="forms.smsbowerEnable" type="checkbox" />启用</label></div>
+        <label class="label-line">API Base<input v-model="forms.smsbowerApiBase" type="url" placeholder="https://smsbower.page" /></label>
+        <label class="label-line">
+          <span class="field-label-row"><span>API Key</span><span v-if="forms.smsbowerApiKeyConfigured" class="secret-configured">已配置</span></span>
+          <input v-model="forms.smsbowerApiKey" type="password" autocomplete="new-password" :placeholder="forms.smsbowerApiKeyConfigured ? '留空继续使用已保存 key' : '输入 SMSBower API Key'" />
+          <small class="field-help">只有输入新 Key 才会替换；页面不会回显已保存的完整密钥。</small>
+        </label>
+        <div class="form two">
+          <label>服务代码<input v-model="forms.smsbowerService" type="text" placeholder="dr" /></label>
+          <label>单个邮箱最高价（可选）<input v-model="forms.smsbowerMaxPrice" type="text" inputmode="decimal" placeholder="留空不限价" /></label>
+        </div>
+        <fieldset class="domain-field">
+          <legend>邮箱域名</legend>
+          <div class="domain-options">
+            <label :class="['domain-option', { selected: forms.smsbowerDomains.includes('gmail.com') }]"><input v-model="forms.smsbowerDomains" type="checkbox" value="gmail.com" /><span><b>Google 邮箱</b><small>@gmail.com</small></span></label>
+            <label :class="['domain-option', { selected: forms.smsbowerDomains.includes('icloud.com') }]"><input v-model="forms.smsbowerDomains" type="checkbox" value="icloud.com" /><span><b>iCloud 邮箱</b><small>@icloud.com</small></span></label>
+          </div>
+          <small v-if="!forms.smsbowerDomains.length" class="domain-error">请至少选择一个域名</small>
+          <small v-else class="field-help">注册时按勾选顺序尝试可用域名。</small>
+        </fieldset>
+        <label class="checkline"><input v-model="forms.smsbowerRegisterChild" type="checkbox" />主号成功后注册一个子号</label>
+        <p class="field-help">子号使用同一邮箱的 +split 别名收码。开启后，每组为 1 个主号 + 1 个子号，任务数量包含两者；主号已注册则跳过整组。设置保存后对新任务生效。</p>
+        <div class="actions"><button class="primary" :disabled="busy || !forms.smsbowerDomains.length || !forms.smsbowerService.trim() || (forms.smsbowerEnable && !forms.smsbowerApiKeyConfigured && !forms.smsbowerApiKey.trim())" @click="emit('save-smsbower')">保存 SMSBower</button></div>
       </div>
       <div class="panel-soft">
         <div class="task-title-row"><div><h3>Maddy WebUI</h3><p class="hint">X-API-Key + 域名列表。</p></div><label class="checkline"><input v-model="forms.maddyEnable" type="checkbox" />启用</label></div>
@@ -192,7 +218,7 @@ onBeforeUnmount(stopMessagePolling);
     </div>
     <div class="account-filters">
       <label class="search-field"><span>⌕</span><input v-model="query" type="search" placeholder="搜索邮箱、状态或失败原因" /></label>
-      <select v-model="provider"><option value="auto">全部邮箱</option><option value="outlook_token">Outlook</option><option value="icloud_api">iCloud</option><option value="maddy_webui">Maddy</option><option value="fastmail_api">Fastmail</option></select>
+      <select v-model="provider"><option value="auto">全部邮箱</option><option value="outlook_token">Outlook</option><option value="icloud_api">iCloud</option><option value="smsbower_mail">SMSBower</option><option value="maddy_webui">Maddy</option><option value="fastmail_api">Fastmail</option></select>
       <select v-model="stateFilter"><option value="all">全部状态</option><option value="available">可用</option><option value="in_use">占用</option><option value="used">已使用</option><option value="failed">失败</option><option value="cooldown">冷却</option><option value="token_invalid">凭证失效</option></select>
       <span class="filter-result">{{ filtered.length }} 个邮箱</span>
     </div>
@@ -273,5 +299,63 @@ onBeforeUnmount(stopMessagePolling);
   color: #24834c;
   font-size: 9px;
   font-weight: 700;
+}
+
+.domain-field {
+  border: 0;
+  padding: 0;
+  min-width: 0;
+}
+
+.domain-field legend {
+  margin-bottom: 6px;
+  color: var(--muted, #7a7f8a);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.domain-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.domain-option {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px;
+  border: 1px solid var(--line, #dde1e8);
+  border-radius: 6px;
+  color: var(--muted, #7a7f8a);
+  cursor: pointer;
+}
+
+.domain-option.selected {
+  border-color: var(--accent, #3478f6);
+  color: var(--text, #222);
+}
+
+.domain-option input {
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+  accent-color: var(--accent, #3478f6);
+}
+
+.domain-option span {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.domain-option b { font-size: 11px; }
+.domain-option small { color: var(--muted, #7a7f8a); font-size: 9px; overflow-wrap: anywhere; }
+.domain-error { display: block; margin-top: 5px; color: #b3261e; font-size: 9px; }
+
+@media (max-width: 420px) {
+  .domain-options { grid-template-columns: 1fr; }
 }
 </style>

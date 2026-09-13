@@ -87,7 +87,11 @@ class AccountDeactivatedError(RuntimeError):
     """The account API confirmed that the account is deactivated."""
 
 
-class HealthEdgeBlockedError(RuntimeError):
+class HealthTransientError(RuntimeError):
+    """The network or upstream failed before a credential verdict was known."""
+
+
+class HealthEdgeBlockedError(HealthTransientError):
     """The edge rejected this network path without evaluating the token."""
 
 
@@ -141,9 +145,11 @@ def _raise_if_deactivated(value: Any, *, source: str) -> None:
 
 def _is_transient_health_probe_error(error: BaseException) -> bool:
     message = str(error or "").lower()
-    return isinstance(error, HealthEdgeBlockedError) or any(
+    return isinstance(error, HealthTransientError) or any(
         marker in message
         for marker in (
+            "health_http_408",
+            "health_http_425",
             "health_http_429",
             "health_http_500",
             "health_http_502",
@@ -175,6 +181,11 @@ def _normalized_proxy_candidates(values: Iterable[str] | None) -> list[str]:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def normalize_health_probe_channel(value: Any) -> str:
+    """Return the supported account-plan probe channel."""
+    return "nerver" if str(value or "").strip().lower() == "nerver" else "v4"
 
 
 def _jwt_payload(token: str) -> dict[str, Any]:
@@ -482,18 +493,42 @@ def refresh_chatgpt_session_tokens(
         try:
             data = response.json()
         except Exception:
-            data = {}
-        fresh_access = str((data or {}).get("accessToken") or "").strip()
-        if response.status_code != 200 or not fresh_access:
+            data = None
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        body = str(getattr(response, "text", "") or "")
+        if status_code in {408, 425, 429} or 500 <= status_code < 600:
+            raise HealthTransientError(
+                f"nextauth_session_http_{status_code}: temporary upstream response"
+            )
+        if status_code == 403 and any(
+            marker in body.lower()
+            for marker in ("<html", "<!doctype", "cf-ray", "/cdn-cgi/")
+        ):
+            raise HealthEdgeBlockedError("nextauth_session_edge_blocked_http_403")
+        if status_code == 200 and not isinstance(data, dict):
+            raise HealthTransientError("nextauth_session_invalid_json")
+        data = data if isinstance(data, dict) else {}
+        fresh_access = str(data.get("accessToken") or "").strip()
+        if status_code != 200 or not fresh_access:
             detail = str(
-                (data or {}).get("error")
-                or (data or {}).get("message")
-                or response.text[:300]
-                or "session ended"
+                data.get("error")
+                or data.get("message")
+                or body[:300]
+                or ("session ended" if status_code == 200 else "empty response")
             )
-            raise InvalidAccessTokenError(
-                f"nextauth_session_http_{response.status_code}: {detail}"
+            error = f"nextauth_session_http_{status_code}: {detail}"
+            rejected_session = any(
+                marker in detail.lower()
+                for marker in ("session ended", "session has ended", "session expired", "session has expired", "invalid session")
             )
+            if status_code == 401 or (status_code == 200 and not data) or rejected_session:
+                raise InvalidAccessTokenError(error)
+            if status_code == 200:
+                raise HealthTransientError("nextauth_session_missing_access_token")
+            # A generic non-success response is not proof that the stored
+            # session is invalid. Keep it recoverable instead of marking the
+            # account invalid or rejecting an otherwise valid import.
+            raise RuntimeError(error)
         auth = _jwt_payload(fresh_access).get("https://api.openai.com/auth")
         auth = auth if isinstance(auth, dict) else {}
         account = data.get("account") if isinstance(data.get("account"), dict) else {}
@@ -557,11 +592,14 @@ def _response_json(response, path: str) -> dict[str, Any]:
     return data
 
 
-def fetch_remote_account_info(record: dict[str, Any]) -> dict[str, Any]:
+def fetch_remote_account_info(
+    record: dict[str, Any], channel: str = "v4",
+) -> dict[str, Any]:
     token = str(record.get("access_token") or "").strip()
     if not token:
         raise InvalidAccessTokenError("missing access_token")
 
+    probe_channel = normalize_health_probe_channel(channel)
     identity = _request_identity(record)
     device_id = identity["device_id"]
     session_id = str(uuid.uuid4())
@@ -586,7 +624,7 @@ def fetch_remote_account_info(record: dict[str, Any]) -> dict[str, Any]:
     init_path = "/backend-api/conversation/init"
     account_path = "/backend-api/accounts/check/v4-2023-04-27"
     try:
-        requests_to_run = (
+        requests_to_run = [
                 (
                     "me",
                     lambda: _response_json(
@@ -610,8 +648,20 @@ def fetch_remote_account_info(record: dict[str, Any]) -> dict[str, Any]:
                         init_path,
                     ),
                 ),
+            ]
+        if probe_channel == "nerver":
+            # Imported lazily because trial_eligibility imports the shared
+            # request identity helpers from this module.
+            def check_nerver():
+                from common.trial_eligibility import check_trial_eligibility_nerver
+
+                return check_trial_eligibility_nerver(token, timeout=8)
+
+            requests_to_run.append(("plan", check_nerver))
+        else:
+            requests_to_run.append(
                 (
-                    "accounts",
+                    "plan",
                     lambda: _response_json(
                         session.get(
                             CHATGPT_BASE
@@ -621,13 +671,14 @@ def fetch_remote_account_info(record: dict[str, Any]) -> dict[str, Any]:
                         ),
                         account_path,
                     ),
-                ),
+                )
             )
         payloads: dict[str, dict[str, Any]] = {}
-        errors: list[BaseException] = []
-        # 并行发送 me/init/accounts 三个请求（对齐 chatgpt2api v3.2.2
+        errors: dict[str, BaseException] = {}
+        # 并行发送 me/init/plan 三个请求（对齐 chatgpt2api v3.2.2
         # get_user_info 的并行探测）：单账号测活耗时由 3 个串行 RTT 降为
-        # 1 个并行 RTT；错误判定保持"多请求错误中优先采信 401"。
+        # 1 个并行 RTT。nerver 只辅助套餐探测；账号有效性仍由 ChatGPT
+        # 的 me/init 响应决定，不能用第三方成功响应掩盖它们的错误。
         # curl_cffi Session 默认 use_thread_local_curl=True，工作线程各持
         # 独立 Curl 句柄，同一 Session 并发请求是安全的。
         with ThreadPoolExecutor(max_workers=len(requests_to_run)) as probe_executor:
@@ -641,48 +692,69 @@ def fetch_remote_account_info(record: dict[str, Any]) -> dict[str, Any]:
                 except (KeyboardInterrupt, SystemExit):
                     raise
                 except BaseException as exc:
-                    errors.append(exc)
+                    errors[name] = exc
         for name, payload in payloads.items():
-            _raise_if_deactivated(payload, source=name)
-        accounts = payloads.get("accounts") or {}
-        account_entries = accounts.get("accounts") or {}
-        account_entries = account_entries if isinstance(account_entries, dict) else {}
-        # 多工作区账号(Team): AT 的 chatgpt_account_id 指向本次会话实际
-        # 登录的工作区, 优先取它的套餐/账号ID; 否则退回 default(个人)工作区,
-        # 避免 Team 账号被 default 个人工作区覆盖成 free。
-        token_account_id = ""
-        try:
-            auth_claims = _jwt_payload(token).get("https://api.openai.com/auth")
-            token_account_id = str(
-                (auth_claims if isinstance(auth_claims, dict) else {}).get(
-                    "chatgpt_account_id"
-                )
-                or ""
-            ).strip()
-        except Exception:
-            token_account_id = ""
-        selected = (
-            account_entries.get(token_account_id)
-            if token_account_id and isinstance(
-                account_entries.get(token_account_id), dict
-            )
-            else None
-        )
-        default = selected or account_entries.get("default") or next(
-            (item for item in account_entries.values() if isinstance(item, dict)),
-            {},
-        )
-        account = default.get("account") if isinstance(default, dict) else {}
-        account = account if isinstance(account, dict) else {}
-        if errors:
+            if name in {"me", "init"} or probe_channel == "v4":
+                _raise_if_deactivated(payload, source=name)
+        critical_errors = [
+            error
+            for name, error in errors.items()
+            if name in {"me", "init"} or probe_channel == "v4"
+        ]
+        if critical_errors:
             invalid_token = next(
-                (exc for exc in errors if isinstance(exc, InvalidAccessTokenError)),
+                (
+                    exc
+                    for exc in critical_errors
+                    if isinstance(exc, InvalidAccessTokenError)
+                ),
                 None,
             )
-            raise invalid_token or errors[0]
+            raise invalid_token or critical_errors[0]
         me = payloads["me"]
         init = payloads["init"]
-        accounts = payloads["accounts"]
+        plan_payload = payloads.get("plan") or {}
+        if probe_channel == "v4":
+            account_entries = plan_payload.get("accounts") or {}
+            account_entries = (
+                account_entries if isinstance(account_entries, dict) else {}
+            )
+            # 多工作区账号(Team): AT 的 chatgpt_account_id 指向本次会话实际
+            # 登录的工作区, 优先取它的套餐/账号ID; 否则退回 default(个人)工作区,
+            # 避免 Team 账号被 default 个人工作区覆盖成 free。
+            token_account_id = ""
+            try:
+                auth_claims = _jwt_payload(token).get("https://api.openai.com/auth")
+                token_account_id = str(
+                    (auth_claims if isinstance(auth_claims, dict) else {}).get(
+                        "chatgpt_account_id"
+                    )
+                    or ""
+                ).strip()
+            except Exception:
+                token_account_id = ""
+            selected = (
+                account_entries.get(token_account_id)
+                if token_account_id
+                and isinstance(account_entries.get(token_account_id), dict)
+                else None
+            )
+            default = selected or account_entries.get("default") or next(
+                (
+                    item
+                    for item in account_entries.values()
+                    if isinstance(item, dict)
+                ),
+                {},
+            )
+            account = default.get("account") if isinstance(default, dict) else {}
+            account = account if isinstance(account, dict) else {}
+        else:
+            account = {
+                "account_id": record.get("account_id") or "",
+                "plan_type": plan_payload.get("plan_type") or "",
+            }
+        plan_probe_error = str(errors.get("plan") or "")[:400]
     finally:
         session.close()
 
@@ -715,6 +787,8 @@ def fetch_remote_account_info(record: dict[str, Any]) -> dict[str, Any]:
         "health_status": "limited" if status == "限流" else "alive",
         "health_checked_at": _now(),
         "health_error": "",
+        "health_probe_channel": probe_channel,
+        "health_probe_error": plan_probe_error,
         "device_id": device_id,
     }
 
@@ -724,7 +798,8 @@ _HEALTH_OWNED_FIELDS = frozenset({
     "account_id", "workspace_account_id", "user_id", "email", "plan_type",
     "last_token_refresh_at", "last_token_refresh_error", "last_invalid_at",
     "status", "health_status", "health_checked_at", "health_error",
-    "health_probe_error", "health_probe_proxy_mode", "reauth_blocked_reason",
+    "health_probe_error", "health_probe_proxy_mode", "health_probe_channel",
+    "reauth_blocked_reason",
     "type", "quota", "image_quota_unknown", "limits_progress",
     "default_model_slug", "restore_at", "device_id",
 })
@@ -815,8 +890,10 @@ def check_account(
     persist: bool = True,
     path: Path = ACCOUNTS_FILE,
     proxy_candidates: Iterable[str] | None = None,
+    channel: str = "v4",
 ) -> dict[str, Any]:
     current = dict(record)
+    probe_channel = normalize_health_probe_channel(channel)
     operation_log_path = Path(path or ACCOUNTS_FILE).with_name(
         "account_operation_logs.sqlite3"
     )
@@ -828,6 +905,7 @@ def check_account(
         path=operation_log_path,
     )
     current.pop("plan_type_override", None)
+    current["health_probe_channel"] = probe_channel
     stored_proxy = str(current.get("proxy") or "").strip()
     configured_proxies = _normalized_proxy_candidates(proxy_candidates)
     if configured_proxies:
@@ -918,7 +996,14 @@ def check_account(
             try:
                 refresh_for_probe()
                 try:
-                    remote = fetch_remote_account_info({**current, "proxy": probe_proxy})
+                    probe_record = {**current, "proxy": probe_proxy}
+                    remote = (
+                        fetch_remote_account_info(
+                            probe_record, channel=probe_channel,
+                        )
+                        if probe_channel == "nerver"
+                        else fetch_remote_account_info(probe_record)
+                    )
                 except InvalidAccessTokenError:
                     session_error: InvalidAccessTokenError | None = None
                     if current.get("session_token"):
@@ -943,10 +1028,18 @@ def check_account(
                             timeout=_PROBE_REFRESH_TIMEOUT,
                         )
                         apply_refreshed(refreshed)
-                    remote = fetch_remote_account_info({**current, "proxy": probe_proxy})
+                    probe_record = {**current, "proxy": probe_proxy}
+                    remote = (
+                        fetch_remote_account_info(
+                            probe_record, channel=probe_channel,
+                        )
+                        if probe_channel == "nerver"
+                        else fetch_remote_account_info(probe_record)
+                    )
                 _validate_health_metadata(record, current, remote)
                 remote["health_probe_proxy_mode"] = probe_proxy_mode
-                remote["health_probe_error"] = ""
+                remote["health_probe_channel"] = probe_channel
+                remote.setdefault("health_probe_error", "")
                 current.update(remote)
                 break
             except Exception as exc:
@@ -1027,6 +1120,7 @@ def check_account(
                 health_error="",
                 health_probe_error=str(exc)[:400],
                 health_probe_proxy_mode=probe_proxy_mode,
+                health_probe_channel=probe_channel,
             )
         else:
             current.update(
@@ -1034,6 +1128,7 @@ def check_account(
                 health_status="error",
                 health_checked_at=_now(),
                 health_error=str(exc)[:400],
+                health_probe_channel=probe_channel,
             )
     current["updated_at"] = _now()
     final_health = str(current.get("health_status") or "error").strip().lower()
@@ -1047,7 +1142,10 @@ def check_account(
             else "账号测活失败"
         ),
         error=current.get("health_error") or current.get("health_probe_error"),
-        metadata={"health_status": final_health},
+        metadata={
+            "health_status": final_health,
+            "health_probe_channel": probe_channel,
+        },
         path=operation_log_path,
     )
     if persist:
@@ -1087,10 +1185,13 @@ def check_accounts(
     path: Path = ACCOUNTS_FILE,
     progress_callback=None,
     item_callback=None,
+    completion_callback=None,
     worker_limit: Callable[[int], int] | None = None,
     proxy_candidates: Iterable[str] | None = None,
     skip_known_deactivated: bool = True,
+    channel: str = "v4",
 ) -> dict[str, Any]:
+    probe_channel = normalize_health_probe_channel(channel)
     source_items = list(records if records is not None else load_accounts(path))
     operation_log_path = Path(path or ACCOUNTS_FILE).with_name(
         "account_operation_logs.sqlite3"
@@ -1104,6 +1205,7 @@ def check_accounts(
     actual_total = len(items)
     results: list[dict[str, Any]] = []
     pending: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    completed = 0
     # A single SQLite transaction per worker completion is expensive for a
     # multi-thousand-account run. Keep progress durable in modest chunks while
     # avoiding thousands of full transaction/JSON cycles.
@@ -1139,20 +1241,17 @@ def check_accounts(
             executor_workers = requested_workers
 
     def run_one(item: dict[str, Any]) -> dict[str, Any]:
+        check_kwargs = {
+            "persist": False,
+            "path": path,
+            "proxy_candidates": proxy_candidates,
+        }
+        if probe_channel == "nerver":
+            check_kwargs["channel"] = probe_channel
         if not callable(worker_limit):
-            return check_account(
-                item,
-                persist=False,
-                path=path,
-                proxy_candidates=proxy_candidates,
-            )
+            return check_account(item, **check_kwargs)
         return _HEALTH_WORKER_GATE.run(
-            lambda: check_account(
-                item,
-                persist=False,
-                path=path,
-                proxy_candidates=proxy_candidates,
-            ),
+            lambda: check_account(item, **check_kwargs),
             requested=requested_workers,
             limit_provider=worker_limit,
         )
@@ -1182,7 +1281,19 @@ def check_accounts(
             for future in completed_futures:
                 original = in_flight.pop(future)
                 checked = future.result()
+                completed += 1
                 pending.append((original, checked))
+                # ``completion_callback`` is deliberately invoked before the
+                # persistence batch is flushed.  It is for live progress only;
+                # callers that need a persisted row should keep using
+                # ``item_callback``/``progress_callback`` below.  Separating
+                # these callbacks prevents the UI from jumping once per
+                # 25-row SQLite transaction while retaining batched writes.
+                if callable(completion_callback):
+                    try:
+                        completion_callback(completed, len(items), checked)
+                    except Exception:
+                        pass
                 if len(pending) >= batch_size:
                     persist_pending()
                 submit_next()
@@ -1205,6 +1316,7 @@ def check_accounts(
     deactivated = len(skipped_items) + detected_deactivated
     invalid_other = max(0, counts["invalid"] - detected_deactivated)
     return {
+        "channel": probe_channel,
         "requested": requested,
         "actual_total": actual_total,
         "checked": len(results),

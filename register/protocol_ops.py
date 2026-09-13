@@ -55,6 +55,7 @@ def repair_security_one(
     partial_sink: Callable[[dict[str, Any]], None] | None = None,
     protocol_runtime: ProtocolRuntimeSettings | None = None,
     force_password_confirmation: bool = False,
+    mailbox_override: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Complete browser security in one protocol session.
 
@@ -66,6 +67,11 @@ def repair_security_one(
     email = str(account.get("email") or "").strip()
     if not email:
         raise RuntimeError("安全字段补全缺少邮箱")
+    if mailbox_override is not None and (
+        not isinstance(mailbox_override, dict)
+        or str(mailbox_override.get("address") or "").strip().lower() != email.lower()
+    ):
+        raise RuntimeError("安全字段补全预分配邮箱与目标账号不一致")
 
     existing_password = str(account.get("password") or "").strip()
     existing_totp = str(account.get("totp_secret") or "").strip()
@@ -108,7 +114,7 @@ def repair_security_one(
     runtime_context = activate_runtime(protocol_runtime or ProtocolRuntimeSettings())
     runtime_context.__enter__()
     registrar: PlatformRegistrar | None = None
-    mailbox: dict[str, Any] | None = None
+    mailbox: dict[str, Any] | None = mailbox_override
     fields: dict[str, Any] = {}
     protocol_tokens: dict[str, Any] = {}
     early_totp_replaced = False
@@ -252,11 +258,12 @@ def repair_security_one(
     try:
         ensure_running()
         if needs_password or is_browser_registration:
-            mailbox = create_mailbox(
-                email,
-                register_proxy=proxy,
-                allow_used=True,
-            )
+            if mailbox is None:
+                mailbox = create_mailbox(
+                    email,
+                    register_proxy=proxy,
+                    allow_used=True,
+                )
             if str(mailbox.get("address") or "").strip().lower() != email.lower():
                 raise RuntimeError("安全字段补全邮箱池未返回目标邮箱")
         registrar = PlatformRegistrar(proxy)

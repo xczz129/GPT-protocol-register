@@ -13,6 +13,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from typing import Any
 from web.routes.auth import MailMessagesRequest
+from register.mail_channel_options import option_enabled
 
 router = APIRouter()
 
@@ -43,12 +44,15 @@ class MailboxesUpdate(BaseModel):
     api_key: str | None = None
     api_token: str | None = None
     admin_key: str | None = None
+    service: str | None = None
+    max_price: str | float | None = None
     accounts: str | None = None
     default_domain: str | None = None
     domains: list[str] | None = None
     local_length: int | None = None
     capacity: int | None = None
     enable: bool | None = None
+    register_child: bool | None = None
     label: str | None = None
     mailbox_password: str | None = None
 
@@ -95,6 +99,7 @@ def _mail_stats(cfg: dict[str, Any]) -> dict[str, Any]:
         if ptype not in _state().CANONICAL_PROVIDER_TYPES:
             continue
         lines = str(item.get("mailboxes") or "")
+        provider_details: dict[str, Any] = {}
         if ptype == "icloud_api":
             pool = _state().parse_icloud_credentials(lines)
             stats = _state()._pool_stats_for(pool, state)
@@ -162,14 +167,73 @@ def _mail_stats(cfg: dict[str, Any]) -> dict[str, Any]:
                 "token_invalid": local_stats["token_invalid"],
                 "cooldown": local_stats["cooldown"],
             }
+        elif ptype == "smsbower_mail":
+            try:
+                fallback_capacity = max(0, int(item.get("capacity") or 0))
+            except (TypeError, ValueError):
+                fallback_capacity = 0
+            summary: dict[str, Any] = {}
+            inventory_error = ""
+            available = fallback_capacity
+            if bool(item.get("enable", True)):
+                conf = _state()._make_config(mail_cfg)
+                conf["request_timeout"] = min(
+                    float(conf.get("request_timeout") or 30), 6.0
+                )
+                smsbower_provider = _state().SmsBowerMailProvider(dict(item), conf)
+                try:
+                    # availability_summary owns the shared, credential-safe
+                    # 40-second inventory cache used by count_pool_capacity.
+                    summary = smsbower_provider.availability_summary()
+                    available = max(0, int(summary.get("count") or 0))
+                except Exception as exc:
+                    inventory_error = smsbower_provider._safe_detail(exc)[:200]
+                finally:
+                    smsbower_provider.close()
+            local_rows = [
+                {"email": email}
+                for email, entry in state.items()
+                if isinstance(entry, dict)
+                and _state().normalize_provider_type(str(entry.get("provider") or ""))
+                == "smsbower_mail"
+            ]
+            local_stats = _state()._pool_stats_for(local_rows, state)
+            stats = {
+                "total": available,
+                "available": available,
+                "used": local_stats["used"],
+                "failed": local_stats["failed"],
+                "in_use": local_stats["in_use"],
+                "token_invalid": local_stats["token_invalid"],
+                "cooldown": local_stats["cooldown"],
+            }
+            provider_details = {
+                "service": str(
+                    summary.get("service")
+                    or item.get("service")
+                    or _state().SMSBOWER_MAIL_DEFAULT_SERVICE
+                ),
+                "domains": _state().SmsBowerMailProvider._normalize_domains(
+                    summary.get("domains")
+                    or item.get("domains")
+                    or ["gmail.com", "icloud.com"]
+                ),
+                "max_price": str(item.get("max_price") or ""),
+                "inventory": [
+                    dict(row)
+                    for row in summary.get("items", [])
+                    if isinstance(row, dict)
+                ],
+            }
+            if inventory_error:
+                provider_details["inventory_error"] = inventory_error
         else:
             pool = _state().parse_outlook_credentials(lines)
             stats = _state()._pool_stats_for(pool, state)
         for k in totals:
             totals[k] += stats[k]
         api_secret = str(item.get("api_key") or item.get("api_token") or "")
-        providers_out.append(
-            {
+        provider_payload = {
                 "type": ptype,
                 "enable": bool(item.get("enable", True)),
                 "label": str(item.get("label") or ptype),
@@ -177,18 +241,32 @@ def _mail_stats(cfg: dict[str, Any]) -> dict[str, Any]:
                     item.get("mode")
                     or (
                         "api"
-                        if ptype in {"icloud_api", "maddy_webui", "fastmail_api"}
+                        if ptype in {"icloud_api", "maddy_webui", "fastmail_api", "smsbower_mail"}
                         else "imap"
                     )
                 ),
                 "api_base": str(item.get("api_base") or ""),
                 "default_domain": str(item.get("default_domain") or item.get("domain") or ""),
-                "api_key": _state()._mask_secret(api_secret) if api_secret else "",
-                "api_token": _state()._mask_secret(api_secret) if api_secret else "",
                 "mailboxes": lines,
                 **stats,
+                **provider_details,
             }
-        )
+        if ptype == "smsbower_mail":
+            provider_payload["register_child"] = option_enabled(item.get("register_child"))
+            provider_payload["has_api_key"] = bool(
+                _state().SmsBowerMailProvider._resolve_api_key(item)
+            )
+            provider_payload["api_key_masked"] = (
+                _state()._mask_secret(api_secret) if api_secret else ""
+            )
+        else:
+            provider_payload["api_key"] = (
+                _state()._mask_secret(api_secret) if api_secret else ""
+            )
+            provider_payload["api_token"] = (
+                _state()._mask_secret(api_secret) if api_secret else ""
+            )
+        providers_out.append(provider_payload)
     primary = next(
         (p for p in providers_out if p["type"] == "outlook_token"),
         providers_out[0] if providers_out else {},
@@ -289,10 +367,10 @@ def _mailbox_items(
                 if email not in known:
                     pool.append({"email": email})
                     known.add(email)
-        elif ptype == "fastmail_api":
+        elif ptype in {"fastmail_api", "smsbower_mail"}:
             pool = _state().parse_domain_mailboxes(lines)
-            # mailcode-api owns the alias pool; locally we only track the
-            # aliases this provider acquired (state file metadata).
+            # Dynamic providers own their remote pool; locally we index only
+            # addresses acquired by this configured provider.
             provider_ref = f"{ptype}#{pi}"
             configured_api_base = str(provider.get("api_base") or "").strip().rstrip("/").lower()
             known = {str(item.get("email") or "").strip().lower() for item in pool}
@@ -344,7 +422,7 @@ def _mailbox_items(
                     provider.get("mode")
                     or (
                         "api"
-                        if ptype in {"icloud_api", "maddy_webui", "fastmail_api"}
+                        if ptype in {"icloud_api", "maddy_webui", "fastmail_api", "smsbower_mail"}
                         else "imap"
                     )
                 ),
@@ -378,6 +456,17 @@ def _find_mailbox_credential(
     for provider in _state()._providers(cfg):
         ptype = _state().normalize_provider_type(str(provider.get("type") or ""))
         if ptype not in _state().CANONICAL_PROVIDER_TYPES or (want and ptype != want):
+            continue
+        if ptype == "smsbower_mail":
+            state_entry = _state()._load_state_file().get(target)
+            if isinstance(state_entry, dict) and (
+                _state().normalize_provider_type(str(state_entry.get("provider") or ""))
+                == "smsbower_mail"
+            ):
+                return dict(provider, type=ptype), {
+                    "email": target,
+                    "mail_id": str(state_entry.get("mail_id") or ""),
+                }
             continue
         if ptype == "fastmail_api":
             if any(
@@ -576,6 +665,12 @@ def _fetch_mailbox_messages_sync(
         finally:
             provider.close()
 
+    if ptype == "smsbower_mail":
+        raise HTTPException(
+            400,
+            "SMSBower 临时邮箱仅支持注册任务中的验证码轮询，不提供历史收件箱",
+        )
+
     provider = _state().ICloudApiProvider(provider_entry, conf)
     mailbox = {
         "provider": "icloud_api",
@@ -738,7 +833,7 @@ def _mailbox_provider_map(cfg: dict[str, Any]) -> dict[str, str]:
         ptype = _state().normalize_provider_type(str(provider.get("type") or ""))
         if ptype not in _state().CANONICAL_PROVIDER_TYPES:
             continue
-        if ptype in {"maddy_webui", "fastmail_api"}:
+        if ptype in {"maddy_webui", "fastmail_api", "smsbower_mail"}:
             parser = _state().parse_domain_mailboxes
         else:
             parser = _state().parse_icloud_credentials if ptype == "icloud_api" else _state().parse_outlook_credentials
@@ -746,14 +841,15 @@ def _mailbox_provider_map(cfg: dict[str, Any]) -> dict[str, str]:
             email = str(item.get("email") or "").strip().lower()
             if email:
                 result.setdefault(email, ptype)
-    # Dynamic fastmail aliases live in the state file, not in mailboxes text.
+    # Dynamic Fastmail aliases and purchased SMSBower addresses live in state.
     for email, entry in _state()._load_state_file().items():
         if not isinstance(entry, dict):
             continue
-        if _state().normalize_provider_type(str(entry.get("provider") or "")) == "fastmail_api":
+        ptype = _state().normalize_provider_type(str(entry.get("provider") or ""))
+        if ptype in {"fastmail_api", "smsbower_mail"}:
             address = str(email or "").strip().lower()
             if address:
-                result.setdefault(address, "fastmail_api")
+                result.setdefault(address, ptype)
     return result
 
 
@@ -762,7 +858,7 @@ def _filter_mailbox_text(
 ) -> tuple[str, int]:
     kept: list[str] = []
     removed = 0
-    if ptype in {"maddy_webui", "fastmail_api"}:
+    if ptype in {"maddy_webui", "fastmail_api", "smsbower_mail"}:
         parser = _state().parse_domain_mailboxes
     else:
         parser = (
@@ -770,7 +866,7 @@ def _filter_mailbox_text(
         )
     valid = {item["email"].strip().lower() for item in parser(raw)}
     for line in str(raw or "").splitlines():
-        if ptype in {"maddy_webui", "fastmail_api"}:
+        if ptype in {"maddy_webui", "fastmail_api", "smsbower_mail"}:
             email = line.split("----", 1)[0].strip().lower()
         else:
             email = line.split("----", 1)[0].strip().lower() if "----" in line else ""
@@ -788,7 +884,7 @@ def _filter_mailbox_text(
 def _serialize_mailbox_credential(item: dict[str, str], ptype: str) -> str:
     if ptype == "icloud_api":
         return f"{item['email']}----{item['api_key']}"
-    if ptype in {"maddy_webui", "fastmail_api"}:
+    if ptype in {"maddy_webui", "fastmail_api", "smsbower_mail"}:
         remote_id = str(item.get("id") or "").strip()
         return f"{item['email']}----{remote_id}" if remote_id else item["email"]
     return "----".join(
@@ -804,7 +900,7 @@ def _serialize_mailbox_credential(item: dict[str, str], ptype: str) -> str:
 def _merge_mailbox_credentials(
     existing: str, incoming: str, ptype: str, *, append: bool = True
 ) -> tuple[str, dict[str, int]]:
-    if ptype in {"maddy_webui", "fastmail_api"}:
+    if ptype in {"maddy_webui", "fastmail_api", "smsbower_mail"}:
         parser = _state().parse_domain_mailboxes
     else:
         parser = (
@@ -856,6 +952,7 @@ def _delete_mailboxes_from_config(
         "icloud_api": set(),
         "maddy_webui": set(),
         "fastmail_api": set(),
+        "smsbower_mail": set(),
     }
     for item in body.items or []:
         email = str(item.get("email") or "").strip().lower()
@@ -880,7 +977,7 @@ def _delete_mailboxes_from_config(
         if want and ptype != want:
             continue
         raw = str(provider.get("mailboxes") or "")
-        if ptype in {"maddy_webui", "fastmail_api"}:
+        if ptype in {"maddy_webui", "fastmail_api", "smsbower_mail"}:
             pool = _state().parse_domain_mailboxes(raw)
             targets = selected.get(ptype, set())
             if body.delete_all:
@@ -889,6 +986,16 @@ def _delete_mailboxes_from_config(
                     for item in pool
                     if str(item.get("email") or "").strip()
                 }
+                if ptype == "smsbower_mail":
+                    targets.update(
+                        str(email or "").strip().lower()
+                        for email, state_entry in _state()._load_state_file().items()
+                        if isinstance(state_entry, dict)
+                        and _state().normalize_provider_type(
+                            str(state_entry.get("provider") or "")
+                        )
+                        == "smsbower_mail"
+                    )
             remote_removed: set[str] = set()
             if body.delete_all:
                 provider["mailboxes"] = ""
@@ -899,12 +1006,16 @@ def _delete_mailboxes_from_config(
                 local_removed = {email for email in targets if email in valid}
                 removed += len(local_removed - remote_removed)
                 removed_emails.update(local_removed)
-            if ptype in {"maddy_webui", "fastmail_api"} and targets:
+            if ptype in {"maddy_webui", "fastmail_api", "smsbower_mail"} and targets:
                 state = _state()._load_state_file()
                 state_targets = {
                     email
                     for email in targets
                     if isinstance(state.get(email), dict)
+                    and not (
+                        ptype == "smsbower_mail"
+                        and state[email].get("smsbower_pending_status") in {2, 3}
+                    )
                 }
                 removed += len(state_targets - removed_emails)
                 removed_emails.update(state_targets)
@@ -1051,6 +1162,48 @@ async def put_mailboxes(body: MailboxesUpdate):
                 raise HTTPException(400, f"unsupported provider_type: {body.provider_type}")
             prov = _state()._ensure_provider(cfg, ptype)
             prov["type"] = ptype
+            smsbower_settings: dict[str, Any] | None = None
+            if ptype == "smsbower_mail":
+                if body.domains is not None and not body.domains:
+                    raise HTTPException(
+                        400, "SMSBower Mail requires at least one domain"
+                    )
+                candidate = {
+                    "type": "smsbower_mail",
+                    "register_child": (
+                        body.register_child
+                        if body.register_child is not None
+                        else prov.get("register_child")
+                    ),
+                    "api_base": (
+                        body.api_base
+                        if body.api_base is not None
+                        else prov.get("api_base")
+                    ),
+                    "service": (
+                        body.service
+                        if body.service is not None
+                        else prov.get("service")
+                    ),
+                    "domains": (
+                        body.domains
+                        if body.domains is not None
+                        else prov.get("domains")
+                    ),
+                    "max_price": (
+                        body.max_price
+                        if body.max_price is not None
+                        else prov.get("max_price")
+                    ),
+                }
+                try:
+                    _state()._sanitize_smsbower_mail_provider_entry(candidate)
+                except ValueError as exc:
+                    raise HTTPException(400, str(exc)) from exc
+                smsbower_settings = {
+                    key: candidate[key]
+                    for key in ("mode", "api_base", "service", "domains", "max_price", "register_child")
+                }
             merged_text, import_stats = _merge_mailbox_credentials(
                 str(prov.get("mailboxes") or ""),
                 body.mailboxes,
@@ -1068,6 +1221,8 @@ async def put_mailboxes(body: MailboxesUpdate):
                 (
                     "iCloud 邮箱导入"
                     if ptype == "icloud_api"
+                    else "SMSBower 邮箱配置"
+                    if ptype == "smsbower_mail"
                     else "Maddy WebUI 配置"
                     if ptype == "maddy_webui"
                     else "Fastmail 配置"
@@ -1090,6 +1245,12 @@ async def put_mailboxes(body: MailboxesUpdate):
             if ptype == "outlook_token":
                 if body.mode:
                     prov["mode"] = body.mode
+            elif ptype == "smsbower_mail":
+                prov.update(smsbower_settings or {})
+                api_key = _maddy_secret_input(body.api_key)
+                if api_key:
+                    prov["api_key"] = api_key
+                    prov.pop("key", None)
             elif ptype == "maddy_webui":
                 prov["mode"] = "api"
                 if body.api_base is not None:

@@ -6,6 +6,8 @@ import AppModal from "../../components/ui/AppModal.vue";
 import AppButton from "../../components/ui/AppButton.vue";
 import { useBatchOpsStore } from "../../stores/batchops";
 import { useUiStore } from "../../stores/ui";
+import type { TrialChannel } from "../../api/batchops";
+import { fetchUiSettings } from "../../api/settings";
 
 export type BatchKind = "reauth" | "security_repair" | "password_change" | "totp_change" | "refreshAt" | "trial";
 
@@ -27,7 +29,12 @@ const passwordMode = ref<"random" | "custom">("random");
 const newPassword = ref("");
 const confirmPassword = ref("");
 const force = ref(false);
+const trialChannel = ref<TrialChannel>("v4");
 const submitting = ref(false);
+const settingsLoading = ref(false);
+let settingsGeneration = 0;
+
+const workerLimit = computed(() => props.kind === "refreshAt" ? 10 : 20);
 
 const config = computed(() => {
   const n = props.all ? "全部" : props.keys.length;
@@ -76,12 +83,27 @@ const config = computed(() => {
 });
 
 watch(() => props.open, (value) => {
+  const generation = ++settingsGeneration;
+  settingsLoading.value = false;
   if (value) {
     concurrency.value = config.value?.defaultConcurrency || 3;
     passwordMode.value = "random";
     newPassword.value = "";
     confirmPassword.value = "";
     force.value = false;
+    trialChannel.value = "v4";
+    if (props.kind === "trial") {
+      settingsLoading.value = true;
+      void fetchUiSettings().then((settings) => {
+        if (generation !== settingsGeneration) return;
+        concurrency.value = Math.max(1, Math.min(20, Math.floor(Number(settings.trial_workers) || 20)));
+        trialChannel.value = settings.trial_channel === "nerver" ? "nerver" : "v4";
+      }).catch(() => {
+        // The editable local defaults remain available if settings cannot be loaded.
+      }).finally(() => {
+        if (generation === settingsGeneration) settingsLoading.value = false;
+      });
+    }
   }
 });
 
@@ -93,14 +115,14 @@ const passwordInvalid = computed(() => {
 });
 
 async function submit() {
-  if (submitting.value || passwordInvalid.value) return;
+  if (submitting.value || settingsLoading.value || passwordInvalid.value) return;
   submitting.value = true;
-  const workers = Math.max(1, Math.floor(Number(concurrency.value) || 1));
+  const workers = Math.max(1, Math.min(workerLimit.value, Math.floor(Number(concurrency.value) || 1)));
   try {
     if (props.kind === "refreshAt") {
       await batch.startRefreshAt(props.keys, Boolean(props.all), workers);
     } else if (props.kind === "trial") {
-      await batch.startTrial(props.keys, Boolean(props.all), force.value, workers);
+      await batch.startTrial(props.keys, Boolean(props.all), force.value, workers, trialChannel.value);
     } else {
       await batch.startReauthBatch(props.kind, props.keys, {
         concurrency: workers,
@@ -127,8 +149,19 @@ async function submit() {
 
     <div class="field-row">
       <span class="field-label">并发数</span>
-      <input v-model.number="concurrency" class="field-input" type="number" min="1" step="1" />
+      <input v-model.number="concurrency" class="field-input" type="number" min="1" :max="workerLimit" step="1" :disabled="settingsLoading || submitting" />
     </div>
+
+    <div v-if="kind === 'trial'" class="field-row">
+      <span class="field-label">检测渠道</span>
+      <div class="segmented" role="radiogroup" aria-label="试用检测渠道">
+        <button type="button" role="radio" :aria-checked="trialChannel === 'v4'" :class="{ active: trialChannel === 'v4' }" :disabled="settingsLoading || submitting" @click="trialChannel = 'v4'">v4 接口</button>
+        <button type="button" role="radio" :aria-checked="trialChannel === 'nerver'" :class="{ active: trialChannel === 'nerver' }" :disabled="settingsLoading || submitting" @click="trialChannel = 'nerver'">nerver 接口</button>
+      </div>
+    </div>
+    <p v-if="kind === 'trial'" class="channel-note">
+      {{ settingsLoading ? "正在读取并发与渠道默认值…" : trialChannel === "nerver" ? "nerver：通过 nerver 渠道检测，无需资格代理。" : "v4：通过 ChatGPT v4 接口检测，使用资格代理配置。" }}
+    </p>
 
     <template v-if="kind === 'password_change'">
       <div class="field-row">
@@ -158,7 +191,7 @@ async function submit() {
 
     <template #footer>
       <AppButton variant="ghost" @click="emit('close')">取消</AppButton>
-      <AppButton variant="primary" :disabled="Boolean(passwordInvalid)" :loading="submitting" @click="submit">
+      <AppButton variant="primary" :disabled="Boolean(passwordInvalid) || settingsLoading" :loading="submitting" @click="submit">
         启动任务
       </AppButton>
     </template>
@@ -245,6 +278,13 @@ async function submit() {
 
 .check-row input {
   accent-color: var(--accent);
+}
+
+.channel-note {
+  margin: -4px 0 12px 70px;
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  line-height: 1.5;
 }
 
 .warn-text {

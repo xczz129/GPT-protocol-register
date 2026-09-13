@@ -1,15 +1,18 @@
 <script setup lang="ts">
 /* --- 注册任务配置表单 --- */
-import { reactive, ref } from "vue";
+import { computed, reactive, ref, watch } from "vue";
 import { Play } from "@lucide/vue";
 import AppButton from "../../components/ui/AppButton.vue";
 import { useTasksStore } from "../../stores/tasks";
 import { useGroupsStore } from "../../stores/groups";
 import { useUiStore } from "../../stores/ui";
+import { useStatusStore } from "../../stores/status";
+import { normalizeRegistrationNumbers, smsbowerPolicy } from "../../../shared/mailRegistration";
 
 const tasks = useTasksStore();
 const groups = useGroupsStore();
 const ui = useUiStore();
+const status = useStatusStore();
 
 const form = reactive({
   engine: "protocol",
@@ -24,11 +27,21 @@ const form = reactive({
 });
 
 const busy = ref(false);
+const smsbower = computed(() => (status.panel.mail?.providers || []).find((provider) => provider.type === "smsbower_mail"));
+const registrationPolicy = computed(() => smsbowerPolicy(form.mailType, smsbower.value?.register_child));
+
+function normalizeNumbers() {
+  Object.assign(form, normalizeRegistrationNumbers(form, smsbower.value?.register_child));
+}
+
+watch(() => [form.mailType, smsbower.value?.register_child], normalizeNumbers);
 
 async function submit() {
   if (busy.value) return;
   busy.value = true;
   try {
+    if (form.mailType === "smsbower_mail") await status.load(true);
+    normalizeNumbers();
     await tasks.start({
       engine: form.engine,
       total: Math.max(1, Math.min(500, Math.floor(form.total) || 1)),
@@ -65,13 +78,13 @@ async function submit() {
       </label>
 
       <label class="field">
-        <span>注册数量</span>
-        <input v-model.number="form.total" class="input" type="number" min="1" max="500" />
+        <span>{{ registrationPolicy.paired ? "注册数量（主号 + 子号）" : "注册数量" }}</span>
+        <input v-model.number="form.total" class="input" type="number" :min="registrationPolicy.totalMin" :step="registrationPolicy.totalStep" max="500" @blur="normalizeNumbers" />
       </label>
 
       <label class="field">
         <span>并发数</span>
-        <input v-model.number="form.concurrency" class="input" type="number" min="1" max="64" />
+        <input v-model.number="form.concurrency" class="input" type="number" :min="registrationPolicy.concurrencyMin" :step="registrationPolicy.concurrencyStep" max="64" @blur="normalizeNumbers" />
       </label>
 
       <label class="field">
@@ -80,11 +93,18 @@ async function submit() {
           <option value="auto">自动（全部可用邮箱池）</option>
           <option value="outlook">仅 Outlook</option>
           <option value="icloud">仅 iCloud</option>
+          <option value="smsbower_mail">SMSBower 临时邮箱</option>
           <option value="domain">仅域名邮箱</option>
           <option value="maddy">仅 Maddy</option>
           <option value="fastmail">仅 Fastmail</option>
         </select>
       </label>
+
+      <p v-if="registrationPolicy.selected" class="pair-hint">
+        <template v-if="registrationPolicy.paired">{{ Math.ceil((Number(form.total) || 2) / 2) }} 组主子号 · 每组占 2 个并发名额，主号成功后再注册子号。数量、并发最低为 2，奇数自动补齐为偶数。</template>
+        <template v-else>已关闭注册子号，仅注册主号。SMSBower 并发最低为 2，奇数自动补齐为偶数。</template>
+        <span>检测到邮箱已注册时跳过；子号开关在邮箱池设置。</span>
+      </p>
 
       <label class="field">
         <span>目标分组</span>
@@ -155,6 +175,20 @@ async function submit() {
 .field.full {
   grid-column: 1 / -1;
 }
+
+.pair-hint {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding: 10px 12px;
+  border-left: 2px solid var(--accent);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  background: var(--accent-bg);
+  color: var(--text-secondary);
+  font-size: 0.76rem;
+  line-height: 1.6;
+}
+
+.pair-hint span { display: block; color: var(--text-muted); }
 
 .field > span {
   font-size: 0.76rem;

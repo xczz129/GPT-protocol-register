@@ -1,13 +1,13 @@
 # GPT Register (Protocol + Fingerprint Browser)
 
-合并 **reg-factory 指纹浏览器注册流** + **邮箱池（Outlook token / iCloud API）/ 代理池**，
+合并 **reg-factory 指纹浏览器注册流** + **邮箱池（Outlook / iCloud / SMSBower）/ 代理池**，
 **仅 ChatGPT 注册**。
 
 本目录独立于 `~/outlook/chatgpt-register-sub2api`，不会修改你的原项目。
 
 ## 流程
 
-1. 从邮箱池取号（Outlook 或 iCloud Hide My Email）
+1. 从邮箱池取号（Outlook、iCloud Hide My Email 或 SMSBower 临时邮箱）
 2. 按 `registration.engine` 选择纯 HTTP 协议或指纹浏览器
 3. 协议模式使用 `curl_cffi`、PKCE、Sentinel/PoW；浏览器模式使用 Playwright
 4. 完成邮箱/密码与 6 位 OTP 验证
@@ -55,6 +55,51 @@ mail:
 > 注意：API 服务端需在其「设置」里配置 iCloud 主邮箱 + App 专用密码，否则会返回
 > `请先在设置里填写 iCloud 邮箱和 App 专用密码`。
 
+### SMSBower 临时邮箱（`type: smsbower_mail`）
+
+SMSBower 可按需购买 Gmail 或 iCloud 临时邮箱。`domains` 的排列顺序就是尝试顺序，
+因此可以只选一种，也可以同时选择并决定优先使用哪一种。示例默认关闭，且不包含真实密钥：
+
+```yaml
+mail:
+  providers:
+    - type: smsbower_mail
+      enable: false
+      label: SMSBower Mail
+      api_base: https://smsbower.page
+      # 可直接填写，或留空并设置进程环境变量 SMSBOWER_MAIL_API_KEY
+      api_key: ""
+      service: dr
+      # 主号成功后再注册一个共享收件源的 +split 子号
+      register_child: true
+      domains:
+        - gmail.com
+        - icloud.com
+      # 单个邮箱最高价；留空表示不限价
+      max_price: ""
+```
+
+面板邮箱池支持启用、选择 Gmail/iCloud、调整优先顺序和设置最高价格。购买接口不会自动
+重试；响应不确定或终态回收失败时会阻止继续购买，避免重复扣费。API 密钥不会出现在
+`/api/config` 响应或邮箱状态文件中。`mail.smsbower_wait_timeout` 默认且最低为 180 秒，
+不会受其他邮箱池默认 90 秒等待时间影响。
+
+该渠道先走密码注册分支；确认进入已有账号的登录、密码重置或 MFA 分支时，将邮箱记为
+已注册并跳过，不登录原账号、不重置密码，也不继续读取其验证码。未知认证分支会报错，
+不会被误记为“已注册”。
+
+邮箱池中的“注册子号”默认开启。每组只购买一个邮箱，先完成主号，再使用同一收件源的
+`+split` 地址注册子号；主号未完成则子号不启动。两者共享一个激活记录，结束后只结算一次。
+选择 SMSBower 时并发至少为 2 且必须是偶数；开启子号时，总数表示主子号合计的账号名额，
+也必须是至少 2 的偶数。每组占两个调度名额，多组可以同时进行，组内顺序取码避免串码。
+关闭子号时仅注册主号。停止任务会等待正在执行的购买或认证操作退出，再回收邮箱。
+
+运维页显示该渠道的尝试数、已注册、未收到验证码、成功、其他失败、取消及进行中数量，
+并支持主号/子号及 Gmail/iCloud 分组。比例以实际开始的账号尝试为分母，未启动子号不计入。
+验证码平均、最短、最长耗时按“开始等待到收到有效格式验证码”计算；超时单列，不进入均值。
+统计从启用此功能后的任务开始积累，存储于 `data/mail_registration_metrics.sqlite3`，
+不会保存邮箱地址、验证码或密钥，重启与备份恢复均保留统计。
+
 ### Fastmail（`type: fastmail_api`）
 
 基于自建 **mailcode-api** 服务（Fastmail 主账号 + 服务端别名池）。服务端负责
@@ -83,7 +128,7 @@ mail:
 - 别名：`acquire` 即在服务端标记已用；当前部署不会自动删除或停用已分配别名；
   本地验证码超时只释放本地预约，不会删除服务端别名
 
-两种 provider 可同时启用；指定邮箱注册时会自动选中对应池。
+多个 provider 可同时启用；指定邮箱注册时会自动选中对应池。
 
 ## 依赖
 
@@ -150,7 +195,7 @@ cd ..
 | `web-ui/index.html` → `src/main.js`（旧界面） | `web/static/vue/index.html` / `/static/vue/index.html` |
 | `web-ui/new.html` → `src/new/main.ts`（新界面） | `web/static/vue/new.html` / `/static/vue/new.html` |
 
-构建会清空并重新生成 `web/static/vue/`，包括两套入口共用的 `assets/`。该资源目录被 Git 忽略，因此新克隆即使已有 HTML，也必须执行构建；部署时应一起复制本次生成的 HTML 和完整 `assets/`，否则页面引用的 JS / CSS 会缺失。不要在正被访问的生产静态目录内直接构建，先在独立目录构建并验证后再发布。
+构建会清空并重新生成 `web/static/vue/`，包括两套入口共用的 `assets/`。HTML 和完整资源一并纳入 Git 同步，避免克隆后入口引用的 JS/CSS 缺失；修改前端源码后仍需重新构建并提交本次完整产物。不要在正被访问的生产静态目录内直接构建，先在独立目录构建并验证后再发布。
 
 源码发布必须包含 `web-ui/` 的两份 HTML、全部 `src/`（含 `src/new/`）、`package.json`、`package-lock.json`、`vite.config.js`、`tsconfig.json`，以及 `web/static/` 中非构建生成的资源。协议流程还直接依赖 `register/sentinel_vm/runtime_worker.js`、`sentinel/sentinel-runner.js`、`sentinel/sdk.js`；这些 JS 是运行源码，不能作为缓存忽略。
 
@@ -192,7 +237,7 @@ web:
 - 配置 API 默认脱敏返回，保存配置时保留已保存密钥
 - 账号列表默认隐藏密码/Token；下载 JSON 才包含完整导出字段
 - 启动 / 停止注册任务
-- Outlook + iCloud + 域名邮箱 + Maddy + Fastmail 五套邮箱池分别编辑
+- Outlook + iCloud + 域名邮箱 + Maddy + Fastmail + SMSBower 六套邮箱池分别编辑
 - 配置 Local Chrome / Camoufox / Obscura
 - 代理池、SSE 实时日志、已注册账号列表
 - 侧边栏 Kakao 提链工作台：按账号/全部账号批量执行、每账号重试次数、后台日志与结果
@@ -222,7 +267,8 @@ python3 cli.py health -j 5
 | `data/registered_accounts.sqlite3` | 账号实时主库（SQLite WAL、单行 UPSERT、按 email/account_id 去重；首次启动自动迁移旧 JSON） |
 | `data/registered_accounts.json` | 旧数据迁移源与 JSON 兼容格式；面板下载和备份从实时主库按需导出完整数据 |
 | `data/task_history.sqlite3` | 面板任务历史（SQLite WAL；首次读取时自动迁移旧 `task_history.json`） |
-| `data/outlook_token_state.json` | 邮箱池状态（Outlook + iCloud 共用） |
+| `data/outlook_token_state.json` | 邮箱池状态（包括 SMSBower 待结算状态，不含其 API 密钥） |
+| `data/mail_registration_metrics.sqlite3` | 渠道注册结果及取码耗时统计（不含邮箱、验证码或密钥） |
 | `data/kakao_proxy_pools.json` | 按国家拆分的 Kakao sticky Seed 代理池（面板可新增国家并独立编辑） |
 | `data/kakao_proxy_state.json` | Kakao 代理成功、冷却和移除状态 |
 | `common/kakao_trial.py` | 免费 0 KRW 试用活动配置、Checkout/update Payload 与金额校验 |
@@ -232,7 +278,7 @@ python3 cli.py health -j 5
 
 ## 安全与版本控制
 
-Git 只保存可复现的源码、依赖锁文件和脱敏配置样例。`config.yaml`、`.env*`、账号数据库及 WAL/SHM、Cookie、Token、邮箱与代理状态、任务检查点、日志、截图和备份均属于本地运行数据，不得加入 Git；更换服务器时通过单独的数据备份恢复。前端 `node_modules/` 和构建生成的 `assets/` 也不提交，使用上面的锁文件安装与构建命令恢复。
+Git 保存源码、依赖锁文件、脱敏配置样例和配套的前端 HTML/静态资源。`config.yaml`、`.env*`、账号数据库及 WAL/SHM、Cookie、Token、邮箱与代理状态、任务检查点、日志、截图和备份均属于本地运行数据，不得加入 Git；更换服务器时通过单独的数据备份恢复。前端 `node_modules/` 不提交，依赖使用上面的锁文件安装命令恢复。
 
 `.gitignore` 默认排除本地敏感与运行态文件：
 
@@ -256,7 +302,7 @@ gpt-register-fp/
   register/sentinel_vm/ # Node 协议运行脚本
   sentinel/           # Codex OAuth Node runner 与 SDK
   local_browser.py     # Local Chrome / Camoufox / Obscura
-  mail/               # Outlook + iCloud 取码（跨进程文件锁）
+  mail/               # Outlook / iCloud / SMSBower 邮箱池与取码
   common/
   config.yaml / config.example.yaml
 ```

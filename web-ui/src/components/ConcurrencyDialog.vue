@@ -58,7 +58,7 @@ function save() {
             <button class="app-dialog-close" type="button" title="关闭" aria-label="关闭" @click="emit('cancel')"><X :size="16" aria-hidden="true" /></button>
           </div>
           <p>{{ displayMessage }}</p>
-          <div v-if="hasMode" class="concurrency-mode" role="radiogroup" aria-label="登录方式">
+          <div v-if="hasMode" class="concurrency-mode" role="radiogroup" :aria-label="modeLabel">
             <span class="concurrency-mode-label">{{ modeLabel }}</span>
             <div class="seg-controls">
               <button v-for="opt in modeOptions" :key="opt.value" type="button" class="seg-btn" :class="{ active: pickedMode === opt.value }" @click="pickedMode = opt.value">{{ opt.label }}</button>

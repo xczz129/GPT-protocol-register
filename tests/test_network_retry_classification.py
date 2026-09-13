@@ -10,6 +10,11 @@ from proxy_util import is_proxy_transport_error
     "message",
     [
         "curl: (35) TLS connect error",
+        (
+            "Failed to perform, curl: (35) BoringSSL SSL_connect: Connection "
+            "closed abruptly (SSL_ERROR_SYSCALL; error queue empty) in "
+            "connection to sentinel.openai.com:443"
+        ),
         "SSL 27: proxy tunnel failed",
         "certificate verify failed",
         "unexpected EOF while reading",

@@ -19,6 +19,29 @@ CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 REDIRECT_URI = "http://localhost:1455/auth/callback"
 SCOPE = "openid email profile offline_access"
 
+
+def _is_retryable_sentinel_transport_error(value: Any) -> bool:
+    """Return true for transient sentinel route/TLS failures."""
+    text = str(value or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "curl: (35)",
+            "tls connect error",
+            "tls handshake",
+            "ssl connect",
+            "ssl handshake",
+            "connection reset",
+            "connection aborted",
+            "connection closed",
+            "broken pipe",
+            "timed out",
+            "timeout",
+            "unexpected eof",
+            "proxy tunnel",
+        )
+    )
+
 def _b64(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
@@ -443,24 +466,41 @@ class ProtocolClient:
     def sentinel_header(self, flow: str) -> str:
         p = generate_requirements_token(self.device_id)
         body = build_sentinel_request_body(p, self.device_id, flow)
-        r = self.session.post(
-            "https://sentinel.openai.com/backend-api/sentinel/req",
-            data=body,
-            headers={
-                "Content-Type": "text/plain;charset=UTF-8",
-                "Accept": "*/*",
-                "Accept-Language": "zh-CN,zh;q=0.9",
-                "Origin": "https://sentinel.openai.com",
-                "Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html",
-                "User-Agent": USER_AGENT,
-                "sec-fetch-site": "same-origin",
-                "sec-fetch-mode": "cors",
-                "sec-fetch-dest": "empty",
-            },
-            timeout=self.timeout,
-        )
+        headers = {
+            "Content-Type": "text/plain;charset=UTF-8",
+            "Accept": "*/*",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Origin": "https://sentinel.openai.com",
+            "Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html",
+            "User-Agent": USER_AGENT,
+            "sec-fetch-site": "same-origin",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-dest": "empty",
+        }
+        r = None
+        for attempt in range(3):
+            try:
+                r = self.session.post(
+                    "https://sentinel.openai.com/backend-api/sentinel/req",
+                    data=body,
+                    headers=headers,
+                    timeout=self.timeout,
+                )
+                break
+            except Exception as exc:
+                if not _is_retryable_sentinel_transport_error(exc) or attempt >= 2:
+                    raise
+                # The request body is deterministic for this client/flow;
+                # retrying it preserves the same device binding while the
+                # bounded backoff gives a transient proxy/TLS route time to
+                # recover.
+                time.sleep(min(2.0, 0.25 * (2**attempt)))
+        if r is None:
+            raise RuntimeError("sentinel_request_failed: no response")
         if r.status_code >= 400:
-            raise RuntimeError(f"Sentinel HTTP {r.status_code}: {(r.text or '')[:250]}")
+            raise RuntimeError(
+                f"Sentinel HTTP {r.status_code}: {(r.text or '')[:250]}"
+            )
         challenge = r.json()
         return generate_sentinel_token(challenge, flow, self.device_id)
 

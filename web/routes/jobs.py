@@ -19,6 +19,11 @@ import re
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
+from register.mail_channel_options import (
+    is_smsbower_selected,
+    smsbower_child_enabled,
+    validate_smsbower_job,
+)
 
 router = APIRouter()
 
@@ -1148,7 +1153,6 @@ async def job_start(body: StartJobRequest):
                 raise HTTPException(400, "目标分组不存在，请刷新分组列表")
             out["group_id"] = group_id
             out["group_name"] = group["name"]
-            release_stale_in_use()
             cfg = _state()._read_config()
             reg_cfg = cfg.get("registration") if isinstance(cfg.get("registration"), dict) else {}
             engine = str(out.get("engine") or reg_cfg.get("engine") or "protocol").strip().lower()
@@ -1166,6 +1170,19 @@ async def job_start(body: StartJobRequest):
             mail_cfg = cfg.get("mail") if isinstance(cfg.get("mail"), dict) else {}
             mail_type = (out.get("mail_type") or "auto") or "auto"
             want_j = max(1, int(out.get("concurrency") or 1))
+            try:
+                validate_smsbower_job(
+                    mail_cfg,
+                    mail_type,
+                    int(out.get("total") or 1),
+                    want_j,
+                    fixed_email=out.get("email") or None,
+                )
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+            smsbower_selected = is_smsbower_selected(mail_type)
+            smsbower_paired = smsbower_selected and smsbower_child_enabled(mail_cfg)
+            release_stale_in_use()
             cap = count_pool_capacity(
                 mail_cfg,
                 provider_type=None
@@ -1201,6 +1218,12 @@ async def job_start(body: StartJobRequest):
             else:
                 want_n = int(out.get("total") or 1)
                 out["total"] = max(1, min(want_n, available))
+                if smsbower_paired:
+                    # Capacity is expressed in account slots. Never dispatch
+                    # an orphan child/main when a changing inventory trims it.
+                    out["total"] -= out["total"] % 2
+                    if out["total"] < 2:
+                        raise HTTPException(400, "SMSBower 可用邮箱不足一组主号和子号，请刷新邮箱池")
                 out["_requested_concurrency"] = want_j
                 out["requested_concurrency"] = want_j
                 effective, resource_mode = _state()._effective_registration_workers(
@@ -1208,6 +1231,11 @@ async def job_start(body: StartJobRequest):
                     want_j,
                     out["total"],
                 )
+                if smsbower_selected:
+                    # A pair reserves two logical slots while main -> child
+                    # runs sequentially. Child-disabled single-account jobs
+                    # still retain the channel's minimum logical concurrency.
+                    effective = max(2, int(effective) // 2 * 2)
                 out["concurrency"] = effective
                 out["_resource_mode"] = resource_mode
                 out["_pool_available"] = available

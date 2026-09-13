@@ -134,7 +134,7 @@ from common.panel_ops import (
     task_metrics,
     update_ops_state,
 )
-from common.redaction import mask_secret as _mask_secret, merge_config_preserving_secrets as _merge_config_preserving_secrets, redact_config_for_api as _redact_config_for_api
+from common.redaction import mask_secret as _mask_secret, merge_config_preserving_secrets as _merge_config_preserving_secrets, redact_config_for_api as _base_redact_config_for_api
 from common.totp import totp_code
 from config import ROOT as CONFIG_ROOT
 from config_loader import DEFAULT_CONFIG, apply_fingerprint_env, load_config
@@ -161,6 +161,9 @@ from mail import (
     MADDY_WEBUI_DEFAULT_BLOCKED_DOMAINS,
     MADDY_WEBUI_DEFAULT_LOCAL_LENGTH,
     MaddyWebuiProvider,
+    SMSBOWER_MAIL_DEFAULT_BASE,
+    SMSBOWER_MAIL_DEFAULT_SERVICE,
+    SmsBowerMailProvider,
     ICloudApiProvider,
     OutlookTokenProvider,
     _entry_available as _mailbox_entry_available,
@@ -183,6 +186,7 @@ from mail import (
 )
 from register.rebind import RebindError, run_rebind
 from register.protocol_runtime import ProtocolRuntimeSettings
+from register.mail_channel_options import option_enabled
 
 try:
     import yaml  # type: ignore
@@ -628,7 +632,7 @@ def _write_config(cfg: dict[str, Any]) -> None:
                 os.fsync(handle.fileno())
                 try:
                     os.fchmod(handle.fileno(), 0o600)
-                except OSError:
+                except (AttributeError, OSError):
                     pass
             Path(tmp_name).replace(CONFIG_FILE)
         finally:
@@ -679,6 +683,24 @@ def _providers(cfg: dict[str, Any]) -> list[dict[str, Any]]:
     return [item for item in providers if isinstance(item, dict)]
 
 
+def _redact_config_for_api(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Return panel configuration without exposing SMSBower mail credentials."""
+    data = _base_redact_config_for_api(cfg)
+    source_providers = _providers(cfg)
+    for index, provider in enumerate(_providers(data)):
+        if normalize_provider_type(str(provider.get("type") or "")) != "smsbower_mail":
+            continue
+        source = source_providers[index] if index < len(source_providers) else {}
+        configured = bool(SmsBowerMailProvider._resolve_api_key(source))
+        # This key authorizes purchases. Expose only explicit display metadata.
+        provider.pop("api_key", None)
+        provider.pop("key", None)
+        provider["has_api_key"] = configured
+        provider["api_key_masked"] = str(provider.get("api_key_masked") or "")
+        provider["register_child"] = option_enabled(source.get("register_child"))
+    return data
+
+
 def _find_provider(cfg: dict[str, Any], ptype: str) -> dict[str, Any] | None:
     want = normalize_provider_type(ptype)
     for item in _providers(cfg):
@@ -703,6 +725,21 @@ def _ensure_provider(cfg: dict[str, Any], ptype: str) -> dict[str, Any]:
             "enable": True,
             "label": "iCloud Pool",
             "api_base": "https://icloud.xbovo.online",
+            "mailboxes": "",
+        }
+    elif want == "smsbower_mail":
+        entry = {
+            "type": "smsbower_mail",
+            "enable": True,
+            "register_child": True,
+            "label": "SMSBower Mail",
+            "mode": "api",
+            "api_base": SMSBOWER_MAIL_DEFAULT_BASE,
+            "api_key": "",
+            "service": SMSBOWER_MAIL_DEFAULT_SERVICE,
+            "domains": ["gmail.com", "icloud.com"],
+            "max_price": "",
+            "capacity": 0,
             "mailboxes": "",
         }
     elif want == "maddy_webui":
@@ -735,6 +772,32 @@ def _ensure_provider(cfg: dict[str, Any], ptype: str) -> dict[str, Any]:
         entry["type"] = "outlook_token"
     providers.append(entry)
     return entry
+
+
+def _sanitize_smsbower_mail_provider_entry(provider: dict[str, Any]) -> bool:
+    """Normalize persisted SMSBower Mail settings without making API calls."""
+    if not isinstance(provider, dict):
+        return False
+    before = copy.deepcopy(provider)
+    provider["type"] = "smsbower_mail"
+    provider["mode"] = "api"
+    provider["register_child"] = option_enabled(provider.get("register_child"))
+    provider["api_base"] = SmsBowerMailProvider._normalize_api_base(
+        provider.get("api_base") or SMSBOWER_MAIL_DEFAULT_BASE
+    )
+    service = str(provider.get("service") or SMSBOWER_MAIL_DEFAULT_SERVICE).strip().lower()
+    provider["service"] = service or SMSBOWER_MAIL_DEFAULT_SERVICE
+    provider["domains"] = SmsBowerMailProvider._normalize_domains(
+        provider.get("domains")
+        if provider.get("domains") not in (None, "", [])
+        else ["gmail.com", "icloud.com"]
+    )
+    provider["max_price"] = SmsBowerMailProvider._normalize_max_price(
+        provider.get("max_price")
+    )
+    provider.setdefault("capacity", 0)
+    provider.setdefault("mailboxes", "")
+    return provider != before
 
 
 def _pool_stats_for(pool: list[dict[str, str]], state: dict[str, Any]) -> dict[str, int]:
@@ -939,6 +1002,9 @@ def _records_by_keys_with_fallback(
 
 _ACCOUNT_REAUTH_MODES = frozenset({"browser", "protocol"})
 _ACCOUNT_HEALTH_PROGRESS_LOCK = threading.Lock()
+# Manual health batches and automatic maintenance share the same execution
+# slot. Progress state alone cannot guard maintenance, which has its own UI.
+_ACCOUNT_HEALTH_RUN_LOCK = threading.Lock()
 _MAINTENANCE_RUN_LOCK = threading.Lock()
 # Inline row updates are useful for a small selection, but sending and merging
 # hundreds of public rows on every progress poll makes an all-account check
@@ -946,6 +1012,7 @@ _MAINTENANCE_RUN_LOCK = threading.Lock()
 _ACCOUNT_HEALTH_INLINE_UPDATE_LIMIT = 200
 _ACCOUNT_HEALTH_PROGRESS: dict[str, Any] = {
     "running": False,
+    "channel": "v4",
     "requested": 0,
     "actual_total": 0,
     "total": 0,
@@ -978,6 +1045,10 @@ _ACCOUNT_HEALTH_DONE_KEYS: set[str] = set()
 _ACCOUNT_HEALTH_CHECKPOINT_SAVER = task_checkpoint.DebouncedCheckpointSaver(
     _ACCOUNT_HEALTH_CHECKPOINT_TASK, interval=2.0
 )
+
+
+def _normalize_account_health_channel(value: Any) -> str:
+    return "nerver" if str(value or "").strip().lower() == "nerver" else "v4"
 
 
 def _account_health_resource_budget(requested_workers: int) -> tuple[int, str]:
@@ -1050,6 +1121,7 @@ def _account_health_checkpoint_payload(
         "params": {
             "keys": list(_ACCOUNT_HEALTH_CHECKPOINT_KEYS),
             "workers": max(1, int(snapshot.get("requested_workers") or 1)),
+            "channel": _normalize_account_health_channel(snapshot.get("channel")),
         },
         "done_keys": sorted(_ACCOUNT_HEALTH_DONE_KEYS),
         "snapshot": snapshot,
@@ -1057,12 +1129,18 @@ def _account_health_checkpoint_payload(
     }
 
 
-def _account_health_checkpoint_begin(keys: list[Any], *, workers: int) -> None:
+def _account_health_checkpoint_begin(
+    keys: list[Any], *, workers: int, channel: str = "v4",
+) -> None:
     global _ACCOUNT_HEALTH_CHECKPOINT_KEYS
     _ACCOUNT_HEALTH_CHECKPOINT_KEYS = [
         str(key).strip() for key in keys if str(key).strip()
     ]
     _ACCOUNT_HEALTH_DONE_KEYS.clear()
+    with _ACCOUNT_HEALTH_PROGRESS_LOCK:
+        _ACCOUNT_HEALTH_PROGRESS["channel"] = _normalize_account_health_channel(
+            channel
+        )
     task_checkpoint.save_checkpoint(
         _ACCOUNT_HEALTH_CHECKPOINT_TASK,
         _account_health_checkpoint_payload(running=True),
@@ -1077,6 +1155,9 @@ def _account_health_checkpoint_restore() -> None:
         return
     params = checkpoint.get("params") or {}
     keys = [str(key) for key in (params.get("keys") or []) if str(key)]
+    channel = _normalize_account_health_channel(
+        params.get("channel") or (checkpoint.get("snapshot") or {}).get("channel")
+    )
     done_keys = {str(key) for key in (checkpoint.get("done_keys") or []) if str(key)}
     pending = [key for key in keys if key not in done_keys]
     snapshot = dict(checkpoint.get("snapshot") or {})
@@ -1098,6 +1179,7 @@ def _account_health_checkpoint_restore() -> None:
         _ACCOUNT_HEALTH_PROGRESS.update(snapshot)
         _ACCOUNT_HEALTH_PROGRESS.update(
             running=False,
+            channel=channel,
             interrupted=interrupted,
             pending_keys=pending,
             pending_count=len(pending),
@@ -1113,6 +1195,7 @@ def _start_account_health_progress(
     *,
     requested: int | None = None,
     skipped_known_deactivated: int = 0,
+    channel: str = "v4",
 ) -> None:
     actual_total = max(0, int(total or 0))
     skipped = max(0, int(skipped_known_deactivated or 0))
@@ -1130,6 +1213,7 @@ def _start_account_health_progress(
         _ACCOUNT_HEALTH_PROGRESS.clear()
         _ACCOUNT_HEALTH_PROGRESS.update(
             running=True,
+            channel=_normalize_account_health_channel(channel),
             requested=requested_total,
             actual_total=actual_total,
             total=actual_total,
@@ -1211,7 +1295,18 @@ def _update_account_health_progress(
                 if isinstance(updates, dict):
                     updates[delete_key] = public_item
     _refresh_account_health_resource_state()
-    # 检查点:记录已完成账号并防抖落盘(服务重启可恢复进度)。
+
+
+def _mark_account_health_persisted(
+    _done: int, _total: int, item: dict[str, Any]
+) -> None:
+    """Record a health row in the checkpoint after it was written.
+
+    Live progress is intentionally updated before the 25-row persistence
+    batch is flushed.  Checkpoint completion must lag that update so an
+    interrupted write cannot make resume skip an account whose probe result
+    was never stored.
+    """
     done_key = account_delete_key(item)
     if done_key:
         _ACCOUNT_HEALTH_DONE_KEYS.add(done_key)
@@ -1496,7 +1591,16 @@ def _run_account_maintenance_sync(*, force: bool = False) -> dict[str, Any]:
             "reason": "maintenance_already_running",
         }
     try:
-        return _run_account_maintenance_sync_impl(force=force)
+        if not _ACCOUNT_HEALTH_RUN_LOCK.acquire(blocking=False):
+            return {
+                "ok": True,
+                "skipped": True,
+                "reason": "health_check_already_running",
+            }
+        try:
+            return _run_account_maintenance_sync_impl(force=force)
+        finally:
+            _ACCOUNT_HEALTH_RUN_LOCK.release()
     finally:
         _MAINTENANCE_RUN_LOCK.release()
 
@@ -1561,7 +1665,7 @@ def _run_account_maintenance_sync_impl(*, force: bool = False) -> dict[str, Any]
         result = check_accounts(
             records=all_records,
             workers=settings["workers"],
-            item_callback=_health_progress,
+            completion_callback=_health_progress,
             worker_limit=_account_health_worker_limit,
             proxy_candidates=_current_health_proxy_pool(cfg),
         )
@@ -2465,7 +2569,7 @@ async def get_config():
         cfg = _read_config()
         return _cached_json_response(
             cfg,
-            f"config:v2:{_file_stamp(CONFIG_FILE)}",
+            f"config:v3:{_file_stamp(CONFIG_FILE)}",
             "config_ttl",
             60,
             lambda: {"config": _redact_config_for_api(cfg)},
@@ -2502,8 +2606,18 @@ async def put_config(body: ConfigUpdate):
             mail = current.get("mail") if isinstance(current.get("mail"), dict) else {}
             providers = mail.get("providers") if isinstance(mail.get("providers"), list) else []
             for provider in providers:
-                if isinstance(provider, dict) and normalize_provider_type(str(provider.get("type") or "")) == "maddy_webui":
+                ptype = (
+                    normalize_provider_type(str(provider.get("type") or ""))
+                    if isinstance(provider, dict)
+                    else ""
+                )
+                if ptype == "maddy_webui":
                     _sanitize_maddy_provider_entry(provider)
+                elif ptype == "smsbower_mail":
+                    try:
+                        _sanitize_smsbower_mail_provider_entry(provider)
+                    except ValueError as exc:
+                        raise HTTPException(400, str(exc)) from exc
         return {"ok": True, "config": _redact_config_for_api(current)}
 
     return await asyncio.to_thread(_do)

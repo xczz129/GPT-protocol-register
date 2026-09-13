@@ -1,6 +1,7 @@
 <script setup>
 import { computed, ref } from "vue";
 import { apiUrl } from "../api.js";
+import MailRegistrationStats from "./MailRegistrationStats.vue";
 
 const props = defineProps({
   operations: { type: Object, default: () => ({}) },
@@ -126,6 +127,7 @@ function formatTime(value) { if (!value) return "-"; try { const date = new Date
           </div>
         </div>
       </div>
+      <MailRegistrationStats :stats="operations.mail_registration" :loading="busy" />
     </section>
 
     <section class="card">

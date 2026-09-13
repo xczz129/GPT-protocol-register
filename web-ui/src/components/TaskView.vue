@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { Check, Copy, Play, Square, Pause, RotateCcw, ClipboardList, RefreshCw, Trash2 } from "@lucide/vue";
 import AppPager from "./AppPager.vue";
+import { normalizeRegistrationNumbers, smsbowerPolicy } from "../shared/mailRegistration";
 
 const props = defineProps({
   status: { type: Object, default: () => ({}) },
@@ -61,6 +62,12 @@ function provider(type) {
   return (props.status.mail?.providers || []).find((item) => item.type === type) || {};
 }
 
+const registrationPolicy = computed(() => smsbowerPolicy(props.form.mailType, provider("smsbower_mail").register_child));
+function normalizeNumbers() {
+  Object.assign(props.form, normalizeRegistrationNumbers(props.form, provider("smsbower_mail").register_child));
+}
+watch(() => [props.form.mailType, provider("smsbower_mail").register_child], normalizeNumbers, { immediate: true });
+
 function elapsed(task) {
   const status = String(task.status || "queued");
   if (!["success", "failed", "cancelled", "skipped"].includes(status)) {
@@ -108,7 +115,7 @@ onBeforeUnmount(() => clearInterval(clockTimer));
       <div class="card-h">
         <div>
           <h2>注册任务配置</h2>
-          <p class="subtle">配置并发、数量、邮箱来源与注册引擎引擎，开启批量自动化流程。</p>
+          <p class="subtle">配置并发、数量、邮箱来源与注册引擎，开启批量自动化流程。</p>
         </div>
       </div>
       <div class="form">
@@ -119,18 +126,24 @@ onBeforeUnmount(() => clearInterval(clockTimer));
             <option value="protocol">协议注册（原生 Refresh Token）</option>
           </select>
         </label>
-        <label>任务数量<input v-model.number="form.total" type="number" min="1" max="500" /></label>
-        <label>任务并发<input v-model.number="form.concurrency" type="number" min="1" /></label>
+        <label>{{ registrationPolicy.paired ? "任务数量（主号 + 子号）" : "任务数量" }}<input v-model.number="form.total" type="number" :min="registrationPolicy.totalMin" :step="registrationPolicy.totalStep" max="500" @blur="normalizeNumbers" /></label>
+        <label>任务并发<input v-model.number="form.concurrency" type="number" :min="registrationPolicy.concurrencyMin" :step="registrationPolicy.concurrencyStep" max="64" @blur="normalizeNumbers" /></label>
         <label class="full">邮箱池类型
           <select v-model="form.mailType">
             <option value="auto">自动（全部可用邮箱池）</option>
             <option value="outlook">仅 Outlook</option>
             <option value="icloud">仅 iCloud</option>
+            <option value="smsbower_mail">SMSBower 临时邮箱</option>
             <option value="domain">仅域名邮箱</option>
             <option value="maddy">仅 Maddy</option>
             <option value="fastmail">仅 Fastmail</option>
           </select>
         </label>
+        <p v-if="registrationPolicy.selected" class="full hint" role="note">
+          <template v-if="registrationPolicy.paired">{{ Math.ceil((Number(form.total) || 2) / 2) }} 组主子号 · 每组占 2 个并发名额，主号成功后再注册子号。数量、并发最低为 2，奇数自动补齐为偶数。</template>
+          <template v-else>已关闭注册子号，仅注册主号。SMSBower 并发最低为 2，奇数自动补齐为偶数。</template>
+          检测到邮箱已注册时跳过；子号开关在邮箱池设置。
+        </p>
         <label class="full">目标存储分组
           <select v-model="form.groupId" :disabled="!groups.length || form.autoGroup">
             <option v-for="group in groups" :key="group.id" :value="group.id">{{ group.name }}（{{ group.account_count || 0 }}）</option>
@@ -194,6 +207,7 @@ onBeforeUnmount(() => clearInterval(clockTimer));
         <div class="stat"><span class="key">邮箱合计</span><span class="value">可用 {{ status.mail?.available ?? 0 }} / 总数 {{ status.mail?.total ?? 0 }}</span></div>
         <div class="stat"><span class="key">Outlook</span><span class="value">可用 {{ provider('outlook_token').available ?? 0 }} / 总数 {{ provider('outlook_token').total ?? 0 }}</span></div>
         <div class="stat"><span class="key">iCloud</span><span class="value">可用 {{ provider('icloud_api').available ?? 0 }} / 总数 {{ provider('icloud_api').total ?? 0 }}</span></div>
+        <div class="stat"><span class="key">SMSBower</span><span class="value">可用 {{ provider('smsbower_mail').available ?? 0 }} / 总数 {{ provider('smsbower_mail').total ?? 0 }}</span></div>
         <div class="stat"><span class="key">Maddy</span><span class="value">可用 {{ provider('maddy_webui').available ?? 0 }} / 总数 {{ provider('maddy_webui').total ?? 0 }}</span></div>
         <div class="stat"><span class="key">Fastmail</span><span class="value">可用 {{ provider('fastmail_api').available ?? 0 }} / 总数 {{ provider('fastmail_api').total ?? 0 }}</span></div>
         <div class="stat"><span class="key">代理池</span><span class="value">{{ status.proxy?.enabled ? `${status.proxy?.pool_count || 1} 条` : "关闭" }}</span></div>

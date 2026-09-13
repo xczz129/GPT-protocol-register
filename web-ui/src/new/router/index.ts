@@ -22,7 +22,7 @@ const routes: RouteRecordRaw[] = [
 
   /* --- 注册中心 --- */
   { path: "/register/tasks", component: TasksView, meta: { title: "任务调度", subtitle: "创建、调度并观察账号注册任务", section: "注册中心" } },
-  { path: "/register/mail", component: MailView, meta: { title: "邮箱池", subtitle: "维护 Outlook、iCloud、域名邮箱、Maddy 与 Fastmail", section: "注册中心" } },
+  { path: "/register/mail", component: MailView, meta: { title: "邮箱池", subtitle: "维护 Outlook、iCloud、SMSBower、域名邮箱、Maddy 与 Fastmail", section: "注册中心" } },
   { path: "/register/proxy", component: ProxyView, meta: { title: "代理设置", subtitle: "配置注册出站、资源代理与清障服务", section: "注册中心" } },
   { path: "/register/fingerprint", component: FingerprintView, meta: { title: "指纹环境", subtitle: "检查可用运行环境并管理指纹参数", section: "注册中心" } },
 

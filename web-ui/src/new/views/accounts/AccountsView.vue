@@ -11,6 +11,7 @@ import AccountTable from "./AccountTable.vue";
 import AccountCardList from "./AccountCardList.vue";
 import AccountBatchBar from "./AccountBatchBar.vue";
 import HealthProgress from "./HealthProgress.vue";
+import HealthStartDialog from "./HealthStartDialog.vue";
 import AccountLogDialog from "./AccountLogDialog.vue";
 import DeviceInfoDialog from "./DeviceInfoDialog.vue";
 import ImportAccountsDialog from "./ImportAccountsDialog.vue";
@@ -68,15 +69,33 @@ const startDialogKind = ref<BatchKind>("reauth");
 const startDialogKeys = ref<string[]>([]);
 const startDialogAll = ref(false);
 
+/* 测活启动弹窗：选中账号和全量测活共用，默认并发从服务端设置读取。 */
+const healthStartDialogOpen = ref(false);
+const healthStartKeys = ref<string[]>([]);
+const healthStartAll = ref(false);
+
 /** 测活全部（不选中）：跳过已封号 */
 async function healthAll() {
-  if (!(await confirm(`测活全部 ${accounts.activeCount} 个账号（跳过已封号）？数量较多时会持续一段时间。`, { title: "全部测活", confirmText: "开始" }))) return;
-  try {
-    await accounts.startHealth([], true, 20);
-    ui.notify("已开始全部测活", "success");
-  } catch (error) {
-    ui.notify(error instanceof Error ? error.message : "测活启动失败", "error");
+  await accounts.load();
+  if (accounts.loadError) {
+    ui.notify("账号列表加载不完整，请刷新后重试", "error");
+    return;
   }
+  if (accounts.health.running || !accounts.activeCount) return;
+  healthStartKeys.value = [];
+  healthStartAll.value = true;
+  healthStartDialogOpen.value = true;
+}
+
+function healthSelected(keys: string[]) {
+  if (accounts.health.running || !keys.length) return;
+  healthStartKeys.value = [...keys];
+  healthStartAll.value = false;
+  healthStartDialogOpen.value = true;
+}
+
+function onHealthStarted() {
+  accounts.clearSelection();
 }
 
 /** 刷新AT全部（不选中）：服务端按"测活失败 ∪ AT过期/缺失"筛选 */
@@ -214,12 +233,13 @@ onMounted(async () => {
       </div>
     </section>
 
-    <AccountBatchBar @start-batch="openStartDialog" @codex="() => {}" />
+    <AccountBatchBar @start-batch="openStartDialog" @start-health="healthSelected" @codex="() => {}" />
     <AccountLogDialog :account-key="logDialogKey" :open="logDialogOpen" @close="logDialogOpen = false" />
     <DeviceInfoDialog :open="deviceDialogOpen" :account-key="deviceDialogKey" :email="deviceDialogEmail" @close="deviceDialogOpen = false" />
 
     <!-- 批任务弹窗组 -->
     <ImportAccountsDialog :open="importDialogOpen" @close="importDialogOpen = false" @history="openImportHistory" />
+    <HealthStartDialog :open="healthStartDialogOpen" :keys="healthStartKeys" :all="healthStartAll" @close="healthStartDialogOpen = false" @started="onHealthStarted" />
     <BatchStartDialog :open="startDialogOpen" :kind="startDialogKind" :keys="startDialogKeys" :all="startDialogAll" @close="startDialogOpen = false" @started="onBatchStarted" />
     <BatchJobDialog :open="reauthJobDialogOpen || batch.reauthDialogOpen" kind="reauth" @close="reauthJobDialogOpen = false; batch.reauthDialogOpen = false" />
     <BatchJobDialog :open="refreshAtDialogOpen || batch.refreshAtDialogOpen" kind="refreshAt" @close="refreshAtDialogOpen = false; batch.refreshAtDialogOpen = false" />

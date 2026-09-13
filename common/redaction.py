@@ -8,6 +8,25 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 
+_SMS_CODE_SECRET_FIELDS = (
+    ("api_key", "api_key_masked", "has_api_key"),
+    (
+        "firefox_api_password",
+        "firefox_api_password_masked",
+        "has_firefox_api_password",
+    ),
+    (
+        "firefox_api_token",
+        "firefox_api_token_masked",
+        "has_firefox_api_token",
+    ),
+)
+_SMS_CODE_DISPLAY_FIELDS = frozenset(
+    {metadata for _, masked, flag in _SMS_CODE_SECRET_FIELDS for metadata in (masked, flag)}
+    | {"has_firefox_password", "has_firefox_token"}
+)
+
+
 def mask_secret(value: str, *, head: int = 6, tail: int = 4) -> str:
     text = str(value or "").strip()
     if not text:
@@ -39,6 +58,13 @@ def _mask_url_password(value: str) -> str:
 def redact_config_for_api(cfg: dict[str, Any]) -> dict[str, Any]:
     data = copy.deepcopy(cfg)
     data.pop("_loaded_from", None)
+    sms_code = data.get("sms_code") if isinstance(data.get("sms_code"), dict) else {}
+    if isinstance(sms_code, dict):
+        for secret_key, masked_key, flag_key in _SMS_CODE_SECRET_FIELDS:
+            raw_secret = str(sms_code.get(secret_key) or "").strip()
+            sms_code[secret_key] = ""
+            sms_code[masked_key] = mask_secret(raw_secret) if raw_secret else ""
+            sms_code[flag_key] = bool(raw_secret)
     mail = data.get("mail") if isinstance(data.get("mail"), dict) else {}
     providers = mail.get("providers") if isinstance(mail, dict) else []
     if isinstance(providers, list):
@@ -107,6 +133,27 @@ def merge_config_preserving_secrets(base: dict[str, Any], overlay: dict[str, Any
         return
     for key, value in overlay.items():
         if str(key).startswith("_"):
+            continue
+        if key == "sms_code" and isinstance(value, dict):
+            sms_code = base.setdefault("sms_code", {})
+            if not isinstance(sms_code, dict):
+                sms_code = {}
+                base["sms_code"] = sms_code
+            secret_keys = {item[0] for item in _SMS_CODE_SECRET_FIELDS}
+            for sk, sv in value.items():
+                if sk in _SMS_CODE_DISPLAY_FIELDS:
+                    continue
+                secret_text = str(sv or "")
+                if sk in secret_keys and (
+                    not secret_text.strip()
+                    or "***" in secret_text
+                    or "…" in secret_text
+                    or secret_text.startswith("•")
+                ):
+                    continue
+                sms_code[sk] = sv
+            for display_key in _SMS_CODE_DISPLAY_FIELDS:
+                sms_code.pop(display_key, None)
             continue
         if key == "mail" and isinstance(value, dict) and isinstance(base.get("mail"), dict):
             b_mail = base["mail"]

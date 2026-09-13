@@ -43,14 +43,19 @@ def account(email="first@example.invalid", **extra):
     return {"email": email, "password": "fake-password", "totp_secret": "fake-totp", **extra}
 
 
-def fake_login(route, monkeypatch, *, mfa_failures=0, send_failures=0, wait=None):
-    calls = SimpleNamespace(acquire=0, login=0, closed=0, cancelled=0, send=0, mfa=0, workspaces=[])
+def fake_login(route, monkeypatch, *, mfa_failures=0, send_failures=0, wait=None,
+               mfa_payload=None, last_auth_response=None, navigation_error=None,
+               send_error="synthetic number rejected", otp_failures=0,
+               otp_error="synthetic code rejected"):
+    calls = SimpleNamespace(acquire=0, login=0, closed=0, cancelled=0, send=0, mfa=0, otp=0,
+                            workspaces=[], navigated=[])
 
     class Client:
         def __init__(self, *args, **kwargs):
             calls.login += 1
             self.verifier = "fake-verifier"
             self.session = SimpleNamespace(close=self.close)
+            self.last_auth_response = deepcopy(last_auth_response or {})
 
         def close(self):
             calls.closed += 1
@@ -61,18 +66,26 @@ def fake_login(route, monkeypatch, *, mfa_failures=0, send_failures=0, wait=None
         def mfa_id(self): return "fake-mfa"
         def issue_mfa_challenge(self, challenge): pass
 
+        def navigate(self, url):
+            calls.navigated.append(url)
+            if navigation_error:
+                raise RuntimeError(navigation_error)
+
         def verify_mfa(self, *args):
             calls.mfa += 1
             if calls.mfa <= mfa_failures:
                 raise RuntimeError("mfa/verify incorrect_code")
-            return SimpleNamespace(json=lambda: {"page": {"type": "add_phone"}})
+            return SimpleNamespace(json=lambda: deepcopy(mfa_payload if mfa_payload is not None else {"page": {"type": "add_phone"}}))
 
         def send_phone(self, *args):
             calls.send += 1
             if calls.send <= send_failures:
-                raise RuntimeError("synthetic number rejected")
+                raise RuntimeError(send_error)
 
-        def submit_phone_otp(self, *args): pass
+        def submit_phone_otp(self, *args):
+            calls.otp += 1
+            if calls.otp <= otp_failures:
+                raise RuntimeError(otp_error)
         def select_workspace(self, *args, **kwargs):
             calls.workspaces.append((args, kwargs))
             return "http://localhost/?code=fake-code"
@@ -108,6 +121,58 @@ def test_number_attempt_budget_is_not_increased_by_mfa_allowance(route, monkeypa
     assert len(attempts) == limit
     assert all(item["result"] == "failed" for item in attempts)
     assert calls.closed == calls.login
+
+
+@pytest.mark.parametrize("mfa_payload, fallback, expected", [
+    ({"auth_step": {"step": "add-phone"}, "continue_url": "https://auth.openai.com/add-phone?flow=fresh"},
+     {}, "https://auth.openai.com/add-phone?flow=fresh"),
+    ({"page": {"type": "add_phone"}}, {"continue_url": "https://auth.openai.com/add-phone?flow=stored"},
+     "https://auth.openai.com/add-phone?flow=stored"),
+    ({"page": {"type": "add_phone"}}, {}, "https://auth.openai.com/add-phone"),
+])
+def test_panel_phone_navigation_uses_url_evidence_before_acquiring(route, monkeypatch, mfa_payload, fallback, expected):
+    calls = fake_login(route, monkeypatch, mfa_payload=mfa_payload, last_auth_response=fallback)
+    assert route._process_one(account(), config())["status"] == "success"
+    assert calls.navigated == [expected]
+    assert calls.acquire == 1
+
+
+def test_panel_navigation_failure_never_buys_a_number(route, monkeypatch):
+    calls = fake_login(route, monkeypatch, navigation_error="HTTP 400 navigate: invalid transition")
+    steps = []
+    with pytest.raises(RuntimeError, match="phone_navigation_failed"):
+        route._process_one(account(), config(20), steps)
+    assert calls.acquire == calls.send == 0
+    assert calls.login == calls.closed == 1
+    assert any("未获取号码" in row["m"] for row in steps)
+
+
+@pytest.mark.parametrize("stage_name", ["send", "otp"])
+def test_panel_stale_signin_session_has_separate_small_failure_limit(route, monkeypatch, stage_name):
+    stale = "HTTP 409: Your sign-in session is no longer valid. Please start again."
+    options = ({"send_failures": 20, "send_error": stale} if stage_name == "send"
+               else {"otp_failures": 20, "otp_error": stale})
+    calls = fake_login(route, monkeypatch, **options)
+    attempts, steps = [], []
+    with pytest.raises(RuntimeError, match="signin_session_invalid"):
+        route._process_one(account(), config(20), steps, phone_attempts=attempts)
+    assert calls.acquire == route._SESSION_FAILURE_LIMIT == 2
+    assert calls.cancelled == calls.login == calls.closed == 2
+    assert all(item["result"] == "session_invalid" for item in attempts)
+    assert any("登录会话" in row["m"] for row in steps)
+    assert not any("号码 +15550000000 失败" in row["m"] for row in steps)
+
+
+def test_panel_single_stale_session_restarts_with_fresh_client(route, monkeypatch):
+    calls = fake_login(route, monkeypatch, send_failures=1,
+                       send_error="sign-in session is no longer valid")
+    attempts = []
+    result = route._process_one(account(), config(20), phone_attempts=attempts)
+    assert result["status"] == "success"
+    assert calls.login == calls.closed == calls.acquire == 2
+    assert calls.cancelled == 1
+    assert len(calls.navigated) == 2
+    assert [item["result"] for item in attempts] == ["session_invalid", "success"]
 
 
 def test_mfa_retry_does_not_consume_number_budget(route, monkeypatch):

@@ -26,11 +26,13 @@ from common.session_export import (
     save_chatgpt_tokens,
 )
 from common.chatgpt2api import upload_session
+from common.mail_registration_metrics import begin_attempt
 from config import CHATGPT_CF_NODES
 from mail import (
     create_mailbox,
     mark_mailbox_code_boundary,
     mark_mailbox_result,
+    mark_smsbower_otp_accepted,
     release_mailbox,
     wait_for_code,
 )
@@ -48,6 +50,7 @@ from register.sessions import (
     _register_session,
     _unregister_session,
 )
+from register.registration_outcome import RegisteredEmailDetected, requires_fresh_registration
 from register.util import (
     ROOT as PROJECT_ROOT,
     PLATFORM,
@@ -75,6 +78,8 @@ from register.page import (
     click_exact,
     click_any_exact,
     switch_password_to_email_code,
+    install_fresh_registration_guard,
+    check_fresh_registration_page,
     click_submit_or_enter,
     dismiss_cookie_banner,
     fill_email_verified,
@@ -268,21 +273,35 @@ async def _poll_auto_sent_code_before_resend(
 
 
 async def _submit_verification_code(
-    page, code: str, timeout: float = 12
+    page, code: str, timeout: float = 12, *, mailbox: dict[str, Any] | None = None
 ) -> OtpSubmitResult:
     """Submit one OTP while preserving acceptance separately from SPA routing."""
     loop = asyncio.get_running_loop()
     response_future = loop.create_future()
+    acceptance_recorded = False
+
+    def record_acceptance() -> None:
+        nonlocal acceptance_recorded
+        if mailbox is not None and not acceptance_recorded:
+            mark_smsbower_otp_accepted(mailbox)
+            acceptance_recorded = True
 
     def capture_otp_response(response) -> None:
         try:
             url = str(response.url or "")
+            parsed = urlparse(url)
             if (
-                "/api/accounts/email-otp/validate" not in url
+                parsed.scheme != "https"
+                or parsed.hostname != "auth.openai.com"
+                or parsed.path.rstrip("/") != "/api/accounts/email-otp/validate"
                 or response_future.done()
             ):
                 return
             response_future.set_result(response)
+            if 200 <= int(response.status) < 300:
+                # Record consumption before the next page wait can be
+                # cancelled or fail while the accepted OTP is navigating.
+                record_acceptance()
         except Exception:
             logger.debug("capture_otp_response: ignoring exception", exc_info=True)
 
@@ -329,6 +348,8 @@ async def _submit_verification_code(
                 response = None
         status, payload = await _read_otp_response(response) if response else (0, {})
         accepted = 200 <= status < 300
+        if accepted:
+            record_acceptance()
         continue_url = _trusted_otp_continue_url(_find_otp_continue_url(payload))
         if status:
             result_text = "已接受" if accepted else "未通过"
@@ -345,6 +366,7 @@ async def _submit_verification_code(
             confirmation_body = await safe_body_text(page, limit=1600, timeout=2)
             confirmed_on_page = _otp_confirmation_present(confirmation_body)
             if accepted or confirmed_on_page:
+                record_acceptance()
                 if confirmed_on_page and not accepted:
                     _log("[4] 页面确认邮箱已验证，按已接受状态恢复后续流程")
                 advanced = await _recover_after_accepted_otp(page, continue_url)
@@ -384,6 +406,7 @@ async def register_one(
     hybrid_mode: bool = False,
     persist_result: bool = True,
     defer_success_event: bool = False,
+    mailbox_override: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Register one ChatGPT account via fingerprint browser."""
     token = _TASK_IDX.set(index)
@@ -397,7 +420,6 @@ async def register_one(
     bb = pid = None
     browser = ctx = page = None
     success = False
-    otp_accepted_by_server = False
     diagnostic_written = False
     last_error = ""
     _stop = stop_check if callable(stop_check) else _default_stop_check
@@ -474,10 +496,16 @@ async def register_one(
     try:
         emit("queued", step="等待分配邮箱", proxy=proxy_brief(proxy))
         check_stop()
-        mailbox = create_mailbox(
-            mail_config, username=fixed_email, provider_type=provider_type
+        mailbox = (
+            mailbox_override
+            if mailbox_override is not None
+            else create_mailbox(mail_config, username=fixed_email, provider_type=provider_type)
         )
-        email = str(mailbox.get("address") or "")
+        email = str(mailbox.get("address") or "").strip()
+        if not email:
+            raise RuntimeError("邮箱服务未返回 address")
+        if requires_fresh_registration(mailbox):
+            begin_attempt(mailbox)
         _TASK_EMAIL.set(email)
         prov = str(mailbox.get("provider") or provider_type or "?")
         emit(
@@ -497,6 +525,7 @@ async def register_one(
         _register_session(bb, pid)
         emit("running", pid=str(pid), step=f"浏览器已创建 {pid}")
         await ctx.clear_cookies()
+        await install_fresh_registration_guard(ctx, mailbox)
         # Browser startup is infrastructure time; the registration timeout starts
         # when the page flow can actually begin.
         start = time.time()
@@ -789,7 +818,9 @@ async def register_one(
             emit("running", step="[混合] 协议提交邮箱")
             _log("[2] [混合] 使用浏览器会话协议提交邮箱…")
             await fill_email_verified(page, email, tries=2)
-            hybrid_status = await start_nextauth_email_flow(page, email)
+            hybrid_status = await start_nextauth_email_flow(
+                page, email, password_first=requires_fresh_registration(mailbox),
+            )
             if hybrid_status == "advanced":
                 advanced = True
                 await wait_for_any(
@@ -974,7 +1005,9 @@ async def register_one(
                 check_stop()
                 _log("[2] 首次 Continue 超时，立即使用当前浏览器会话请求…")
                 emit("running", step="Continue 超时，浏览器会话请求接管")
-                early_fallback = await start_nextauth_email_flow(page, email)
+                early_fallback = await start_nextauth_email_flow(
+                    page, email, password_first=requires_fresh_registration(mailbox),
+                )
                 if early_fallback == "advanced" or await _left_email_step():
                     advanced = True
                     _log("[2] 浏览器会话请求已接管并进入认证流程")
@@ -1016,7 +1049,9 @@ async def register_one(
             if hybrid_mode:
                 _log("[2] UI Continue 未推进，使用 HAR NextAuth 请求链兜底…")
                 emit("running", step="NextAuth 请求链兜底")
-                fallback_status = await start_nextauth_email_flow(page, email)
+                fallback_status = await start_nextauth_email_flow(
+                    page, email, password_first=requires_fresh_registration(mailbox),
+                )
                 if fallback_status == "advanced":
                     advanced = True
                     _log("[2] NextAuth 兜底已进入 authorize")
@@ -1047,7 +1082,9 @@ async def register_one(
                 if not advanced:
                     _log("[2] [全浏览器] UI 跳转未落地，由当前浏览器会话接管认证请求…")
                     emit("running", step="[全浏览器] 当前会话接管认证请求")
-                    fallback_status = await start_nextauth_email_flow(page, email)
+                    fallback_status = await start_nextauth_email_flow(
+                        page, email, password_first=requires_fresh_registration(mailbox),
+                    )
                     if fallback_status == "advanced" or await _left_email_step():
                         advanced = True
                         _log("[2] [全浏览器] 当前会话接管成功，已进入认证流程")
@@ -1170,10 +1207,12 @@ async def register_one(
                 timeout=8,
             )
 
-        if await safe_count(
+        password_input_count = await safe_count(
             page,
             'input[type="password"], input[name="password"], input[name="new-password"]',
-        ) > 0:
+        )
+        await check_fresh_registration_page(page, mailbox, require_signup=password_input_count > 0)
+        if password_input_count > 0:
             password_url = (await _page_url(page)).lower()
             existing_account_login = _is_existing_account_password_url(password_url)
             if existing_account_login:
@@ -1224,6 +1263,7 @@ async def register_one(
                     timeout=20,
                 )
                 cur_after_password = await _page_url(page)
+                await check_fresh_registration_page(page, mailbox)
                 if "password" in cur_after_password:
                     _log("[3] 注册密码页仍未推进，再提交一次…")
                     await click_submit_or_enter(page, 'input[type="password"]')
@@ -1234,6 +1274,7 @@ async def register_one(
                         timeout=15,
                     )
                     cur_after_password = await _page_url(page)
+                    await check_fresh_registration_page(page, mailbox)
                 # 以“密码输入框已消失”判定提交成功：表单被服务端接受后跳转，
                 # 密码框不再渲染；不能看 URL 子串（query 参数带 password 字样会误判，
                 # 导致落库空密码、服务端真实密码永久丢失）
@@ -1249,6 +1290,9 @@ async def register_one(
                 if password_submitted:
                     _log("[3] 注册密码已由服务端页面确认")
             await dump_state(page, "填密码后")
+        await check_fresh_registration_page(page, mailbox)
+        if requires_fresh_registration(mailbox) and not mailbox.get("_registration_identity_created"):
+            raise RuntimeError("registration_identity_not_confirmed")
         check_timeout()
 
         body_text = (await safe_body_text(page)).lower()
@@ -1480,17 +1524,13 @@ async def register_one(
                     emit("running", step="[混合] 页面校验验证码")
                     _log("[4] [混合] 由当前页面提交 OTP，保留登录/注册分支状态")
                     otp_result = await _submit_verification_code(
-                        page, code, timeout=15
+                        page, code, timeout=15, mailbox=mailbox,
                     )
                 else:
                     otp_result = await _submit_verification_code(
-                        page, code, timeout=12
+                        page, code, timeout=12, mailbox=mailbox,
                     )
                 advanced = otp_result.advanced
-                if otp_result.accepted:
-                    # OTP 被服务端接受 = 账号已在服务端创建；后续任何失败都不能
-                    # 把邮箱释放回池（回池会触发重复注册、密码状态错乱）
-                    otp_accepted_by_server = True
                 await dump_state(page, "填验证码后", verbose=not advanced)
                 if not advanced:
                     check_stop()
@@ -1584,6 +1624,7 @@ async def register_one(
                                 page,
                                 fresh_code,
                                 timeout=15 if hybrid_mode else 12,
+                                mailbox=mailbox,
                             )
                             await dump_state(page, "重发验证码后")
                         elif fresh_code:
@@ -1905,6 +1946,11 @@ async def register_one(
             _log("[失败] 没有 session cookie / accessToken")
         return None
 
+    except RegisteredEmailDetected:
+        last_error = RegisteredEmailDetected.code
+        emit("skipped", step="邮箱已被注册，已跳过并取消本次注册", skip_reason=last_error)
+        _log("[跳过] 邮箱已被注册，未登录、未重置密码、未读取验证码")
+        return None
     except JobCancelled:
         last_error = "cancelled"
         emit("cancelled", step="用户取消", error=last_error)
@@ -1938,7 +1984,7 @@ async def register_one(
         if (
             not success
             and last_error
-            and last_error not in {"cancelled", "stop requested"}
+            and last_error not in {"cancelled", "stop requested", RegisteredEmailDetected.code}
         ):
             try:
                 await _capture_registration_diagnostic(last_error)
@@ -1951,11 +1997,13 @@ async def register_one(
                 record_operation_event(
                     {"email": email},
                     "registration",
-                    "cancelled" if last_error in {"cancelled", "stop requested"} else "failed",
+                    "skipped" if last_error == RegisteredEmailDetected.code else (
+                        "cancelled" if last_error in {"cancelled", "stop requested"} else "failed"
+                    ),
                     message=(
-                        "注册已停止"
-                        if last_error in {"cancelled", "stop requested"}
-                        else "注册失败"
+                        "邮箱已被注册，已跳过" if last_error == RegisteredEmailDetected.code else (
+                            "注册已停止" if last_error in {"cancelled", "stop requested"} else "注册失败"
+                        )
                     ),
                     error=last_error,
                     metadata={"engine": "browser"},
@@ -1967,10 +2015,15 @@ async def register_one(
             try:
                 if success:
                     mark_mailbox_result(mailbox, success=True)
-                elif otp_accepted_by_server:
+                elif mailbox.get("_otp_accepted_by_server"):
                     # OTP 已被服务端接受（账号已创建）但流程未走完：
                     # 标记 used 防止邮箱回池后被当作新邮箱重复注册
-                    mark_mailbox_result(mailbox, success=True)
+                    if requires_fresh_registration(mailbox):
+                        mark_mailbox_result(
+                            mailbox, success=False, error=last_error or "registration_incomplete",
+                        )
+                    else:
+                        mark_mailbox_result(mailbox, success=True)
                     _log(
                         f"[邮箱] OTP 已接受但流程未完成，标记 used 不回池: "
                         f"{_mask_email(mailbox.get('address', ''))}"
@@ -1989,7 +2042,7 @@ async def register_one(
                 except Exception:
                     logger.debug("register_one: ignoring exception", exc_info=True)
         if bb and pid:
-            keep = keep_on_fail and not success and last_error != "cancelled"
+            keep = keep_on_fail and not success and last_error not in {"cancelled", RegisteredEmailDetected.code}
             if keep:
                 try:
                     await teardown(bb, pid, delete=False)

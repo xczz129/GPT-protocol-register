@@ -30,11 +30,12 @@ import PlusEligibilityView from "./components/PlusEligibilityView.vue";
 import RebindView from "./components/RebindView.vue";
 import TrialProxyView from "./components/TrialProxyView.vue";
 import TaskView from "./components/TaskView.vue";
+import { normalizeRegistrationNumbers } from "./shared/mailRegistration";
 
 const views = {
   task: ["注册任务", "创建、调度并观察账号注册任务"],
   fingerprint: ["指纹浏览器", "检查可用运行环境并管理指纹参数"],
-  mail: ["邮箱池", "维护 Outlook、iCloud、域名邮箱、Maddy 与 Fastmail"],
+  mail: ["邮箱池", "维护 Outlook、iCloud、SMSBower、域名邮箱、Maddy 与 Fastmail"],
   proxy: ["代理设置", "配置注册出站、资源代理与清障服务"],
   "plus-eligibility": ["Plus 免费试用", "检查账号是否符合 Plus 1 个月免费试用；支持 v4 与 nerver 双渠道"],
   chatgpt2api: ["chatgpt2api", "管理账号自动上传与连接状态"],
@@ -101,7 +102,7 @@ const passwordChangeDialog = reactive({ open: false, count: 0 });
 const clipboardDialog = reactive({ open: false, title: "", value: "", successMessage: "" });
 const accountLogDialog = reactive({ open: false, account: null, logs: [], total: 0, loading: false, error: "" });
 const copyingAccessToken = ref(false);
-const healthProgress = reactive({ running: false, requested: 0, actualTotal: 0, total: 0, done: 0, checked: 0, usable: 0, unavailable: 0, skippedKnownDeactivated: 0, deactivated: 0, invalidOther: 0, current: "", alive: 0, limited: 0, invalid: 0, reauthRequired: 0, error: 0, requestedWorkers: 0, workers: 0, throttled: false, resourceMode: "normal", updates: [], interrupted: false, pendingCount: 0, message: "" });
+const healthProgress = reactive({ running: false, channel: "v4", requested: 0, actualTotal: 0, total: 0, done: 0, checked: 0, usable: 0, unavailable: 0, skippedKnownDeactivated: 0, deactivated: 0, invalidOther: 0, current: "", alive: 0, limited: 0, invalid: 0, reauthRequired: 0, error: 0, requestedWorkers: 0, workers: 0, throttled: false, resourceMode: "normal", updates: [], interrupted: false, pendingCount: 0, message: "" });
 const reauthProgress = reactive({ running: false, stopping: false, mode: "protocol", operation: "reauth", concurrency: 3, total: 0, done: 0, current: "", success: 0, failed: 0, cancelled: 0, last: "", lastStatus: "", lastMessage: "", items: [] });
 const protocolLoginPreflight = reactive({ requested: 0, matched: 0, submitted: 0, invalidFormat: [], notFound: [], missingCredentials: [] });
 const rebindPreflight = reactive({ eligible: false, requested: 0, matched: 0, eligibleCount: 0, source: null, sources: [], target: null, items: [], reservationId: "", invalidFormat: [], invalidTargets: [], notFound: [], missingCredentials: [], conflicts: [], message: "" });
@@ -188,6 +189,14 @@ const mailForms = reactive({
   icloudText: "",
   icloudApiBase: "https://icloud.xbovo.online",
   icloudEnable: true,
+  smsbowerEnable: false,
+  smsbowerRegisterChild: true,
+  smsbowerApiBase: "https://smsbower.page",
+  smsbowerApiKey: "",
+  smsbowerApiKeyConfigured: false,
+  smsbowerService: "dr",
+  smsbowerDomains: ["gmail.com", "icloud.com"],
+  smsbowerMaxPrice: "",
   maddyEnable: false,
   maddyApiBase: "https://120.53.232.195/api",
   maddyApiToken: "",
@@ -341,6 +350,11 @@ function maddyApiKeyPayload() {
   return value && !isMaskedSecret(value) ? { api_key: value } : {};
 }
 
+function smsbowerApiKeyPayload() {
+  const value = String(mailForms.smsbowerApiKey || "").trim();
+  return value && !isMaskedSecret(value) ? { api_key: value } : {};
+}
+
 function fillForms() {
   const cfg = config.value;
   const registration = cfg.registration || {};
@@ -352,6 +366,7 @@ function fillForms() {
   if (!groups.value.some((item) => item.id === taskForm.groupId)) taskForm.groupId = groups.value[0]?.id || "";
   const outlook = provider("outlook_token");
   const icloud = provider("icloud_api");
+  const smsbower = provider("smsbower_mail");
   const maddy = provider("maddy_webui");
   const fastmail = provider("fastmail_api");
   mailForms.outlookText = "";
@@ -359,6 +374,23 @@ function fillForms() {
   mailForms.icloudText = "";
   mailForms.icloudApiBase = icloud.api_base || "https://icloud.xbovo.online";
   mailForms.icloudEnable = icloud.enable !== false;
+  mailForms.smsbowerEnable = smsbower.enable === true;
+  mailForms.smsbowerRegisterChild = smsbower.register_child !== false;
+  mailForms.smsbowerApiBase = String(smsbower.api_base || "https://smsbower.page");
+  const smsbowerMaskedKey = smsbower.api_key_masked || "";
+  const smsbowerReturnedKey = smsbower.api_key || "";
+  mailForms.smsbowerApiKey = "";
+  mailForms.smsbowerApiKeyConfigured = Boolean(
+    smsbower.has_api_key || smsbowerMaskedKey || smsbowerReturnedKey,
+  );
+  mailForms.smsbowerService = String(smsbower.service || "dr");
+  const smsbowerDomainSource = Array.isArray(smsbower.domains)
+    ? smsbower.domains
+    : smsbower.domain ? [smsbower.domain] : [];
+  const smsbowerDomains = [...new Set(smsbowerDomainSource.map((domain) => String(domain).trim().toLowerCase()))]
+    .filter((domain) => ["gmail.com", "icloud.com"].includes(domain));
+  mailForms.smsbowerDomains = smsbowerDomains.length ? smsbowerDomains : ["gmail.com", "icloud.com"];
+  mailForms.smsbowerMaxPrice = smsbower.max_price == null ? "" : String(smsbower.max_price);
   mailForms.maddyEnable = maddy.enable === true;
   mailForms.maddyApiBase = maddy.api_base || "https://120.53.232.195/api";
   const maddyMaskedKey = maddy.api_key_masked || maddy.api_token_masked || "";
@@ -1267,7 +1299,12 @@ function handleVisibilityChange() {
 }
 
 async function startJob() {
-  await run(() => api("/api/job/start", { method: "POST", body: jsonBody({ total: taskForm.total, concurrency: taskForm.concurrency, keep_on_fail: taskForm.keepOnFail, email: taskForm.email || null, mail_type: taskForm.mailType, engine: taskForm.engine, group_id: taskForm.groupId, auto_group: taskForm.autoGroup, auto_group_size: taskForm.autoGroupSize }) }), "任务已启动", [loadStatus, loadTasks, loadGroups]);
+  await run(async () => {
+    if (taskForm.mailType === "smsbower_mail") await loadStatus();
+    const provider = (status.value.mail?.providers || []).find((item) => item.type === "smsbower_mail");
+    Object.assign(taskForm, normalizeRegistrationNumbers(taskForm, provider?.register_child));
+    return api("/api/job/start", { method: "POST", body: jsonBody({ total: taskForm.total, concurrency: taskForm.concurrency, keep_on_fail: taskForm.keepOnFail, email: taskForm.email || null, mail_type: taskForm.mailType, engine: taskForm.engine, group_id: taskForm.groupId, auto_group: taskForm.autoGroup, auto_group_size: taskForm.autoGroupSize }) });
+  }, "任务已启动", [loadStatus, loadTasks, loadGroups]);
 }
 async function stopJob() { await run(() => api("/api/job/stop", { method: "POST", body: "{}" }), "正在停止任务", [loadStatus]); }
 async function pauseJob() { await run(() => api("/api/job/pause", { method: "POST", body: "{}" }), "已暂停后续任务派发", [loadStatus, loadTasks]); }
@@ -1302,6 +1339,48 @@ async function saveIcloud() {
   if (result?.ok) {
     mailForms.icloudText = "";
     status.value = { ...status.value, mail: result.mail || status.value.mail };
+    loadMailboxes().catch(() => {});
+  }
+}
+async function saveSmsbowerMail() {
+  if (!mailForms.smsbowerDomains.length) {
+    notify("请至少选择一个 SMSBower 邮箱域名", "err");
+    return;
+  }
+  const service = String(mailForms.smsbowerService || "").trim();
+  if (!service) {
+    notify("请输入 SMSBower 服务代码", "err");
+    return;
+  }
+  const maxPrice = String(mailForms.smsbowerMaxPrice || "").trim();
+  if (maxPrice && (!/^\d+(?:\.\d+)?$/.test(maxPrice) || Number(maxPrice) <= 0)) {
+    notify("SMSBower 最高价必须是大于 0 的金额，留空表示不限价", "err");
+    return;
+  }
+  const keyPayload = smsbowerApiKeyPayload();
+  const result = await run(
+    () => api("/api/mailboxes", {
+      method: "PUT",
+      body: jsonBody({
+        provider_type: "smsbower_mail",
+        mailboxes: "",
+        ...(String(mailForms.smsbowerApiBase || "").trim() ? { api_base: String(mailForms.smsbowerApiBase).trim() } : {}),
+        ...keyPayload,
+        enable: mailForms.smsbowerEnable,
+        register_child: mailForms.smsbowerRegisterChild,
+        service,
+        domains: [...mailForms.smsbowerDomains],
+        max_price: maxPrice,
+        append: true,
+      }),
+    }),
+    "SMSBower 邮箱配置已保存",
+  );
+  if (result?.ok) {
+    if (Object.keys(keyPayload).length) mailForms.smsbowerApiKeyConfigured = true;
+    mailForms.smsbowerApiKey = "";
+    status.value = { ...status.value, mail: result.mail || status.value.mail };
+    loadConfig().catch(() => {});
     loadMailboxes().catch(() => {});
   }
 }
@@ -1566,6 +1645,7 @@ function applyHealthProgress(value) {
   }
   Object.assign(healthProgress, {
     running: !!value.running,
+    channel: value.channel === "nerver" ? "nerver" : "v4",
     requested: Math.max(0, requested),
     actualTotal: Math.max(0, actualTotal),
     total: Math.max(0, actualTotal),
@@ -1640,12 +1720,13 @@ async function resumeHealthCheck() {
   if (healthProgress.running) { notify("账号批量测活正在运行，请等待当前任务完成", "err"); return; }
   if (!healthProgress.pendingCount) { notify("没有可续跑的测活账号", "err"); return; }
   const workers = Math.max(1, Math.min(20, Math.floor(Number(healthProgress.requestedWorkers) || Number(uiSettings.value.health_workers) || 20)));
-  Object.assign(healthProgress, { running: true, done: 0, checked: 0, usable: 0, unavailable: 0, invalidOther: 0, current: `${Math.min(workers, Math.max(1, Number(healthProgress.pendingCount) || 1))} 路协议请求并发`, alive: 0, limited: 0, invalid: 0, reauthRequired: 0, error: 0, updates: [], interrupted: false, pendingCount: 0, message: "", requestedWorkers: workers, workers });
+  const channel = healthProgress.channel === "nerver" ? "nerver" : "v4";
+  Object.assign(healthProgress, { running: true, channel, done: 0, checked: 0, usable: 0, unavailable: 0, invalidOther: 0, current: `${Math.min(workers, Math.max(1, Number(healthProgress.pendingCount) || 1))} 路协议请求并发`, alive: 0, limited: 0, invalid: 0, reauthRequired: 0, error: 0, updates: [], interrupted: false, pendingCount: 0, message: "", requestedWorkers: workers, workers });
   startHealthProgressPolling();
   healthRequestActive = true;
   healthServerRunObserved = false;
   try {
-    const result = await api("/api/accounts/health/resume", { method: "POST", body: jsonBody({ workers }) });
+    const result = await api("/api/accounts/health/resume", { method: "POST", body: jsonBody({ workers, channel }) });
     const value = await pollHealthProgress(true);
     if (!value) applyHealthProgress({ ...result, running: false });
     scheduleAccountsRefresh(100);
@@ -2237,20 +2318,29 @@ async function healthAccounts(keys, options = {}) {
   }
   const requestCount = all ? Math.max(knownTotal, targetKeys.length) : targetKeys.length;
   const savedHealthWorkers = Math.max(1, Math.min(20, Math.floor(Number(uiSettings.value.health_workers) || 20)));
+  const savedHealthChannel = healthProgress.channel === "nerver" ? "nerver" : "v4";
   const picked = await openConcurrencyDialog({
     title,
     message: options.description || `请求 ${requestCount} 条账号记录，已封号记录自动跳过。`,
     value: savedHealthWorkers,
     kind: "health",
+    mode: savedHealthChannel,
+    modeLabel: "检测渠道",
+    modeOptions: [{ value: "v4", label: "v4 接口" }, { value: "nerver", label: "nerver 接口" }],
+    modeMessages: {
+      v4: `将通过 ChatGPT /me 与会话接口检查账号有效性，并使用 v4 接口探测 ${requestCount} 条账号的套餐信息；已封号记录自动跳过。`,
+      nerver: `将通过 ChatGPT /me 与会话接口检查账号有效性，并使用 nerver 接口辅助探测 ${requestCount} 条账号的套餐；nerver 结果不会单独判定账号存活。`,
+    },
   });
   if (!picked) return;
   const workers = Math.max(1, Math.min(20, Math.floor(Number(picked.workers) || savedHealthWorkers)));
-  Object.assign(healthProgress, { running: true, requested: requestCount, actualTotal: Math.max(0, requestCount - knownSkipped), total: Math.max(0, requestCount - knownSkipped), done: 0, checked: 0, usable: 0, unavailable: knownSkipped, skippedKnownDeactivated: knownSkipped, deactivated: knownSkipped, invalidOther: 0, current: `${Math.min(workers, Math.max(1, requestCount - knownSkipped))} 路协议请求并发`, alive: 0, limited: 0, invalid: 0, reauthRequired: 0, error: 0, requestedWorkers: workers, workers, throttled: false, resourceMode: "normal", updates: [], interrupted: false, pendingCount: 0, message: "" });
+  const channel = picked.mode === "nerver" ? "nerver" : "v4";
+  Object.assign(healthProgress, { running: true, channel, requested: requestCount, actualTotal: Math.max(0, requestCount - knownSkipped), total: Math.max(0, requestCount - knownSkipped), done: 0, checked: 0, usable: 0, unavailable: knownSkipped, skippedKnownDeactivated: knownSkipped, deactivated: knownSkipped, invalidOther: 0, current: `${Math.min(workers, Math.max(1, requestCount - knownSkipped))} 路协议请求并发`, alive: 0, limited: 0, invalid: 0, reauthRequired: 0, error: 0, requestedWorkers: workers, workers, throttled: false, resourceMode: "normal", updates: [], interrupted: false, pendingCount: 0, message: "" });
   startHealthProgressPolling();
   healthRequestActive = true;
   healthServerRunObserved = false;
   try {
-    const result = await api("/api/accounts/health", { method: "POST", body: jsonBody({ keys: all ? [] : targetKeys, delete_all: all, workers }) });
+    const result = await api("/api/accounts/health", { method: "POST", body: jsonBody({ keys: all ? [] : targetKeys, delete_all: all, workers, channel }) });
     const value = await pollHealthProgress(true);
     if (!value) {
       applyHealthProgress({ ...result, running: false, actual_total: result.actual_total, total: result.actual_total, done: result.checked });
@@ -2317,6 +2407,7 @@ async function trialEligibilityAccounts(payload = {}) {
     kind: "trial",
     max: 20,
     mode: savedTrialChannel,
+    modeLabel: "检测渠道",
     modeOptions: [{ value: "v4", label: "v4 接口" }, { value: "nerver", label: "nerver 接口" }],
     modeMessages: {
       v4: `将按资格代理配置走 ChatGPT v4 接口检测 ${count} 个 Free 账号；Plus 账号自动跳过。`,
@@ -3126,13 +3217,13 @@ function toggleSmsCountry(id) { const value = String(id); const list = smsCountr
 const uiSettings = ref({ health_workers: 20, reauth_workers: 3, trial_workers: 20, refresh_at_workers: 10, codex_sms_workers: 2, reauth_mode: "protocol", trial_channel: "v4" });
 let uiSettingsLoaded = false;
 async function loadUiSettings() { try { const value = await api("/api/ui-settings"); uiSettings.value = value || {}; uiSettingsLoaded = true; } catch {} }
-const concurrencyDialog = reactive({ open: false, title: "", message: "", value: 10, kind: "health", max: 20, mode: "protocol", modeOptions: [], modeMessages: {} });
+const concurrencyDialog = reactive({ open: false, title: "", message: "", value: 10, kind: "health", max: 20, mode: "protocol", modeLabel: "登录方式", modeOptions: [], modeMessages: {} });
 let concurrencyDialogResolve = null;
-async function openConcurrencyDialog({ title, message, value, kind, max, mode, modeOptions, modeMessages }) {
+async function openConcurrencyDialog({ title, message, value, kind, max, mode, modeLabel, modeOptions, modeMessages }) {
   if (!uiSettingsLoaded) await loadUiSettings();
   if (concurrencyDialogResolve) { const stale = concurrencyDialogResolve; concurrencyDialogResolve = null; stale(null); }
   const ceiling = Math.max(1, Math.floor(Number(max) || 20));
-  Object.assign(concurrencyDialog, { open: true, title: title || "并发设置", message: message || "", value: Math.max(1, Math.min(ceiling, Math.floor(Number(value) || 1))), kind: kind || "health", max: ceiling, mode: mode || "protocol", modeOptions: Array.isArray(modeOptions) ? modeOptions : [], modeMessages: modeMessages && typeof modeMessages === "object" ? modeMessages : {} });
+  Object.assign(concurrencyDialog, { open: true, title: title || "并发设置", message: message || "", value: Math.max(1, Math.min(ceiling, Math.floor(Number(value) || 1))), kind: kind || "health", max: ceiling, mode: mode || "protocol", modeLabel: modeLabel || "登录方式", modeOptions: Array.isArray(modeOptions) ? modeOptions : [], modeMessages: modeMessages && typeof modeMessages === "object" ? modeMessages : {} });
   return new Promise((resolve) => { concurrencyDialogResolve = resolve; });
 }
 function closeConcurrencyDialog(result) {
@@ -3342,7 +3433,7 @@ onBeforeUnmount(() => {
         <OperationProgress :progress="progress" />
         <TaskView v-if="active === 'task'" :status="status" :tasks="tasks" :groups="groups" :form="taskForm" :busy="busy" @start="startJob" @stop="stopJob" @pause="pauseJob" @resume="resumeJob" @retry-failed="retryFailedJobs" @create-group="(name) => createAccountGroup(name, true)" @reset-mail="resetMail" @refresh-accounts="loadAccounts" @refresh-tasks="loadTasks" @delete-tasks="deleteTasks" @navigate="navigate" />
         <BrowserView v-else-if="active === 'fingerprint'" :config="config" :capabilities="capabilities" :busy="busy" @save="saveBrowser" @refresh="loadCapabilities" />
-        <MailView v-else-if="active === 'mail'" :forms="mailForms" :mailboxes="mailboxes" :progress="progress" :busy="busy" @save-outlook="saveOutlook" @save-icloud="saveIcloud" @save-maddy="saveMaddyMail" @save-fastmail="saveFastmailMail" @load-maddy-domains="loadMaddyDomains" @load-fastmail-accounts="loadFastmailAccounts" @refresh="loadMailboxes" @delete="deleteMailboxes" @state="updateMailboxState" />
+        <MailView v-else-if="active === 'mail'" :forms="mailForms" :mailboxes="mailboxes" :progress="progress" :busy="busy" @save-outlook="saveOutlook" @save-icloud="saveIcloud" @save-smsbower="saveSmsbowerMail" @save-maddy="saveMaddyMail" @save-fastmail="saveFastmailMail" @load-maddy-domains="loadMaddyDomains" @load-fastmail-accounts="loadFastmailAccounts" @refresh="loadMailboxes" @delete="deleteMailboxes" @state="updateMailboxState" />
         <ProxyView v-else-if="active === 'proxy'" :form="proxyForm" :diagnostics="proxyDiagnostics" :progress="progress" :busy="busy" @save="saveProxy" @test="testProxies" />
         <template v-else-if="active === 'plus-eligibility'">
           <PlusEligibilityView :form="tokenEligibilityForm" :state="tokenEligibility" @check="checkTokenEligibility" @clear="clearTokenEligibility" @batch-check="startBatchTokenEligibility" @batch-stop="stopBatchTokenEligibility" />
@@ -3363,7 +3454,7 @@ onBeforeUnmount(() => {
     <AppDialog :dialog="dialog" @confirm="closeDialog" @cancel="closeDialog(false)" />
     <PasswordChangeDialog :open="passwordChangeDialog.open" :count="passwordChangeDialog.count" @confirm="closePasswordChangeDialog" @cancel="closePasswordChangeDialog(false)" />
     <ClipboardDialog :open="clipboardDialog.open" :title="clipboardDialog.title" :value="clipboardDialog.value" @close="closeClipboardDialog" @copied="clipboardDialogCopied" />
-    <ConcurrencyDialog :open="concurrencyDialog.open" :title="concurrencyDialog.title" :message="concurrencyDialog.message" :value="concurrencyDialog.value" :max="concurrencyDialog.max" :mode="concurrencyDialog.mode" :mode-options="concurrencyDialog.modeOptions" :mode-messages="concurrencyDialog.modeMessages" @confirm="closeConcurrencyDialog" @cancel="closeConcurrencyDialog(null)" @save="saveConcurrencyDefault" />
+    <ConcurrencyDialog :open="concurrencyDialog.open" :title="concurrencyDialog.title" :message="concurrencyDialog.message" :value="concurrencyDialog.value" :max="concurrencyDialog.max" :mode="concurrencyDialog.mode" :mode-label="concurrencyDialog.modeLabel" :mode-options="concurrencyDialog.modeOptions" :mode-messages="concurrencyDialog.modeMessages" @confirm="closeConcurrencyDialog" @cancel="closeConcurrencyDialog(null)" @save="saveConcurrencyDefault" />
     <SmsCountryPicker :open="smsCountryDialog.open" :provider="smsForm.provider" :items="smsCountryDialog.items" :selected="smsCountryDialog.selected" :loading="smsCountryDialog.loading" :error="smsCountryDialog.error" :prices="smsCountryPrices" :providers="smsCountryProviders" @close="smsCountryDialog.open = false" @toggle="toggleSmsCountry" @set-price="setSmsCountryPrice" @set-provider="setSmsCountryProvider" />
     <ImportAccountsDialog :open="importAccountsDialog.open" :busy="busy" @close="importAccountsDialog.open = false" @submit="submitImportAccounts" @history="openImportHistory" />
     <CodexOauthDialog :open="codexOauthDialog.open" :status="codexOauthStatus" @close="closeCodexOauth" @stop="stopCodexOauth" @copy="codexCopyRt" @retry="retryCodexOauthFailed" @retry-all="retryAllCodexOauthFailed" @history="openImportHistory" />
