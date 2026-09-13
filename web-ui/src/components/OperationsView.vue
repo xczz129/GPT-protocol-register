@@ -190,7 +190,7 @@ function formatTime(value) { if (!value) return "-"; try { const date = new Date
         </template>
         <label v-if="smsForm.provider !== 'firefox'" class="full">国家顺序(按顺序取号)<div class="sms-country-field"><div v-if="smsCountries.length" class="sms-country-chips"><span v-for="(name, index) in smsCountries" :key="name + index" class="sms-country-chip">{{ index + 1 }}. {{ name }}</span></div><span v-else class="sms-country-none">未选择</span><button class="btn secondary sm" type="button" @click="emit('pick-countries')">选择国家</button></div></label>
         <label>等码超时(秒)<input v-model.number="smsForm.timeoutSeconds" type="number" min="30" max="1800" /></label>
-        <label>换号重试次数<input v-model.number="smsForm.maxPhoneAttempts" type="number" min="1" /></label>
+        <label>取号次数上限（0 为不限）<input v-model.number="smsForm.maxPhoneAttempts" type="number" min="0" step="1" /><small>同号码重建会话不增加次数，可随时停止。</small></label>
       </div>
       <div class="actions"><button class="primary" :disabled="busy" @click="emit('save-sms-config')">保存接码设置</button><button class="btn secondary" :disabled="busy" @click="emit('test-sms')">查看余额</button></div>
       <p class="hint">{{ smsConfig.configured ? (smsConfig.enabled ? `已启用 ${smsConfig.provider_label || ''}` : `已配置 ${smsConfig.provider_label || ''} 但未启用`) : "未配置接码凭证" }}</p>

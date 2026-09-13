@@ -13,8 +13,8 @@ export function smsbowerPolicy(mailType: string, registerChild: unknown = true) 
     paired,
     totalMin: paired ? 2 : 1,
     totalStep: paired ? 2 : 1,
-    concurrencyMin: selected ? 2 : 1,
-    concurrencyStep: selected ? 2 : 1,
+    concurrencyMin: paired ? 2 : 1,
+    concurrencyStep: paired ? 2 : 1,
   };
 }
 
@@ -29,7 +29,7 @@ export function normalizeRegistrationNumbers(form: RegistrationNumbers, register
   const concurrency = boundedInteger(form.concurrency, policy.concurrencyMin, 64);
   return {
     total: policy.paired ? Math.ceil(total / 2) * 2 : total,
-    concurrency: policy.selected ? Math.ceil(concurrency / 2) * 2 : concurrency,
+    concurrency: policy.paired ? Math.ceil(concurrency / 2) * 2 : concurrency,
   };
 }
 

@@ -24,6 +24,7 @@ def test_stale_phone_session_leaves_phone_loop_instead_of_waiting_again():
     job = imports.ImportJob(id="job", account_id="account", email="a@example.test", batch_id="batch")
     client = SimpleNamespace(
         last_auth_response={},
+        navigate=Mock(),
         send_phone=Mock(side_effect=RuntimeError("HTTP 409: sign-in session is no longer valid")),
     )
 
@@ -34,7 +35,7 @@ def test_stale_phone_session_leaves_phone_loop_instead_of_waiting_again():
     manager._wait_input.assert_not_called()
 
 
-def test_provider_cancel_failure_does_not_hide_stale_phone_session(monkeypatch):
+def test_unsent_activation_is_retained_when_signin_session_expires(monkeypatch):
     manager = imports.ImportJobManager.__new__(imports.ImportJobManager)
     manager.store = SimpleNamespace(update=Mock())
     manager.skip_phone_required = False
@@ -46,11 +47,14 @@ def test_provider_cancel_failure_does_not_hide_stale_phone_session(monkeypatch):
     provider = SimpleNamespace(acquire=Mock(return_value=activation), cancel=Mock(side_effect=RuntimeError("provider unavailable")))
     monkeypatch.setattr(imports, "_sms_client_for", lambda *_args: provider)
     job = imports.ImportJob(id="job", account_id="account", email="a@example.test", batch_id="batch")
-    client = SimpleNamespace(last_auth_response={}, send_phone=Mock(side_effect=RuntimeError("sign-in session is no longer valid")))
+    client = SimpleNamespace(last_auth_response={}, navigate=Mock(), send_phone=Mock(side_effect=RuntimeError("sign-in session is no longer valid")))
 
     with pytest.raises(imports.AuthSessionRestartRequired):
         manager._phone_step(job, client)
 
+    provider.cancel.assert_not_called()
+    assert job._sms_activation is activation
+    manager._release_retained_activation(job)
     provider.cancel.assert_called_once_with(activation)
 
 
@@ -86,7 +90,8 @@ def test_stale_session_retry_closes_old_client_before_new_client(monkeypatch):
     manager._run_job(job.id)
 
     assert events == ["create-0", "close-0", "create-1", "close-1"]
-    assert job.network_retries == 1
+    assert job.network_retries == 0
+    assert job.session_retries == 1
     assert job.status == "failed"  # The second, explicit credential failure stops.
 
 

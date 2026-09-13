@@ -58,6 +58,7 @@ from codex_oauth.sms import (  # noqa: E402
     check_sms_balance,
     normalize_firefox_country,
     parse_firefox_docking_code,
+    parse_phone_attempt_limit,
 )
 
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -452,12 +453,16 @@ def _phone_navigation_url(*responses: Any) -> str:
             target = urljoin("https://auth.openai.com/", raw)
             parsed = urlparse(target)
             if parsed.scheme == "https" and parsed.netloc.lower() == "auth.openai.com":
+                if parsed.path.rstrip("/") != "/add-phone":
+                    raise RuntimeError("phone_navigation_unexpected_step")
                 return target
     return "https://auth.openai.com/add-phone"
 
 
 def _signin_session_expired(error: BaseException | str) -> bool:
     text = str(error or "").lower().replace("_", "-")
+    if "http 409" in text and "/api/accounts/add-phone/send" in text and "invalid-state" in text:
+        return True
     return any(
         marker in text
         for marker in (
@@ -465,6 +470,7 @@ def _signin_session_expired(error: BaseException | str) -> bool:
             "sign in session is no longer valid",
             "signin session is no longer valid",
             "sign-in-session-is-no-longer-valid",
+            "signin-session-invalid",
         )
     )
 
@@ -769,9 +775,6 @@ _MFA_CODE_RETRIES = 3
 # Route/TLS failures are independent from the paid phone-number budget.  A
 # single configured phone attempt must still get a few fresh HTTP sessions.
 _NETWORK_RETRIES = 3
-# Two consecutive stale sign-in sessions are enough evidence to stop this
-# account.  They must not consume a large operator-configured number budget.
-_SESSION_FAILURE_LIMIT = 2
 
 
 def _mfa_code_error(error: BaseException | str) -> bool:
@@ -903,17 +906,57 @@ def _process_one(
     # 提交新号码会得到 invalid_auth_step。因此每个号码配一整轮完整登录
     # (新会话 bootstrap → 邮箱 → 密码 → 2FA → 接码),号码失败取消后
     # 重新登录走下一轮。
-    rounds = int(settings.max_phone_attempts or 5) if sms is not None else 1
+    rounds = settings.max_phone_attempts if sms is not None else 1
     last_error = ""
     mfa_code_failures = 0
     network_failures = 0
     session_failures = 0
-    for attempt in range(1, rounds + _NETWORK_RETRIES + 1 + _MFA_CODE_RETRIES + _SESSION_FAILURE_LIMIT):
-        if stop_event.is_set():
-            raise _SmsCancelled("任务已停止")
-        # 接码流程不再走注册代理,统一本地直连
-        client = ProtocolClient(email, timeout=30)
+    activation: SmsActivation | None = None
+    phone_attempt: dict | None = None
+    phone_sent = False
+    verified_phone = ""
+    attempt = 0
+
+    def phone_budget_exhausted() -> bool:
+        return rounds > 0 and len(phone_attempts) >= rounds
+
+    def attempt_label() -> str:
+        return f"{len(phone_attempts)}/{rounds if rounds > 0 else '不限'}"
+
+    def release_activation(outcome: str) -> None:
+        nonlocal activation, phone_attempt, phone_sent
+        if activation is None:
+            return
+        if phone_attempt is not None and phone_attempt.get("result") != "success":
+            phone_attempt["result"] = outcome
         try:
+            if not activation.finished:
+                sms.cancel(activation)
+        except Exception:
+            log("号码取消确认失败，请核对供应商记录", "warning")
+        finally:
+            activation = None
+            phone_attempt = None
+            phone_sent = False
+
+    def wait_for_retry(name: str, message: str, seconds: float) -> None:
+        try:
+            stage(name, message)
+            if stop_event.wait(seconds):
+                raise _SmsCancelled("任务已停止")
+        except _SmsCancelled:
+            release_activation("cancelled")
+            raise
+
+    while True:
+        if stop_event.is_set():
+            release_activation("cancelled")
+            raise _SmsCancelled("任务已停止")
+        attempt += 1
+        # 接码流程不再走注册代理,统一本地直连
+        client = None
+        try:
+            client = ProtocolClient(email, timeout=30)
             log("本地直连" + (f"(第 {attempt} 轮)" if attempt > 1 else ""))
             stage("login", "初始化登录会话")
             log("初始化会话与 PKCE")
@@ -942,7 +985,7 @@ def _process_one(
             if not mfa_data:
                 fallback_data = getattr(client, "last_auth_response", None)
                 mfa_data = dict(fallback_data) if isinstance(fallback_data, dict) else {}
-            phone_used = ""
+            phone_used = verified_phone
             phone_required, reason = _phone_requirement(mfa_data)
             if phone_required is True:
                 log(f"服务端要求手机验证({reason or 'add-phone'})")
@@ -965,39 +1008,52 @@ def _process_one(
                         raise _SmsAuthSessionExpired(str(exc)) from exc
                     raise RuntimeError(f"phone_navigation_failed: {exc}") from exc
                 log("已进入手机验证页面")
+                if activation is not None:
+                    check_active = getattr(sms, "is_active", None)
+                    still_active = not activation.finished and (
+                        check_active(activation) if callable(check_active) else True
+                    )
+                    if not still_active:
+                        release_activation("activation_expired")
+                        log("原号码租约已结束或已收过短信，按取号设置获取下一号码", "warning")
                 # MFA/login retries do not grant extra paid number attempts.
-                if len(phone_attempts) >= rounds:
-                    raise RuntimeError(f"已达到最多 {rounds} 次取号上限")
-                stage("acquiring", "正在获取号码")
-                phone_attempt = {
-                    "attempt": len(phone_attempts) + 1, "provider": settings.provider,
-                    "country": "", "country_label": "未知", "tier": "",
-                    "estimated_price": None, "price_source": "unknown",
-                    "acquired": False, "result": "acquiring",
-                    "at": datetime.now().isoformat(timespec="seconds"),
-                }
-                phone_attempts.append(phone_attempt)
-                _set_sms_item(email, batch_id, attempt=len(phone_attempts))
-                log(f"接码获取号码(第 {len(phone_attempts)}/{rounds} 次)")
-                try:
-                    activation = sms.acquire()
-                except Exception:
-                    phone_attempt["result"] = "acquire_failed"
-                    raise
-                label = activation.label or str(activation.country)
-                country_label = re.split(r"\s+#|\s+\$", label, maxsplit=1)[0]
-                estimate = getattr(activation, "estimated_price", None)
-                phone_attempt.update(
-                    acquired=True, country=str(activation.country), country_label=country_label,
-                    tier=str(getattr(activation, "tier", "") or ""),
-                    estimated_price=estimate, price_source="catalogue" if estimate is not None else "unknown",
-                    result="pending",
-                )
+                if activation is None:
+                    if phone_budget_exhausted():
+                        raise RuntimeError(f"已达到最多 {rounds} 次取号上限")
+                    stage("acquiring", "正在获取号码")
+                    phone_attempt = {
+                        "attempt": len(phone_attempts) + 1, "provider": settings.provider,
+                        "country": "", "country_label": "未知", "tier": "",
+                        "estimated_price": None, "price_source": "unknown",
+                        "acquired": False, "result": "acquiring",
+                        "at": datetime.now().isoformat(timespec="seconds"),
+                    }
+                    phone_attempts.append(phone_attempt)
+                    _set_sms_item(email, batch_id, attempt=len(phone_attempts))
+                    log(f"接码获取号码(第 {attempt_label()} 次)")
+                    try:
+                        activation = sms.acquire()
+                    except Exception:
+                        phone_attempt["result"] = "acquire_failed"
+                        raise
+                    phone_sent = False
+                    label = activation.label or str(activation.country)
+                    country_label = re.split(r"\s+#|\s+\$", label, maxsplit=1)[0]
+                    estimate = getattr(activation, "estimated_price", None)
+                    phone_attempt.update(
+                        acquired=True, country=str(activation.country), country_label=country_label,
+                        tier=str(getattr(activation, "tier", "") or ""),
+                        estimated_price=estimate, price_source="catalogue" if estimate is not None else "unknown",
+                        result="pending",
+                    )
+                else:
+                    log("原号码尚未发出短信，授权已重建，继续使用同一号码")
                 try:
                     desc = activation.label or f"国家 {activation.country}"
                     log(f"已分配 {activation.phone}({desc})")
                     stage("phone", "正在提交手机号")
                     client.send_phone(activation.phone)
+                    phone_sent = True
                     log("手机号已提交,等待短信验证码")
                     stage("waiting_sms", "等待短信验证码", wait_deadline=time.time() + settings.timeout_seconds)
                     code = sms.wait_code(activation, cancel_event=stop_event)
@@ -1013,10 +1069,20 @@ def _process_one(
                         log("手机验证已通过，供应商完成确认失败，请稍后核对供应商记录", "warning")
                     log("手机验证通过")
                     phone_used = activation.phone
+                    verified_phone = phone_used
+                    activation = None
+                    phone_attempt = None
+                    phone_sent = False
                 except Exception as exc:
                     last_error = str(exc)
                     cancelled = stop_event.is_set() or isinstance(exc, _SmsCancelled)
                     stale_session = isinstance(exc, _SmsAuthSessionExpired) or _signin_session_expired(exc)
+                    if stale_session and not cancelled and not phone_sent and activation is not None and not activation.finished:
+                        phone_attempt["result"] = "session_retry"
+                        phone_attempt["session_retries"] = int(phone_attempt.get("session_retries") or 0) + 1
+                        log("发送前登录会话失效，保留未使用号码，重建授权后继续", "warning")
+                        _set_sms_item(email, batch_id, wait_deadline=None)
+                        raise _SmsAuthSessionExpired(last_error) from exc
                     # Successful phone verification remains successful even if
                     # the provider's finish request subsequently fails.
                     if phone_attempt["result"] != "success":
@@ -1024,30 +1090,20 @@ def _process_one(
                             "cancelled" if cancelled else ("session_invalid" if stale_session else "failed")
                         )
                     # 号码不可用:取消激活,会话作废,由外层重新登录换号。
-                    try:
-                        sms.cancel(activation)
-                        log(
-                            "登录会话已失效，当前号码已取消，准备重建授权会话"
-                            if stale_session else "号码已取消,重新登录换号",
-                            "warning",
-                        )
-                    except Exception:
-                        log(
-                            "登录会话已失效，当前号码取消失败，请核对供应商记录"
-                            if stale_session else "号码取消失败(继续换号)",
-                            "warning",
-                        )
                     if not stale_session:
                         log(f"号码 {activation.phone} 失败: {last_error[:200]}", "warning")
+                    release_activation("cancelled" if cancelled else "session_invalid" if stale_session else "failed")
+                    log("当前号码已结束，重新登录后按配置尝试下一号码", "warning")
                     _set_sms_item(email, batch_id, wait_deadline=None)
                     if cancelled:
                         raise _SmsCancelled("任务已停止") from exc
                     if stale_session:
                         raise _SmsAuthSessionExpired(last_error) from exc
-                    if len(phone_attempts) >= rounds:
-                        raise RuntimeError(f"取号 {len(phone_attempts)}/{rounds} 次均未完成: {last_error[:160]}") from exc
+                    if phone_budget_exhausted():
+                        raise RuntimeError(f"取号 {attempt_label()} 次均未完成: {last_error[:160]}") from exc
                     continue
             else:
+                release_activation("not_needed")
                 log("无需手机验证,直接进入 workspace")
             stage("workspace", "选择工作区")
             try:
@@ -1057,7 +1113,7 @@ def _process_one(
             except Exception as exc:
                 if (
                     sms is not None
-                    and attempt < rounds
+                    and not phone_budget_exhausted()
                     and "phone" in str(exc).lower()
                 ):
                     # workspace 步骤回退到手机验证:同样作废会话重登。
@@ -1102,24 +1158,19 @@ def _process_one(
         except Exception as exc:
             last_error = str(exc)
             if stop_event.is_set() or isinstance(exc, _SmsCancelled):
+                release_activation("cancelled")
                 raise _SmsCancelled("任务已停止") from exc
             if isinstance(exc, _SmsAuthSessionExpired) or _signin_session_expired(exc):
                 session_failures += 1
-                if session_failures >= _SESSION_FAILURE_LIMIT:
-                    message = (
-                        f"signin_session_invalid: 连续 {session_failures} 次登录会话失效，"
-                        "已停止此账号，避免继续获取号码"
-                    )
-                    log(message, "error")
-                    raise RuntimeError(message) from exc
+                delay = min(30.0, 2.0 ** min(session_failures - 1, 5))
                 log(
-                    f"登录会话失效，关闭旧客户端后重建全新授权会话 "
-                    f"({session_failures}/{_SESSION_FAILURE_LIMIT})",
+                    f"登录会话失效，第 {session_failures} 次恢复，{delay:g}s 后重建完整授权"
+                    + ("；保留原号码" if activation is not None else ""),
                     "warning",
                 )
-                stage("session_retry", "登录会话失效，准备重新登录")
+                wait_for_retry("session_retry", "登录会话失效，准备重新登录", delay)
                 continue
-            if len(phone_attempts) >= rounds:
+            if phone_budget_exhausted() and activation is None:
                 raise
             if _proxy_retryable_error(exc) and network_failures < _NETWORK_RETRIES:
                 network_failures += 1
@@ -1139,9 +1190,7 @@ def _process_one(
                         f"({mfa_code_failures}/{_MFA_CODE_RETRIES})",
                         "warning",
                     )
-                    stage("mfa_retry", "等待下一次二次认证窗口")
-                    if stop_event.wait(wait):
-                        raise _SmsCancelled("任务已停止") from exc
+                    wait_for_retry("mfa_retry", "等待下一次二次认证窗口", wait)
                 else:
                     log(
                         f"2FA 验证码被拒,换相邻时间窗口验证码自动重试"
@@ -1149,13 +1198,14 @@ def _process_one(
                         "warning",
                     )
                 continue
+            release_activation("failed")
             raise
         finally:
             try:
-                client.session.close()
+                if client is not None:
+                    client.session.close()
             except Exception:
                 pass
-    raise RuntimeError(f"取号 {len(phone_attempts)}/{rounds} 次，登录未完成: {last_error[:160]}")
 
 
 def _run_batch(
@@ -1177,7 +1227,7 @@ def _run_batch(
                     {
                         "email": str(rec.get("email") or "").strip(), "status": "pending",
                         "stage": "queued", "message": "等待执行", "attempt": 0,
-                        "max_phone_attempts": int(sms_cfg.get("max_phone_attempts") or 5),
+                        "max_phone_attempts": parse_phone_attempt_limit(sms_cfg.get("max_phone_attempts")),
                         "wait_deadline": None, "updated_at": datetime.now().isoformat(timespec="seconds"),
                     }
                     for rec in records
@@ -1314,7 +1364,7 @@ class SmsConfigUpdate(BaseModel):
     poll_interval_ms: int = Field(default=5000, ge=1000, le=60000)
     timeout_seconds: int = Field(default=180, ge=30, le=1800)
     max_price: str = Field(default="", max_length=20)
-    max_phone_attempts: int = Field(default=5, ge=1)
+    max_phone_attempts: int = Field(default=0, ge=0)
     firefox_api_name: str = Field(default="", max_length=120)
     firefox_api_password: str = Field(default="", max_length=120)
     firefox_api_token: str = Field(default="", max_length=200)
@@ -1353,7 +1403,7 @@ def _sms_config_section(cfg: dict) -> dict:
         "poll_interval_ms": _int(raw.get("poll_interval_ms"), 5000),
         "timeout_seconds": _int(raw.get("timeout_seconds"), 180),
         "max_price": str(raw.get("max_price") or ""),
-        "max_phone_attempts": _int(raw.get("max_phone_attempts"), 5),
+        "max_phone_attempts": parse_phone_attempt_limit(raw.get("max_phone_attempts")),
         "firefox_api_name": str(raw.get("firefox_api_name") or ""),
         "firefox_api_password": str(raw.get("firefox_api_password") or ""),
         "firefox_api_token": str(raw.get("firefox_api_token") or ""),
@@ -2326,7 +2376,7 @@ class SmsRunOptions(BaseModel):
     provider: Literal["smsbower", "firefox"] | None = None
     country_order: str | None = Field(default=None, max_length=4000)
     max_price: str | float | None = Field(default=None)
-    max_phone_attempts: int | None = Field(default=None, ge=1, le=50)
+    max_phone_attempts: int | None = Field(default=None, ge=0)
     timeout_seconds: int | None = Field(default=None, ge=30, le=1800)
 
 
@@ -2422,7 +2472,13 @@ def _effective_sms_config(cfg: dict, options: SmsRunOptions | dict | None = None
     provider = str(section.get("provider") or "smsbower")
     for key in ("max_phone_attempts", "timeout_seconds"):
         if key in override:
-            section[key] = override[key]
+            if key == "max_phone_attempts":
+                try:
+                    section[key] = parse_phone_attempt_limit(override[key])
+                except ValueError:
+                    raise HTTPException(400, "取号次数必须是非负整数，0 表示不限") from None
+            else:
+                section[key] = override[key]
     if "country_order" in override:
         countries = str(override["country_order"] or "").strip()
         if provider == "firefox":
@@ -2461,7 +2517,7 @@ def _safe_sms_settings(sms_cfg: dict) -> dict:
         "provider": provider, "provider_label": settings.provider_label,
         "enabled": settings.enabled, "configured": settings.credentials_configured,
         "country_order": country_order, "max_price": str(sms_cfg.get("max_price") or ""),
-        "max_phone_attempts": int(getattr(settings, "max_phone_attempts", sms_cfg.get("max_phone_attempts") or 5)),
+        "max_phone_attempts": parse_phone_attempt_limit(getattr(settings, "max_phone_attempts", sms_cfg.get("max_phone_attempts"))),
         "timeout_seconds": int(getattr(settings, "timeout_seconds", sms_cfg.get("timeout_seconds") or 180)),
         "price_cap_supported": provider == "smsbower",
     }

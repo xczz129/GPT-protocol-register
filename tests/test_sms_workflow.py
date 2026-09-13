@@ -148,17 +148,21 @@ def test_panel_navigation_failure_never_buys_a_number(route, monkeypatch):
 
 
 @pytest.mark.parametrize("stage_name", ["send", "otp"])
-def test_panel_stale_signin_session_has_separate_small_failure_limit(route, monkeypatch, stage_name):
+def test_panel_stale_signin_session_recovers_beyond_two_failures(route, monkeypatch, stage_name):
     stale = "HTTP 409: Your sign-in session is no longer valid. Please start again."
-    options = ({"send_failures": 20, "send_error": stale} if stage_name == "send"
-               else {"otp_failures": 20, "otp_error": stale})
+    options = ({"send_failures": 3, "send_error": stale} if stage_name == "send"
+               else {"otp_failures": 3, "otp_error": stale})
     calls = fake_login(route, monkeypatch, **options)
     attempts, steps = [], []
-    with pytest.raises(RuntimeError, match="signin_session_invalid"):
-        route._process_one(account(), config(20), steps, phone_attempts=attempts)
-    assert calls.acquire == route._SESSION_FAILURE_LIMIT == 2
-    assert calls.cancelled == calls.login == calls.closed == 2
-    assert all(item["result"] == "session_invalid" for item in attempts)
+    event = SimpleNamespace(is_set=lambda: False, wait=lambda _duration: False)
+    result = route._process_one(account(), config(20), steps, phone_attempts=attempts, stop_event=event)
+    assert result["status"] == "success"
+    assert calls.login == calls.closed == 4
+    assert calls.acquire == (1 if stage_name == "send" else 4)
+    assert calls.cancelled == (0 if stage_name == "send" else 3)
+    assert attempts[-1]["result"] == "success"
+    if stage_name == "send":
+        assert attempts[0]["session_retries"] == 3
     assert any("登录会话" in row["m"] for row in steps)
     assert not any("号码 +15550000000 失败" in row["m"] for row in steps)
 
@@ -167,12 +171,14 @@ def test_panel_single_stale_session_restarts_with_fresh_client(route, monkeypatc
     calls = fake_login(route, monkeypatch, send_failures=1,
                        send_error="sign-in session is no longer valid")
     attempts = []
-    result = route._process_one(account(), config(20), phone_attempts=attempts)
+    event = SimpleNamespace(is_set=lambda: False, wait=lambda _duration: False)
+    result = route._process_one(account(), config(1), phone_attempts=attempts, stop_event=event)
     assert result["status"] == "success"
-    assert calls.login == calls.closed == calls.acquire == 2
-    assert calls.cancelled == 1
+    assert calls.login == calls.closed == 2
+    assert calls.acquire == 1
+    assert calls.cancelled == 0
     assert len(calls.navigated) == 2
-    assert [item["result"] for item in attempts] == ["session_invalid", "success"]
+    assert [item["result"] for item in attempts] == ["success"]
 
 
 def test_mfa_retry_does_not_consume_number_budget(route, monkeypatch):

@@ -77,7 +77,7 @@ def _append_account(record: dict[str, Any]) -> None:
 
         from common.account_store import account_is_deactivated
 
-        if not account_is_deactivated(saved):
+        if saved.get("access_token") and not account_is_deactivated(saved):
             schedule_trial_eligibility_check(saved, path=ACCOUNTS_FILE)
     except Exception:
         # Eligibility metadata is best-effort; the account itself is already

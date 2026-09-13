@@ -1231,10 +1231,8 @@ async def job_start(body: StartJobRequest):
                     want_j,
                     out["total"],
                 )
-                if smsbower_selected:
-                    # A pair reserves two logical slots while main -> child
-                    # runs sequentially. Child-disabled single-account jobs
-                    # still retain the channel's minimum logical concurrency.
+                if smsbower_paired:
+                    # Only an enabled primary/child pair needs two logical slots.
                     effective = max(2, int(effective) // 2 * 2)
                 out["concurrency"] = effective
                 out["_resource_mode"] = resource_mode

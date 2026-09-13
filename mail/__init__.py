@@ -3839,6 +3839,13 @@ class SmsBowerMailProvider:
                 mailbox["_smsbower_wait_timed_out"] = not bool(code)
                 if not code and mailbox.get("_registration_outcome") != "already_registered":
                     mailbox["_registration_outcome"] = "otp_timeout"
+            if code:
+                mailbox["_registration_code_received"] = True
+                if lease is not None:
+                    roles = lease.setdefault("received_roles", [])
+                    role = str(mailbox.get("_smsbower_pair_role") or "primary")
+                    if role not in roles:
+                        roles.append(role)
             return code
 
     def _wait_for_code_inner(
@@ -3856,24 +3863,7 @@ class SmsBowerMailProvider:
             delivered = max(0, int(mailbox.get("_smsbower_codes_delivered") or 0))
         except (TypeError, ValueError):
             delivered = 0
-        try:
-            next_requests = max(
-                0, int(mailbox.get("_smsbower_next_code_requests") or 0)
-            )
-        except (TypeError, ValueError):
-            next_requests = 0
-        if delivered > next_requests:
-            # setStatus is state-changing. Record the attempt before sending so
-            # a lost response cannot make a later wait blindly replay it.
-            mailbox["_smsbower_next_code_requests"] = delivered
-            try:
-                self.set_status(mail_id, 5)
-            except Exception as error:
-                mailbox["_smsbower_next_code_request_error"] = self._safe_detail(
-                    error
-                )[:300]
-                raise
-            mailbox.pop("_smsbower_next_code_request_error", None)
+        _request_next_smsbower_code(self, mailbox)
 
         mailbox.pop("_last_code_wait_error", None)
         mailbox["_code_wait_attempts"] = 0
@@ -3952,6 +3942,64 @@ _SMSBOWER_SHARED_CODE_FIELDS = (
     "_smsbower_last_code", "_smsbower_seen_codes",
     "_smsbower_next_code_request_error",
 )
+
+
+def _smsbower_code_count(mailbox: dict[str, Any], key: str) -> int:
+    try:
+        return max(0, int(mailbox.get(key) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _request_next_smsbower_code(provider: SmsBowerMailProvider, mailbox: dict[str, Any]) -> None:
+    """Advance a consumed code cursor once; never replay an uncertain request."""
+    delivered = _smsbower_code_count(mailbox, "_smsbower_codes_delivered")
+    requested = _smsbower_code_count(mailbox, "_smsbower_next_code_requests")
+    if delivered <= requested:
+        return
+    mailbox["_smsbower_next_code_requests"] = delivered
+    try:
+        provider.set_status(provider._mail_id(mailbox), 5)
+    except Exception as error:
+        mailbox["_smsbower_next_code_request_error"] = provider._safe_detail(error)[:300]
+        raise
+    mailbox.pop("_smsbower_next_code_request_error", None)
+
+
+def prepare_smsbower_next_code(mailbox: dict[str, Any]) -> None:
+    """Prepare repeat delivery BEFORE a new auth flow can send its email OTP.
+
+    Doing this in wait_for_code alone is too late: a fast child OTP may already
+    have arrived, and changing the activation to wait-next can discard it.
+    """
+    if normalize_provider_type(str(mailbox.get("provider") or "")) != "smsbower_mail":
+        return
+    lease = _smsbower_pair_lease(mailbox)
+    with lease["lock"] if lease is not None else nullcontext():
+        if lease is not None:
+            if lease.get("finalized"):
+                raise SmsBowerMailError("SMSBower pair lease is already finalized")
+            for name in _SMSBOWER_SHARED_CODE_FIELDS:
+                if name in lease:
+                    mailbox[name] = lease[name]
+        delivered = _smsbower_code_count(mailbox, "_smsbower_codes_delivered")
+        requested = _smsbower_code_count(mailbox, "_smsbower_next_code_requests")
+        if delivered <= requested:
+            return
+        entry = {"type": "smsbower_mail", "api_base": mailbox.get("api_base"),
+                 "api_key": mailbox.get("_smsbower_api_key"), "service": mailbox.get("service"),
+                 "domains": [mailbox.get("domain") or "gmail.com"]}
+        provider = SmsBowerMailProvider(entry, _make_config({}))
+        try:
+            _request_next_smsbower_code(provider, mailbox)
+        finally:
+            provider.close()
+            if lease is not None:
+                for name in _SMSBOWER_SHARED_CODE_FIELDS:
+                    if name in mailbox:
+                        lease[name] = mailbox[name]
+                    else:
+                        lease.pop(name, None)
 
 
 def _smsbower_pair_lease(mailbox: dict[str, Any]) -> dict[str, Any] | None:

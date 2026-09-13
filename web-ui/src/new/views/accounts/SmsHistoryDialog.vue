@@ -63,7 +63,7 @@ const labels: Record<string, string> = { success: "授权成功", synced: "已�
 function optionLabel(entry: HistoryRow) {
   const options = entry.options?.sms_options;
   if (!options) return "";
-  return [entry.options?.strategy ? ({ auto: "自动补齐中转", sync_only: "仅补同步", reauthorize: "重新授权" }[entry.options.strategy]) : "", options.provider === "firefox" ? "火狐狸" : options.provider === "smsbower" ? "SMSBower" : "", options.country_order ? `国家 ${options.country_order}` : "", options.max_phone_attempts ? `每账号最多 ${options.max_phone_attempts} 次` : ""].filter(Boolean).join(" · ");
+  return [entry.options?.strategy ? ({ auto: "自动补齐中转", sync_only: "仅补同步", reauthorize: "重新授权" }[entry.options.strategy]) : "", options.provider === "firefox" ? "火狐狸" : options.provider === "smsbower" ? "SMSBower" : "", options.country_order ? `国家 ${options.country_order}` : "", options.max_phone_attempts === 0 ? "取号次数不限" : options.max_phone_attempts ? `每账号最多 ${options.max_phone_attempts} 次` : ""].filter(Boolean).join(" · ");
 }
 function retryEntries(emails: string[]) {
   batch.codexHistoryOpen = false;
@@ -79,6 +79,11 @@ async function copyRt(entry: HistoryRow) {
   ui.notify(ok ? "已复制历史 RT" : "复制失败", ok ? "success" : "error");
 }
 function logClass(level: string) { return level === "error" ? "log-error" : level === "warning" ? "log-warning" : level === "ok" ? "log-ok" : ""; }
+function phoneAttemptText(attempt: NonNullable<CodexHistoryEntry["phone_attempts"]>[number]) {
+  const state = String(attempt.result || attempt.status || "");
+  const labels: Record<string, string> = { success: "成功", failed: "失败", cancelled: "取消", timeout: "等码超时", session_retry: "保留号码，重建登录会话", activation_expired: "号码租约已结束" };
+  return `${attempt.phone || (attempt.acquired ? "已分配号码" : "未取到号码")} · ${labels[state] || state || "已记录"}`;
+}
 </script>
 
 <template>
@@ -95,7 +100,7 @@ function logClass(level: string) { return level === "error" ? "log-error" : leve
         <p class="message">{{ entry.outcome === 'synced' ? '已补齐中转 JSON，未重新授权' : entry.outcome === 'skipped' ? (entry.relay_status === 'ready' ? '中转已有匹配凭据，未在线验证' : '旧记录仅确认持有 RT，未核对中转') : entry.error || entry.note || (entry.outcome === 'cancelled' ? '任务取消' : 'RT 获取成功') }}</p>
         <small v-if="entry.relay_file" class="options">中转文件：{{ entry.relay_file }}</small><small v-if="entry.authorization_status === 'success' && entry.relay_status === 'failed'" class="options">授权已成功，需补同步中转</small><small v-if="optionLabel(entry)" class="options">{{ optionLabel(entry) }}</small>
         <footer><small>{{ entry.phone_attempts?.length ? `取号 ${entry.phone_attempts.length} 次` : entry.phone ? `号码 ${entry.phone}` : entry.batch_id ? `批次 ${entry.batch_id.slice(0, 12)}` : '历史记录' }}</small><div class="actions"><AppButton v-if="entry.logs?.length || entry.phone_attempts?.length" size="sm" :aria-expanded="!!expanded[entry.key]" @click="expanded = { ...expanded, [entry.key]: !expanded[entry.key] }"><ScrollText :size="13" />{{ expanded[entry.key] ? '收起详情' : '记录详情' }}</AppButton><AppButton v-if="entry.rt && ['success', 'synced', 'skipped'].includes(entry.outcome)" size="sm" @click="copyRt(entry)"><Clipboard :size="13" />复制历史 RT</AppButton><AppButton v-if="entry.outcome === 'failed' && latestFailures.some((item) => item.key === entry.key)" size="sm" :disabled="batch.codex.running || batch.codexStartBusy" @click="retryEntries([entry.email])"><RefreshCw :size="13" />重试</AppButton></div></footer>
-        <div v-if="expanded[entry.key]" class="details"><div v-if="entry.phone_attempts?.length" class="phone-attempts"><p v-for="(attempt, index) in entry.phone_attempts" :key="index">第 {{ index + 1 }} 次 · {{ attempt.phone || '未取到号码' }} · {{ ({ success: '成功', failed: '失败', cancelled: '取消', timeout: '等码超时' } as Record<string, string>)[attempt.status || ''] || attempt.status || '已记录' }}</p></div><p v-for="(line, index) in entry.logs || []" :key="index" :class="logClass(line.level)"><span class="log-time">{{ line.t }}</span>{{ line.m }}</p></div>
+        <div v-if="expanded[entry.key]" class="details"><div v-if="entry.phone_attempts?.length" class="phone-attempts"><p v-for="(attempt, index) in entry.phone_attempts" :key="index">第 {{ index + 1 }} 次 · {{ phoneAttemptText(attempt) }}</p></div><p v-for="(line, index) in entry.logs || []" :key="index" :class="logClass(line.level)"><span class="log-time">{{ line.t }}</span>{{ line.m }}</p></div>
       </article>
       <AppButton v-if="filtered.length > limit" size="sm" @click="limit += 60">再显示 {{ Math.min(60, filtered.length - limit) }} 条记录</AppButton>
     </div>

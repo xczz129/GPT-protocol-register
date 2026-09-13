@@ -12,6 +12,7 @@ from mail import (
     create_smsbower_child,
     finalize_smsbower_pair,
     prepare_smsbower_pair,
+    prepare_smsbower_next_code,
     release_mailbox,
 )
 from mail.parsing import normalize_provider_type
@@ -41,6 +42,12 @@ def registration_outcome(mailbox: dict[str, Any], record: Any, stopped: bool) ->
     if stopped:
         return "cancelled"
     return marker if marker in {"otp_timeout", "other_failed", "cancelled"} else "other_failed"
+
+
+def primary_can_start_child(mailbox: dict[str, Any], record: Any) -> bool:
+    if mailbox.get("_registration_outcome") == "already_registered":
+        return False
+    return bool(record or mailbox.get("_registration_code_received") or mailbox.get("_otp_accepted_by_server"))
 
 
 async def run_dynamic_mail_groups(
@@ -129,12 +136,12 @@ async def run_dynamic_mail_groups(
                 primary["_registration_cancel_event"] = threading.Event()
                 _, was_cancelled = await _await_owned(asyncio.create_task(run_account(index, primary)), lambda: request_cancel(primary))
                 primary_success = bool(result_at(index))
-                if sms:
+                if sms and not primary.get("_registration_recovery_pending"):
                     finish_attempt(primary.get("_registration_metric_attempt_id"), registration_outcome(primary, result_at(index), cancelled()))
                 if was_cancelled:
                     raise asyncio.CancelledError
                 if with_child and reserved is not None:
-                    if not primary_success or cancelled():
+                    if not primary_can_start_child(primary, result_at(index)) or cancelled():
                         emit(reserved, "skipped" if not cancelled() else "cancelled", mailbox_role="child", skip_reason="parent_not_registered", step="主号未完成，子号未启动")
                         reserved = None
                         continue
@@ -152,8 +159,11 @@ async def run_dynamic_mail_groups(
                         emit(reserved, "skipped", email=child.get("address"), mailbox_role="child", skip_reason="already_registered", step="子号已注册，已跳过")
                         reserved = None
                         continue
-                    emit(reserved, "running", email=child.get("address"), mailbox_role="child", step="主号完成，开始子号注册")
                     child["_registration_cancel_event"] = threading.Event()
+                    _, was_cancelled = await _await_owned(asyncio.create_task(asyncio.to_thread(prepare_smsbower_next_code, child)), lambda: request_cancel(child))
+                    if was_cancelled or cancelled():
+                        raise asyncio.CancelledError
+                    emit(reserved, "running", email=child.get("address"), mailbox_role="child", step="邮箱继续保留，开始子号注册和取码")
                     _, was_cancelled = await _await_owned(asyncio.create_task(run_account(reserved, child)), lambda: request_cancel(child))
                     child_success = bool(result_at(reserved))
                     finish_attempt(child.get("_registration_metric_attempt_id"), registration_outcome(child, result_at(reserved), cancelled()))
@@ -187,7 +197,8 @@ async def run_dynamic_mail_groups(
                     secret = str(primary.get("_smsbower_api_key") or "")
                     if secret:
                         detail = detail.replace(secret, "[REDACTED]")
-                    finish_attempt(primary.get("_registration_metric_attempt_id"), registration_outcome(primary, result_at(index), cancelled()))
+                    if not primary.get("_registration_recovery_pending"):
+                        finish_attempt(primary.get("_registration_metric_attempt_id"), registration_outcome(primary, result_at(index), cancelled()))
                 if child is not None:
                     finish_attempt(child.get("_registration_metric_attempt_id"), registration_outcome(child, result_at(reserved) if reserved else None, cancelled()))
                 target = reserved if primary_success and reserved is not None else index
@@ -195,11 +206,25 @@ async def run_dynamic_mail_groups(
                 if reserved is not None and target != reserved:
                     emit(reserved, "cancelled" if cancelled() else "skipped", skip_reason="parent_not_registered", step="主号未完成，子号未启动")
             finally:
-                if primary is not None:
-                    if sms and primary.get("_smsbower_pair_state") is not None:
-                        await _await_owned(asyncio.create_task(asyncio.to_thread(finalize_smsbower_pair, primary, primary_success=primary_success, child_success=child_success)), request_cancel)
-                    elif not primary_success:
-                        await _await_owned(asyncio.create_task(asyncio.to_thread(release_mailbox, primary)), request_cancel)
+                try:
+                    if primary is not None and primary.get("_registration_recovery_pending") and not primary.get("_registration_recovery_attempted") and not cancelled():
+                        # Collect the child's code before spending more of the
+                        # shared activation window on the primary's token repair.
+                        primary["_registration_recovery_only"] = True
+                        primary["_registration_recovery_attempted"] = True
+                        emit(index, "running", email=primary.get("address"), step="子号取码流程已结束，正在密码登录补全主号 AT 和 2FA")
+                        _, was_cancelled = await _await_owned(asyncio.create_task(run_account(index, primary)), lambda: request_cancel(primary))
+                        primary_success = bool(result_at(index))
+                        if was_cancelled:
+                            raise asyncio.CancelledError
+                finally:
+                    if primary is not None:
+                        if sms:
+                            finish_attempt(primary.get("_registration_metric_attempt_id"), registration_outcome(primary, result_at(index), cancelled()))
+                        if sms and primary.get("_smsbower_pair_state") is not None:
+                            await _await_owned(asyncio.create_task(asyncio.to_thread(finalize_smsbower_pair, primary, primary_success=primary_success, child_success=child_success)), request_cancel)
+                        elif not primary_success:
+                            await _await_owned(asyncio.create_task(asyncio.to_thread(release_mailbox, primary)), request_cancel)
 
     tasks = [asyncio.create_task(worker()) for _ in range(min(width, len(indices)))]
     try:

@@ -151,9 +151,9 @@ test("start validates limits and sends only per-run public options after deliber
     task: { runCodex: async (...args) => launches.push(args) },
   });
   await h.check(true);
-  h.form.attempts = 0;
+  h.form.attempts = -1;
   await h.launch();
-  assert.match(h.invalid.value, /取号上限/);
+  assert.match(h.invalid.value, /非负整数/);
   assert.equal(launches.length, 0);
   h.form.attempts = 2;
   h.form.maxPrice = "-1";
@@ -166,6 +166,23 @@ test("start validates limits and sends only per-run public options after deliber
   assert.equal(launches[0][3].max_phone_attempts, 2);
   assert.equal(launches[0][3].max_price, "0.25");
   assert.equal(Object.hasOwn(launches[0][3], "api_key"), false);
+  h.dispose();
+});
+
+test("start accepts unlimited and large positive phone attempt limits", async () => {
+  const launches = [];
+  const h = component("SmsStartDialog", ["check", "form", "invalid", "launch"], {
+    api: { codexPreflight: async () => preflightResult() },
+    task: { runCodex: async (...args) => launches.push(args) },
+  });
+  await h.check(true);
+  h.form.attempts = 0;
+  assert.equal(h.invalid.value, "");
+  await h.launch();
+  h.form.attempts = 130;
+  assert.equal(h.invalid.value, "");
+  await h.launch();
+  assert.deepEqual(launches.map(item => item[3].max_phone_attempts), [0, 130]);
   h.dispose();
 });
 

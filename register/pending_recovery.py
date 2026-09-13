@@ -1,0 +1,106 @@
+"""Retry the password-login completion of an owned, partially saved account."""
+from __future__ import annotations
+
+import time
+from typing import Any, Callable
+from urllib.parse import quote
+
+from register.protocol_runtime import ProtocolRuntimeSettings
+from register.sessions import JobCancelled
+
+CREDENTIAL_FIELDS = {"password", "access_token", "refresh_token", "session_token", "id_token", "totp_secret", "account_id", "mfa_factor_id"}
+
+
+def merge_registration_progress(saved: dict[str, Any], update: dict[str, Any]) -> None:
+    for key, value in update.items():
+        if key in CREDENTIAL_FIELDS and saved.get(key) and not str(value or "").strip():
+            continue
+        if key in {"password_set", "mfa_enabled"} and saved.get(key) is True and value is False:
+            continue
+        saved[key] = value
+
+
+def can_recover_registration(account: dict[str, Any], mailbox: dict[str, Any] | None) -> bool:
+    if (mailbox or {}).get("_registration_outcome") == "already_registered":
+        return False
+    owned = bool((mailbox or {}).get("_registration_identity_created")) or account.get("registration_state") == "security_pending"
+    return bool(owned and str(account.get("email") or "").strip() and str(account.get("password") or "").strip() and not str(account.get("access_token") or "").strip())
+
+
+def _recover_once(index: int, **kwargs):
+    from register.protocol_ops import recover_pending_registration_one
+    return recover_pending_registration_one(index, **kwargs)
+
+
+def recover_registration(
+    index: int, *, account: dict[str, Any], mailbox: dict[str, Any] | None,
+    mail_config: dict[str, Any], proxy: str = "", stop_check: Callable[[], bool] | None = None,
+    task_event=None, partial_sink=None, protocol_runtime: ProtocolRuntimeSettings | None = None,
+) -> dict[str, Any]:
+    """Three completion attempts; no new mailbox purchase or registration call."""
+    if not can_recover_registration(account, mailbox):
+        raise RuntimeError("registration_recovery_not_eligible")
+    stop = stop_check or (lambda: False)
+    saved = dict(account)
+    runtime = protocol_runtime or ProtocolRuntimeSettings()
+
+    def persist(update: dict[str, Any]) -> None:
+        merge_registration_progress(saved, update)
+        saved["registration_state"] = "security_pending"
+        if callable(partial_sink):
+            partial_sink(dict(saved))
+
+    def progress_event(event_index: int, status: str | None = None, **fields: Any) -> None:
+        # Only the owning scheduler decides when the account task is terminal.
+        # An inner login failure can still be retried by the next attempt.
+        if callable(task_event):
+            task_event(event_index, "running" if status in {"failed", "success"} else status, **fields)
+
+    for attempt in range(1, 4):
+        if stop():
+            raise JobCancelled("stop requested")
+        persist({"registration_recovery_attempts": attempt, "registration_recovery_state": "running"})
+        if callable(task_event):
+            task_event(index, "running", email=saved["email"], step=f"密码已保存，正在密码登录补全 AT 和 2FA（第 {attempt} 次）")
+        try:
+            result = _recover_once(
+                index, account=dict(saved), mail_config=mail_config, proxy=proxy, mailbox_override=mailbox,
+                owned_new_identity=bool((mailbox or {}).get("_registration_identity_created")),
+                stop_check=stop, task_event=progress_event, partial_sink=persist,
+                protocol_runtime=runtime.with_deadline(time.monotonic() + runtime.account_timeout),
+                max_attempts=1,
+            )
+            if not isinstance(result, dict) or not all(str(result.get(key) or "").strip() for key in ("access_token", "account_id", "password", "totp_secret")) or result.get("mfa_enabled") is not True:
+                raise RuntimeError("registration_recovery_incomplete_result")
+            result.update(registration_recovery_state="complete", registration_recovery_attempts=attempt,
+                          registration_recovery_error="", registration_state="complete")
+            return result
+        except JobCancelled:
+            persist({"registration_recovery_state": "cancelled"})
+            raise
+        except Exception as error:
+            failure_text = str(error).lower()
+            detail = str(error)
+            secrets = [str(saved.get(key) or "") for key in CREDENTIAL_FIELDS]
+            secrets.append(str((mailbox or {}).get("_smsbower_api_key") or ""))
+            for value in secrets:
+                if value:
+                    detail = detail.replace(value, "[REDACTED]").replace(quote(value, safe=""), "[REDACTED]")
+            persist({"registration_recovery_state": "pending", "registration_recovery_error": detail[:300]})
+            permanent = any(marker in failure_text for marker in (
+                "incorrect_password", "invalid_password", "invalid_credentials", "account_deactivated",
+                "already_registered", "not_eligible", "totp_required", "mfa_secret_missing", "mailbox_unavailable",
+                "no activation found", "activation is already", "phone_verification_required",
+                "saved_password_required", "owned_identity_and_saved_password_required", "registered_candidate_rejected",
+                "existing_totp_credentials_required", "email_mailbox_required", "registration_or_reset_route_rejected",
+                "account_identity_mismatch", "mailbox_identity_mismatch",
+            ))
+            if permanent or attempt == 3:
+                raise RuntimeError("registration_recovery_pending: " + detail[:300]) from error
+            deadline = time.monotonic() + min(2 ** (attempt - 1), 4)
+            while time.monotonic() < deadline:
+                if stop():
+                    persist({"registration_recovery_state": "cancelled"})
+                    raise JobCancelled("stop requested")
+                time.sleep(min(0.2, max(0, deadline - time.monotonic())))
+    raise RuntimeError("registration_recovery_pending")

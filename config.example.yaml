@@ -32,8 +32,8 @@ mail:
     # ---------- SMSBower 临时邮箱（注册时按需购买）----------
     - type: smsbower_mail
       enable: false
-      # 主号成功后注册一个 +split 子号；任务数量包含主号和子号。
-      # 此渠道并发最低 2 且为偶数；开启子号时任务数量也须为偶数。
+      # 主号收码后注册一个 +split 子号；任务数量包含主号和子号。
+      # 仅开启子号时，并发和任务数量最低 2 且为偶数；关闭后使用普通整数并发。
       register_child: true
       label: SMSBower Mail
       # 也可留空并设置环境变量 SMSBOWER_MAIL_API_KEY
@@ -105,6 +105,10 @@ mail:
   smsbower_wait_timeout: 180
   wait_interval: 3
   icloud_resync_interval: 15
+
+sms_code:
+  # 0 表示每账号取号次数不限；正整数保留指定上限。
+  max_phone_attempts: 0
 
 proxy:
   enabled: false

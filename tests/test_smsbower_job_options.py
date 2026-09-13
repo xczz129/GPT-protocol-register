@@ -49,9 +49,8 @@ def job_api(monkeypatch):
 
 
 @pytest.mark.parametrize("concurrency", [1, 3, 5])
-@pytest.mark.parametrize("register_child", [True, False])
-def test_http_start_rejects_invalid_channel_concurrency_before_mail_state(job_api, concurrency, register_child):
-    job_api.cfg["mail"]["providers"][0]["register_child"] = register_child
+def test_http_start_rejects_invalid_channel_concurrency_before_mail_state(job_api, concurrency):
+    job_api.cfg["mail"]["providers"][0]["register_child"] = True
 
     response = job_api.client.post("/api/job/start", json={"mail_type": "smsbower_mail", "total": 4, "concurrency": concurrency})
 
@@ -94,14 +93,15 @@ def test_resource_budget_rounds_down_to_even_logical_slots(job_api, monkeypatch,
     assert job_api.state.params["total"] == 10
 
 
-def test_child_disabled_single_main_keeps_two_logical_concurrency_slots(job_api):
+@pytest.mark.parametrize("concurrency", [1, 3, 5])
+def test_child_disabled_uses_regular_integer_concurrency(job_api, concurrency):
     job_api.cfg["mail"]["providers"][0]["register_child"] = False
-    response = job_api.client.post("/api/job/start", json={"mail_type": "smsbower_mail", "total": 1, "concurrency": 2})
+    response = job_api.client.post("/api/job/start", json={"mail_type": "smsbower_mail", "total": 6, "concurrency": concurrency})
 
     assert response.status_code == 200
-    assert job_api.state.params["total"] == 1
-    assert job_api.state.params["concurrency"] == 2
-    assert job_api.state.params["group_plan"] == ["test-group"]
+    assert job_api.state.params["total"] == 6
+    assert job_api.state.params["concurrency"] == concurrency
+    assert job_api.state.params["group_plan"] == ["test-group"] * 6
 
 
 def test_inventory_truncation_keeps_a_complete_pair(job_api):

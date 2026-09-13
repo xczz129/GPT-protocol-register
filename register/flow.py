@@ -9,6 +9,7 @@ import sys
 import time
 import traceback as _tb
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -407,6 +408,7 @@ async def register_one(
     persist_result: bool = True,
     defer_success_event: bool = False,
     mailbox_override: dict[str, Any] | None = None,
+    partial_sink=None,
 ) -> dict[str, Any] | None:
     """Register one ChatGPT account via fingerprint browser."""
     token = _TASK_IDX.set(index)
@@ -422,6 +424,7 @@ async def register_one(
     success = False
     diagnostic_written = False
     last_error = ""
+    pending_snapshot: dict[str, Any] = {}
     _stop = stop_check if callable(stop_check) else _default_stop_check
     _ensure_print_prefix()
 
@@ -455,6 +458,29 @@ async def register_one(
             if secret:
                 text = text.replace(secret, "***")
         return text
+
+    def persist_pending_password() -> None:
+        if mailbox is None or not email or not password:
+            return
+        if mailbox.get("_registration_outcome") == "already_registered":
+            return
+        confirmed = bool(mailbox.get("_registration_identity_created")) or bool(password_submitted and mailbox.get("_otp_accepted_by_server"))
+        if not confirmed:
+            return
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        pending_snapshot.update(email=email, password=password, password_set=True,
+            registration_state="security_pending", registration_method="browser",
+            provider_type=str(mailbox.get("provider") or ""), group_id=str(group_id or ""),
+            browser_type=str(getattr(bb, "provider_name", "browser")), proxy=proxy, updated_at=now)
+        pending_snapshot.setdefault("created_at", now)
+        pending_snapshot.setdefault("registered_at", now)
+        if last_error:
+            pending_snapshot["registration_recovery_error"] = _redact_runtime_text(last_error)[:240]
+        mailbox["_registration_partial_account"] = dict(pending_snapshot)
+        if callable(partial_sink):
+            partial_sink(dict(pending_snapshot), mailbox)
+        elif persist_result:
+            _append_account(dict(pending_snapshot))
 
     async def _capture_registration_diagnostic(reason: str, *, force: bool = False) -> None:
         nonlocal diagnostic_written
@@ -1293,6 +1319,7 @@ async def register_one(
         await check_fresh_registration_page(page, mailbox)
         if requires_fresh_registration(mailbox) and not mailbox.get("_registration_identity_created"):
             raise RuntimeError("registration_identity_not_confirmed")
+        persist_pending_password()
         check_timeout()
 
         body_text = (await safe_body_text(page)).lower()
@@ -1981,6 +2008,11 @@ async def register_one(
             logger.debug("register_one: ignoring exception", exc_info=True)
         return None
     finally:
+        if not success:
+            try:
+                persist_pending_password()
+            except Exception as error:
+                _log(f"[待补全] 保存注册密码失败: {type(error).__name__}")
         if (
             not success
             and last_error

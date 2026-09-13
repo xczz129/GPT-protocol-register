@@ -20,7 +20,7 @@ const form = reactive({
   firefoxToken: "",
   dockingCode: "",
   timeoutSeconds: 600,
-  maxPhoneAttempts: 3,
+  maxPhoneAttempts: 0,
   maxPrice: "" as string | number,
 });
 
@@ -36,7 +36,7 @@ watch(
     form.firefoxApiName = String(cfg.firefox_api_name || "");
     form.dockingCode = String(cfg.firefox_docking_code || "");
     form.timeoutSeconds = Number(cfg.timeout_seconds ?? 600);
-    form.maxPhoneAttempts = Number(cfg.max_phone_attempts ?? 3);
+    form.maxPhoneAttempts = Number(cfg.max_phone_attempts ?? 0);
     form.maxPrice = String(cfg.max_price || "");
   },
   { immediate: true },
@@ -55,7 +55,7 @@ const hasUnsavedChanges = computed(() => {
     || form.dockingCode.trim() !== String(c.firefox_docking_code || "").trim()
     || String(form.maxPrice ?? "").trim() !== String(c.max_price || "").trim()
     || form.timeoutSeconds !== Number(c.timeout_seconds ?? 600)
-    || form.maxPhoneAttempts !== Number(c.max_phone_attempts ?? 3);
+    || form.maxPhoneAttempts !== Number(c.max_phone_attempts ?? 0);
 });
 const balanceTime = computed(() => {
   const value = ops.smsBalance?.checkedAt;
@@ -206,8 +206,8 @@ function buildBody(): Record<string, unknown> {
   if (!isFirefox.value && price && (!Number.isFinite(Number(price)) || Number(price) <= 0)) {
     throw new Error("每号最高价必须是大于 0 的数字，或留空不限价");
   }
-  if (!Number.isInteger(form.maxPhoneAttempts) || form.maxPhoneAttempts < 1) {
-    throw new Error("最多使用号码数必须是大于或等于 1 的整数");
+  if (!Number.isInteger(form.maxPhoneAttempts) || form.maxPhoneAttempts < 0) {
+    throw new Error("取号次数必须是非负整数，0 表示不限次数");
   }
   const body: Record<string, unknown> = {
     enabled: form.enabled,
@@ -351,8 +351,9 @@ async function clearHistory() {
         <input v-model.number="form.timeoutSeconds" class="input" type="number" min="30" max="1800" />
       </label>
       <label class="field">
-        <span>最多取号次数（包含首次）</span>
-        <input v-model.number="form.maxPhoneAttempts" class="input" type="number" min="1" />
+        <span>取号次数上限（0 表示不限）</span>
+        <input v-model.number="form.maxPhoneAttempts" class="input" type="number" min="0" step="1" />
+        <small>0 为不限次数；正整数包含首次取号。同号码重建会话不增加取号次数，可随时停止任务。</small>
       </label>
     </div>
 

@@ -151,7 +151,48 @@ def test_consumed_mailbox_is_not_miscounted_as_registration_success(harness):
 
     run(2, task)
     totals = get_summary()["totals"]
-    assert totals["success"] == 0 and totals["other_failed"] == 1
+    assert totals["success"] == 0 and totals["other_failed"] == 2
+
+
+def test_primary_code_keeps_activation_for_child_even_when_at_recovery_is_pending(harness):
+    calls = []
+
+    async def task(index, mailbox):
+        calls.append(index)
+        assert not harness[1], "the shared activation must remain open"
+        mailbox["_registration_code_received"] = True
+        if index == 1:
+            mailbox["_registration_outcome"] = "other_failed"
+            return None
+        return {"email": mailbox["address"]}
+
+    records, _ = run(2, task)
+    assert calls == [1, 2]
+    assert list(records) == [2]
+    assert harness[1][0][1] == {"primary_success": False, "child_success": True}
+
+
+def test_primary_password_recovery_waits_until_child_code_flow_has_finished(harness):
+    order = []
+
+    async def task(index, mailbox):
+        assert not harness[1]
+        if index == 1 and not mailbox.get("_registration_recovery_only"):
+            order.append("primary-code")
+            mailbox.update(_registration_code_received=True, _registration_recovery_pending=True,
+                           _registration_partial_account={"email": mailbox["address"], "password": "fixture-password"})
+            return None
+        if index == 2:
+            order.append("child-code")
+            return {"email": mailbox["address"]}
+        order.append("primary-password-login")
+        assert get_summary()["totals"]["attempted"] == 2
+        return {"email": mailbox["address"]}
+
+    records, _ = run(2, task)
+    assert order == ["primary-code", "child-code", "primary-password-login"]
+    assert len(records) == 2 and len(harness[1]) == 1
+    assert get_summary()["totals"]["success"] == 2
 
 
 def test_child_switch_off_does_not_double_registration_or_purchase(harness):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Callable
 from common.session_export import parse_jwt_payload
@@ -37,6 +38,244 @@ from register.protocol_context import (
 from register.protocol_fingerprint import _browser_fingerprint
 
 from register.protocol_registrar import PlatformRegistrar
+
+
+def can_recover_pending_registration(
+    account: dict[str, Any], *, mailbox_override: dict[str, Any] | None = None,
+    owned_new_identity: bool = False,
+) -> bool:
+    """Accept saved pending records or this attempt's confirmed new identity.
+
+    Historical pending records can predate password_set; the saved password is
+    still verified by login. A random candidate without either ownership proof
+    is insufficient. An explicit already-registered skip is never recoverable.
+    """
+    if not isinstance(account, dict):
+        return False
+    email = str(account.get("email") or "").strip().lower()
+    if not email or not str(account.get("password") or "").strip():
+        return False
+    mailbox = mailbox_override if isinstance(mailbox_override, dict) else {}
+    if any(str(source.get("_registration_outcome") or source.get("registration_outcome") or "") == "already_registered"
+           for source in (account, mailbox)):
+        return False
+    if mailbox_override is not None and str(mailbox.get("address") or "").strip().lower() != email:
+        return False
+    saved_pending = str(account.get("registration_state") or "").strip().lower() == "security_pending"
+    fresh_owned = bool(owned_new_identity and mailbox.get("_registration_identity_created"))
+    return saved_pending or fresh_owned
+
+
+def recover_pending_registration_one(
+    index: int,
+    *,
+    account: dict[str, Any],
+    mail_config: dict[str, Any],
+    proxy: str = "",
+    provider_type: str | None = None,
+    mailbox_override: dict[str, Any] | None = None,
+    owned_new_identity: bool = False,
+    stop_check: Callable[[], bool] | None = None,
+    task_event=None,
+    partial_sink: Callable[[dict[str, Any]], None] | None = None,
+    account_log_sink: Callable[[dict[str, Any]], None] | None = None,
+    proxy_config: dict[str, Any] | None = None,
+    protocol_runtime: ProtocolRuntimeSettings | None = None,
+    max_attempts: int = 2,
+) -> dict[str, Any]:
+    """Recover AT and verified MFA using the pending account's existing password.
+
+    This function never allocates mail, calls user/register, resets passwords or
+    disables an unknown factor. The caller owns the mailbox lease and final
+    persistence; partial_sink receives credential updates before later steps.
+    """
+    if not can_recover_pending_registration(
+        account, mailbox_override=mailbox_override, owned_new_identity=owned_new_identity,
+    ):
+        raise RuntimeError("pending_recovery_owned_identity_and_saved_password_required")
+    email = str(account["email"]).strip()
+    password = str(account["password"]).strip()
+    secret = str(account.get("totp_secret") or "").strip()
+    stop = stop_check if callable(stop_check) else lambda: False
+    event = _operation_event_forwarder(
+        task_event, account_log_sink, operation="registration_recovery", index=index,
+        email=email, secrets=(password, secret, str((mailbox_override or {}).get("_smsbower_api_key") or "")),
+    )
+    context_tokens = (
+        (_TASK_EVENT, _TASK_EVENT.set(event if callable(event) else None)),
+        (_STOP_CHECK, _STOP_CHECK.set(stop)),
+        (_FIXED_EMAIL, _FIXED_EMAIL.set(email)),
+        (_PROVIDER_TYPE, _PROVIDER_TYPE.set(provider_type or account.get("provider_type"))),
+        (_MAIL_CONFIG, _MAIL_CONFIG.set(dict(mail_config))),
+        (_PROXY_CONFIG, _PROXY_CONFIG.set(dict(proxy_config or {}))),
+    )
+    runtime = replace(protocol_runtime or ProtocolRuntimeSettings(), verify_chatgpt_me=True,
+                      enable_totp_after_register=True)
+    if runtime.deadline is None:
+        runtime = runtime.with_deadline(time.monotonic() + runtime.account_timeout)
+    runtime_context = activate_runtime(runtime)
+    runtime_context.__enter__()
+    registrar: PlatformRegistrar | None = None
+    result = dict(account)
+    stage = "password_login"
+
+    def ensure_running() -> None:
+        if stop():
+            raise JobCancelled("stop requested")
+        if current_runtime_settings().expired():
+            raise RuntimeError("pending_recovery_account_timeout")
+
+    def save_partial(update: dict[str, Any]) -> None:
+        credential_keys = {"password", "totp_secret", "access_token", "session_token", "refresh_token", "id_token", "account_id"}
+        update = {
+            key: value for key, value in update.items()
+            if not (key in credential_keys and value in (None, "", {}, []) and result.get(key) not in (None, "", {}, []))
+            and not (key in {"mfa_enabled", "password_set"} and value is False and result.get(key) is True)
+        }
+        add_secrets = getattr(event, "add_secrets", None)
+        if callable(add_secrets):
+            add_secrets(update.get("password"), update.get("totp_secret"), update.get("access_token"), update.get("session_token"))
+        result.update(update)
+        if callable(partial_sink):
+            partial_sink(dict(update))
+
+    def validate_tokens(tokens: dict[str, Any]) -> None:
+        _validate_protocol_login_result(tokens)
+        payload = parse_jwt_payload(str(tokens.get("access_token") or "")) or {}
+        expiration = payload.get("exp")
+        try:
+            if expiration is not None and float(expiration) <= time.time():
+                raise RuntimeError("pending_recovery_access_token_expired")
+        except (TypeError, ValueError) as error:
+            raise RuntimeError("pending_recovery_access_token_expiry_invalid") from error
+        profile = payload.get("https://api.openai.com/profile")
+        session = tokens.get("session")
+        user = session.get("user") if isinstance(session, dict) else {}
+        returned_emails = [payload.get("email"), (profile or {}).get("email") if isinstance(profile, dict) else None,
+                           (user or {}).get("email") if isinstance(user, dict) else None]
+        if any(str(value).strip().lower() != email.lower() for value in returned_emails if value):
+            raise RuntimeError("pending_recovery_account_identity_mismatch")
+        original_id = str(account.get("account_id") or "").strip()
+        if original_id and original_id != str(tokens.get("account_id") or "").strip():
+            raise RuntimeError("pending_recovery_account_identity_mismatch")
+
+    def save_tokens(tokens: dict[str, Any]) -> None:
+        validate_tokens(tokens)
+        decorated = _decorate_protocol_tokens(registrar, {key: value for key, value in tokens.items() if not key.startswith("_")})
+        save_partial({**decorated, "password": password, "password_set": True,
+                      "registration_state": "security_pending", "last_security_error": ""})
+
+    def mfa_info(tokens: dict[str, Any]) -> dict[str, Any]:
+        response, error = registrar._chatgpt_mfa_request("get", "/backend-api/accounts/mfa_info", tokens["access_token"], index)
+        if response is None or getattr(response, "status_code", 0) != 200:
+            raise RuntimeError(error or "pending_recovery_mfa_info_unavailable")
+        return _response_json(response)
+
+    def confirms_factor(info: dict[str, Any], factor_id: str) -> bool:
+        factors = info.get("factors")
+        explicit = isinstance(factors, dict) and isinstance(factors.get("totp"), list)
+        values = factors.get("totp", []) if isinstance(factors, dict) else factors
+        if not isinstance(values, list):
+            return False
+        return bool(factor_id) and any(
+            isinstance(factor, dict) and str(factor.get("id") or "") == factor_id
+            and not _truthy(factor.get("is_recovery"))
+            and (explicit or str(factor.get("type") or factor.get("factor_type") or "").lower() == "totp")
+            for factor in values
+        )
+
+    try:
+        ensure_running()
+        save_partial({"registration_state": "security_pending", "registration_recovery_stage": stage})
+        attempt_limit = max(1, min(3, int(max_attempts or 2)))
+        tokens: dict[str, Any] = {}
+        for attempt in range(attempt_limit):
+            ensure_running()
+            if mailbox_override is not None:
+                from mail import prepare_smsbower_next_code
+
+                prepare_smsbower_next_code(mailbox_override)
+            registrar = PlatformRegistrar(proxy)
+            try:
+                tokens = registrar.login_pending_with_password(email, password, index,
+                    mailbox=mailbox_override, totp_secret=secret)
+                validate_tokens(tokens)
+                break
+            except Exception as error:
+                retryable = not isinstance(error, JobCancelled) and (
+                    is_proxy_transport_error(error) or any(marker in str(error).lower() for marker in (
+                        "chatgpt_session_incomplete", "http_429", "http_502", "http_503", "http_504", "invalid_state",
+                    ))
+                )
+                registrar.close()
+                registrar = None
+                if not retryable or attempt + 1 >= attempt_limit:
+                    raise
+                step(index, "恢复登录遇到临时网络/会话错误，关闭旧会话后重试", "yellow")
+                for _ in range(10 * (attempt + 1)):
+                    ensure_running()
+                    time.sleep(0.1)
+        ensure_running()
+        save_tokens(tokens)
+        stage = "verify_2fa"
+        save_partial({"registration_recovery_stage": stage})
+        info = mfa_info(tokens)
+        enabled = _truthy(info.get("mfa_enabled")) or _truthy(info.get("mfa_enabled_v2"))
+        if enabled:
+            if not secret:
+                raise RuntimeError("pending_recovery_remote_totp_secret_missing")
+            if not tokens.get("_pending_totp_verified"):
+                # Possessing a string in the DB is not verification. Confirm
+                # it against the active factor without rotating that factor.
+                ensure_running()
+                tokens = registrar.login_with_password_totp(email, password, secret, index)
+                save_tokens(tokens)
+                info = mfa_info(tokens)
+            factor_id = str(tokens.get("mfa_factor_id") or "")
+            if not confirms_factor(info, factor_id) or not (
+                _truthy(info.get("mfa_enabled")) or _truthy(info.get("mfa_enabled_v2"))
+            ):
+                raise RuntimeError("pending_recovery_totp_verification_not_confirmed")
+            save_partial({"totp_secret": secret, "mfa_enabled": True, "mfa_factor_id": factor_id,
+                          "mfa_factor_type": "totp", "totp_setup_pending": False})
+        else:
+            ensure_running()
+            stage = "enable_2fa"
+            save_partial({"registration_recovery_stage": stage})
+            security = registrar._enroll_totp(tokens, index, credential_sink=save_partial)
+            save_partial(security)
+            # Enrollment already verifies the exact activated factor against
+            # mfa_info before returning. Incomplete/mocked responses fail here.
+            if not str(result.get("totp_secret") or "").strip() or result.get("mfa_enabled") is not True:
+                raise RuntimeError("pending_recovery_totp_enrollment_incomplete")
+        ensure_running()
+        _validate_protocol_account_result(result)
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        save_partial({"registration_state": "complete", "registration_recovery_stage": "complete",
+                      "registration_recovered_at": now, "password_verified_at": now,
+                      "totp_verified_at": now, "last_security_error": ""})
+        if callable(event):
+            event(index, "success", email=email, step="已用保存密码恢复 AT，并完成 2FA 复核")
+        return dict(result)
+    except Exception as error:
+        safe = _redact_operation_error(error, password, secret, result.get("totp_secret"),
+                                       result.get("access_token"), result.get("session_token"),
+                                       (mailbox_override or {}).get("_smsbower_api_key"))
+        save_partial({"registration_state": "security_pending", "registration_recovery_stage": stage,
+                      "last_security_error": safe[:300]})
+        if callable(event):
+            event(index, "cancelled" if isinstance(error, JobCancelled) else "failed", email=email,
+                  step="恢复已停止，已保存当前进展" if isinstance(error, JobCancelled) else "恢复未完成，保留待补全状态",
+                  error=safe[:300])
+        if isinstance(error, JobCancelled):
+            raise
+        raise RuntimeError(f"pending_recovery_failed: {safe}") from error
+    finally:
+        if registrar is not None:
+            registrar.close()
+        runtime_context.__exit__(None, None, None)
+        for variable, token in reversed(context_tokens):
+            variable.reset(token)
 
 
 

@@ -47,7 +47,8 @@ def validate_smsbower_job(mail_config: dict[str, Any], provider_type: str | None
         return
     if fixed_email:
         raise ValueError("SMSBower 不支持指定固定邮箱，请从邮箱池分配")
-    if concurrency < 2 or concurrency % 2:
+    paired = smsbower_child_enabled(mail_config)
+    if paired and (concurrency < 2 or concurrency % 2):
         raise ValueError("SMSBower 并发数必须至少为 2，且必须是偶数")
-    if smsbower_child_enabled(mail_config) and (total < 2 or total % 2):
+    if paired and (total < 2 or total % 2):
         raise ValueError("启用子号时，总账号数必须至少为 2，且必须是偶数（每组一个主号和一个子号）")

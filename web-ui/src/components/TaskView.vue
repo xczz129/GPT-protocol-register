@@ -140,8 +140,8 @@ onBeforeUnmount(() => clearInterval(clockTimer));
           </select>
         </label>
         <p v-if="registrationPolicy.selected" class="full hint" role="note">
-          <template v-if="registrationPolicy.paired">{{ Math.ceil((Number(form.total) || 2) / 2) }} 组主子号 · 每组占 2 个并发名额，主号成功后再注册子号。数量、并发最低为 2，奇数自动补齐为偶数。</template>
-          <template v-else>已关闭注册子号，仅注册主号。SMSBower 并发最低为 2，奇数自动补齐为偶数。</template>
+          <template v-if="registrationPolicy.paired">{{ Math.ceil((Number(form.total) || 2) / 2) }} 组主子号 · 主号收码后保留邮箱，待子号收码流程结束再统一结算。启用子号时，数量、并发最低为 2，奇数补齐为偶数。</template>
+          <template v-else>已关闭注册子号，仅注册主号；并发恢复普通规则，可使用 1、3、5 等整数。</template>
           检测到邮箱已注册时跳过；子号开关在邮箱池设置。
         </p>
         <label class="full">目标存储分组

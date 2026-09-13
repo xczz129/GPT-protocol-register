@@ -25,6 +25,21 @@ FIREFOX_API = "https://www.firefox.fun/yhapi.ashx"
 FIREFOX_UA = "codex-oauth-local/1.0"
 SMS_PROVIDERS = ("smsbower", "firefox")
 
+
+def parse_phone_attempt_limit(value: Any = None) -> int:
+    """Zero means unlimited; retain every explicit nonnegative integer."""
+    if value is None or value == "":
+        return 0
+    if isinstance(value, bool) or isinstance(value, float) and not value.is_integer():
+        raise ValueError("max_phone_attempts must be a nonnegative integer")
+    try:
+        attempts = int(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("max_phone_attempts must be a nonnegative integer") from error
+    if attempts < 0:
+        raise ValueError("max_phone_attempts must be a nonnegative integer")
+    return attempts
+
 # Firefox.fun's country table (``PagCountry``) uses its own short country
 # identifiers rather than ISO country codes.  ``Country_Area`` in that table
 # is the international calling code.  Keep the table local so phone
@@ -528,7 +543,7 @@ class SmsSettings:
     poll_interval_ms: int = 5000
     timeout_seconds: int = 180
     max_price: str = ""
-    max_phone_attempts: int = 5
+    max_phone_attempts: int = 0
     # The fields below are appended so existing positional SmsSettings(...)
     # calls remain compatible with the SMSBower-only version.
     provider: str = "smsbower"
@@ -540,6 +555,9 @@ class SmsSettings:
     firefox_docking_code: str = ""
     firefox_did: str = ""
     firefox_api_token: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "max_phone_attempts", parse_phone_attempt_limit(self.max_phone_attempts))
 
     @classmethod
     def from_mapping(cls, value: Any) -> "SmsSettings":
@@ -602,10 +620,7 @@ class SmsSettings:
             timeout = max(30, min(1800, int(value.get("timeout_seconds", 180))))
         except (TypeError, ValueError):
             timeout = 180
-        try:
-            attempts = max(1, int(value.get("max_phone_attempts", 5)))
-        except (TypeError, ValueError):
-            attempts = 5
+        attempts = parse_phone_attempt_limit(value.get("max_phone_attempts"))
         raw_enabled = value.get("enabled", False)
         if isinstance(raw_enabled, str):
             enabled = raw_enabled.strip().lower() in {"1", "true", "yes", "on", "启用"}
@@ -801,6 +816,22 @@ class SmsBowerClient:
                 continue
             return SmsActivation(parts[1], parts[2], int(country), self.settings.api_key)
         raise SmsError(last_error)
+
+    def is_active(self, activation: SmsActivation) -> bool:
+        """Check a retained, unsent activation without reserving another number."""
+        if activation.finished:
+            return False
+        try:
+            body = self._request("getStatus", id=activation.activation_id)
+        except SmsError as error:
+            if any(marker in str(error).upper() for marker in ("NO_ACTIVATION", "EXPIRED")):
+                return False
+            raise
+        if body.startswith(("STATUS_WAIT_CODE", "STATUS_WAIT_RETRY", "STATUS_WAIT_RESEND")):
+            return True
+        if body.startswith(("STATUS_CANCEL", "STATUS_FINISH", "STATUS_OK:")):
+            return False
+        raise SmsError("SMSBower 无法确认原号码激活状态")
 
     def wait_code(self, activation: SmsActivation, *, cancel_event: Any = None) -> str:
         """Wait for a code without closing the activation.
@@ -1027,6 +1058,20 @@ class FirefoxSmsClient:
                 api_key=self._token,
             )
         raise SmsError(last_error)
+
+    def is_active(self, activation: SmsActivation) -> bool:
+        """Reuse only a provider-confirmed number still waiting for its first code."""
+        if activation.finished:
+            return False
+        body = self._authorized_request("getPhoneCode", pkey=activation.activation_id)
+        if body.startswith("1|"):
+            return False
+        failure = self._failure(body)
+        if failure == "-3" or "等待验证码" in failure:
+            return True
+        # Unknown supplier errors are terminal here, never a reason to
+        # silently buy a replacement activation.
+        raise SmsError(f"火狐狸无法确认原号码激活状态：{failure[:120]}")
 
     def wait_code(self, activation: SmsActivation, *, cancel_event: Any = None) -> str:
         """Poll ``getPhoneCode`` until a code arrives or the activation ends."""

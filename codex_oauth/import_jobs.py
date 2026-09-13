@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urljoin
 
 from .oauth import (
     ProtocolClient,
@@ -105,9 +105,15 @@ class AuthSessionRestartRequired(ImportErrorBase):
     pass
 
 
+class PhoneNumberRestartRequired(AuthSessionRestartRequired):
+    """A different number must begin with a fresh authorization transaction."""
+
+
 def _is_stale_signin_session_error(value: Any) -> bool:
     """Recognize the auth edge's stale sign-in-session response."""
     text = str(value or "").lower().replace("_", "-")
+    if "http 409" in text and "/api/accounts/add-phone/send" in text and "invalid-state" in text:
+        return True
     return any(
         marker in text
         for marker in (
@@ -115,6 +121,7 @@ def _is_stale_signin_session_error(value: Any) -> bool:
             "sign in session is no longer valid",
             "signin session is no longer valid",
             "sign-in-session-is-no-longer-valid",
+            "signin-session-invalid",
         )
     )
 
@@ -598,6 +605,13 @@ class ImportJob:
     # Number of automatic route retries for this attempt.  It is persisted so
     # a worker restart cannot loop forever on the same broken proxy.
     network_retries: int = 0
+    session_retries: int = 0
+    phone_attempts: int = 0
+    _sms_activation: SmsActivation | None = field(default=None, repr=False, compare=False)
+    _sms_client: Any = field(default=None, repr=False, compare=False)
+    _sms_sent: bool = field(default=False, repr=False, compare=False)
+    _sms_keep_for_session_retry: bool = field(default=False, repr=False, compare=False)
+    _pending_phone: str = field(default="", repr=False, compare=False)
     skip_phone_event: threading.Event = field(default_factory=threading.Event, repr=False)
     _on_change: Callable[[], None] | None = field(default=None, repr=False, compare=False)
 
@@ -653,6 +667,8 @@ class ImportJob:
             phone_masked=str(value.get("phone_masked") or ""),
             attempt=attempt,
             network_retries=max(0, min(3, int(value.get("network_retries") or 0))),
+            session_retries=max(0, int(value.get("session_retries") or 0)),
+            phone_attempts=max(0, int(value.get("phone_attempts") or 0)),
         )
 
     def as_persisted(self) -> dict[str, Any]:
@@ -676,6 +692,8 @@ class ImportJob:
             "phone_masked": _mask_phone(self.current_phone) or self.phone_masked,
             "attempt": max(1, int(self.attempt)),
             "network_retries": max(0, min(3, int(self.network_retries))),
+            "session_retries": max(0, int(self.session_retries)),
+            "phone_attempts": max(0, int(self.phone_attempts)),
             "logs": [
                 {
                     "at": max(0, int(item.get("at") or 0)),
@@ -1498,6 +1516,22 @@ class ImportJobManager:
             pass
 
     def _phone_step(self, job: ImportJob, client: ProtocolClient) -> None:
+        try:
+            self._phone_step_impl(job, client)
+        except AuthSessionRestartRequired:
+            # Only an explicitly rejected, unsent phone submission may keep
+            # its lease while a fresh authorization transaction is started.
+            if not job._sms_keep_for_session_retry or job._sms_sent:
+                self._release_retained_activation(job)
+            raise
+        except BaseException:
+            # Provider adapters, task persistence, or UI-step callbacks may
+            # raise exceptions other than SmsError. All terminal paths own
+            # the same cleanup, including cancellation after acquisition.
+            self._release_retained_activation(job)
+            raise
+
+    def _phone_step_impl(self, job: ImportJob, client: ProtocolClient) -> None:
         now = int(time.time())
         job.phone_required = True
         job.phone_required_at = now
@@ -1509,21 +1543,23 @@ class ImportJobManager:
             raise PhoneRequiredSkipped("账号需要接码，自动跳过")
         settings = self._sms_settings()
         job.sms_provider = settings.provider_label
-        sms_client = _sms_client_for(settings, self.timeout)
+        sms_client = job._sms_client or _sms_client_for(settings, self.timeout)
         # OpenAI 2026-09 起校验页面导航:先进入 add-phone 页面,
         # 否则 add-phone/send 直接 409 session invalid
         nav_data = getattr(client, "last_auth_response", None)
-        nav_url = str(nav_data.get("continue_url") or "").strip() if isinstance(nav_data, dict) else ""
-        if nav_url.startswith("http"):
-            try:
-                client.navigate(nav_url)
-                job.add_log("已进入手机验证页面")
-            except Exception as exc:
-                if _is_stale_signin_session_error(exc):
-                    raise AuthSessionRestartRequired(
-                        "sign-in session is no longer valid; restarting authorization session"
-                    ) from exc
-                job.add_log(f"进入手机验证页面失败（{exc}）", "warning")
+        nav_url = urljoin("https://auth.openai.com/", _auth_step_info(nav_data)[0] or "/add-phone")
+        parsed_navigation = urlparse(nav_url)
+        if parsed_navigation.scheme != "https" or parsed_navigation.netloc != "auth.openai.com" or parsed_navigation.path.rstrip("/") != "/add-phone":
+            raise ImportErrorBase("phone_navigation_unexpected_step")
+        try:
+            client.navigate(nav_url)
+            job.add_log("已进入手机验证页面")
+        except Exception as exc:
+            if _is_stale_signin_session_error(exc):
+                raise AuthSessionRestartRequired(
+                    "sign-in session is no longer valid; restarting authorization session"
+                ) from exc
+            raise ImportErrorBase(f"phone_navigation_failed: {exc}") from exc
         if sms_client is not None:
             job.add_log(
                 f"服务端要求手机号；{settings.provider_label} 自动接码已启用，将自动申请号码并轮询短信"
@@ -1538,36 +1574,63 @@ class ImportJobManager:
                 f"服务端要求手机号；未配置 {settings.provider_label} 凭证，等待网页输入手机号",
                 "warning",
             )
-        attempts = 0
+        attempts = job.phone_attempts
         provider_disabled_by_failure = False
         # A manually supplied replacement number must be consumed by the next
         # iteration.  Keeping it outside the loop prevents the old state
         # machine from asking for the same input twice after a rejected number.
-        pending_phone = ""
+        pending_phone = job._pending_phone
+        job._pending_phone = ""
+
+        def cancel_number(activation: SmsActivation | None) -> None:
+            self._cancel_activation(sms_client, activation)
+            if job._sms_activation is activation:
+                job._sms_activation = None
+                job._sms_client = None
+                job._sms_sent = False
+                job._sms_keep_for_session_retry = False
+
+        def may_acquire_again() -> bool:
+            return settings.max_phone_attempts == 0 or attempts < settings.max_phone_attempts
+
         while True:
             self._check_cancel(job)
-            attempts += 1
             activation: SmsActivation | None = None
             automatic = sms_client is not None and not pending_phone
-            if pending_phone:
+            if job._sms_activation is not None:
+                activation = job._sms_activation
+                check_active = getattr(sms_client, "is_active", None)
+                active = not activation.finished and (check_active(activation) if callable(check_active) else True)
+                if not active:
+                    cancel_number(activation)
+                    raise PhoneNumberRestartRequired("原号码租约已结束，重新授权后按配置换号")
+                phone = activation.phone
+                automatic = True
+                job.add_log("原号码尚未发出短信，授权已重建，继续使用同一号码")
+            elif pending_phone:
                 phone = pending_phone
                 pending_phone = ""
                 automatic = False
                 job.current_phone = phone
             elif sms_client:
-                self._set_step(job, "phone", f"正在从 {settings.provider_label} 获取手机号（第 {attempts} 次）", status="running")
+                if not may_acquire_again():
+                    raise ImportErrorBase(f"已达到最多 {settings.max_phone_attempts} 次取号上限")
+                attempts += 1
+                job.phone_attempts = attempts
+                denominator = settings.max_phone_attempts if settings.max_phone_attempts > 0 else "不限"
+                self._set_step(job, "phone", f"正在从 {settings.provider_label} 获取手机号（第 {attempts}/{denominator} 次）", status="running")
                 try:
                     activation = sms_client.acquire()
+                    job._sms_activation = activation
+                    job._sms_client = sms_client
+                    job._sms_sent = False
+                    job._sms_keep_for_session_retry = False
                     phone = activation.phone
                     job.current_phone = phone
                     job.add_log(f"已分配 {phone}（国家 {activation.country}）")
                 except SmsError as exc:
                     job.add_log(f"自动接码分配失败：{exc}", "warning")
-                    activation = None
-                    automatic = False
-                    sms_client = None
-                    provider_disabled_by_failure = True
-                    phone = self._wait_input(job, "phone")
+                    raise
             else:
                 if not provider_disabled_by_failure:
                     phone = self._wait_input_or_provider(job, "phone", watch_provider=True)
@@ -1575,9 +1638,6 @@ class ImportJobManager:
                         settings = self._sms_settings()
                         sms_client = _sms_client_for(settings, self.timeout)
                         if sms_client is not None:
-                            # The loop increments the attempt counter; the
-                            # provider switch itself did not consume a number.
-                            attempts -= 1
                             continue
                         phone = self._wait_input(job, "phone")
                 else:
@@ -1589,11 +1649,14 @@ class ImportJobManager:
                 # The activation may have been acquired just before the
                 # operator clicked skip/cancel.  Release it before bubbling
                 # the terminal signal to ``_run_job``.
-                self._cancel_activation(sms_client, activation)
+                cancel_number(activation)
                 raise
             self._set_step(job, "phone", f"向 {_mask_phone(phone)} 请求短信验证码")
             try:
                 response = client.send_phone(phone)
+                if activation is not None:
+                    job._sms_sent = True
+                    job._sms_keep_for_session_retry = False
                 try:
                     phone_data = response.json()
                 except Exception:
@@ -1606,10 +1669,14 @@ class ImportJobManager:
                     try:
                         self._check_cancel(job)
                     except (PhoneRequiredSkipped, JobCancelled):
-                        self._cancel_activation(sms_client, activation)
+                        cancel_number(activation)
                         raise
                     if activation and sms_client and not activation.finished:
                         sms_client.finish(activation)
+                    job._sms_activation = None
+                    job._sms_client = None
+                    job._sms_sent = False
+                    job._sms_keep_for_session_retry = False
                     job.add_log("服务端已完成手机号步骤，无需短信验证码，继续授权")
                     job.phone_required = False
                     job.phone_required_at = 0
@@ -1623,48 +1690,47 @@ class ImportJobManager:
                     job.add_log("手机号已接受，开始轮询短信")
             except Exception as exc:
                 message = str(exc)
-                self._cancel_activation(sms_client, activation)
-                self._check_cancel(job)
                 if _is_stale_signin_session_error(message):
                     # The add-phone endpoint is stateful.  Once the auth edge
                     # invalidates the sign-in session, retrying a number or
                     # OTP against this client can never recover it.  Bubble a
                     # dedicated signal so _run_job closes this client and
                     # starts a completely fresh ProtocolClient flow.
+                    if activation is not None and not activation.finished and not job._sms_sent and not job.cancel_event.is_set() and not job.skip_phone_event.is_set():
+                        job._sms_activation = activation
+                        job._sms_client = sms_client
+                        job._sms_keep_for_session_retry = True
+                        job.add_log("发送前会话失效，保留原号码重新授权", "warning")
+                    else:
+                        cancel_number(activation)
+                    self._check_cancel(job)
                     raise AuthSessionRestartRequired(
                         "sign-in session is no longer valid; restarting authorization session"
                     ) from exc
-                if "invalid_auth_step" in message:
-                    job.add_log("服务端已完成手机号步骤，继续授权")
-                    job.phone_required = False
-                    job.phone_required_at = 0
-                    self.store.update(job.account_id, phone_required=False, phone_required_at=0)
-                    return
+                cancel_number(activation)
+                self._check_cancel(job)
                 job.add_log(f"手机号被拒绝：{message}", "warning")
-                if automatic and attempts < settings.max_phone_attempts:
-                    continue
+                if automatic:
+                    if may_acquire_again():
+                        raise PhoneNumberRestartRequired("号码被拒绝，重新授权后换号") from exc
+                    raise ImportErrorBase(f"取号 {attempts}/{settings.max_phone_attempts} 次均未完成") from exc
                 # Manual mode lets the operator replace a rejected number.
                 sms_client = None
                 provider_disabled_by_failure = True
-                pending_phone = self._wait_input(job, "phone")
-                continue
+                job._pending_phone = self._wait_input(job, "phone")
+                raise PhoneNumberRestartRequired("手工号码已更换，重新授权后提交") from exc
             if activation and sms_client:
                 self._set_step(job, "sms", f"等待 {settings.provider_label} 返回验证码", status="waiting_sms")
                 try:
                     code = sms_client.wait_code(activation, cancel_event=job.cancel_event)
                     job.add_log("已收到短信验证码（内容已隐藏）")
                 except SmsError as exc:
-                    sms_client.cancel(activation)
+                    cancel_number(activation)
                     self._check_cancel(job)
                     job.add_log(f"轮询短信失败：{exc}", "warning")
-                    if attempts < settings.max_phone_attempts:
-                        continue
-                    automatic = False
-                    sms_client = None
-                    provider_disabled_by_failure = True
-                    activation = None
-                    pending_phone = self._wait_input(job, "phone")
-                    continue
+                    if may_acquire_again() and any(marker in str(exc).lower() for marker in ("超时", "timeout", "激活已结束", "status_cancel")):
+                        raise PhoneNumberRestartRequired("号码未收到验证码，重新授权后换号") from exc
+                    raise
             else:
                 code = self._wait_input(job, "sms_code")
             try:
@@ -1672,30 +1738,26 @@ class ImportJobManager:
             except (PhoneRequiredSkipped, JobCancelled):
                 # ``wait_code`` returns the code before OAuth accepts it.  A
                 # concurrent skip/cancel must still release that activation.
-                self._cancel_activation(sms_client, activation)
+                cancel_number(activation)
                 raise
             self._set_step(job, "sms", "提交短信验证码")
             try:
                 client.submit_phone_otp(code)
             except Exception as exc:
-                self._cancel_activation(sms_client, activation)
+                cancel_number(activation)
                 self._check_cancel(job)
                 if _is_stale_signin_session_error(exc):
                     raise AuthSessionRestartRequired(
                         "sign-in session is no longer valid; restarting authorization session"
                     ) from exc
                 job.add_log(f"短信验证码验证失败：{exc}", "warning")
-                if automatic and attempts < settings.max_phone_attempts:
-                    continue
+                if automatic and may_acquire_again():
+                    raise PhoneNumberRestartRequired("号码验证码验证失败，重新授权后换号") from exc
                 if automatic:
                     # The automatic activation was released above.  Do not
                     # ask for a second code against that cancelled number;
                     # switch to a fresh manual number instead.
-                    sms_client = None
-                    provider_disabled_by_failure = True
-                    activation = None
-                    pending_phone = self._wait_input(job, "phone")
-                    continue
+                    raise ImportErrorBase(f"取号 {attempts}/{settings.max_phone_attempts} 次均未完成") from exc
                 # A bad manual code should request a fresh code on the same
                 # number before requiring a new phone.
                 code = self._wait_input(job, "sms_code")
@@ -1707,17 +1769,21 @@ class ImportJobManager:
                             "sign-in session is no longer valid; restarting authorization session"
                         ) from exc
                     sms_client = None
-                    pending_phone = self._wait_input(job, "phone")
-                    continue
+                    job._pending_phone = self._wait_input(job, "phone")
+                    raise PhoneNumberRestartRequired("手工号码已更换，重新授权后提交") from exc
             # A skip request can race with the upstream OTP response.  Honor
             # it before marking the activation successful and returning.
             try:
                 self._check_cancel(job)
             except (PhoneRequiredSkipped, JobCancelled):
-                self._cancel_activation(sms_client, activation)
+                cancel_number(activation)
                 raise
             if activation and sms_client and not activation.finished:
                 sms_client.finish(activation)
+            job._sms_activation = None
+            job._sms_client = None
+            job._sms_sent = False
+            job._sms_keep_for_session_retry = False
             job.add_log("手机验证成功")
             job.phone_required = False
             job.phone_required_at = 0
@@ -1731,7 +1797,29 @@ class ImportJobManager:
                 job.add_log(f"consent 刷新提示：{exc}", "warning")
             return
 
+    def _release_retained_activation(self, job: ImportJob) -> None:
+        sms_client, activation = job._sms_client, job._sms_activation
+        job._sms_client = None
+        job._sms_activation = None
+        job._sms_sent = False
+        job._sms_keep_for_session_retry = False
+        self._cancel_activation(sms_client, activation)
+
     def _run_job(self, job_id: str) -> None:
+        # Session recovery can be unlimited. Keep it iterative so repeated
+        # stale sessions never accumulate recursive worker calls.
+        while True:
+            delay = self._run_job_once(job_id)
+            if delay is None:
+                return
+            with self._lock:
+                job = self._jobs.get(job_id)
+            if job is None:
+                return
+            # The next iteration records cancellation and releases any lease.
+            job.cancel_event.wait(delay)
+
+    def _run_job_once(self, job_id: str) -> float | None:
         with self._lock:
             job = self._jobs.get(job_id)
         if not job:
@@ -1740,6 +1828,7 @@ class ImportJobManager:
         # Check the event before creating a network session so cancellation
         # never resurrects a job that the UI already marked as stopped.
         if job.cancel_event.is_set():
+            self._release_retained_activation(job)
             with self._lock:
                 job.status = "cancelled"
                 job.step = "cancelled"
@@ -1750,6 +1839,7 @@ class ImportJobManager:
             return
         account = self.store.get(job.account_id)
         if not account:
+            self._release_retained_activation(job)
             self._fail_job(job, "导入账号已不存在")
             return
         with self._lock:
@@ -1759,6 +1849,27 @@ class ImportJobManager:
         client: ProtocolClient | None = None
         slot_acquired = False
         retry_requested = False
+        retry_delay = 0.0
+
+        def request_session_restart(error: Exception) -> None:
+            nonlocal retry_requested, retry_delay
+            job.session_retries += 1
+            job.status = "queued"
+            job.step = "queued"
+            job.progress = 0
+            job.error = redact_log(str(error))
+            job.waiting_for = ""
+            retry_delay = min(30.0, 2.0 ** min(job.session_retries - 1, 5))
+            reason = "号码验证未完成" if isinstance(error, PhoneNumberRestartRequired) else "登录会话已失效"
+            job.add_log(
+                f"{reason}，关闭旧会话后重新授权（第 {job.session_retries} 次，{retry_delay:g}s 后）"
+                + ("；保留原号码" if job._sms_activation is not None else ""),
+                "warning",
+            )
+            self.store.update(job.account_id, status="queued", last_error=job.error)
+            with self._lock:
+                self._persist_jobs_locked()
+            retry_requested = True
         try:
             # The executor has a fixed upper bound; this gate is the live,
             # operator-configurable limit for network/OAuth work.
@@ -1786,6 +1897,8 @@ class ImportJobManager:
                     job.add_log("2FA 验证成功")
                     break
                 except Exception as exc:
+                    if _is_stale_signin_session_error(exc):
+                        raise AuthSessionRestartRequired(str(exc)) from exc
                     if attempt >= 1:
                         raise
                     job.add_log(f"2FA 第一次验证失败，重新申请 challenge：{exc}", "warning")
@@ -1889,25 +2002,9 @@ class ImportJobManager:
         except AuthSessionRestartRequired as exc:
             # A stale sign-in session cannot be repaired by retrying the
             # current phone/OTP step.  Let the finally block close the old
-            # client, then recursively run the complete flow with a fresh
+            # client, then iteratively run the complete flow with a fresh
             # ProtocolClient (new cookies, device id, PKCE state).
-            if job.network_retries < 3:
-                job.network_retries += 1
-                job.status = "queued"
-                job.step = "queued"
-                job.progress = 0
-                job.error = redact_log(str(exc))
-                job.waiting_for = ""
-                job.add_log(
-                    f"登录会话已失效，将关闭旧会话并全新授权重试（第 {job.network_retries}/3 次）",
-                    "warning",
-                )
-                self.store.update(job.account_id, status="queued", last_error=job.error)
-                with self._lock:
-                    self._persist_jobs_locked()
-                retry_requested = True
-            else:
-                self._fail_job(job, str(exc))
+            request_session_restart(exc)
         except PhoneRequiredSkipped as exc:
             with self._lock:
                 job.status = "skipped_phone"
@@ -1936,7 +2033,9 @@ class ImportJobManager:
             self.store.update(account.id, status="cancelled", last_error=str(exc))
         except Exception as exc:
             message = str(exc)
-            if _is_retryable_network_error(message) and job.network_retries < 3:
+            if _is_stale_signin_session_error(exc):
+                request_session_restart(exc)
+            elif _is_retryable_network_error(message) and job.network_retries < 3:
                 # Do not reuse the partially authenticated client.  The
                 # finally block closes it and releases the worker slot before
                 # the fresh session is queued again.
@@ -1954,6 +2053,7 @@ class ImportJobManager:
                 with self._lock:
                     self._persist_jobs_locked()
                 retry_requested = True
+                retry_delay = min(8.0, 2.0 ** (job.network_retries - 1))
             else:
                 self._fail_job(job, message)
         finally:
@@ -1964,10 +2064,12 @@ class ImportJobManager:
                     pass
             if slot_acquired:
                 self._release_worker_slot()
+            if not retry_requested or not job._sms_keep_for_session_retry or job._sms_sent:
+                self._release_retained_activation(job)
         if retry_requested:
-            # Backoff outside the worker slot so another account can progress.
-            time.sleep(min(8.0, 1.0 * (2 ** (job.network_retries - 1))))
-            self._run_job(job_id)
+            # Backoff happens in the iterative owner after releasing the slot.
+            return retry_delay
+        return None
 
     def _fail_job(self, job: ImportJob, message: str) -> None:
         with self._lock:

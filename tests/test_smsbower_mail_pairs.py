@@ -257,6 +257,32 @@ def test_child_rejects_all_parent_codes_and_requests_next_code_once(pair, monkey
     assert child["_smsbower_seen_codes"] == ["111111", "222222", "333333"]
 
 
+def test_fast_child_code_is_not_cleared_after_it_arrives(pair, monkeypatch):
+    provider, primary, set_status = pair
+    current = {"code": "111111"}
+    mail.prepare_smsbower_pair(primary)
+    monkeypatch.setattr(provider, "get_code", lambda _: current["code"])
+    assert provider.wait_for_code(primary) == "111111"
+    mail.mark_smsbower_otp_accepted(primary)
+    assert not set_status.called
+    child = mail.create_smsbower_child(primary)
+
+    def status(mail_id, value):
+        if value == 5:
+            current["code"] = None
+
+    set_status.side_effect = status
+    mail.prepare_smsbower_next_code(child)
+    set_status.assert_called_once_with(primary["mail_id"], 5)
+    current["code"] = "222222"  # The child auth request now sends and delivers.
+    assert provider.wait_for_code(child) == "222222"
+    assert child["_registration_code_received"] is True
+    assert set_status.call_count == 1
+    mail.mark_smsbower_otp_accepted(child)
+    mail.finalize_smsbower_pair(primary, primary_success=True, child_success=True)
+    assert [call.args[1] for call in set_status.call_args_list] == [5, 3]
+
+
 def test_lost_next_code_request_is_shared_and_never_replayed_by_child(pair, monkeypatch):
     provider, primary, set_status = pair
     primary["_smsbower_codes_delivered"] = 1

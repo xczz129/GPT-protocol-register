@@ -37,7 +37,9 @@ from register.mail_channel_options import (
     smsbower_child_enabled,
     validate_smsbower_job,
 )
-from register.smsbower_batch import run_dynamic_mail_groups
+from register.smsbower_batch import run_dynamic_mail_groups, _await_owned
+from register.pending_recovery import can_recover_registration, merge_registration_progress, recover_registration
+from register.registration_outcome import RegisteredEmailDetected
 from register.flow import register_one
 from register.protocol import repair_security_one
 from register.protocol_runtime import ProtocolRuntimeSettings
@@ -383,7 +385,7 @@ async def run_register(
             print(f"  [调度] 可用邮箱={available}/{pool_total}  总数={n}  并发={conc}")
 
     print("=" * 50)
-    if not fixed_email and is_smsbower_selected(provider_type):
+    if not fixed_email and is_smsbower_selected(provider_type) and smsbower_child_enabled(mail_config):
         if smsbower_child_enabled(mail_config):
             n -= n % 2
             if n < 2:
@@ -515,7 +517,7 @@ async def run_register(
             mailbox_override: dict[str, Any] | None = None,
         ):
             async with sem:
-                cancellation = (mailbox_override or {}).get("_registration_cancel_event")
+                cancellation = (mailbox_override or {}).get("_registration_cancel_event") or threading.Event()
                 def task_stopped() -> bool:
                     return bool(_stop()) or bool(cancel_event is not None and cancel_event.is_set()) or bool(cancellation is not None and cancellation.is_set())
                 task_group_id = (
@@ -567,6 +569,19 @@ async def run_register(
                 record = None
                 skipped = False
                 security_completion_failed = False
+                pending_account: dict[str, Any] = dict((mailbox_override or {}).get("_registration_partial_account") or {})
+                active_mailbox = mailbox_override
+
+                def remember_partial(update: dict[str, Any], mailbox: dict[str, Any] | None = None) -> None:
+                    nonlocal active_mailbox
+                    if mailbox is not None:
+                        active_mailbox = mailbox
+                    merge_registration_progress(pending_account, update)
+                    pending_account["group_id"] = task_group_id
+                    pending_account["registration_state"] = "security_pending"
+                    if active_mailbox is not None:
+                        active_mailbox["_registration_partial_account"] = dict(pending_account)
+                    upsert_account_record(dict(pending_account), ACCOUNTS_FILE)
                 for attempt in range(proxy_retry_limit + 1):
                     try:
                         await _wait_if_paused(i, task_stopped)
@@ -605,6 +620,9 @@ async def run_register(
                         transport_error = is_proxy_transport_error(detail)
                         if callable(task_event):
                             forwarded = dict(fields)
+                            if status == "failed" and not task_stopped() and can_recover_registration(pending_account, active_mailbox):
+                                status = "running"
+                                forwarded["step"] = "注册凭据已保存，正在准备密码登录补全"
                             if transport_error:
                                 forwarded.pop("error", None)
                                 forwarded["step"] = "当前代理连接失败，正在切换下一条代理"
@@ -620,27 +638,64 @@ async def run_register(
                             proxy=proxy_brief(proxy),
                             step=f"开始第 {attempt + 1} 次尝试",
                         )
-                        record = await register_one(
-                            i,
-                            n,
-                            # Each attempt owns an independent Playwright driver.
-                            # A fatal driver crash must not poison sibling tasks.
-                            None,
-                            mail_config=mail_config,
-                            proxy=proxy,
-                            fixed_email=task_email,
-                            provider_type=provider_type,
-                            timeout=timeout,
-                            keep_on_fail=keep_on_fail,
-                            stop_check=task_stopped,
-                            task_event=attempt_event,
-                            c2a_config=c2a_cfg,
-                            group_id=task_group_id,
-                            hybrid_mode=hybrid_mode,
-                            defer_success_event=post_security,
-                            **({"mailbox_override": mailbox_override} if mailbox_override is not None else {}),
-                        )
-                        if record and post_security:
+                        recovery_only = bool((mailbox_override or {}).get("_registration_recovery_only"))
+                        if recovery_only:
+                            mailbox_override["_registration_recovery_attempted"] = True
+                            recovery = asyncio.create_task(asyncio.to_thread(recover_registration, i,
+                                account=pending_account, mailbox=active_mailbox, mail_config=mail_config, proxy=proxy,
+                                stop_check=task_stopped, task_event=attempt_event, partial_sink=remember_partial,
+                                protocol_runtime=ProtocolRuntimeSettings.from_config(reg_cfg)))
+                            record, recovery_cancelled = await _await_owned(recovery, cancellation.set)
+                            if recovery_cancelled:
+                                raise JobCancelled("stop requested")
+                            record = upsert_account_record(record, ACCOUNTS_FILE)
+                            mailbox_override["_registration_recovery_pending"] = False
+                        else:
+                            try:
+                                record = await register_one(
+                                    i,
+                                    n,
+                                    # Each attempt owns an independent Playwright driver.
+                                    # A fatal driver crash must not poison sibling tasks.
+                                    None,
+                                    mail_config=mail_config,
+                                    proxy=proxy,
+                                    fixed_email=task_email,
+                                    provider_type=provider_type,
+                                    timeout=timeout,
+                                    keep_on_fail=keep_on_fail,
+                                    stop_check=task_stopped,
+                                    task_event=attempt_event,
+                                    c2a_config=c2a_cfg,
+                                    group_id=task_group_id,
+                                    hybrid_mode=hybrid_mode,
+                                    defer_success_event=post_security,
+                                    partial_sink=remember_partial,
+                                    **({"mailbox_override": mailbox_override} if mailbox_override is not None else {}),
+                                )
+                            except (JobCancelled, asyncio.CancelledError, RegisteredEmailDetected):
+                                raise
+                            except Exception:
+                                # Browser cleanup/timeout may raise after the password
+                                # has been saved. Continue the same owned identity.
+                                if skipped or task_stopped() or not can_recover_registration(pending_account, active_mailbox):
+                                    raise
+                                record = None
+                        if not record and not recovery_only and not task_stopped() and can_recover_registration(pending_account, active_mailbox):
+                            defer = bool(active_mailbox is not None and active_mailbox.get("provider") == "smsbower_mail" and active_mailbox.get("register_child", True) and active_mailbox.get("_smsbower_pair_role", "primary") == "primary" and (active_mailbox.get("_registration_code_received") or active_mailbox.get("_otp_accepted_by_server")))
+                            if defer:
+                                active_mailbox["_registration_recovery_pending"] = True
+                                emit_task(i, "running", email=task_email, step="主号已收码，保留邮箱给子号后再密码登录补全")
+                            else:
+                                recovery = asyncio.create_task(asyncio.to_thread(recover_registration, i,
+                                    account=pending_account, mailbox=active_mailbox, mail_config=mail_config, proxy=proxy,
+                                    stop_check=task_stopped, task_event=attempt_event, partial_sink=remember_partial,
+                                    protocol_runtime=ProtocolRuntimeSettings.from_config(reg_cfg)))
+                                record, recovery_cancelled = await _await_owned(recovery, cancellation.set)
+                                if recovery_cancelled:
+                                    raise JobCancelled("stop requested")
+                                record = upsert_account_record(record, ACCOUNTS_FILE)
+                        if record and post_security and record.get("registration_state") != "complete":
                             email_value = str(record.get("email") or "").strip()
                             record["registration_state"] = "security_pending"
                             upsert_account_record(dict(record), ACCOUNTS_FILE)
@@ -788,8 +843,10 @@ async def run_register(
                         break
                     if skipped:
                         break
+                    if "registration_recovery_pending" in attempt_error.lower():
+                        break
                     if mailbox_override is not None and mailbox_override.get("provider") == "smsbower_mail" and (
-                        mailbox_override.get("_registration_identity_created")
+                        (mailbox_override.get("_registration_identity_created") and not mailbox_override.get("_registration_recovery_only"))
                         or mailbox_override.get("_smsbower_terminal_status")
                         or mailbox_override.get("_registration_outcome") in {"already_registered", "otp_timeout"}
                     ):
@@ -849,6 +906,8 @@ async def run_register(
                         except JobCancelled:
                             break
                 results[i - 1] = record
+                if not record and mailbox_override is not None and mailbox_override.get("_registration_recovery_pending") and not mailbox_override.get("_registration_recovery_only"):
+                    return
                 if not record and not skipped and not task_stopped():
                     emit_task(i, "failed", step="任务失败")
 

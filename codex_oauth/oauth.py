@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64, binascii, hashlib, json, os, re, secrets, tempfile, threading, time, uuid
 import hmac, struct
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode, urlparse, parse_qs, parse_qsl, urljoin, unquote
@@ -248,13 +249,80 @@ class ProtocolClient:
         self.navigation_id = str(uuid.uuid4())
         self.auth_session_data: dict = {}
         self.last_auth_response: dict = {}
+        self._auth_session_cookie = ""
         try:
-            for domain in (".openai.com", "openai.com", ".auth.openai.com", "auth.openai.com"):
-                self.session.cookies.set("oai-did", self.device_id, domain=domain)
+            # One matching cookie is enough. Four overlapping domain copies
+            # send conflicting values as soon as the server rotates one.
+            self.session.cookies.set("oai-did", self.device_id, domain="auth.openai.com")
         except Exception:
             # curl-cffi versions with a restricted cookie jar still accept the
             # device id through the explicit request header below.
             pass
+
+    @staticmethod
+    def _auth_cookie(cookies: Any, name: str) -> Any:
+        jar = getattr(cookies, "jar", None)
+        if jar is None:
+            return None
+        matches = [
+            cookie for cookie in jar
+            if cookie.name == name
+            and str(cookie.domain or "").lstrip(".").lower() in {"openai.com", "auth.openai.com"}
+            and str(cookie.path or "/") == "/"
+        ]
+        return max(matches, key=lambda cookie: (
+            len(str(cookie.domain).lstrip(".")), not str(cookie.domain).startswith("."),
+        ), default=None)
+
+    def _auth_cookie_value(self, name: str) -> str:
+        cookie = self._auth_cookie(getattr(self.session, "cookies", None), name)
+        return str(cookie.value or "") if cookie is not None else ""
+
+    def _sync_auth_cookies(self, response: Any = None) -> None:
+        cookies = getattr(self.session, "cookies", None)
+        jar = getattr(cookies, "jar", None)
+        if jar is None:
+            return
+        selected = self._auth_cookie(getattr(response, "cookies", None), "oai-did")
+        if selected is None and response is not None:
+            headers = getattr(response, "headers", {})
+            get_list = getattr(headers, "get_list", None)
+            raw_headers = get_list("set-cookie") if callable(get_list) else [headers.get("set-cookie", "")]
+            for raw in raw_headers or []:
+                parsed = SimpleCookie()
+                try:
+                    parsed.load(str(raw or ""))
+                except Exception:
+                    continue
+                morsel = parsed.get("oai-did")
+                if morsel is None or not morsel.value:
+                    continue
+                domain = str(morsel["domain"] or "auth.openai.com")
+                path = str(morsel["path"] or "/")
+                if domain.lstrip(".").lower() not in {"openai.com", "auth.openai.com"} or path != "/":
+                    continue
+                cookies.set("oai-did", morsel.value, domain=domain, path=path)
+                selected = next((cookie for cookie in jar if cookie.name == "oai-did" and cookie.domain == domain and cookie.path == path), None)
+        if selected is None:
+            selected = self._auth_cookie(cookies, "oai-did")
+        if selected is not None and selected.value:
+            self.device_id = str(selected.value)
+            selected_scope = (selected.domain, selected.path)
+            for cookie in list(jar):
+                if (
+                    cookie.name == "oai-did"
+                    and str(cookie.domain or "").lstrip(".").lower() in {"openai.com", "auth.openai.com"}
+                    and (cookie.domain, cookie.path) != selected_scope
+                ):
+                    jar.clear(cookie.domain, cookie.path, cookie.name)
+            # The response jar can be separate from the persistent session.
+            cookies.set("oai-did", self.device_id, domain=selected.domain, path=selected.path)
+        auth_cookie = self._auth_cookie_value("oai-client-auth-session")
+        if auth_cookie != getattr(self, "_auth_session_cookie", ""):
+            self._auth_session_cookie = auth_cookie
+            # A navigation can rotate the signed session after the previous
+            # JSON response. Do not keep an older MFA/workspace snapshot.
+            self.auth_session_data = {}
 
     def _update_navigation(self, response: Any) -> None:
         try:
@@ -263,6 +331,7 @@ class ProtocolClient:
             value = ""
         if value:
             self.navigation_id = str(value)
+        self._sync_auth_cookies(response)
 
     def navigate(self, url: str, referer: str = "https://auth.openai.com/") -> Any:
         """模拟浏览器页面导航(GET)。
@@ -274,6 +343,7 @@ class ProtocolClient:
         current = str(url or "").strip()
         if not current:
             return None
+        phone_navigation = urlparse(current).path.rstrip("/") == "/add-phone"
         for _ in range(6):
             response = self.session.get(
                 current,
@@ -321,9 +391,24 @@ class ProtocolClient:
                 )
                 self._update_navigation(response)
                 status = int(response.status_code)
+                if 300 <= status < 400:
+                    location = response.headers.get("location", "")
+                    if not location:
+                        raise RuntimeError("auth_navigation_redirect_missing")
+                    referer, current = current, urljoin(current, location)
+                    continue
             if status >= 400:
                 raise RuntimeError(f"HTTP {status} navigate {urlparse(current).path}: {self._response_detail(response)}")
             break
+        else:
+            raise RuntimeError("auth_navigation_redirect_limit")
+        if phone_navigation:
+            final_url = str(getattr(response, "url", "") or current)
+            final_path = urlparse(final_url).path.rstrip("/")
+            if final_path in {"/log-in", "/login", "/log-in/password", "/log-in-or-create-account", "/mfa-challenge"}:
+                raise RuntimeError("signin_session_invalid: phone navigation returned to authentication")
+            if status != 200 or urlparse(final_url).hostname != "auth.openai.com" or final_path != "/add-phone":
+                raise RuntimeError("phone_navigation_unexpected_step")
         return response
 
     @staticmethod
@@ -401,10 +486,7 @@ class ProtocolClient:
             break
         else:
             raise RuntimeError("OAuth authorize redirect chain exceeded limit")
-        try:
-            self.device_id = self.session.cookies.get("oai-did", self.device_id) or self.device_id
-        except Exception:
-            pass
+        self._sync_auth_cookies()
 
     def post_json(self, path: str, payload: dict):
         referers = {
@@ -567,7 +649,7 @@ class ProtocolClient:
         """Workspace entries from the auth session (payload first, cookie fallback)."""
         data = self.auth_session_data
         if not data:
-            raw = self.session.cookies.get("oai-client-auth-session", "")
+            raw = self._auth_cookie_value("oai-client-auth-session")
             if not raw: raise RuntimeError("oai-client-auth-session cookie missing")
             part = unquote(raw.split(".", 1)[0])
             data = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
@@ -623,7 +705,7 @@ class ProtocolClient:
             for factor in factors:
                 if factor.get("factor_type") == "totp" and factor.get("id"):
                     return str(factor["id"])
-        raw = self.session.cookies.get("oai-client-auth-session", "")
+        raw = self._auth_cookie_value("oai-client-auth-session")
         if not raw: raise RuntimeError("oai-client-auth-session cookie missing")
         part = unquote(raw.split(".", 1)[0])
         data = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))

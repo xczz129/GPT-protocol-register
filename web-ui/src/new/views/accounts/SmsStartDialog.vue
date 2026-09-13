@@ -13,14 +13,14 @@ const checking = ref(false);
 const error = ref("");
 const preview = ref<CodexPreflight | null>(null);
 const initialized = ref(false);
-const form = reactive({ strategy: "auto" as RelayStrategy, concurrency: 3, provider: "smsbower", countryOrder: "", maxPrice: "", attempts: 3, timeout: 180 });
+const form = reactive({ strategy: "auto" as RelayStrategy, concurrency: 3, provider: "smsbower", countryOrder: "", maxPrice: "", attempts: 0, timeout: 180 });
 let requestId = 0;
 let debounce: ReturnType<typeof setTimeout> | undefined;
 
 const invalid = computed(() => {
   if (!Number.isInteger(form.concurrency) || form.concurrency < 1 || form.concurrency > 20) return "并发必须是 1–20 之间的整数";
   if (form.strategy === "sync_only") return "";
-  if (!Number.isInteger(form.attempts) || form.attempts < 1 || form.attempts > 20) return "每个账号的取号上限必须是 1–20 之间的整数";
+  if (!Number.isInteger(form.attempts) || form.attempts < 0) return "取号次数必须是非负整数，0 表示不限次数";
   if (!Number.isInteger(form.timeout) || form.timeout < 30 || form.timeout > 1800) return "单个号码的等码时间必须是 30–1800 秒之间的整数";
   if (form.provider === "smsbower" && form.maxPrice.trim() && (!/^\d+(\.\d+)?$/.test(form.maxPrice.trim()) || Number(form.maxPrice) <= 0)) return "每号最高价必须是大于 0 的金额，留空表示不设置本次统一限价";
   return "";
@@ -144,7 +144,7 @@ onBeforeUnmount(() => {
         <div class="field"><label for="sms-run-concurrency">同时处理账号数</label><input id="sms-run-concurrency" v-model.number="form.concurrency" class="input" type="number" min="1" max="20" step="1" /><small>建议从 1–3 开始</small></div>
         <div v-if="form.strategy !== 'sync_only'" class="field country"><label for="sms-run-country">国家顺序</label><input id="sms-run-country" v-model="form.countryOrder" class="input" type="text" autocomplete="off" :disabled="form.provider === 'firefox'" :placeholder="form.provider === 'firefox' ? '例如 usa, chl, eng' : '例如 6, 4, 151'" /><small>{{ form.provider === 'firefox' ? '国家由已保存的对接码确定；更换国家请到接码设置更新对接码' : '按国家编号依次尝试，逗号分隔；可沿用已保存的国家与供应商顺序' }}</small></div>
         <div v-if="form.strategy !== 'sync_only'" class="field"><label for="sms-run-price">每个号码最高价</label><input id="sms-run-price" v-model="form.maxPrice" class="input" type="text" inputmode="decimal" :disabled="form.provider !== 'smsbower'" :placeholder="form.provider === 'smsbower' ? '留空不设统一限价' : '此渠道不支持价格上限'" /><small>{{ form.provider === 'smsbower' ? '按渠道计价币种；留空不设统一限价，国家单独限价仍生效。非任务总预算' : '火狐狸当前接口不支持限价' }}</small></div>
-        <div v-if="form.strategy !== 'sync_only'" class="field"><label for="sms-run-attempts">每个账号最多取号</label><div class="unit-field"><input id="sms-run-attempts" v-model.number="form.attempts" class="input" type="number" min="1" max="20" step="1" /><span>次</span></div></div>
+        <div v-if="form.strategy !== 'sync_only'" class="field"><label for="sms-run-attempts">取号次数上限</label><div class="unit-field"><input id="sms-run-attempts" v-model.number="form.attempts" class="input" type="number" min="0" step="1" /><span>次</span></div><small>0 表示不限次数；同号码恢复会话不增加次数。</small></div>
         <div v-if="form.strategy !== 'sync_only'" class="field"><label for="sms-run-timeout">单个号码等码时间</label><div class="unit-field"><input id="sms-run-timeout" v-model.number="form.timeout" class="input" type="number" min="30" max="1800" step="30" /><span>秒</span></div></div>
       </fieldset>
 

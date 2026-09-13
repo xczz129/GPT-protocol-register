@@ -164,7 +164,7 @@ onBeforeUnmount(stopMessagePolling);
           <small v-if="!forms.smsbowerDomains.length" class="domain-error">请至少选择一个域名</small>
           <small v-else class="field-help">注册时按勾选顺序尝试可用域名。</small>
         </fieldset>
-        <label class="checkline"><input v-model="forms.smsbowerRegisterChild" type="checkbox" />主号成功后注册一个子号</label>
+        <label class="checkline"><input v-model="forms.smsbowerRegisterChild" type="checkbox" />注册子号（邮箱保留到子号收码结束）</label>
         <p class="field-help">子号使用同一邮箱的 +split 别名收码。开启后，每组为 1 个主号 + 1 个子号，任务数量包含两者；主号已注册则跳过整组。设置保存后对新任务生效。</p>
         <div class="actions"><button class="primary" :disabled="busy || !forms.smsbowerDomains.length || !forms.smsbowerService.trim() || (forms.smsbowerEnable && !forms.smsbowerApiKeyConfigured && !forms.smsbowerApiKey.trim())" @click="emit('save-smsbower')">保存 SMSBower</button></div>
       </div>

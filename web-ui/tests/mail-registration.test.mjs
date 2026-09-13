@@ -41,8 +41,9 @@ test("SMSBower account slots are even, bounded and include both the main and chi
   }
 });
 
-test("turning off children permits a single account while preserving even channel concurrency", () => {
-  assert.deepEqual(plain(shared.normalizeRegistrationNumbers({ mailType: "smsbower_mail", total: 1, concurrency: 3 }, false)), { total: 1, concurrency: 4 });
+test("turning off children permits ordinary odd and single-worker concurrency", () => {
+  assert.deepEqual(plain(shared.normalizeRegistrationNumbers({ mailType: "smsbower_mail", total: 1, concurrency: 3 }, false)), { total: 1, concurrency: 3 });
+  assert.deepEqual(plain(shared.normalizeRegistrationNumbers({ mailType: "smsbower_mail", total: 1, concurrency: 1 }, false)), { total: 1, concurrency: 1 });
   assert.deepEqual(plain(shared.normalizeRegistrationNumbers({ mailType: "icloud", total: 3, concurrency: 1 })), { total: 3, concurrency: 1 });
   assert.equal(shared.smsbowerPolicy("smsbower_mail", false).paired, false);
   assert.equal(shared.smsbowerPolicy("smsbower_mail").paired, true);
@@ -84,7 +85,7 @@ test("the real task form normalizes selection and uses the latest saved child se
     await h.submit();
     assert.equal(h.sent.length, 1);
     assert.equal(h.sent[0].total, 3);
-    assert.equal(h.sent[0].concurrency, 2);
+    assert.equal(h.sent[0].concurrency, 1);
     assert.equal(h.registrationPolicy.value.paired, false);
     assert.equal(h.busy.value, false);
   } finally { h.dispose(); }

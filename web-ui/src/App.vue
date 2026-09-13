@@ -3044,7 +3044,7 @@ async function runMaddyAutoRegister() {
 }
 async function testWebhook() { await run(() => api("/api/maintenance/test-webhook", { method: "POST", body: jsonBody({ enabled: maintenanceForm.enabled, interval_hours: maintenanceForm.intervalHours, workers: maintenanceForm.workers, auto_delete_invalid: maintenanceForm.autoDeleteInvalid, webhook_url: maintenanceForm.webhookUrl, notify_on_complete: maintenanceForm.notifyOnComplete, notify_on_pool_low: maintenanceForm.notifyOnPoolLow, pool_low_threshold: maintenanceForm.poolLowThreshold }) }), (r) => r.message || "Webhook 测试完成"); }
 async function createBackupNow() { await run(() => api("/api/backups", { method: "POST", body: "{}" }), "备份已创建", [loadOperations]); }
-const smsForm = reactive({ enabled: false, provider: "smsbower", apiKey: "", service: "dr", countryOrder: "6, 4, 151", timeoutSeconds: 180, maxPhoneAttempts: 5, firefoxApiName: "", firefoxToken: "", firefoxCountryOrder: "usa, chl, eng" });
+const smsForm = reactive({ enabled: false, provider: "smsbower", apiKey: "", service: "dr", countryOrder: "6, 4, 151", timeoutSeconds: 180, maxPhoneAttempts: 0, firefoxApiName: "", firefoxToken: "", firefoxCountryOrder: "usa, chl, eng" });
 const smsConfig = ref({});
 const codexOauthDialog = reactive({ open: false });
 const codexOauthStatus = ref({ running: false, total: 0, done: 0, success: 0, failed: 0, logs: [], results: [] });
@@ -3075,7 +3075,7 @@ async function resumeCodexOauthIfRunning() {
   } catch {}
   return false;
 }
-async function loadSmsConfig() { try { const value = await api("/api/sms-config"); smsConfig.value = value || {}; Object.assign(smsForm, { enabled: !!value.enabled, provider: value.provider || "smsbower", apiKey: "", service: value.service || "dr", countryOrder: value.country_order || "6, 4, 151", timeoutSeconds: Number(value.timeout_seconds || 180), maxPhoneAttempts: Number(value.max_phone_attempts || 5), firefoxApiName: value.firefox_api_name || "", firefoxToken: "", firefoxDockingCode: value.firefox_docking_code || "", firefoxCountryOrder: value.firefox_country_order || "usa, chl, eng" }); } catch {} }
+async function loadSmsConfig() { try { const value = await api("/api/sms-config"); smsConfig.value = value || {}; Object.assign(smsForm, { enabled: !!value.enabled, provider: value.provider || "smsbower", apiKey: "", service: value.service || "dr", countryOrder: value.country_order || "6, 4, 151", timeoutSeconds: Number(value.timeout_seconds || 180), maxPhoneAttempts: Number(value.max_phone_attempts ?? 0), firefoxApiName: value.firefox_api_name || "", firefoxToken: "", firefoxDockingCode: value.firefox_docking_code || "", firefoxCountryOrder: value.firefox_country_order || "usa, chl, eng" }); } catch {} }
 const smsStats = ref(null);
 const smsStatsLoading = ref(false);
 async function loadSmsStats() {

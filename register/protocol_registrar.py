@@ -184,6 +184,21 @@ class PlatformRegistrar:
             self.session.headers.update(_client_hint_headers(fp))
         except Exception:
             pass
+        try:
+            cookies = self.session.cookies
+            jar = getattr(cookies, "jar", cookies)
+            hosts = {urlsplit(auth_base).hostname or "auth.openai.com",
+                     urlsplit(chatgpt_base).hostname or "chatgpt.com"}
+            scopes = {*hosts, "openai.com", "auth.openai.com", "chatgpt.com", "www.chatgpt.com"}
+            for cookie in list(jar):
+                if cookie.name == "oai-did" and str(cookie.domain or "").lstrip(".").lower() in scopes:
+                    jar.clear(cookie.domain, cookie.path, cookie.name)
+            # One value per target host avoids overlapping .openai.com and
+            # .auth.openai.com cookies disagreeing with the Sentinel/header ID.
+            for host in sorted(hosts):
+                cookies.set("oai-did", self.device_id, domain=host, path="/")
+        except Exception:
+            pass
 
     @staticmethod
     def _diagnostic(index: int, message: str) -> None:
@@ -257,13 +272,12 @@ class PlatformRegistrar:
                 self.session.cookies.set(name, value, domain="auth.openai.com")
             except Exception:
                 pass
+        self._sync_session_identity()
         step(index, "FlareSolverr clearance 已缓存，重试当前请求", "yellow")
         return bundle
 
     def _platform_authorize(self, email: str, index: int, screen_hint: str = "signup") -> str:
         step(index, "开始 platform authorize")
-        self.session.cookies.set("oai-did", self.device_id, domain=".auth.openai.com")
-        self.session.cookies.set("oai-did", self.device_id, domain="auth.openai.com")
         self.code_verifier, code_challenge = _generate_pkce()
         params = {
             "issuer": auth_base,
@@ -1129,6 +1143,134 @@ class PlatformRegistrar:
         tokens["mfa_factor_type"] = "totp"
         return tokens
 
+    def login_pending_with_password(
+        self,
+        email: str,
+        password: str,
+        index: int,
+        *,
+        mailbox: dict[str, Any] | None = None,
+        totp_secret: str = "",
+    ) -> dict[str, Any]:
+        """Authenticate an owned pending identity without any signup/reset call.
+
+        Ownership and persistence are enforced by recover_pending_registration_one.
+        Unlike the strict password+TOTP maintenance flow, a new account may not
+        have MFA yet, or may require an email challenge after its password.
+        """
+        email, password = str(email or "").strip(), str(password or "").strip()
+        secret = str(totp_secret or "").strip()
+
+        def ensure_running() -> None:
+            if _STOP_CHECK.get()():
+                raise JobCancelled("stop requested")
+            if current_runtime_settings().expired():
+                raise RuntimeError("pending_recovery_account_timeout")
+
+        def details(payload: dict[str, Any]) -> tuple[str, str]:
+            url, page = _auth_step_details(payload)
+            return url or str(payload.get("final_url") or ""), str(page or "").lower().replace("-", "_")
+
+        def password_page(url: str, page: str) -> bool:
+            path = _url_path(url).rstrip("/")
+            if "reset-password" in path or "create-account" in path or "signup" in path:
+                return False
+            return path in {"/log-in/password", "/login/password", "/sign-in/password"} or page in {
+                "password_verification", "login_password",
+            }
+
+        def reject_registration_step(url: str, page: str) -> None:
+            path = _url_path(url).rstrip("/")
+            if any(part in path for part in ("create-account", "signup", "sign-up", "reset-password", "about-you", "user/register")) or page in {
+                "create_account_password", "signup_password", "username_password_create",
+                "reset_password", "reset_password_new_password", "about_you", "create_account",
+            }:
+                raise RuntimeError("pending_recovery_registration_or_reset_route_rejected")
+
+        ensure_running()
+        if not email or not password:
+            raise RuntimeError("pending_recovery_saved_password_required")
+        if isinstance(mailbox, dict) and mailbox.get("_registration_outcome") == "already_registered":
+            raise RuntimeError("pending_recovery_registered_candidate_rejected")
+        if mailbox is not None and str(mailbox.get("address") or "").strip().lower() != email.lower():
+            raise RuntimeError("pending_recovery_mailbox_identity_mismatch")
+        _add_task_event_secrets(password, secret)
+        initial = self._complete_chatgpt_session(email, password, index, start_only=True)
+        ensure_running()
+        url, page = details(initial)
+        reject_registration_step(url, page)
+        if not password_page(url, page):
+            initial = self._authorize_continue_login(email, index, passwordless=False, restart_invalid_state=False)
+            ensure_running()
+            url, page = details(initial)
+            reject_registration_step(url, page)
+            if not password_page(url, page):
+                raise RuntimeError("pending_recovery_password_route_unavailable")
+        if mailbox is not None:
+            mark_mailbox_code_boundary(mailbox, grace_seconds=0)
+        step(index, "恢复未完成账号：使用已保存密码登录")
+        state = self._post_auth_json(
+            f"{auth_base}/api/accounts/password/verify", f"{auth_base}/log-in/password",
+            {"password": password}, index, "password_verify",
+        )
+        ensure_running()
+        verified_factor = ""
+        seen_steps: set[tuple[str, str]] = set()
+        for _ in range(6):
+            ensure_running()
+            url, page = details(state)
+            reject_registration_step(url, page)
+            identity = (url, page)
+            if identity in seen_steps:
+                raise RuntimeError("pending_recovery_auth_step_loop")
+            seen_steps.add(identity)
+            path = _url_path(url).rstrip("/")
+            if _is_chatgpt_callback_url(url):
+                self._navigate_auth_step(url, f"{auth_base}/log-in/password", index)
+                ensure_running()
+                tokens = dict(self._read_chatgpt_session(email, password, index))
+                tokens["_pending_totp_verified"] = bool(verified_factor)
+                if verified_factor:
+                    tokens.update(mfa_factor_id=verified_factor, mfa_factor_type="totp")
+                return tokens
+            if page == "mfa_challenge" or path == "/mfa-challenge":
+                factor_id, factor_type = self._totp_factor(state)
+                if not secret or not factor_id or factor_type != "totp":
+                    raise RuntimeError("pending_recovery_existing_totp_credentials_required")
+                self._post_auth_json(
+                    f"{auth_base}/api/accounts/mfa/issue_challenge", f"{auth_base}/log-in/password",
+                    {"id": factor_id, "type": "totp", "force_fresh_challenge": False}, index, "mfa_issue_challenge",
+                )
+                ensure_running()
+                state = self._post_auth_json(
+                    f"{auth_base}/api/accounts/mfa/verify", url or f"{auth_base}/mfa-challenge",
+                    {"id": factor_id, "type": "totp", "code": totp_code(secret)}, index, "mfa_verify",
+                )
+                verified_factor = factor_id
+                continue
+            if page in {"email_otp_verification", "email_verification", "email_otp"} or path in {
+                "/email-verification", "/verify-email", "/api/accounts/email-otp/send",
+            }:
+                if mailbox is None:
+                    raise RuntimeError("pending_recovery_email_mailbox_required")
+                if url:
+                    self._navigate_auth_step(url, f"{auth_base}/log-in/password", index)
+                ensure_running()
+                code = wait_for_code(mailbox, register_proxy=self.proxy)
+                ensure_running()
+                if not code:
+                    raise RuntimeError("pending_recovery_email_otp_timeout")
+                state = self._validate_otp(code, index, allow_sentinel_retry=True)
+                mark_smsbower_otp_accepted(mailbox)
+                ensure_running()
+                continue
+            if "workspace" in f"{path} {page}" or path.endswith("/consent"):
+                callback = self._select_workspace(index, "", url or f"{auth_base}/log-in/password")
+                state = {"continue_url": callback}
+                continue
+            raise RuntimeError("pending_recovery_unexpected_login_step")
+        raise RuntimeError("pending_recovery_auth_step_limit")
+
     def change_password(
         self,
         email: str,
@@ -1434,6 +1576,7 @@ class PlatformRegistrar:
         tokens: dict[str, Any],
         index: int,
         replace_existing: bool = False,
+        credential_sink: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """Enroll and activate a TOTP factor.
 
@@ -1599,6 +1742,13 @@ class PlatformRegistrar:
         if registration_trace is not None:
             registration_trace.set_secrets(secret)
         _add_task_event_secrets(secret)
+        if callable(credential_sink):
+            # Persist the new secret before activation can change remote state.
+            # A later response/verification failure must not lose the only key.
+            credential_sink({
+                "totp_secret": secret, "mfa_factor_id": factor_id, "mfa_factor_type": "totp",
+                "mfa_enabled": False, "totp_setup_pending": True,
+            })
 
         activate_response = None
         activate_error = ""
@@ -1692,6 +1842,8 @@ class PlatformRegistrar:
                 or f"mfa_activate_failed: {detail[:200]}"
             )
 
+        if callable(credential_sink):
+            credential_sink({"mfa_enabled": True, "totp_setup_pending": False})
         final_response, final_error = self._chatgpt_mfa_request(
             "get",
             "/backend-api/accounts/mfa_info",
@@ -2937,6 +3089,9 @@ class PlatformRegistrar:
         if not email:
             release_mailbox(mailbox)
             raise RuntimeError("邮箱服务未返回 address")
+        # The outer owner may need the same live mailbox for password-login
+        # recovery after a partial registration; never serialize this handle.
+        self.registration_mailbox = mailbox
         if requires_fresh_registration(mailbox):
             begin_attempt(mailbox)
         label = str(mailbox.get("label") or "")
@@ -2949,6 +3104,7 @@ class PlatformRegistrar:
             _add_task_event_secrets(password_candidate)
             password = ""
             mfa_result: dict[str, Any] = {}
+            pending_tokens: dict[str, Any] = {}
             first_name, last_name = _random_name()
             birthdate = _random_birthdate()
             source_type = (
@@ -2964,12 +3120,15 @@ class PlatformRegistrar:
             ) -> None:
                 if not callable(partial_sink) or not password:
                     return
+                if isinstance(snapshot_tokens, dict):
+                    pending_tokens.update({key: value for key, value in snapshot_tokens.items()
+                                           if value not in (None, "", {}, [])})
                 partial_sink(
                     self._build_registration_record(
                         email,
                         password,
-                        snapshot_tokens or {},
-                        {},
+                        pending_tokens,
+                        mfa_result,
                         source_type,
                         mailbox,
                         registration_state="security_pending",
@@ -3011,6 +3170,10 @@ class PlatformRegistrar:
                 if isinstance(registration_password_result, str)
                 else password_candidate
             )
+            # The password is already confirmed at this point. A failed
+            # navigation must still leave enough ownership/credentials for a
+            # password-login recovery instead of another registration attempt.
+            persist_security_pending(announce=True)
             registration_continue, registration_page_type = _auth_step_details(
                 registration_password_result
                 if isinstance(registration_password_result, dict)
@@ -3029,7 +3192,6 @@ class PlatformRegistrar:
                     index,
                 )
             ensure_running()
-            persist_security_pending(announce=True)
             validated: dict[str, Any] | None = None
             max_otp_attempts = 3
             for otp_attempt in range(max_otp_attempts):
@@ -3101,6 +3263,8 @@ class PlatformRegistrar:
                     _url_path(continue_url) == "/log-in/password"
                     or str(page_type or "").strip().lower() == "password_verification"
                 ):
+                    if mailbox.get("_registration_identity_created") and password:
+                        raise RuntimeError("pending_recovery_password_login_required_after_otp")
                     step(
                         index,
                         "验证码后进入已有密码认证，已跳过注册（未发送密码重置验证码）",
@@ -3189,7 +3353,15 @@ class PlatformRegistrar:
                 tokens = self._read_chatgpt_session(email, password, index)
             persist_security_pending(tokens)
             if current_runtime_settings().enable_totp_after_register:
-                mfa_result = self._enroll_totp(tokens, index)
+                def persist_mfa_progress(update: dict[str, Any]) -> None:
+                    mfa_result.update({key: value for key, value in update.items()
+                                       if value not in (None, "", {}, [])})
+                    persist_security_pending(tokens)
+
+                security = self._enroll_totp(
+                    tokens, index, **({"credential_sink": persist_mfa_progress} if callable(partial_sink) else {}),
+                )
+                mfa_result.update(security)
             else:
                 step(
                     index,

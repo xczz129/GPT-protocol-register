@@ -51,6 +51,16 @@ test('invalid price and fractional phone limit stop before saving settings', asy
   assert.match(h.notices[2][0], /整数/);
 });
 
+test('zero means unlimited and positive phone limits are not capped at twenty', () => {
+  const h = settings();
+  h.form.maxPhoneAttempts = 0;
+  assert.equal(h.buildBody().max_phone_attempts, 0);
+  h.form.maxPhoneAttempts = 130;
+  assert.equal(h.buildBody().max_phone_attempts, 130);
+  h.form.maxPhoneAttempts = -1;
+  assert.throws(() => h.buildBody(), /非负整数/);
+});
+
 test('switching unsaved provider clearly retains saved provider for balance query', async () => {
   const h = settings();
   h.form.provider = 'firefox';

@@ -80,6 +80,7 @@ from register.mail_channel_options import (
 )
 from register.smsbower_batch import run_dynamic_mail_groups
 from register.registration_outcome import RegisteredEmailDetected
+from register.pending_recovery import can_recover_registration, merge_registration_progress, recover_registration
 from register.util import _append_account
 
 from register.protocol_context import (    # noqa: F401 - 兼容 re-export
@@ -293,7 +294,7 @@ def register_one(
         """Keep password/session credentials when TOTP is the remaining step."""
         if not isinstance(record, dict):
             return
-        partial_account.update(record)
+        merge_registration_progress(partial_account, record)
         trace.set_secrets(
             partial_account.get("password"),
             partial_account.get("totp_secret"),
@@ -312,6 +313,9 @@ def register_one(
         partial_account["updated_at"] = datetime.now(timezone.utc).isoformat().replace(
             "+00:00", "Z"
         )
+        active_mailbox = mailbox_override or (getattr(registrar, "registration_mailbox", None) if registrar is not None else None)
+        if active_mailbox is not None:
+            active_mailbox["_registration_partial_account"] = dict(partial_account)
         try:
             upsert_account_record(dict(partial_account), ACCOUNTS_FILE)
         except Exception as error:
@@ -331,8 +335,44 @@ def register_one(
         if mailbox_override is not None:
             register_options["mailbox_override"] = mailbox_override
             trace.set_secrets(mailbox_override.get("_smsbower_api_key"))
-        result = registrar.register(index, **register_options)
-        _validate_protocol_account_result(result)
+        result = None
+        recovery_only = bool((mailbox_override or {}).get("_registration_recovery_only"))
+        try:
+            if recovery_only:
+                mailbox_override["_registration_recovery_attempted"] = True
+                merge_registration_progress(partial_account, (mailbox_override or {}).get("_registration_partial_account") or {})
+                result = recover_registration(index, account=partial_account, mailbox=mailbox_override,
+                    mail_config=mail_config, proxy=proxy, stop_check=stop, task_event=forwarded_task_event,
+                    partial_sink=persist_partial, protocol_runtime=protocol_runtime)
+            else:
+                result = registrar.register(index, **register_options)
+            _validate_protocol_account_result(result)
+        except (RegisteredEmailDetected, PasswordResetRequired):
+            raise
+        except Exception:
+            if recovery_only or stop():
+                raise
+            actual_mailbox = mailbox_override or getattr(registrar, "registration_mailbox", None)
+            candidate = dict(partial_account)
+            if isinstance(result, dict):
+                merge_registration_progress(candidate, result)
+            if not can_recover_registration(candidate, actual_mailbox):
+                raise
+            if actual_mailbox is not None:
+                actual_mailbox["_registration_partial_account"] = candidate
+            if actual_mailbox is not None and actual_mailbox.get("provider") == "smsbower_mail" and actual_mailbox.get("register_child", True) and actual_mailbox.get("_smsbower_pair_role", "primary") == "primary" and (actual_mailbox.get("_registration_code_received") or actual_mailbox.get("_otp_accepted_by_server")):
+                actual_mailbox["_registration_recovery_pending"] = True
+                forwarded_task_event(index, "running", email=candidate.get("email"), step="主号已收码并保存密码，先保留邮箱给子号取码，再密码登录补全")
+                trace.finish("recovery_pending", email=candidate.get("email"), persist_operation=False)
+                return None
+            result = recover_registration(index, account=candidate, mailbox=actual_mailbox,
+                mail_config=mail_config, proxy=proxy, stop_check=stop, task_event=forwarded_task_event,
+                partial_sink=persist_partial, protocol_runtime=protocol_runtime)
+            _validate_protocol_account_result(result)
+        if mailbox_override is not None:
+            mailbox_override["_registration_recovery_pending"] = False
+            if recovery_only:
+                mailbox_override["_registration_recovery_attempted"] = True
         if mailbox_override is not None and mailbox_override.get("provider") == "smsbower_mail":
             result["mailbox_role"] = str(mailbox_override.get("_smsbower_pair_role") or "primary")
             result["mailbox_base_address"] = str(mailbox_override.get("base_address") or mailbox_override.get("address") or "")
@@ -578,7 +618,7 @@ async def run_protocol_register(
     else:
         n = min(n, available)
         conc = min(conc, n, available)
-        if is_smsbower_selected(provider_type):
+        if is_smsbower_selected(provider_type) and smsbower_child_enabled(mail_config):
             if smsbower_child_enabled(mail_config):
                 n -= n % 2
                 if n < 2:
@@ -976,8 +1016,12 @@ async def run_protocol_register(
                     break
                 if record:
                     break
+                if "registration_recovery_pending" in attempt_error.lower():
+                    # Password completion has its own retry budget. Never feed
+                    # this already-created identity back into signup retries.
+                    break
                 if mailbox_override is not None and mailbox_override.get("provider") == "smsbower_mail" and (
-                    mailbox_override.get("_registration_identity_created")
+                    (mailbox_override.get("_registration_identity_created") and not mailbox_override.get("_registration_recovery_only"))
                     or mailbox_override.get("_smsbower_terminal_status")
                     or mailbox_override.get("_registration_outcome") in {"already_registered", "otp_timeout"}
                 ):
@@ -1051,6 +1095,8 @@ async def run_protocol_register(
                             )
                 await asyncio.sleep(1.5)
             results[index - 1] = record
+            if not record and mailbox_override is not None and mailbox_override.get("_registration_recovery_pending") and not mailbox_override.get("_registration_recovery_only"):
+                return
             if skipped:
                 persist_registration_summary(
                     status="skipped",
