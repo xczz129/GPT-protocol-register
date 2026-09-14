@@ -57,6 +57,7 @@ from mail.parsing import (
 from proxy_util import (
     compute_proxy_retry_limit,
     is_proxy_transport_error,
+    is_rate_limit_error,
     normalize_proxy_url,
     proxy_brief,
     resolve_proxy_pool,
@@ -349,13 +350,27 @@ def register_one(
             _validate_protocol_account_result(result)
         except (RegisteredEmailDetected, PasswordResetRequired):
             raise
-        except Exception:
+        except Exception as initial_error:
             if recovery_only or stop():
                 raise
             actual_mailbox = mailbox_override or getattr(registrar, "registration_mailbox", None)
             candidate = dict(partial_account)
             if isinstance(result, dict):
                 merge_registration_progress(candidate, result)
+            if candidate:
+                initial_detail = _redact_operation_error(initial_error, *(candidate.get(key) for key in (
+                    "password", "totp_secret", "access_token", "refresh_token", "session_token")),
+                    (actual_mailbox or {}).get("_smsbower_api_key"), (actual_mailbox or {}).get("api_key"))
+                trace.set_secrets((actual_mailbox or {}).get("api_key"))
+                persist_partial({"registration_initial_error": initial_detail})
+                if is_rate_limit_error(initial_error):
+                    raise
+                if (actual_mailbox or {}).get("_registration_identity_created") and not (actual_mailbox or {}).get("_otp_accepted_by_server"):
+                    persist_partial({"registration_recovery_state": "awaiting_email_verification",
+                                     "registration_recovery_error": initial_detail})
+                    forwarded_task_event(index, "running", email=candidate.get("email"),
+                        step="邮箱验证尚未完成，已保留密码和原始错误，停止自动登录补全")
+                    raise RuntimeError("registration_recovery_pending: email_verification_incomplete: " + initial_detail) from initial_error
             if not can_recover_registration(candidate, actual_mailbox):
                 raise
             if actual_mailbox is not None:
@@ -476,7 +491,16 @@ def register_one(
         return None
     except Exception as e:
         cost = time.time() - start
+        rate_limited = is_rate_limit_error(e)
         transport_error = is_proxy_transport_error(e)
+        failure_mailbox = mailbox_override or getattr(registrar, "registration_mailbox", None) or {}
+        if not isinstance(failure_mailbox, dict):
+            failure_mailbox = {}
+        failure_detail = _redact_operation_error(e, *(partial_account.get(key) for key in (
+            "password", "totp_secret", "access_token", "refresh_token", "session_token")),
+            failure_mailbox.get("api_key"), failure_mailbox.get("_smsbower_api_key"))
+        if rate_limited and not is_rate_limit_error(failure_detail):
+            failure_detail = "auth_rate_limit_exceeded: " + failure_detail
         with stats_lock:
             if not transport_error:
                 stats["done"] += 1
@@ -487,22 +511,22 @@ def register_one(
                 "yellow",
             )
         else:
-            log(f"任务{index} 注册失败，本次耗时{cost:.1f}s，原因: {e}", "red")
+            log(f"任务{index} 注册失败，本次耗时{cost:.1f}s，原因: {failure_detail}", "red")
         if emit_account_events:
-            status = "cancelled" if stop() else ("running" if transport_error else "failed")
+            status = "failed" if rate_limited else ("cancelled" if stop() else ("running" if transport_error else "failed"))
             fields = (
                 {
                     "email": str(partial_account.get("email") or trace.email).strip(),
                     "trace_file": trace_file_ref,
-                    "error": str(e)[:300],
+                    "error": failure_detail[:300],
                     "step": "当前代理连接失败，等待切换下一条代理",
                 }
                 if transport_error and not stop()
                 else {
                     "email": str(partial_account.get("email") or trace.email).strip(),
                     "trace_file": trace_file_ref,
-                    "error": str(e)[:300],
-                    "step": str(e)[:160],
+                    "error": failure_detail[:300],
+                    "step": "认证服务限流，已停止自动重试，账号进展已保留" if rate_limited else failure_detail[:160],
                 }
             )
             forwarded_task_event(index, status, **fields)
@@ -706,6 +730,9 @@ async def run_protocol_register(
     retry_email_lock = threading.Lock()
     batch_bad_proxies: set[str] = set()
     batch_bad_proxy_lock = threading.Lock()
+    auth_rate_limited = threading.Event()
+    attempted_indices: set[int] = set()
+    finished_without_attempt: set[int] = set()
     schedule_emails = planned_emails + [str(fixed_email or "")] * (n - len(planned_emails))
     task_waves = build_registration_waves(
         schedule_emails,
@@ -780,7 +807,7 @@ async def run_protocol_register(
         )
 
     def stopped() -> bool:
-        return bool(stop()) or (
+        return auth_rate_limited.is_set() or bool(stop()) or (
             cancel_event is not None and cancel_event.is_set()
         )
 
@@ -865,6 +892,7 @@ async def run_protocol_register(
                 task_email = str(mailbox_override.get("address") or "") or None
 
             if not await wait_until_resumed(index, task_group_id, task_stopped):
+                finished_without_attempt.add(index)
                 persist_registration_summary(
                     status="cancelled",
                     email=task_email or "",
@@ -956,6 +984,10 @@ async def run_protocol_register(
                     if detail:
                         attempt_error = detail
                         last_error = detail
+                        if is_rate_limit_error(detail):
+                            auth_rate_limited.set()
+                            if mailbox_override is not None:
+                                mailbox_override["_registration_rate_limited"] = True
                     if status == "skipped" or str(fields.get("skip_reason") or "").strip() == PasswordResetRequired.code:
                         skipped = True
                     if fields.get("trace_file"):
@@ -1004,6 +1036,7 @@ async def run_protocol_register(
                 if mailbox_override is not None:
                     register_kwargs["mailbox_override"] = mailbox_override
                     register_kwargs["provider_type"] = str(mailbox_override.get("provider") or provider_type or "")
+                attempted_indices.add(index)
                 record = await asyncio.to_thread(
                     register_one,
                     index,
@@ -1015,6 +1048,9 @@ async def run_protocol_register(
                     skipped = True
                     break
                 if record:
+                    break
+                if is_rate_limit_error(attempt_error):
+                    auth_rate_limited.set()
                     break
                 if "registration_recovery_pending" in attempt_error.lower():
                     # Password completion has its own retry budget. Never feed
@@ -1124,7 +1160,7 @@ async def run_protocol_register(
                 )
                 return
             if not record:
-                if task_stopped():
+                if task_stopped() and not is_rate_limit_error(last_error):
                     persist_registration_summary(
                         status="cancelled",
                         email=task_email or "",
@@ -1152,9 +1188,12 @@ async def run_protocol_register(
                         group_id=task_group_id,
                         error=last_error or "protocol_register_failed",
                         step=(
-                            f"代理重试用尽：{last_error[:140]}"
-                            if is_proxy_transport_error(last_error)
-                            else (last_error[:160] or "协议注册失败")
+                            "认证服务限流，已停止本批后续认证请求"
+                            if is_rate_limit_error(last_error) else (
+                                f"代理重试用尽：{last_error[:140]}"
+                                if is_proxy_transport_error(last_error)
+                                else (last_error[:160] or "协议注册失败")
+                            )
                         ),
                     )
                 persist_registration_summary(
@@ -1199,11 +1238,16 @@ async def run_protocol_register(
             if callable(task_event):
                 task_event(index, status, group_id=task_group, **fields)
             if status in {"failed", "skipped", "cancelled"}:
+                finished_without_attempt.add(index)
                 persist_registration_summary(status=status, email=str(fields.get("email") or ""), error=str(fields.get("error") or ""), step_text=str(fields.get("step") or ""), group_id_value=task_group)
 
         await run_dynamic_mail_groups(sorted(dynamic_indices), concurrency=conc, mail_config=mail_config, provider_type=provider_type,
                                       run_account=run_allocated, result_at=lambda index: results[index - 1], emit=emit_dynamic,
                                       stop_check=stopped, pause_check=paused)
+    if auth_rate_limited.is_set():
+        for index in sorted(set(range(1, n + 1)) - attempted_indices - finished_without_attempt):
+            if callable(task_event):
+                task_event(index, "cancelled", step="认证服务限流，未启动后续认证", skip_reason="auth_rate_limited")
     return [item for item in results if item]
 
 

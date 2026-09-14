@@ -9,6 +9,7 @@ import {
 import AppTag from "../components/ui/AppTag.vue";
 import { useStatusStore } from "../stores/status";
 import { useTasksStore } from "../stores/tasks";
+import { isVisibleTask, taskEmailLabel, taskFailureDetail } from "../../shared/taskPresentation";
 
 const status = useStatusStore();
 const tasks = useTasksStore();
@@ -27,7 +28,7 @@ const jobDone = computed(
 const jobPercent = computed(() =>
   tasks.job.total ? Math.round((jobDone.value * 100) / tasks.job.total) : 0,
 );
-const recentTasks = computed(() => tasks.items.slice(0, 5));
+const recentTasks = computed(() => tasks.items.filter(isVisibleTask).slice(0, 5));
 
 function taskStatusKind(taskStatus: string): "success" | "warning" | "error" | "info" | "default" {
   return (
@@ -125,7 +126,10 @@ onBeforeUnmount(() => {
         <p v-if="!recentTasks.length" class="recent-empty">暂无任务记录</p>
         <div v-else class="recent-list">
           <div v-for="task in recentTasks" :key="task.card_id || task.index" class="recent-row">
-            <span class="recent-email" :title="task.email">{{ task.email || "（分配中）" }}</span>
+            <div class="recent-info">
+              <span class="recent-email" :title="taskEmailLabel(task)">{{ taskEmailLabel(task) }}</span>
+              <p v-if="taskFailureDetail(task)" class="recent-error">{{ taskFailureDetail(task) }}</p>
+            </div>
             <AppTag :kind="taskStatusKind(task.status)">{{ taskStatusText(task.status) }}</AppTag>
           </div>
         </div>
@@ -298,12 +302,26 @@ onBeforeUnmount(() => {
   border: 1px solid var(--glass-border);
 }
 
+.recent-info {
+  flex: 1;
+  min-width: 0;
+}
+
 .recent-email {
+  display: block;
   font-size: 0.82rem;
   color: var(--text-primary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.recent-error {
+  margin: 4px 0 0;
+  font-size: 0.72rem;
+  line-height: 1.5;
+  color: var(--error);
+  overflow-wrap: anywhere;
 }
 
 @media (max-width: 900px) {

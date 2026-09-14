@@ -4,6 +4,7 @@ import { api, jsonBody } from "./client";
 export interface TaskStep {
   text: string;
   time: string;
+  status?: string;
 }
 
 export interface TaskCard {
@@ -17,6 +18,8 @@ export interface TaskCard {
   started_at_epoch: number;
   elapsed_sec: number;
   batch_started_at: string;
+  skip_reason?: string;
+  error?: string;
 }
 
 export interface JobSnapshot {

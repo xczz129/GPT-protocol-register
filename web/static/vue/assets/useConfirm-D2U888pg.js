@@ -1,0 +1,1 @@
+import{x as e}from"./new-BEoYWaeG.js";function t(){let t=e();return(e,n)=>t.askConfirm(e,n)}export{t};

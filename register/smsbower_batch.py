@@ -39,6 +39,8 @@ def registration_outcome(mailbox: dict[str, Any], record: Any, stopped: bool) ->
     marker = str(mailbox.get("_registration_outcome") or "")
     if marker == "already_registered":
         return marker
+    if mailbox.get("_registration_rate_limited"):
+        return "other_failed"
     if stopped:
         return "cancelled"
     return marker if marker in {"otp_timeout", "other_failed", "cancelled"} else "other_failed"

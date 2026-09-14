@@ -25,6 +25,7 @@ from mail import count_pool_capacity, release_stale_in_use
 from proxy_util import (
     compute_proxy_retry_limit,
     is_proxy_transport_error,
+    is_rate_limit_error,
     normalize_proxy_url,
     proxy_brief,
     resolve_proxy_pool,
@@ -42,6 +43,7 @@ from register.pending_recovery import can_recover_registration, merge_registrati
 from register.registration_outcome import RegisteredEmailDetected
 from register.flow import register_one
 from register.protocol import repair_security_one
+from register.protocol_context import _redact_operation_error
 from register.protocol_runtime import ProtocolRuntimeSettings
 from register.util import REGISTER_TIMEOUT
 
@@ -412,7 +414,7 @@ async def run_register(
     print("=" * 50)
 
     results: list[dict[str, Any] | None] = [None] * n
-    global_rate_limited = asyncio.Event()
+    global_rate_limited = threading.Event()
     # Pin one mailbox to each task for the lifetime of the batch. A transient
     # failure releases the persistent mailbox state, so allocating afresh on
     # every task would repeatedly select the first address when concurrency=1.
@@ -519,7 +521,7 @@ async def run_register(
             async with sem:
                 cancellation = (mailbox_override or {}).get("_registration_cancel_event") or threading.Event()
                 def task_stopped() -> bool:
-                    return bool(_stop()) or bool(cancel_event is not None and cancel_event.is_set()) or bool(cancellation is not None and cancellation.is_set())
+                    return global_rate_limited.is_set() or bool(_stop()) or bool(cancel_event is not None and cancel_event.is_set()) or bool(cancellation is not None and cancellation.is_set())
                 task_group_id = (
                     str(group_plan[i - 1] or "").strip()
                     if isinstance(group_plan, list) and i <= len(group_plan)
@@ -551,8 +553,8 @@ async def run_register(
                             return
                         raise RuntimeError("dual_alias_start_barrier_timeout")
                 if global_rate_limited.is_set():
-                    print(f"  #{i} 已跳过（当前单代理被认证服务限频）")
-                    emit_task(i, "failed", group_id=task_group_id, step="当前代理被限频，已跳过")
+                    print(f"  #{i} 已停止（认证服务限流）")
+                    emit_task(i, "cancelled", group_id=task_group_id, step="认证服务限流，未启动后续认证")
                     return
                 emit_task(i, "queued", group_id=task_group_id, step="等待执行")
                 if task_stopped():
@@ -607,20 +609,26 @@ async def run_register(
                         else ""
                     )
                     attempt_error = ""
+                    attempt_error_detail = ""
 
                     def attempt_event(
                         event_index: int, status: str | None = None, **fields: Any
                     ) -> None:
-                        nonlocal attempt_error, skipped
+                        nonlocal attempt_error, attempt_error_detail, skipped
                         if status == "skipped":
                             skipped = True
                         detail = str(fields.get("error") or "").strip()
                         if detail:
                             attempt_error = detail.lower()
+                            attempt_error_detail = detail
+                            if is_rate_limit_error(detail):
+                                global_rate_limited.set()
+                                if active_mailbox is not None:
+                                    active_mailbox["_registration_rate_limited"] = True
                         transport_error = is_proxy_transport_error(detail)
                         if callable(task_event):
                             forwarded = dict(fields)
-                            if status == "failed" and not task_stopped() and can_recover_registration(pending_account, active_mailbox):
+                            if status == "failed" and not is_rate_limit_error(detail) and not task_stopped() and can_recover_registration(pending_account, active_mailbox):
                                 status = "running"
                                 forwarded["step"] = "注册凭据已保存，正在准备密码登录补全"
                             if transport_error:
@@ -675,12 +683,25 @@ async def run_register(
                                 )
                             except (JobCancelled, asyncio.CancelledError, RegisteredEmailDetected):
                                 raise
-                            except Exception:
+                            except Exception as registration_error:
                                 # Browser cleanup/timeout may raise after the password
                                 # has been saved. Continue the same owned identity.
-                                if skipped or task_stopped() or not can_recover_registration(pending_account, active_mailbox):
+                                owned_pending = bool((active_mailbox or {}).get("_registration_identity_created") and pending_account.get("password"))
+                                if skipped or task_stopped() or not (owned_pending or can_recover_registration(pending_account, active_mailbox)):
                                     raise
+                                attempt_error_detail = str(registration_error)
+                                attempt_error = attempt_error_detail.lower()
                                 record = None
+                        if not record and not recovery_only and not task_stopped() and (active_mailbox or {}).get("_registration_identity_created") and not (active_mailbox or {}).get("_otp_accepted_by_server"):
+                            original_error = _redact_operation_error(attempt_error_detail or attempt_error or "email_verification_incomplete",
+                                *(pending_account.get(key) for key in ("password", "totp_secret", "access_token", "refresh_token", "session_token")),
+                                (active_mailbox or {}).get("_smsbower_api_key"), (active_mailbox or {}).get("api_key"))
+                            remember_partial({"registration_initial_error": original_error,
+                                "registration_recovery_state": "awaiting_email_verification",
+                                "registration_recovery_error": original_error})
+                            security_completion_failed = True
+                            emit_task(i, "failed", email=pending_account.get("email"), error=original_error,
+                                step="邮箱验证尚未完成，已保留密码和原始错误，停止自动登录补全")
                         if not record and not recovery_only and not task_stopped() and can_recover_registration(pending_account, active_mailbox):
                             defer = bool(active_mailbox is not None and active_mailbox.get("provider") == "smsbower_mail" and active_mailbox.get("register_child", True) and active_mailbox.get("_smsbower_pair_role", "primary") == "primary" and (active_mailbox.get("_registration_code_received") or active_mailbox.get("_otp_accepted_by_server")))
                             if defer:
@@ -892,12 +913,10 @@ async def run_register(
                     if any(marker in attempt_error for marker in no_retry_markers):
                         print(f"  #{i} 当前邮箱不可继续，停止同邮箱重试 · {attempt_error}")
                         break
-                    if "rate_limit_exceeded" in attempt_error:
-                        has_alternate_proxy = bool(rotate and len(proxy_pool) > 1)
-                        if not has_alternate_proxy:
-                            global_rate_limited.set()
-                            print(f"  #{i} 当前代理已限频，停止后续排队任务")
-                            break
+                    if is_rate_limit_error(attempt_error):
+                        global_rate_limited.set()
+                        print(f"  #{i} 认证服务限流，停止后续认证请求")
+                        break
                     if attempt < proxy_retry_limit:
                         print(f"  #{i} 重试 {attempt + 1}/{proxy_retry_limit}…")
                         emit_task(i, "running", step=f"准备重试 {attempt + 1}/{proxy_retry_limit}")
@@ -975,7 +994,7 @@ async def run_register(
 
             await run_dynamic_mail_groups(sorted(dynamic_indices), concurrency=conc, mail_config=mail_config, provider_type=provider_type,
                                           run_account=run_allocated, result_at=lambda index: results[index - 1], emit=emit_dynamic,
-                                          stop_check=lambda: bool(_stop()) or bool(cancel_event is not None and cancel_event.is_set()), pause_check=_paused)
+                                          stop_check=lambda: global_rate_limited.is_set() or bool(_stop()) or bool(cancel_event is not None and cancel_event.is_set()), pause_check=_paused)
 
     ok = [r for r in results if r]
     if _stop() or (cancel_event is not None and cancel_event.is_set()):

@@ -13,12 +13,13 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 from curl_cffi import requests
 from common.proxy_clearance import headers_with_clearance
-from proxy_util import is_proxy_transport_error, normalize_proxy_url
+from proxy_util import is_proxy_transport_error, is_rate_limit_error, normalize_proxy_url
 from register.protocol_sentinel import build_sentinel_token as _build_sentinel_token_tuple, build_sentinel_with_so_token
 from register.protocol_runtime import current_runtime_settings
 
 from register.protocol_context import (
     _PROXY_CONFIG,
+    _STOP_CHECK,
     _make_trace_headers,
     _oauth_timeout,
     _response_debug_detail,
@@ -216,13 +217,12 @@ def _cloudflare_block_message(resp, prefix: str = "被 Cloudflare 拦截", reaso
 def request_with_local_retry(session: requests.Session, method: str, url: str, retry_attempts: int = 3, **kwargs):
     """Request with bounded transport/temporary-status retry.
 
-    POST requests are retried only for throttling and gateway-unavailable
-    responses. This keeps the protocol resilient without blindly replaying
-    every application-level failure.
+    Rate limits are returned immediately so the owning task can stop. Other
+    temporary responses retain the existing bounded transport retry behavior.
     """
     last_error = ""
     method_name = str(method or "GET").upper()
-    retryable_statuses = {408, 425, 429, 500, 502, 503, 504}
+    retryable_statuses = {408, 425, 500, 502, 503, 504}
     if method_name not in {"GET", "HEAD", "OPTIONS"}:
         retryable_statuses.discard(500)
     attempts = max(1, retry_attempts)
@@ -230,6 +230,8 @@ def request_with_local_retry(session: requests.Session, method: str, url: str, r
     request_kwargs = dict(kwargs)
     request_kwargs.setdefault("timeout", runtime.timeout_for(runtime.request_timeout))
     for attempt in range(attempts):
+        if _STOP_CHECK.get()():
+            return None, "stop requested"
         if runtime.expired():
             return None, "protocol_account_timeout"
         try:
@@ -238,6 +240,8 @@ def request_with_local_retry(session: requests.Session, method: str, url: str, r
             should_retry = status in retryable_statuses and attempt + 1 < attempts
             if not should_retry:
                 return response, ""
+            if _STOP_CHECK.get()():
+                return None, "stop requested"
             retry_after = 0.0
             try:
                 raw_retry_after = str(getattr(response, "headers", {}).get("retry-after") or "").strip()
@@ -250,6 +254,8 @@ def request_with_local_retry(session: requests.Session, method: str, url: str, r
             time.sleep(min(8.0, max(0.25, retry_after or (0.5 * (2 ** attempt)))))
         except Exception as error:
             last_error = str(error)
+            if is_rate_limit_error(error):
+                return None, "rate_limit_exceeded: " + last_error
             if is_proxy_transport_error(last_error):
                 return None, last_error
             if attempt + 1 >= attempts:

@@ -5,6 +5,7 @@ import time
 from typing import Any, Callable
 from urllib.parse import quote
 
+from proxy_util import is_rate_limit_error
 from register.protocol_runtime import ProtocolRuntimeSettings
 from register.sessions import JobCancelled
 
@@ -23,6 +24,12 @@ def merge_registration_progress(saved: dict[str, Any], update: dict[str, Any]) -
 def can_recover_registration(account: dict[str, Any], mailbox: dict[str, Any] | None) -> bool:
     if (mailbox or {}).get("_registration_outcome") == "already_registered":
         return False
+    if account.get("registration_recovery_state") == "awaiting_email_verification" and not (mailbox or {}).get("_otp_accepted_by_server"):
+        return False
+    if (mailbox or {}).get("_registration_identity_created") and not (mailbox or {}).get("_otp_accepted_by_server"):
+        # A newly saved password does not prove that email verification ended.
+        # Preserve the original mailbox failure instead of starting another login.
+        return False
     owned = bool((mailbox or {}).get("_registration_identity_created")) or account.get("registration_state") == "security_pending"
     return bool(owned and str(account.get("email") or "").strip() and str(account.get("password") or "").strip() and not str(account.get("access_token") or "").strip())
 
@@ -37,7 +44,7 @@ def recover_registration(
     mail_config: dict[str, Any], proxy: str = "", stop_check: Callable[[], bool] | None = None,
     task_event=None, partial_sink=None, protocol_runtime: ProtocolRuntimeSettings | None = None,
 ) -> dict[str, Any]:
-    """Three completion attempts; no new mailbox purchase or registration call."""
+    """Up to three completion attempts; stop immediately on explicit limits."""
     if not can_recover_registration(account, mailbox):
         raise RuntimeError("registration_recovery_not_eligible")
     stop = stop_check or (lambda: False)
@@ -83,17 +90,34 @@ def recover_registration(
             detail = str(error)
             secrets = [str(saved.get(key) or "") for key in CREDENTIAL_FIELDS]
             secrets.append(str((mailbox or {}).get("_smsbower_api_key") or ""))
+            secrets.append(str((mailbox or {}).get("api_key") or ""))
             for value in secrets:
                 if value:
                     detail = detail.replace(value, "[REDACTED]").replace(quote(value, safe=""), "[REDACTED]")
-            persist({"registration_recovery_state": "pending", "registration_recovery_error": detail[:300]})
+            rate_limited = is_rate_limit_error(error)
+            if rate_limited and "rate_limit_exceeded" not in detail.lower():
+                # The status may only live on the exception.response. Keep a
+                # semantic marker when outer schedulers inspect the message.
+                detail = "rate_limit_exceeded: " + detail
+            persist({
+                "registration_recovery_state": "rate_limited" if rate_limited else "pending",
+                "registration_recovery_error": detail[:300],
+            })
+            if rate_limited:
+                if callable(task_event):
+                    task_event(
+                        index, "running", email=saved["email"],
+                        step="服务端限流，已停止本轮自动恢复；密码和安全字段已保留",
+                        error="auth_rate_limit_exceeded",
+                    )
+                raise RuntimeError("registration_recovery_pending: " + detail[:300]) from error
             permanent = any(marker in failure_text for marker in (
-                "incorrect_password", "invalid_password", "invalid_credentials", "account_deactivated",
+                "incorrect_password", "invalid_password", "invalid_credentials", "invalid_username_or_password", "account_deactivated",
                 "already_registered", "not_eligible", "totp_required", "mfa_secret_missing", "mailbox_unavailable",
                 "no activation found", "activation is already", "phone_verification_required",
                 "saved_password_required", "owned_identity_and_saved_password_required", "registered_candidate_rejected",
                 "existing_totp_credentials_required", "email_mailbox_required", "registration_or_reset_route_rejected",
-                "account_identity_mismatch", "mailbox_identity_mismatch",
+                "account_identity_mismatch", "mailbox_identity_mismatch", "password_route_unavailable", "totp_secret_missing",
             ))
             if permanent or attempt == 3:
                 raise RuntimeError("registration_recovery_pending: " + detail[:300]) from error

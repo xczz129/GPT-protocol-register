@@ -227,7 +227,7 @@ def test_stopping_pair_prevents_all_subsequent_auth_and_settles_consumed_lease_o
 
 
 def test_protocol_recovers_registrar_allocated_mailbox_without_an_override(integration, monkeypatch):
-    mailbox = {"provider": "outlook", "address": "owned@example.test", "_registration_identity_created": True}
+    mailbox = {"provider": "outlook", "address": "owned@example.test", "_registration_identity_created": True, "_otp_accepted_by_server": True}
 
     class Registrar:
         device_id = "fixture-device"
@@ -261,7 +261,7 @@ def test_protocol_recovers_registrar_allocated_mailbox_without_an_override(integ
 
 
 def test_browser_recovers_mailbox_reported_with_saved_password_without_override(integration, monkeypatch):
-    mailbox = {"provider": "outlook", "address": "owned@example.test", "_registration_identity_created": True}
+    mailbox = {"provider": "outlook", "address": "owned@example.test", "_registration_identity_created": True, "_otp_accepted_by_server": True}
     monkeypatch.setattr(browser, "count_pool_capacity", lambda *a, **kw: {"total": 1, "available": 1, "emails": [mailbox["address"]]})
 
     async def signup(index, *_args, **kwargs):
@@ -287,7 +287,7 @@ def test_browser_recovers_mailbox_reported_with_saved_password_without_override(
 
 @pytest.mark.parametrize("engine", ["protocol", "browser"])
 def test_failed_password_completion_never_restarts_signup_for_owned_non_sms_identity(integration, monkeypatch, engine):
-    mailbox = {"provider": "outlook", "address": "owned@example.test", "_registration_identity_created": True}
+    mailbox = {"provider": "outlook", "address": "owned@example.test", "_registration_identity_created": True, "_otp_accepted_by_server": True}
     capacity = {"total": 1, "available": 1, "emails": [mailbox["address"]]}
     for module in (mail, browser):
         monkeypatch.setattr(module, "count_pool_capacity", lambda *a, **kw: dict(capacity))
@@ -329,3 +329,83 @@ def test_failed_password_completion_never_restarts_signup_for_owned_non_sms_iden
     assert records == []
     assert integration.order == ["signup", "password-login"], "an owned identity may only continue with its saved password"
     assert integration.writes[-1]["registration_state"] == "security_pending"
+
+
+@pytest.mark.parametrize("engine", ["protocol", "browser"])
+@pytest.mark.parametrize("include_credential", [False, True])
+def test_unverified_email_failure_keeps_original_error_without_password_login(integration, monkeypatch, engine, include_credential):
+    mailbox = {"provider": "icloud_api", "address": "unverified@example.test", "_registration_identity_created": True, "api_key": "fixture-mail-api-secret"}
+    capacity = {"total": 1, "available": 1, "emails": [mailbox["address"]]}
+    for module in (mail, browser):
+        monkeypatch.setattr(module, "count_pool_capacity", lambda *a, **kw: dict(capacity))
+    original_error = "iCloud API HTTP 401: API Key 不正确"
+    if include_credential:
+        original_error += " key=" + mailbox["api_key"]
+    if engine == "protocol":
+        class Registrar:
+            device_id = "fixture-device"
+            fingerprint = {}
+
+            def __init__(self, *_args):
+                self.registration_mailbox = mailbox
+
+            def register(self, index, *, partial_sink):
+                integration.order.append("registration")
+                partial_sink(_pending(mailbox["address"]))
+                raise RuntimeError(original_error)
+
+            def close(self):
+                integration.closed.append(self)
+
+        monkeypatch.setattr(protocol, "PlatformRegistrar", Registrar)
+    else:
+        async def signup(index, *_args, **kwargs):
+            integration.order.append("registration")
+            kwargs["partial_sink"](_pending(mailbox["address"]), mailbox)
+            kwargs["task_event"](index, "failed", error=original_error, step="邮箱读取失败")
+            return None
+
+        monkeypatch.setattr(browser, "register_one", signup)
+    recover = Mock(side_effect=AssertionError("unverified email must not start password login"))
+    monkeypatch.setattr(pending_recovery, "_recover_once", recover)
+    callback = protocol.run_protocol_register if engine == "protocol" else browser.run_register
+    records = asyncio.run(callback({"mail": {}, "registration": {"engine": engine, "max_transient_retries": 2}},
+        total=1, concurrency=1, provider_type="icloud_api"))
+    assert records == []
+    assert integration.order == ["registration"]
+    recover.assert_not_called()
+    last = integration.writes[-1]
+    assert last["registration_state"] == "security_pending"
+    assert last["registration_recovery_state"] == "awaiting_email_verification"
+    assert last["registration_initial_error"] == original_error.replace(mailbox["api_key"], "[已隐藏]")
+    assert mailbox["api_key"] not in last["registration_initial_error"]
+    assert last["password"] == "saved-fixture-password"
+
+
+def test_typed_rate_limit_survives_event_boundary_and_stops_child(integration, monkeypatch):
+    class LimitedError(RuntimeError):
+        response = SimpleNamespace(status_code=429)
+
+    class Registrar:
+        device_id = "fixture-device"
+        fingerprint = {}
+
+        def __init__(self, *_args):
+            pass
+
+        def register(self, index, **kwargs):
+            integration.order.append("auth-attempt")
+            raise LimitedError("request was rejected")
+
+        def close(self):
+            integration.closed.append(self)
+
+    monkeypatch.setattr(protocol, "PlatformRegistrar", Registrar)
+    records = integration.run("protocol")
+    assert records == []
+    assert integration.order == ["auth-attempt"]
+    assert len(integration.purchases) == 1
+    assert any("auth_rate_limit_exceeded" in str(fields.get("error", "")) for _, _, fields in integration.events)
+    assert any(index == 2 and status == "cancelled" for index, status, _ in integration.events)
+    assert get_summary()["totals"]["other_failed"] == 1
+    assert get_summary()["totals"]["cancelled"] == 0

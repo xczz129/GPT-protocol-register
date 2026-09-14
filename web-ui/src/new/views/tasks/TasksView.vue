@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /* --- 任务调度页：任务配置 + 运行控制 + 任务卡列表 --- */
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import {
   Check, ChevronDown, ChevronUp, ClipboardList, Copy, Pause, Play,
   RotateCcw, Square, Trash2,
@@ -18,6 +18,7 @@ import { useConfirm } from "../../composables/useConfirm";
 import { useCopy } from "../../composables/useCopy";
 import type { TaskCard } from "../../api/tasks";
 import type { MailProviderStatus } from "../../api/types";
+import { isVisibleTask, taskEmailLabel, taskFailureDetail } from "../../../shared/taskPresentation";
 
 const tasks = useTasksStore();
 const groups = useGroupsStore();
@@ -35,8 +36,14 @@ const busyAction = ref(false);
 
 let clockTimer: ReturnType<typeof setInterval> | null = null;
 
-const pageCount = computed(() => Math.max(1, Math.ceil(tasks.items.length / pageSize)));
-const pageItems = computed(() => tasks.items.slice((page.value - 1) * pageSize, page.value * pageSize));
+const visibleTasks = computed(() => tasks.items.filter(isVisibleTask));
+const pageCount = computed(() => Math.max(1, Math.ceil(visibleTasks.value.length / pageSize)));
+const pageItems = computed(() => visibleTasks.value.slice((page.value - 1) * pageSize, page.value * pageSize));
+watch(visibleTasks, (items) => {
+  page.value = Math.min(page.value, pageCount.value);
+  const ids = new Set(items.map((task) => String(task.card_id || task.index)));
+  selected.value = new Set([...selected.value].filter((id) => ids.has(id)));
+});
 
 const jobDone = computed(
   () => (tasks.job.success_count || 0) + (tasks.job.fail_count || 0) + (tasks.job.skipped_count || 0),
@@ -211,7 +218,7 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
-      <AppEmpty v-if="!tasks.items.length" title="暂无任务记录" hint="配置上方表单并启动第一个注册任务">
+      <AppEmpty v-if="!visibleTasks.length" title="暂无任务记录" hint="配置上方表单并启动第一个注册任务">
         <template #icon><ClipboardList :size="48" :stroke-width="1" /></template>
       </AppEmpty>
 
@@ -223,13 +230,13 @@ onBeforeUnmount(() => {
                 type="checkbox"
                 class="card-check"
                 :checked="selected.has(String(task.card_id || task.index))"
-                :aria-label="`选择任务 ${task.email}`"
+                :aria-label="`选择任务 ${taskEmailLabel(task)}`"
                 @change="toggleSelect(String(task.card_id || task.index))"
               />
               <div class="card-info">
                 <div class="card-email-row">
-                  <span class="card-email" :title="task.email">{{ task.email || "（分配中）" }}</span>
-                  <button class="mini-action" type="button" title="复制邮箱" @click="copyEmail(task.email)">
+                  <span class="card-email" :title="taskEmailLabel(task)">{{ taskEmailLabel(task) }}</span>
+                  <button v-if="task.email?.trim()" class="mini-action" type="button" title="复制邮箱" @click="copyEmail(task.email)">
                     <Check v-if="copiedKey === `task-${task.email}`" :size="12" class="copied" />
                     <Copy v-else :size="12" />
                   </button>
@@ -239,6 +246,7 @@ onBeforeUnmount(() => {
                   <span v-if="task.proxy" class="meta-proxy" :title="task.proxy">代理 {{ task.proxy }}</span>
                   <span>耗时 {{ elapsed(task) }}</span>
                 </div>
+                <p v-if="taskFailureDetail(task)" class="card-error">{{ taskFailureDetail(task) }}</p>
               </div>
               <div class="card-right">
                 <AppTag :kind="statusInfo(task).kind">{{ statusInfo(task).text }}</AppTag>
@@ -263,7 +271,7 @@ onBeforeUnmount(() => {
           </article>
         </div>
 
-        <AppPager :page="page" :pages="pageCount" :total="tasks.items.length" @update:page="page = $event" />
+        <AppPager :page="page" :pages="pageCount" :total="visibleTasks.length" @update:page="page = $event" />
       </template>
     </section>
   </div>
@@ -469,6 +477,14 @@ onBeforeUnmount(() => {
   color: var(--text-muted);
   margin-top: 2px;
   flex-wrap: wrap;
+}
+
+.card-error {
+  margin: 5px 0 0;
+  font-size: 0.74rem;
+  line-height: 1.5;
+  color: var(--error);
+  overflow-wrap: anywhere;
 }
 
 .meta-proxy {

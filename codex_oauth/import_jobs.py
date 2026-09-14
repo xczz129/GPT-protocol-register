@@ -36,7 +36,7 @@ from .sms import (
     load_sms_settings,
 )
 from .token_files import TokenFileError, move_token_files_to_trash
-from proxy_util import is_proxy_transport_error
+from proxy_util import is_proxy_transport_error, is_rate_limit_error
 
 
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
@@ -265,6 +265,8 @@ def _is_retryable_network_error(error: BaseException | str) -> bool:
     TLS handshake failure only says that this network route failed.  Retrying
     the whole HTTP session is necessary because the auth flow is stateful.
     """
+    if is_rate_limit_error(error):
+        return False
     text = str(error or "").lower()
     if is_proxy_transport_error(text):
         return True

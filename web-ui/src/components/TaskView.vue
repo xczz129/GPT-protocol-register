@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { Check, Copy, Play, Square, Pause, RotateCcw, ClipboardList, RefreshCw, Trash2 } from "@lucide/vue";
 import AppPager from "./AppPager.vue";
 import { normalizeRegistrationNumbers, smsbowerPolicy } from "../shared/mailRegistration";
+import { isVisibleTask, taskEmailLabel, taskFailureDetail } from "../shared/taskPresentation";
 
 const props = defineProps({
   status: { type: Object, default: () => ({}) },
@@ -48,14 +49,16 @@ function copyTextDirect(text, key) {
   }
 }
 
-const pages = computed(() => Math.max(1, Math.ceil(props.tasks.length / pageSize)));
-const pageItems = computed(() => props.tasks.slice((page.value - 1) * pageSize, page.value * pageSize));
+const visibleTasks = computed(() => props.tasks.filter(isVisibleTask));
+const pages = computed(() => Math.max(1, Math.ceil(visibleTasks.value.length / pageSize)));
+const pageItems = computed(() => visibleTasks.value.slice((page.value - 1) * pageSize, page.value * pageSize));
 const jobDone = computed(() => Number(props.status.job?.success_count || 0) + Number(props.status.job?.fail_count || 0) + Number(props.status.job?.skipped_count || 0));
 const jobPercent = computed(() => props.status.job?.total ? Math.round(jobDone.value * 100 / Number(props.status.job.total)) : 0);
 
-watch(() => props.tasks.length, () => {
+watch(visibleTasks, (items) => {
   page.value = Math.min(page.value, pages.value);
-  selected.value = [];
+  const ids = new Set(items.map((task) => task.card_id || task.index));
+  selected.value = selected.value.filter((id) => ids.has(id));
 });
 
 function provider(type) {
@@ -260,7 +263,7 @@ onBeforeUnmount(() => clearInterval(clockTimer));
               <div class="task-name" style="display: flex; align-items: center; gap: 6px;">
                 <span>#{{ task.index }} ·</span>
                 <span
-                  v-if="task.email"
+                  v-if="task.email?.trim()"
                   class="interactive-email"
                   role="button"
                   tabindex="0"
@@ -273,11 +276,12 @@ onBeforeUnmount(() => clearInterval(clockTimer));
                   <b>{{ task.email }}</b>
                   <component :is="copiedFeedback[`task_email_${task.card_id || task.index}`] ? Check : Copy" :size="11" />
                 </span>
-                <span v-else style="color: var(--ink-400);">等待分配邮箱</span>
+                <span v-else style="color: var(--ink-400);">{{ taskEmailLabel(task) }}</span>
               </div>
               <div class="task-sub">
                 {{ batchTime(task) }} · {{ task.provider || "-" }} · {{ task.proxy || "本地" }} · {{ elapsed(task) }}
               </div>
+              <p v-if="taskFailureDetail(task)" class="task-error">{{ taskFailureDetail(task) }}</p>
             </div>
             <span :class="['status-pill', task.status === 'success' ? 'alive' : task.status === 'failed' ? 'invalid' : 'limited']">
               <i></i>
@@ -313,8 +317,18 @@ onBeforeUnmount(() => clearInterval(clockTimer));
         </button>
         <button class="btn danger" :disabled="!tasks.length" @click="emit('delete-tasks', null)">清空任务</button>
         <div style="flex: 1;"></div>
-        <AppPager v-model:page="page" :pages="pages" :total="tasks.length" />
+        <AppPager v-model:page="page" :pages="pages" :total="visibleTasks.length" />
       </div>
     </section>
   </div>
 </template>
+
+<style scoped>
+.task-error {
+  margin: 5px 0 0;
+  font-size: 0.74rem;
+  line-height: 1.5;
+  color: var(--danger, #dc2626);
+  overflow-wrap: anywhere;
+}
+</style>

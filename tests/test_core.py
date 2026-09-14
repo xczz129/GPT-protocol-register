@@ -4794,7 +4794,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
             )
         )
 
-    def test_post_registration_password_retries_auth_rate_limit_before_waiting_otp(self):
+    def test_post_registration_password_stops_auth_rate_limit_before_waiting_otp(self):
         from register.protocol import PlatformRegistrar
 
         registrar = PlatformRegistrar.__new__(PlatformRegistrar)
@@ -4832,19 +4832,19 @@ class ProtocolAndHealthTests(unittest.TestCase):
             patch("register.protocol_registrar.time.sleep") as sleep,
             patch("register.protocol_registrar.step") as protocol_step,
         ):
-            result = registrar._complete_post_registration_password(
-                "rate-limited@example.com",
-                "Strong-password-1",
-                {"address": "rate-limited@example.com"},
-                1,
-            )
+            with self.assertRaisesRegex(RuntimeError, "rate_limit_exceeded"):
+                registrar._complete_post_registration_password(
+                    "rate-limited@example.com",
+                    "Strong-password-1",
+                    {"address": "rate-limited@example.com"},
+                    1,
+                )
 
-        self.assertEqual(result, "Strong-password-1")
-        self.assertEqual(registrar._start_password_add_authorize.call_count, 3)
-        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(registrar._start_password_add_authorize.call_count, 1)
+        sleep.assert_not_called()
         self.assertTrue(
             any(
-                "频率限制" in str(call.args[1])
+                "限流" in str(call.args[1])
                 for call in protocol_step.call_args_list
                 if len(call.args) > 1
             )
@@ -10253,7 +10253,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
         self.assertEqual(result, [])
         browser_register.assert_awaited_once()
         self.assertTrue(
-            any(index == 2 and "代理被限频" in str(step) for index, _, step in events)
+            any(index == 2 and "认证服务限流" in str(step) for index, _, step in events)
         )
 
     def test_account_health_updates_record_without_exposing_token(self):

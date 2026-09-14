@@ -19,7 +19,7 @@ from common.mail_registration_metrics import begin_attempt
 from register.sessions import JobCancelled
 from mail import mark_mailbox_code_boundary, mark_mailbox_result, mark_smsbower_otp_accepted, release_mailbox
 from mail.parsing import CANONICAL_PROVIDER_TYPES, normalize_provider_type
-from proxy_util import proxy_brief
+from proxy_util import is_rate_limit_error, proxy_brief
 from register.protocol_pkce import generate_pkce as _generate_pkce
 from register.protocol_sentinel import build_sentinel_with_so_token
 from register.protocol_runtime import current_runtime_settings
@@ -2546,9 +2546,7 @@ class PlatformRegistrar:
                 except RuntimeError as error:
                     if authorize_attempt >= 1:
                         raise
-                    if _auth_error_has_code(error, "rate_limit_exceeded"):
-                        # Let the outer transaction apply the longer backoff;
-                        # retrying here would issue six auth starts per account.
+                    if is_rate_limit_error(error):
                         raise
                     reset_transaction_identity()
                     mark_mailbox_code_boundary(
@@ -2556,11 +2554,7 @@ class PlatformRegistrar:
                         grace_seconds=0,
                         reset_seen_codes=True,
                     )
-                    delay = (
-                        random.uniform(2.0, 4.0)
-                        if _auth_error_has_code(error, "rate_limit_exceeded")
-                        else 1.0
-                    )
+                    delay = 1.0
                     step(
                         index,
                         f"补密码授权启动失败，{delay:.1f}s 后重建认证事务",
@@ -2669,14 +2663,13 @@ class PlatformRegistrar:
                 )
                 break
             except RuntimeError as error:
+                if is_rate_limit_error(error):
+                    step(index, "认证服务限流，已停止本轮补密码操作", "yellow")
+                    raise
                 invalid_state = _auth_error_has_code(error, "invalid_state")
                 password_already_set = _auth_error_has_code(
                     error,
                     "password_already_set",
-                )
-                auth_rate_limited = _auth_error_has_code(
-                    error,
-                    "rate_limit_exceeded",
                 )
                 auth_error_page = _auth_error_has_code(
                     error,
@@ -2685,7 +2678,6 @@ class PlatformRegistrar:
                 if transaction_attempt >= 2 or not (
                     invalid_state
                     or password_already_set
-                    or auth_rate_limited
                     or auth_error_page
                 ):
                     raise
@@ -2700,14 +2692,6 @@ class PlatformRegistrar:
                         "账号密码已存在，正在重建认证事务并切换密码重置",
                         "yellow",
                     )
-                elif auth_rate_limited:
-                    delay = random.uniform(10.0, 14.0) * (2 ** transaction_attempt)
-                    step(
-                        index,
-                        f"补密码授权触发频率限制，{delay:.1f}s 后重建认证事务",
-                        "yellow",
-                    )
-                    time.sleep(delay)
                 elif auth_error_page:
                     step(
                         index,

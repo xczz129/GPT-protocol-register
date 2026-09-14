@@ -144,8 +144,55 @@ def proxy_brief(proxy: str) -> str:
     return without_scheme
 
 
+_RATE_LIMIT_ERROR_CODE = re.compile(
+    r"(?<![a-z0-9])(?:rate_limit_exceeded|too_many_requests)(?![a-z0-9])",
+    re.IGNORECASE,
+)
+_RATE_LIMIT_HTTP_STATUS = re.compile(
+    r"(?<![a-z0-9])(?:"
+    r"http(?:/\d+(?:\.\d+)?)?(?:[\s_-]+(?:error|status)(?:[\s_-]+code)?)?"
+    r"|(?:response[\s_-]+)?status(?:[\s_-]+code)?"
+    r"|response"
+    r")[\s'\":=_([{<\-]*429(?![a-z0-9])"
+    r"|(?<![a-z0-9])429[\s_:=-]+(?:client[\s_-]+error:?[\s_-]+)?"
+    r"too[\s_-]+many[\s_-]+requests(?![a-z])",
+    re.IGNORECASE,
+)
+
+
+def is_rate_limit_error(error: BaseException | str | None) -> bool:
+    """Recognize an explicit rate-limit code or HTTP 429 response.
+
+    A bare ``429`` is not sufficient: it can be a port, attempt count or ID.
+    Preserve the classification when an HTTP client exposes the status only on
+    its exception/response, or another layer wraps that exception.
+    """
+    seen: set[int] = set()
+    current = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current)
+        if _RATE_LIMIT_ERROR_CODE.search(message) or _RATE_LIMIT_HTTP_STATUS.search(message):
+            return True
+        if not isinstance(current, BaseException):
+            break
+        for source in (current, getattr(current, "response", None)):
+            if source is None:
+                continue
+            for attribute in ("status_code", "status"):
+                status = getattr(source, attribute, None)
+                if isinstance(status, (int, str)) and str(status).strip() == "429":
+                    return True
+        current = current.__cause__ or (
+            current.__context__ if not current.__suppress_context__ else None
+        )
+    return False
+
+
 def is_proxy_transport_error(error: BaseException | str | None) -> bool:
     """Identify failures where retrying through another proxy is useful."""
+    if is_rate_limit_error(error):
+        return False
     message = str(error or "").lower()
     if not message:
         return False
@@ -164,7 +211,6 @@ def is_proxy_transport_error(error: BaseException | str | None) -> bool:
         "response 407",
         "chatgpt_home_http_403",
         "cf_blocked",
-        "rate_limit_exceeded",
         # curl-cffi/OpenSSL and proxy bridges use several equivalent labels
         # for a transient TLS tunnel failure.  These errors do not say
         # anything about the account credential, so a different route should
