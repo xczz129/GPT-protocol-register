@@ -13,11 +13,22 @@ const ui = useUiStore();
         <section class="dialog glass-panel" role="alertdialog" aria-modal="true">
           <h3 class="dialog-title">{{ ui.confirm.title || "确认操作" }}</h3>
           <p class="dialog-message">{{ ui.confirm.message }}</p>
+          <label v-if="ui.confirm.requiredInput" class="dialog-input">
+            <span>请输入“{{ ui.confirm.requiredInput }}”确认</span>
+            <input
+              v-model="ui.confirm.input"
+              class="input"
+              type="text"
+              autocomplete="off"
+              :spellcheck="false"
+              :placeholder="ui.confirm.requiredInput"
+            />
+          </label>
           <div class="dialog-actions">
             <AppButton variant="ghost" @click="ui.resolveConfirm(false)">
               {{ ui.confirm.cancelText || "取消" }}
             </AppButton>
-            <AppButton :variant="ui.confirm.danger ? 'danger' : 'primary'" @click="ui.resolveConfirm(true)">
+            <AppButton :variant="ui.confirm.danger ? 'danger' : 'primary'" :disabled="!ui.canConfirm" @click="ui.resolveConfirm(true)">
               {{ ui.confirm.confirmText || "确认" }}
             </AppButton>
           </div>
@@ -58,6 +69,15 @@ const ui = useUiStore();
   color: var(--text-secondary);
   line-height: 1.7;
   word-break: break-word;
+  white-space: pre-wrap;
+}
+
+.dialog-input {
+  display: grid;
+  gap: 8px;
+  margin-top: 16px;
+  color: var(--text-secondary);
+  font-size: 0.85rem;
 }
 
 .dialog-actions {

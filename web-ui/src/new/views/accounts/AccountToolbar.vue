@@ -62,16 +62,35 @@ async function removeInvalidAccounts() {
   }
 }
 
-/** 全部删除（与旧版一致，二次确认） */
+const deletingAll = ref(false);
+
+/** 全部删除：完整数量预检、独立输入确认，整个过程只允许一个操作。 */
 async function removeAllAccounts() {
-  if (!accounts.rows.length) return;
-  if (!(await confirm(`删除全部 ${accounts.rows.length} 个账号？将移入回收站。`, { title: "全部删除", confirmText: "继续", danger: true }))) return;
-  if (!(await confirm("再次确认：真的要删除全部账号吗？此操作影响所有分组。", { title: "二次确认", confirmText: "全部删除", danger: true }))) return;
+  if (deletingAll.value || accounts.loading) return;
+  deletingAll.value = true;
   try {
+    await accounts.load();
+    if (accounts.loadError || accounts.loading || accounts.rows.length !== accounts.total) {
+      ui.notify("账号列表加载不完整，无法确认删除数量，请刷新后重试", "error");
+      return;
+    }
+    const count = accounts.total;
+    if (!count) return;
+    if (!(await confirm(`删除全部 ${count} 个账号？将移入回收站。`, { title: "全部删除", confirmText: "继续", danger: true }))) return;
+    if (!(await confirm(`即将删除全部 ${count} 个账号，影响所有分组。请核对数量，再输入“删除全部”确认。`, {
+      title: "确认删除全部账号", confirmText: `删除全部 ${count} 个账号`, danger: true, requiredInput: "删除全部",
+    }))) return;
+    await accounts.load();
+    if (accounts.loadError || accounts.loading || accounts.total !== count || accounts.rows.length !== count) {
+      ui.notify("账号列表已变化或加载不完整，未执行删除，请重新确认", "error");
+      return;
+    }
     const result = await accounts.remove([], true);
     ui.notify(`已删除 ${result.removed ?? "全部"} 个账号`, "success");
   } catch (error) {
     ui.notify(error instanceof Error ? error.message : "删除失败", "error");
+  } finally {
+    deletingAll.value = false;
   }
 }
 
@@ -220,8 +239,9 @@ async function removeOne(id: string, name: string) {
       </AppButton>
       <AppButton
         variant="danger" size="sm"
-        :disabled="!accounts.rows.length || accounts.loading"
-        title="删除全部账号（二次确认，移入回收站）"
+        :disabled="!accounts.rows.length || accounts.loading || deletingAll"
+        :loading="deletingAll"
+        title="删除全部账号（需输入确认，移入回收站）"
         @click="removeAllAccounts"
       >
         <Trash2 :size="14" /><span>全部删除</span>

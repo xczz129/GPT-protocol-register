@@ -1,0 +1,1 @@
+import{x as e}from"./new-CEcYhchg.js";function t(){let t=e();return(e,n)=>t.askConfirm(e,n)}export{t};

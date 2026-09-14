@@ -36,7 +36,9 @@ from common.task_store import (
 DATA_DIR = ROOT / "data"
 TRASH_FILE = DATA_DIR / "account_trash.json"
 TRASH_RETENTION_DAYS = 60
-TRASH_MAX_ROWS = 2000
+# This limit applies only to the panel's recent-row cache and list response.
+# The durable archive must retain every account within the retention window.
+TRASH_DISPLAY_LIMIT = 1000
 BACKUP_RETENTION_DAYS = 7
 BACKUP_MAX_FILES = 20
 AUTO_BACKUP_MARK = "gpt-register-backup-auto-"
@@ -137,7 +139,7 @@ def load_trash_snapshot(path: Path | None = None) -> tuple[list[dict[str, Any]],
     # a second on a cold read and must not pause mailbox allocation/recovery.
     def derive(rows: Any) -> tuple[list[dict[str, Any]], dict[str, str]]:
         source = rows if isinstance(rows, list) else []
-        recent = [row for row in reversed(source) if isinstance(row, dict)][:1000]
+        recent = [row for row in reversed(source) if isinstance(row, dict)][:TRASH_DISPLAY_LIMIT]
         email_reasons: dict[str, str] = {}
         for row in source:
             if not isinstance(row, dict):
@@ -227,11 +229,21 @@ def delete_task_runtime(keys: Iterable[str] = (), *, delete_all: bool = False) -
         return _delete_task_runtime(keys, delete_all=delete_all, legacy_path=TASK_HISTORY_FILE)
 
 
+def _read_trash_for_update() -> list[dict[str, Any]]:
+    """Never replace an unreadable recovery source with an empty archive."""
+    try:
+        text = TRASH_FILE.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    rows = json.loads(text)
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        raise ValueError("invalid account trash archive; existing recovery data was not modified")
+    return rows
+
+
 def archive_accounts(records: Iterable[dict[str, Any]], *, reason: str) -> int:
     with _TRASH_LOCK:
-        rows = _read_json(TRASH_FILE, [])
-        if not isinstance(rows, list):
-            rows = []
+        rows = _read_trash_for_update()
         count = 0
         for record in records:
             if not isinstance(record, dict):
@@ -252,9 +264,7 @@ def archive_accounts(records: Iterable[dict[str, Any]], *, reason: str) -> int:
 
 
 def _trim_trash_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keep newest TRASH_MAX_ROWS entries and drop ones older than retention."""
-    if len(rows) > TRASH_MAX_ROWS:
-        rows = rows[-TRASH_MAX_ROWS:]
+    """Expire old entries without ever applying a record-count storage cap."""
     cutoff = datetime.now(timezone.utc) - timedelta(days=TRASH_RETENTION_DAYS)
     kept: list[dict[str, Any]] = []
     for row in rows:
@@ -262,6 +272,11 @@ def _trim_trash_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         try:
             moment = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
         except ValueError:
+            kept.append(row)
+            continue
+        if moment.tzinfo is None:
+            # A legacy timestamp without a zone has no unambiguous age. Keep
+            # its recovery record instead of guessing that it has expired.
             kept.append(row)
             continue
         if moment >= cutoff:
@@ -272,7 +287,7 @@ def _trim_trash_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def list_trash(*, limit: int = 200) -> list[dict[str, Any]]:
     with _TRASH_LOCK:
         rows = _recent_trash_rows()
-        return rows[: max(1, min(limit, 1000))]
+        return rows[: max(1, min(limit, TRASH_DISPLAY_LIMIT))]
 
 
 def take_trash(ids: Iterable[str]) -> list[dict[str, Any]]:
@@ -280,9 +295,7 @@ def take_trash(ids: Iterable[str]) -> list[dict[str, Any]]:
     if not wanted:
         return []
     with _TRASH_LOCK:
-        rows = _read_json(TRASH_FILE, [])
-        if not isinstance(rows, list):
-            return []
+        rows = _read_trash_for_update()
         taken: list[dict[str, Any]] = []
         kept: list[dict[str, Any]] = []
         for row in rows:
@@ -304,9 +317,7 @@ def restore_trash(ids: Iterable[str], path: Path = ACCOUNTS_FILE) -> int:
     if not wanted:
         return 0
     with _TRASH_LOCK:
-        rows = _read_json(TRASH_FILE, [])
-        if not isinstance(rows, list):
-            return 0
+        rows = _read_trash_for_update()
         records: list[dict[str, Any]] = []
         kept: list[Any] = []
         for row in rows:
