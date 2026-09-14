@@ -38,9 +38,12 @@ const childPlaceholder = () => card({
   steps: [{ time: "13:00:00", status: "skipped", text: "主号未完成，子号未启动" }],
 });
 
-test("only an explicitly unstarted empty child placeholder is hidden", () => {
+test("cancelled unallocated slots and explicitly unstarted children are hidden", () => {
   assert.equal(shared.isVisibleTask(childPlaceholder()), false);
   assert.equal(shared.isVisibleTask({ ...childPlaceholder(), status: "cancelled" }), false);
+  assert.equal(shared.isVisibleTask(card({ status: "cancelled" })), false);
+  assert.equal(shared.isVisibleTask(card({ status: "cancelled", email: "   ", error: "stop requested" })), false);
+  assert.equal(shared.isVisibleTask(card({ status: "cancelled", email: "assigned@example.test" })), true);
   for (const fields of [
     { email: "child@example.test" }, { error: "provider request failed" },
     { status: "failed" }, { status: "queued" }, { status: "running" },
@@ -133,14 +136,14 @@ function harness(kind, initialItems = []) {
 
 for (const kind of ["modern", "legacy", "dashboard"]) {
   test(`${kind} task view hides unstarted child cards while displaying a real failed account`, async () => {
-    const h = harness(kind, [childPlaceholder(), card({
+    const h = harness(kind, [childPlaceholder(), card({ card_id: "batch:cancelled", status: "cancelled" }), card({
       card_id: "batch:parent", email: "parent@example.test", status: "failed", elapsed_sec: 247,
       error: "provider timeout after 247 seconds",
     })]);
     const html = await h.render();
     assert.match(html, /parent@example\.test/);
     assert.match(html, /provider timeout after 247 seconds/);
-    assert.doesNotMatch(html, /已跳过|（分配中）|主号未完成，子号未启动/);
+    assert.doesNotMatch(html, /已跳过|（分配中）|未分配邮箱（已取消）|主号未完成，子号未启动/);
     if (kind !== "dashboard") assert.match(html, /data-total="1"/);
   });
 
@@ -161,7 +164,7 @@ for (const kind of ["modern", "legacy"]) {
     try {
       s.page.value = 2;
       s.selected.value = kind === "modern" ? new Set(["batch:6", "batch:0"]) : ["batch:6", "batch:0"];
-      const updated = [...items.slice(0, 6), { ...childPlaceholder(), card_id: "batch:6" }];
+      const updated = [...items.slice(0, 6), card({ status: "cancelled", card_id: "batch:6" })];
       h.taskStore.items = updated;
       h.props.tasks = updated;
       await vue.nextTick();
@@ -177,6 +180,6 @@ test("dashboard selects five visible recent tasks before applying the display li
   const cards = Array.from({ length: 5 }, (_, index) => card({
     card_id: `batch:${index}`, index, email: `visible-${index}@example.test`, status: "success",
   }));
-  const html = await harness("dashboard", [childPlaceholder(), ...cards]).render();
+  const html = await harness("dashboard", [childPlaceholder(), card({ status: "cancelled" }), ...cards]).render();
   for (let index = 0; index < 5; index++) assert.match(html, new RegExp(`visible-${index}@example\\.test`));
 });

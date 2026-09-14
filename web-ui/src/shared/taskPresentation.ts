@@ -28,10 +28,11 @@ export function taskFailureDetail(task: TaskPresentation): string {
 }
 
 export function isVisibleTask(task: TaskPresentation): boolean {
-  // Hide only a reserved child slot that the backend explicitly never started.
-  // An empty address alone can also mean a real mailbox allocation failure.
+  // An unallocated slot that was cancelled adds no account to the task list.
+  // Keep assigned accounts and actual failed allocations visible.
+  if (!text(task.email) && status(task) === "cancelled") return false;
   if (text(task.email) || taskFailureDetail(task)) return true;
-  return !(["skipped", "cancelled"].includes(status(task))
+  return !(status(task) === "skipped"
     && text(task.skip_reason) === "parent_not_registered");
 }
 
