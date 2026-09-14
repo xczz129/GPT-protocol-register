@@ -23,6 +23,7 @@ from proxy_util import proxy_brief
 from register.protocol_pkce import generate_pkce as _generate_pkce
 from register.protocol_sentinel import build_sentinel_with_so_token
 from register.protocol_runtime import current_runtime_settings
+from register.auth_diagnostics import auth_route_diagnostic, read_auth_response
 from register.registration_outcome import (
     RegisteredEmailDetected,
     is_duplicate_registration_error,
@@ -642,7 +643,7 @@ class PlatformRegistrar:
                 (
                     "ChatGPT NextAuth 凭据认证事务已建立（邮箱仅作账号标识）"
                     if str(password or "").strip()
-                    else "ChatGPT NextAuth 初始化完成，等待邮箱验证码"
+                    else "ChatGPT NextAuth 初始化完成，准备检查后续认证步骤"
                 ),
             )
             return {
@@ -1962,6 +1963,7 @@ class PlatformRegistrar:
         passwordless: bool = True,
         restart_invalid_state: bool = True,
     ) -> dict:
+        self._last_authorize_continue_diagnostic = {}
         step(
             index,
             (
@@ -2005,7 +2007,7 @@ class PlatformRegistrar:
         if resp is None or resp.status_code != 200:
             detail = _response_json(resp) if resp is not None else {}
             raise RuntimeError(error or f"login_continue_http_{getattr(resp, 'status_code', 'unknown')}, detail={json.dumps(detail, ensure_ascii=False)[:300]}")
-        data = _response_json(resp)
+        data, self._last_authorize_continue_diagnostic = read_auth_response(resp)
         if (
             passwordless
             and ((data.get("page") or {}).get("payload") or {}).get("passwordless_disabled")
@@ -3051,6 +3053,7 @@ class PlatformRegistrar:
             # Some NextAuth responses stop at the email identifier step. With
             # the password connection selected, this only routes the identity;
             # it does not verify a password or request passwordless OTP.
+            self._last_authorize_continue_diagnostic = {}
             state_data = self._authorize_continue_login(
                 email, index, passwordless=False, restart_invalid_state=False,
             )
@@ -3061,7 +3064,13 @@ class PlatformRegistrar:
             if state == "existing":
                 reject_registered_mailbox(mailbox, "existing_password_login_route")
             if state != "signup":
-                raise RuntimeError("registration_password_route_unavailable")
+                diagnostic = dict(self._last_authorize_continue_diagnostic)
+                diagnostic.update(auth_route_diagnostic(continue_url, page_type))
+                self._diagnostic(index, "注册分支未确认: " + json.dumps(diagnostic, ensure_ascii=False, sort_keys=True))
+                # Error-code strings are also consumed by retry policies. Keep
+                # the upstream code in diagnostics only, preserving decisions.
+                error_context = {key: value for key, value in diagnostic.items() if not key.startswith('api_error')}
+                raise RuntimeError("registration_password_route_unavailable: " + json.dumps(error_context, ensure_ascii=False, sort_keys=True))
             if continue_url:
                 self._navigate_auth_step(continue_url, f"{auth_base}/log-in", index)
         step(index, "邮箱检测为新账号，继续设置密码并注册")
