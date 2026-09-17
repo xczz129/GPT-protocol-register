@@ -140,7 +140,7 @@ def test_team_chooser_recovers_missing_cookie_from_session_dump(registrar):
 
 
 def test_empty_workspace_dump_never_posts_personal_selection(registrar):
-    with pytest.raises(RuntimeError, match="workspace.*without_workspaces"):
+    with pytest.raises(RuntimeError, match="team_workspace_unavailable"):
         registrar._select_workspace(1, "", "https://auth.openai.com/workspace", require_team_workspace=True)
     registrar._post_auth_json.assert_not_called()
 

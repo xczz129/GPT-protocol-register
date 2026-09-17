@@ -105,22 +105,23 @@ def test_child_disabled_uses_regular_integer_concurrency(job_api, concurrency):
 
 
 def test_inventory_truncation_keeps_a_complete_pair(job_api):
+    # smsbower_mail 已切换为按需购买(on-demand):本地库存 available 不再截断 total
     job_api.capacity.return_value = {"available": 5, "total": 5}
     response = job_api.client.post("/api/job/start", json={"mail_type": "smsbower_mail", "total": 6, "concurrency": 6})
 
     assert response.status_code == 200
-    assert job_api.state.params["total"] == 4
-    assert job_api.state.params["concurrency"] == 4
-    assert len(job_api.state.params["group_plan"]) == 4
+    assert job_api.state.params["total"] == 6
+    assert job_api.state.params["concurrency"] == 6
+    assert len(job_api.state.params["group_plan"]) == 6
 
 
 def test_inventory_below_one_pair_rejects_without_starting_worker(job_api):
+    # 按需购买模式下库存不足不再拒绝,正常启动
     job_api.capacity.return_value = {"available": 1, "total": 1}
     response = job_api.client.post("/api/job/start", json={"mail_type": "smsbower_mail", "total": 2, "concurrency": 2})
 
-    assert response.status_code == 400
-    assert job_api.state.running is False
-    job_api.worker.assert_not_called()
+    assert response.status_code == 200
+    assert job_api.state.running is True
 
 
 def test_other_mail_channels_keep_odd_counts_and_worker_limits(job_api, monkeypatch):

@@ -49,7 +49,7 @@ def recovery(monkeypatch):
     instance.session = SimpleNamespace(
         cookies=SimpleNamespace(get=lambda name, **_kwargs: cookies.get(name, "")),
     )
-    instance._navigate_headers = Mock(side_effect=lambda referer: {"Referer": referer})
+    instance._navigate_headers = Mock(side_effect=lambda referer, target_url="": {"Referer": referer})
     instance._post_auth_json = Mock(return_value={"continue_url": TEAM_CALLBACK})
     instance._diagnostic = Mock()
     calls = []

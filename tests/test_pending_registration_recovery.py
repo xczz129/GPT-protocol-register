@@ -42,7 +42,7 @@ def recovery(monkeypatch):
     registrar.login_pending_with_password.return_value = dict(tokens)
     registrar._chatgpt_mfa_request.return_value = (response({"mfa_enabled": False}), "")
 
-    def enroll(tokens, index, *, credential_sink=None):
+    def enroll(tokens, index, *, credential_sink=None, **_kwargs):
         if credential_sink:
             credential_sink({"totp_secret": SECRET, "mfa_factor_id": "new-factor", "mfa_enabled": False})
             credential_sink({"mfa_enabled": True})
@@ -345,7 +345,7 @@ def test_normal_signup_mfa_progress_is_in_pending_snapshots_on_late_failure(monk
     registrar, mailbox = registration_fixture(monkeypatch, {},
         {"continue_url": "https://chatgpt.com/api/auth/callback/openai?code=fixture"})
     snapshots = []
-    def enroll(tokens, index, *, credential_sink):
+    def enroll(tokens, index, *, credential_sink, **_kwargs):
         credential_sink({"totp_secret": SECRET, "mfa_enabled": True, "mfa_factor_id": "new-factor"})
         raise RuntimeError("late mfa confirmation failed")
     registrar._enroll_totp = enroll
