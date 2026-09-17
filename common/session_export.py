@@ -537,7 +537,10 @@ def save_chatgpt_tokens(session, email=""):
     name = _sanitize_file_segment(email or session.get("user", {}).get("email") or "account")
 
     session_path = os.path.join(pdir, f"{name}.session.json")
-    with open(session_path, "w", encoding="utf-8") as f:
+    session_fd = os.open(
+        session_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+    )
+    with os.fdopen(session_fd, "w", encoding="utf-8") as f:
         json.dump(session, f, indent=2, ensure_ascii=False)
     try:
         os.chmod(session_path, 0o600)

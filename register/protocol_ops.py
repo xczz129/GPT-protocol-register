@@ -9,7 +9,7 @@ from typing import Any, Callable
 from common.session_export import parse_jwt_payload
 from register.sessions import JobCancelled
 from mail import mark_mailbox_code_boundary, mark_mailbox_result, release_mailbox
-from proxy_util import is_proxy_transport_error, is_rate_limit_error, proxy_brief
+from proxy_util import is_auth_identity_error, is_proxy_transport_error, is_rate_limit_error, proxy_brief
 from register.protocol_runtime import (
     ProtocolRuntimeSettings,
     activate_runtime,
@@ -202,7 +202,7 @@ def recover_pending_registration_one(
                 validate_tokens(tokens)
                 break
             except Exception as error:
-                retryable = not isinstance(error, JobCancelled) and not is_rate_limit_error(error) and (
+                retryable = not isinstance(error, JobCancelled) and not is_auth_identity_error(error) and not is_rate_limit_error(error) and (
                     is_proxy_transport_error(error) or any(marker in str(error).lower() for marker in (
                         "chatgpt_session_incomplete", "http_502", "http_503", "http_504", "invalid_state",
                     ))

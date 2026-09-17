@@ -39,7 +39,7 @@ def test_empty_summary_has_explicit_missing_rates_and_timings(metrics_db):
         "average_seconds": None, "min_seconds": None, "max_seconds": None,
     }
     assert summary["updated_at"] is None
-    assert {row["domain"] for row in summary["by_domain"]} == {"gmail.com", "icloud.com"}
+    assert {row["domain"] for row in summary["by_domain"]} == set(metrics._DOMAINS)
     assert {row["role"] for row in summary["by_role"]} == {"primary", "child"}
 
 

@@ -13,12 +13,13 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 from curl_cffi import requests
 from common.proxy_clearance import headers_with_clearance
-from proxy_util import is_proxy_transport_error, is_rate_limit_error, normalize_proxy_url
+from proxy_util import is_proxy_transport_error, is_rate_limit_error, is_tls_transient_error, normalize_proxy_url
 from register.protocol_sentinel import build_sentinel_token as _build_sentinel_token_tuple, build_sentinel_with_so_token
 from register.protocol_runtime import current_runtime_settings
 
 from register.protocol_context import (
     _PROXY_CONFIG,
+    _effective_proxy_config,
     _STOP_CHECK,
     _make_trace_headers,
     _oauth_timeout,
@@ -192,8 +193,7 @@ def _headers_with_clearance(
     proxy: str = "",
     user_agent_override: str = "",
 ) -> dict[str, str]:
-    scoped_proxy_config = _PROXY_CONFIG.get()
-    proxy_config = scoped_proxy_config if isinstance(scoped_proxy_config, dict) else config.get("proxy_config")
+    proxy_config = _effective_proxy_config(_PROXY_CONFIG.get())
     return headers_with_clearance(
         proxy_config,
         headers,
@@ -256,6 +256,11 @@ def request_with_local_retry(session: requests.Session, method: str, url: str, r
             last_error = str(error)
             if is_rate_limit_error(error):
                 return None, "rate_limit_exceeded: " + last_error
+            # TLS 瞬断是链路级偶发,原 session 短退避重试几乎必恢复;直接换
+            # 代理会丢 oai-did/csrf cookie 并引入新出口 IP,反而更可疑。
+            if is_tls_transient_error(last_error) and attempt + 1 < attempts:
+                time.sleep(min(4.0, 0.5 * (2 ** attempt)))
+                continue
             if is_proxy_transport_error(last_error):
                 return None, last_error
             if attempt + 1 >= attempts:
@@ -300,8 +305,6 @@ def validate_otp(
         return resp, error
     if resp is not None and resp.status_code == 200:
         return resp, ""
-    # 仅在 sentinel 准备阶段失败（或服务端明确拒绝 sentinel token）时才重放，
-    # 避免对错误验证码等确定性失败做二次提交、加倍消耗 OTP 尝试次数触发风控
     resp_error = ""
     if resp is not None:
         try:
@@ -314,16 +317,13 @@ def validate_otp(
                 resp_error = raw_err
             elif isinstance(raw_err, dict):
                 resp_error = str(raw_err.get("code") or "")
-    deterministic_otp_failure = bool(
-        resp is not None
-        and resp.status_code in {400, 403}
-        and any(
-            marker in resp_error.lower()
-            for marker in ("otp", "code", "rate_limit", "invalid")
-        )
-    )
-    if deterministic_otp_failure and not sentinel_error:
+    # 服务端已给出明确 4xx 应答时不再盲目重放：email-otp/validate 的每次
+    # 提交都消耗 challenge 的 check 次数（max_check_attempts / "Too many
+    # tries"）。对 4xx 重放从未真正救回过会话，只会白白烧掉剩余尝试次数
+    # 并额外多跑一次 5-7 秒的 sentinel SDK。
+    if resp is not None and 400 <= int(getattr(resp, "status_code", 0) or 0) < 500:
         return resp, error or resp_error
+    # 网络异常 / 5xx / sentinel 准备失败时，才用新 sentinel token 重放一次。
     try:
         headers.update(
             _build_sentinel_headers(

@@ -184,7 +184,7 @@ def _now() -> str:
 
 
 def normalize_health_probe_channel(value: Any) -> str:
-    """Return the supported account-plan probe channel."""
+    """Normalize legacy client metadata; health no longer selects a trial API."""
     return "nerver" if str(value or "").strip().lower() == "nerver" else "v4"
 
 
@@ -572,7 +572,7 @@ def _response_json(response, path: str) -> dict[str, Any]:
     try:
         data = response.json()
     except Exception:
-        data = {}
+        data = None
     if response.status_code == 401:
         _raise_if_deactivated(data, source=f"HTTP 401 {path}")
         raise InvalidAccessTokenError(f"token invalidated ({path})")
@@ -595,6 +595,11 @@ def _response_json(response, path: str) -> dict[str, Any]:
 def fetch_remote_account_info(
     record: dict[str, Any], channel: str = "v4",
 ) -> dict[str, Any]:
+    """Check account/session availability through the official me/init APIs.
+
+    ``channel`` is retained for older clients and checkpoints. Both legacy
+    values use the same health checks; plan and trial checks are separate jobs.
+    """
     token = str(record.get("access_token") or "").strip()
     if not token:
         raise InvalidAccessTokenError("missing access_token")
@@ -622,63 +627,35 @@ def fetch_remote_account_info(
     session.headers.update(identity_headers)
     me_path = "/backend-api/me"
     init_path = "/backend-api/conversation/init"
-    account_path = "/backend-api/accounts/check/v4-2023-04-27"
     try:
         requests_to_run = [
-                (
-                    "me",
-                    lambda: _response_json(
-                        session.get(CHATGPT_BASE + me_path, timeout=8),
-                        me_path,
-                    ),
+            (
+                "me",
+                lambda: _response_json(
+                    session.get(CHATGPT_BASE + me_path, timeout=8),
+                    me_path,
                 ),
-                (
-                    "init",
-                    lambda: _response_json(
-                        session.post(
-                            CHATGPT_BASE + init_path,
-                            json={
-                                "gizmo_id": None,
-                                "requested_default_model": None,
-                                "conversation_id": None,
-                                "timezone_offset_min": timezone_offset,
-                            },
-                            timeout=8,
-                        ),
-                        init_path,
+            ),
+            (
+                "init",
+                lambda: _response_json(
+                    session.post(
+                        CHATGPT_BASE + init_path,
+                        json={
+                            "gizmo_id": None,
+                            "requested_default_model": None,
+                            "conversation_id": None,
+                            "timezone_offset_min": timezone_offset,
+                        },
+                        timeout=8,
                     ),
+                    init_path,
                 ),
-            ]
-        if probe_channel == "nerver":
-            # Imported lazily because trial_eligibility imports the shared
-            # request identity helpers from this module.
-            def check_nerver():
-                from common.trial_eligibility import check_trial_eligibility_nerver
-
-                return check_trial_eligibility_nerver(token, timeout=8)
-
-            requests_to_run.append(("plan", check_nerver))
-        else:
-            requests_to_run.append(
-                (
-                    "plan",
-                    lambda: _response_json(
-                        session.get(
-                            CHATGPT_BASE
-                            + account_path
-                            + f"?timezone_offset_min={timezone_offset}",
-                            timeout=8,
-                        ),
-                        account_path,
-                    ),
-                )
-            )
+            ),
+        ]
         payloads: dict[str, dict[str, Any]] = {}
         errors: dict[str, BaseException] = {}
-        # 并行发送 me/init/plan 三个请求（对齐 chatgpt2api v3.2.2
-        # get_user_info 的并行探测）：单账号测活耗时由 3 个串行 RTT 降为
-        # 1 个并行 RTT。nerver 只辅助套餐探测；账号有效性仍由 ChatGPT
-        # 的 me/init 响应决定，不能用第三方成功响应掩盖它们的错误。
+        # 测活只并行请求 me/init；资格与套餐探测不参与可用性判断。
         # curl_cffi Session 默认 use_thread_local_curl=True，工作线程各持
         # 独立 Curl 句柄，同一 Session 并发请求是安全的。
         with ThreadPoolExecutor(max_workers=len(requests_to_run)) as probe_executor:
@@ -694,67 +671,19 @@ def fetch_remote_account_info(
                 except BaseException as exc:
                     errors[name] = exc
         for name, payload in payloads.items():
-            if name in {"me", "init"} or probe_channel == "v4":
-                _raise_if_deactivated(payload, source=name)
-        critical_errors = [
-            error
-            for name, error in errors.items()
-            if name in {"me", "init"} or probe_channel == "v4"
-        ]
-        if critical_errors:
+            _raise_if_deactivated(payload, source=name)
+        if errors:
             invalid_token = next(
                 (
                     exc
-                    for exc in critical_errors
+                    for exc in errors.values()
                     if isinstance(exc, InvalidAccessTokenError)
                 ),
                 None,
             )
-            raise invalid_token or critical_errors[0]
+            raise invalid_token or next(iter(errors.values()))
         me = payloads["me"]
         init = payloads["init"]
-        plan_payload = payloads.get("plan") or {}
-        if probe_channel == "v4":
-            account_entries = plan_payload.get("accounts") or {}
-            account_entries = (
-                account_entries if isinstance(account_entries, dict) else {}
-            )
-            # 多工作区账号(Team): AT 的 chatgpt_account_id 指向本次会话实际
-            # 登录的工作区, 优先取它的套餐/账号ID; 否则退回 default(个人)工作区,
-            # 避免 Team 账号被 default 个人工作区覆盖成 free。
-            token_account_id = ""
-            try:
-                auth_claims = _jwt_payload(token).get("https://api.openai.com/auth")
-                token_account_id = str(
-                    (auth_claims if isinstance(auth_claims, dict) else {}).get(
-                        "chatgpt_account_id"
-                    )
-                    or ""
-                ).strip()
-            except Exception:
-                token_account_id = ""
-            selected = (
-                account_entries.get(token_account_id)
-                if token_account_id
-                and isinstance(account_entries.get(token_account_id), dict)
-                else None
-            )
-            default = selected or account_entries.get("default") or next(
-                (
-                    item
-                    for item in account_entries.values()
-                    if isinstance(item, dict)
-                ),
-                {},
-            )
-            account = default.get("account") if isinstance(default, dict) else {}
-            account = account if isinstance(account, dict) else {}
-        else:
-            account = {
-                "account_id": record.get("account_id") or "",
-                "plan_type": plan_payload.get("plan_type") or "",
-            }
-        plan_probe_error = str(errors.get("plan") or "")[:400]
     finally:
         session.close()
 
@@ -764,20 +693,18 @@ def fetch_remote_account_info(
         (item for item in limits if isinstance(item, dict) and item.get("feature_name") == "image_gen"),
         None,
     )
-    plan = str(
-        account.get("plan_type")
-        or record.get("plan_type")
-        or "free"
-    )
-    quota_unknown = image_limit is None
-    quota = int((image_limit or {}).get("remaining") or 0)
-    status = "正常" if quota_unknown and plan.lower() != "free" else ("限流" if quota == 0 else "正常")
+    raw_quota = (image_limit or {}).get("remaining")
+    quota_unknown = raw_quota is None or isinstance(raw_quota, bool)
+    try:
+        quota = 0 if quota_unknown else max(0, int(raw_quota))
+    except (TypeError, ValueError, OverflowError):
+        quota, quota_unknown = 0, True
+    status = "限流" if not quota_unknown and quota == 0 else "正常"
     return {
+        # Availability probes do not change the selected workspace or plan.
+        **{field: record[field] for field in ("account_id", "plan_type", "type") if field in record},
         "email": me.get("email") or record.get("email"),
         "user_id": me.get("id") or record.get("user_id"),
-        "account_id": account.get("account_id") or record.get("account_id"),
-        "plan_type": plan,
-        "type": plan,
         "quota": quota,
         "image_quota_unknown": quota_unknown,
         "limits_progress": limits,
@@ -788,7 +715,7 @@ def fetch_remote_account_info(
         "health_checked_at": _now(),
         "health_error": "",
         "health_probe_channel": probe_channel,
-        "health_probe_error": plan_probe_error,
+        "health_probe_error": "",
         "device_id": device_id,
     }
 

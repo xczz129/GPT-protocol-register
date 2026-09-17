@@ -16,7 +16,7 @@ from mail import (
     release_mailbox,
 )
 from mail.parsing import normalize_provider_type
-from register.mail_channel_options import option_enabled, smsbower_child_enabled
+from register.mail_channel_options import is_smsbower_selected, option_enabled, smsbower_child_enabled
 
 
 async def _await_owned(task: asyncio.Task, on_cancel: Callable[[], None] | None = None) -> tuple[Any, bool]:
@@ -49,7 +49,47 @@ def registration_outcome(mailbox: dict[str, Any], record: Any, stopped: bool) ->
 def primary_can_start_child(mailbox: dict[str, Any], record: Any) -> bool:
     if mailbox.get("_registration_outcome") == "already_registered":
         return False
+    # A passwordless-existing conversion registers the primary identity only;
+    # the +split child alias would need a second fresh registration of an
+    # address that already belongs to an existing account.
+    if mailbox.get("_registration_passwordless_existing"):
+        return False
     return bool(record or mailbox.get("_registration_code_received") or mailbox.get("_otp_accepted_by_server"))
+
+
+ONLINE_DISPOSABLEMAIL_PURCHASE_BLOCK_CODES = {41003, 41004, 41005}
+
+
+def is_marketplace_stock_error(error: BaseException) -> bool:
+    """A definitive no-purchase stock response from a dynamic mail marketplace.
+
+    SMSBower answers ``No mails yet`` (or ``not available at this price``) and
+    OnlineDisposableMail reports ``暂无库存`` when nothing can be bought at
+    the configured price. No activation/order was created, so letting further
+    task slots retry the purchase would only repeat the same instant failure.
+
+    OnlineDisposableMail additionally reports deterministic purchase blockers
+    with a numeric business code: 41003 (stock), 41004 (balance), 41005
+    (purchase cap) — live-verified as English messages (e.g. ``Insufficient
+    account balance``), so the wrapped ``(code N)`` marker is matched as well
+    because mail.allocate_mailbox re-raises provider errors as a plain
+    RuntimeError. 41002 (purchase timeout) is documented as retriable and
+    must not stop the batch.
+    """
+    text = str(getattr(error, "business_error", "") or str(error)).strip().lower()
+    if (
+        "no mails yet" in text
+        or text.startswith("not available at this price")
+        or "暂无库存" in text
+    ):
+        return True
+    if getattr(error, "business_code", 0) in ONLINE_DISPOSABLEMAIL_PURCHASE_BLOCK_CODES:
+        return True
+    message = str(error)
+    return any(
+        f"(code {code})" in message
+        for code in ONLINE_DISPOSABLEMAIL_PURCHASE_BLOCK_CODES
+    )
 
 
 async def run_dynamic_mail_groups(
@@ -72,8 +112,9 @@ async def run_dynamic_mail_groups(
     """
     pending = deque(indices)
     claim_lock = asyncio.Lock()
-    pairs_possible = smsbower_child_enabled(mail_config)
+    pairs_possible = is_smsbower_selected(provider_type) and smsbower_child_enabled(mail_config)
     width = max(1, int(concurrency or 1) // (2 if pairs_possible else 1))
+    marketplace_stock_out = asyncio.Event()
 
     async def worker() -> None:
         worker_cancelled = threading.Event()
@@ -93,6 +134,8 @@ async def run_dynamic_mail_groups(
             async with claim_lock:
                 if not pending or cancelled():
                     return
+                if marketplace_stock_out.is_set():
+                    return
                 index = pending.popleft()
                 reserved = pending.popleft() if pairs_possible and pending else None
             primary: dict[str, Any] | None = None
@@ -102,18 +145,36 @@ async def run_dynamic_mail_groups(
             try:
                 allocation_config = mail_config
                 if pairs_possible and reserved is None:
-                    # Never buy a two-account activation for a final lone slot.
-                    allocation_config = {
-                        **mail_config,
-                        "providers": [
-                            {**entry, "enable": False}
-                            if isinstance(entry, dict)
-                            and normalize_provider_type(str(entry.get("type") or "")) == "smsbower_mail"
-                            and option_enabled(entry.get("register_child"))
-                            else entry
-                            for entry in mail_config.get("providers") or []
-                        ],
-                    }
+                    # Never buy a child-capable activation for a lone final
+                    # slot; a static provider may still serve it.
+                    filtered = [
+                        {**entry, "enable": False}
+                        if isinstance(entry, dict)
+                        and normalize_provider_type(str(entry.get("type") or "")) == "smsbower_mail"
+                        and option_enabled(entry.get("register_child"))
+                        else entry
+                        for entry in mail_config.get("providers") or []
+                    ]
+                    if any(
+                        isinstance(entry, dict)
+                        and entry.get("enable", True)
+                        and normalize_provider_type(str(entry.get("type") or "")) in {
+                            "outlook_token", "icloud_api", "maddy_webui", "fastmail_api",
+                            "smsbower_mail", "online_disposablemail",
+                        }
+                        for entry in filtered
+                    ):
+                        allocation_config = {**mail_config, "providers": filtered}
+                    else:
+                        # No other provider can serve the lone slot. Keep the
+                        # paired activation unpurchased, but fail with a
+                        # clear reason instead of a generic provider error.
+                        detail = (
+                            "SMSBower 已启用子号：剩余单个任务无法配对，"
+                            "请将任务总数设为偶数（每组 1 主号 + 1 子号）"
+                        )
+                        emit(index, "failed", error=detail, step=detail)
+                        return
                 if cancelled():
                     emit(index, "cancelled", step="已停止，未分配邮箱")
                     if reserved is not None:
@@ -130,19 +191,26 @@ async def run_dynamic_mail_groups(
                         pending.appendleft(reserved)
                     reserved = None
                 primary["_smsbower_pair_role"] = "primary"
+                primary["_registration_metrics_defer_terminal"] = True
+                begin_attempt(primary)
                 if sms:
-                    primary["_registration_metrics_defer_terminal"] = True
-                    begin_attempt(primary)
                     prepare_smsbower_pair(primary)
                 emit(index, "running", email=primary.get("address"), mailbox_role="primary", step="开始主号注册")
                 primary["_registration_cancel_event"] = threading.Event()
                 _, was_cancelled = await _await_owned(asyncio.create_task(run_account(index, primary)), lambda: request_cancel(primary))
                 primary_success = bool(result_at(index))
-                if sms and not primary.get("_registration_recovery_pending"):
+                if not primary.get("_registration_recovery_pending"):
                     finish_attempt(primary.get("_registration_metric_attempt_id"), registration_outcome(primary, result_at(index), cancelled()))
                 if was_cancelled:
                     raise asyncio.CancelledError
                 if with_child and reserved is not None:
+                    if primary.get("_registration_passwordless_existing"):
+                        # The purchase routed to an existing passwordless
+                        # account and was converted into login + password add;
+                        # no fresh child identity can be registered for it.
+                        emit(reserved, "skipped", mailbox_role="child", skip_reason="passwordless_existing_account", step="主号为无密码已有账号，已转换登录并补设密码，不注册子号")
+                        reserved = None
+                        continue
                     if not primary_can_start_child(primary, result_at(index)) or cancelled():
                         emit(reserved, "skipped" if not cancelled() else "cancelled", mailbox_role="child", skip_reason="parent_not_registered", step="主号未完成，子号未启动")
                         reserved = None
@@ -185,8 +253,17 @@ async def run_dynamic_mail_groups(
                 raise
             except Exception as error:
                 if primary is None and getattr(error, "business_error", "") == "already_registered":
-                    address = str(getattr(error, "activation_address", "") or "")
-                    known = {"provider": "smsbower_mail", "address": address, "_smsbower_pair_role": "primary"}
+                    address = str(
+                        getattr(error, "activation_address", "")
+                        or getattr(error, "address", "")
+                        or ""
+                    )
+                    provider_name = (
+                        "online_disposablemail"
+                        if type(error).__name__ == "OnlineDisposableMailError"
+                        else "smsbower_mail"
+                    )
+                    known = {"provider": provider_name, "address": address, "_smsbower_pair_role": "primary"}
                     finish_attempt(begin_attempt(known), "already_registered")
                     emit(index, "skipped", email=address, skip_reason="already_registered", step="邮箱已在本地登记，已取消并跳过")
                     if reserved is not None:
@@ -196,15 +273,28 @@ async def run_dynamic_mail_groups(
                 # mailbox dictionaries: they contain in-memory credentials.
                 detail = str(error)[:240]
                 if primary is not None:
-                    secret = str(primary.get("_smsbower_api_key") or "")
-                    if secret:
-                        detail = detail.replace(secret, "[REDACTED]")
+                    for secret_field in ("_smsbower_api_key", "_odm_api_key"):
+                        secret = str(primary.get(secret_field) or "")
+                        if secret:
+                            detail = detail.replace(secret, "[REDACTED]")
                     if not primary.get("_registration_recovery_pending"):
                         finish_attempt(primary.get("_registration_metric_attempt_id"), registration_outcome(primary, result_at(index), cancelled()))
                 if child is not None:
                     finish_attempt(child.get("_registration_metric_attempt_id"), registration_outcome(child, result_at(reserved) if reserved else None, cancelled()))
+                stock_out = (
+                    primary is None
+                    and not cancelled()
+                    and is_marketplace_stock_error(error)
+                )
+                if stock_out:
+                    marketplace_stock_out.set()
                 target = reserved if primary_success and reserved is not None else index
-                emit(target, "failed" if not cancelled() else "cancelled", error=detail, step=detail)
+                emit(
+                    target,
+                    "failed" if not cancelled() else "cancelled",
+                    error=detail,
+                    step="邮箱市场当前无可用邮箱，已停止后续邮箱分配" if stock_out else detail,
+                )
                 if reserved is not None and target != reserved:
                     emit(reserved, "cancelled" if cancelled() else "skipped", skip_reason="parent_not_registered", step="主号未完成，子号未启动")
             finally:
@@ -221,8 +311,7 @@ async def run_dynamic_mail_groups(
                             raise asyncio.CancelledError
                 finally:
                     if primary is not None:
-                        if sms:
-                            finish_attempt(primary.get("_registration_metric_attempt_id"), registration_outcome(primary, result_at(index), cancelled()))
+                        finish_attempt(primary.get("_registration_metric_attempt_id"), registration_outcome(primary, result_at(index), cancelled()))
                         if sms and primary.get("_smsbower_pair_state") is not None:
                             await _await_owned(asyncio.create_task(asyncio.to_thread(finalize_smsbower_pair, primary, primary_success=primary_success, child_success=child_success)), request_cancel)
                         elif not primary_success:
@@ -238,4 +327,12 @@ async def run_dynamic_mail_groups(
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         while pending:
-            emit(pending.popleft(), "cancelled", step="已停止，未分配邮箱")
+            emit(
+                pending.popleft(),
+                "cancelled",
+                step=(
+                    "邮箱市场已无可用邮箱，停止分配"
+                    if marketplace_stock_out.is_set()
+                    else "已停止，未分配邮箱"
+                ),
+            )

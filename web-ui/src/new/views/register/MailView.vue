@@ -1,7 +1,7 @@
 <script setup lang="ts">
-/* --- 邮箱池：批量导入与按需购买（Outlook/iCloud/SMSBower/Maddy/Fastmail）+ 邮箱管理 ---
+/* --- 邮箱池：批量导入与按需购买（Outlook/iCloud/SMSBower/ODM/Maddy/Fastmail）+ 邮箱管理 ---
    交互对齐旧版 MailView：读信展开后每 5s 轮询，页面隐藏时暂停。 */
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { Inbox, MailPlus, RefreshCw } from "@lucide/vue";
 import AppButton from "../../components/ui/AppButton.vue";
 import AppEmpty from "../../components/ui/AppEmpty.vue";
@@ -11,7 +11,7 @@ import { useMailStore } from "../../stores/mail";
 import { useStatusStore } from "../../stores/status";
 import { useUiStore } from "../../stores/ui";
 import { useConfirm } from "../../composables/useConfirm";
-import { fetchMailboxMessages, type Mailbox, type MailboxMessage } from "../../api/mail";
+import { fetchMailboxMessages, type Mailbox, type MailboxMessage, type OdmEmailType, type OdmService } from "../../api/mail";
 
 const mail = useMailStore();
 const status = useStatusStore();
@@ -57,6 +57,7 @@ function mailboxKey(item: Mailbox) {
 function providerName(item: Mailbox) {
   if (item.provider_type === "icloud_api") return "iCloud";
   if (item.provider_type === "smsbower_mail") return "SMSBower";
+  if (item.provider_type === "online_disposablemail") return "ODM";
   if (item.provider_type === "maddy_webui") return "Maddy";
   if (item.provider_type === "fastmail_api") return "Fastmail";
   return "Outlook";
@@ -179,6 +180,65 @@ async function run(action: () => Promise<Record<string, unknown>>, message: (r: 
 const importSummary = (label: string) => (r: Record<string, unknown>) =>
   `${label} 导入完成：新增 ${r.added || 0}，更新 ${r.updated || 0}，已存在 ${r.unchanged || 0}，合计 ${r.total || 0}`;
 
+/* --- ODM 服务列表：点选填入服务 ID --- */
+const odmServices = ref<OdmService[]>([]);
+const odmTypes = ref<OdmEmailType[]>([]);
+const odmTypesLoaded = ref(false);
+const odmLookup = reactive({ loading: false, error: "", query: "" });
+let odmLookupId = 0;
+const odmSelectedType = computed(() => String(mail.forms.odmEmailTypeId || "").trim());
+const odmSelectedTypeMissing = computed(() => Boolean(odmSelectedType.value) &&
+  !odmTypes.value.some((item) => String(item.email_type_id) === odmSelectedType.value));
+
+watch(() => [mail.forms.odmServiceId, mail.forms.odmApiBase], (current, previous) => {
+  odmLookupId += 1;
+  odmTypes.value = [];
+  odmTypesLoaded.value = false;
+  odmLookup.loading = false;
+  odmLookup.error = "";
+  if (current[1] !== previous[1]) odmServices.value = [];
+}, { flush: "sync" });
+
+async function lookupOdmServices() {
+  const lookupId = ++odmLookupId;
+  odmTypes.value = [];
+  odmTypesLoaded.value = false;
+  odmLookup.loading = true;
+  odmLookup.error = "";
+  try {
+    const data = await mail.loadOdmServices();
+    if (lookupId !== odmLookupId) return;
+    if (data.ok === false) {
+      odmLookup.error = String(data.error || "查询失败");
+    } else {
+      odmServices.value = data.services || [];
+      odmTypes.value = data.types || [];
+      odmTypesLoaded.value = true;
+    }
+  } catch (error) {
+    if (lookupId !== odmLookupId) return;
+    odmLookup.error = error instanceof Error ? error.message : "查询失败";
+  } finally {
+    if (lookupId === odmLookupId) odmLookup.loading = false;
+  }
+}
+async function selectOdmService(service: OdmService) {
+  mail.forms.odmServiceId = String(service.service_id);
+  await lookupOdmServices();
+}
+function odmServiceMatches(service: OdmService) {
+  const needle = odmLookup.query.trim().toLowerCase();
+  if (!needle) return true;
+  return (
+    String(service.name || "").toLowerCase().includes(needle) ||
+    String(service.service_id || "").includes(needle)
+  );
+}
+const odmVisibleServices = computed(() => odmServices.value.filter(odmServiceMatches).slice(0, 20));
+function odmServiceSelected(service: OdmService) {
+  return String(mail.forms.odmServiceId || "").trim() === String(service.service_id).trim();
+}
+
 /* --- 列表操作 --- */
 function selectedItems() {
   const set = new Set(selected.value);
@@ -295,6 +355,72 @@ onMounted(async () => {
           </div>
         </div>
 
+        <!-- OnlineDisposableMail 临时邮箱 -->
+        <div class="channel">
+          <div class="channel-head">
+            <div><h3>OnlineDisposableMail</h3><p class="hint">注册时按需购买，按订单轮询最新验证码</p></div>
+            <label class="check"><input v-model="mail.forms.odmEnable" type="checkbox" /><span>启用</span></label>
+          </div>
+          <label class="field">
+            <span>API Base</span>
+            <input v-model="mail.forms.odmApiBase" class="input" type="url" placeholder="https://api.online-disposablemail.com" />
+          </label>
+          <label class="field">
+            <span class="label-row"><span>API Key</span><em v-if="mail.forms.odmApiKeyConfigured" class="configured">已配置</em></span>
+            <input v-model="mail.forms.odmApiKey" class="input" type="password" autocomplete="new-password" :placeholder="mail.forms.odmApiKeyConfigured ? '留空继续使用已保存 key' : '输入 apiKey'" />
+            <small class="help">只有输入新 Key 才会替换；页面不会回显已保存的完整密钥</small>
+          </label>
+          <div class="field-pair">
+            <label class="field"><span>服务 ID</span><input v-model="mail.forms.odmServiceId" class="input" type="text" inputmode="numeric" placeholder="242 (OpenAI)" /></label>
+            <label class="field"><span>邮箱类型 ID</span>
+              <select v-model="mail.forms.odmEmailTypeId" class="input">
+                <option value="" disabled>请选择可售邮箱类型</option>
+                <option v-if="odmSelectedTypeMissing" :value="odmSelectedType" :disabled="odmTypesLoaded">
+                  {{ odmSelectedType }} · {{ odmSelectedType === '26' ? 'Gmail_1' : '当前选择' }}（{{ odmTypesLoaded ? '当前服务不可售' : '请加载服务列表确认' }}）
+                </option>
+                <option v-for="item in odmTypes" :key="item.email_type_id" :value="String(item.email_type_id)">{{ item.email_type_id }} · {{ item.name }}</option>
+              </select>
+            </label>
+          </div>
+          <div class="field-pair">
+            <label class="field"><span>动态容量</span><input v-model.number="mail.forms.odmCapacity" class="input" type="number" min="1" max="1000" /></label>
+            <label class="field">
+              <span>搜索服务</span>
+              <AppButton :disabled="odmLookup.loading || !mail.forms.odmApiBase.trim()" @click="lookupOdmServices">
+                <RefreshCw :size="14" /><span>{{ odmLookup.loading ? "查询中..." : "加载服务列表" }}</span>
+              </AppButton>
+            </label>
+          </div>
+          <div v-if="odmLookup.error" class="domain-error">{{ odmLookup.error }}</div>
+          <div v-if="odmTypesLoaded && !odmTypes.length" class="domain-error">当前服务暂无可售邮箱类型，请更换服务或稍后刷新。</div>
+          <div v-else-if="odmTypesLoaded && odmSelectedTypeMissing" class="domain-error">所选邮箱类型在当前服务中不可售，请手动选择可售类型。</div>
+          <div v-if="odmServices.length" class="odm-service-list">
+            <input v-model="odmLookup.query" class="input" type="search" placeholder="按名称搜索服务" />
+            <div class="odm-service-options">
+              <button
+                v-for="service in odmVisibleServices"
+                :key="service.service_id"
+                :class="['odm-service-option', { selected: odmServiceSelected(service) }]"
+                type="button"
+                @click="selectOdmService(service)"
+              >
+                <b>{{ service.name }}</b><small>#{{ service.service_id }}</small>
+              </button>
+            </div>
+            <small class="help">点击服务即可填入服务 ID；当前 {{ odmServices.length }} 个服务（仅显示前 20 个匹配项）</small>
+          </div>
+          <p class="help">购买后订单在远端保留收码窗口，超时自动关闭；余额为 0 时渠道自动视为无库存</p>
+          <div class="channel-actions">
+            <AppButton
+              variant="primary"
+              :disabled="busy || odmLookup.loading || !mail.forms.odmServiceId.trim() || !mail.forms.odmEmailTypeId.trim() || (mail.forms.odmEnable && odmTypesLoaded && (!odmTypes.length || odmSelectedTypeMissing)) || (mail.forms.odmEnable && !mail.forms.odmApiKeyConfigured && !mail.forms.odmApiKey.trim())"
+              @click="run(mail.saveOdm, () => 'OnlineDisposableMail 配置已保存', true)"
+            >
+              <span>保存 OnlineDisposableMail</span>
+            </AppButton>
+          </div>
+        </div>
+
         <!-- Maddy -->
         <div class="channel">
           <div class="channel-head">
@@ -373,7 +499,7 @@ onMounted(async () => {
         <input v-model="query" class="input search" type="search" placeholder="搜索邮箱、状态或失败原因" />
         <select v-model="provider" class="input">
           <option value="auto">全部邮箱</option><option value="outlook_token">Outlook</option>
-          <option value="icloud_api">iCloud</option><option value="smsbower_mail">SMSBower</option><option value="maddy_webui">Maddy</option><option value="fastmail_api">Fastmail</option>
+          <option value="icloud_api">iCloud</option><option value="smsbower_mail">SMSBower</option><option value="online_disposablemail">ODM</option><option value="maddy_webui">Maddy</option><option value="fastmail_api">Fastmail</option>
         </select>
         <select v-model="stateFilter" class="input">
           <option value="all">全部状态</option><option value="available">可用</option><option value="in_use">占用</option>
@@ -659,6 +785,55 @@ onMounted(async () => {
   margin-top: 5px;
   color: var(--error);
   font-size: 0.66rem;
+}
+
+/* --- ODM 服务列表 --- */
+.odm-service-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.odm-service-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.odm-service-option {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm);
+  background: var(--inset-bg);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: var(--transition-fast);
+}
+
+.odm-service-option.selected {
+  border-color: var(--accent-border);
+  background: var(--accent-bg);
+  color: var(--text-primary);
+}
+
+.odm-service-option b {
+  font-size: 0.74rem;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.odm-service-option small {
+  flex-shrink: 0;
+  font-size: 0.66rem;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
 }
 
 /* --- 列表 --- */

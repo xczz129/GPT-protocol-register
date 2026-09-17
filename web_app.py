@@ -164,6 +164,10 @@ from mail import (
     SMSBOWER_MAIL_DEFAULT_BASE,
     SMSBOWER_MAIL_DEFAULT_SERVICE,
     SmsBowerMailProvider,
+    ONLINE_DISPOSABLEMAIL_DEFAULT_BASE,
+    ONLINE_DISPOSABLEMAIL_DEFAULT_SERVICE_ID,
+    ONLINE_DISPOSABLEMAIL_DEFAULT_EMAIL_TYPE_ID,
+    OnlineDisposableMailProvider,
     ICloudApiProvider,
     OutlookTokenProvider,
     _entry_available as _mailbox_entry_available,
@@ -684,20 +688,28 @@ def _providers(cfg: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _redact_config_for_api(cfg: dict[str, Any]) -> dict[str, Any]:
-    """Return panel configuration without exposing SMSBower mail credentials."""
+    """Return panel configuration without exposing purchase-channel credentials."""
     data = _base_redact_config_for_api(cfg)
     source_providers = _providers(cfg)
     for index, provider in enumerate(_providers(data)):
-        if normalize_provider_type(str(provider.get("type") or "")) != "smsbower_mail":
-            continue
-        source = source_providers[index] if index < len(source_providers) else {}
-        configured = bool(SmsBowerMailProvider._resolve_api_key(source))
-        # This key authorizes purchases. Expose only explicit display metadata.
-        provider.pop("api_key", None)
-        provider.pop("key", None)
-        provider["has_api_key"] = configured
-        provider["api_key_masked"] = str(provider.get("api_key_masked") or "")
-        provider["register_child"] = option_enabled(source.get("register_child"))
+        ptype = normalize_provider_type(str(provider.get("type") or ""))
+        if ptype == "smsbower_mail":
+            source = source_providers[index] if index < len(source_providers) else {}
+            configured = bool(SmsBowerMailProvider._resolve_api_key(source))
+            # This key authorizes purchases. Expose only explicit display metadata.
+            provider.pop("api_key", None)
+            provider.pop("key", None)
+            provider["has_api_key"] = configured
+            provider["api_key_masked"] = str(provider.get("api_key_masked") or "")
+            provider["register_child"] = option_enabled(source.get("register_child"))
+        elif ptype == "online_disposablemail":
+            source = source_providers[index] if index < len(source_providers) else {}
+            configured = bool(OnlineDisposableMailProvider._resolve_api_key(source))
+            provider.pop("api_key", None)
+            provider.pop("apiKey", None)
+            provider.pop("key", None)
+            provider["has_api_key"] = configured
+            provider["api_key_masked"] = str(provider.get("api_key_masked") or "")
     return data
 
 
@@ -740,6 +752,19 @@ def _ensure_provider(cfg: dict[str, Any], ptype: str) -> dict[str, Any]:
             "domains": ["gmail.com", "icloud.com"],
             "max_price": "",
             "capacity": 0,
+            "mailboxes": "",
+        }
+    elif want == "online_disposablemail":
+        entry = {
+            "type": "online_disposablemail",
+            "enable": True,
+            "label": "Online DisposableMail",
+            "mode": "api",
+            "api_base": ONLINE_DISPOSABLEMAIL_DEFAULT_BASE,
+            "api_key": "",
+            "service_id": ONLINE_DISPOSABLEMAIL_DEFAULT_SERVICE_ID,
+            "email_type_id": ONLINE_DISPOSABLEMAIL_DEFAULT_EMAIL_TYPE_ID,
+            "capacity": 50,
             "mailboxes": "",
         }
     elif want == "maddy_webui":
@@ -797,6 +822,31 @@ def _sanitize_smsbower_mail_provider_entry(provider: dict[str, Any]) -> bool:
     )
     provider.setdefault("capacity", 0)
     provider.setdefault("mailboxes", "")
+    return provider != before
+
+
+def _sanitize_online_disposablemail_provider_entry(provider: dict[str, Any]) -> bool:
+    """Normalize persisted OnlineDisposableMail settings without API calls."""
+    if not isinstance(provider, dict):
+        return False
+    before = copy.deepcopy(provider)
+    provider["type"] = "online_disposablemail"
+    provider["mode"] = "api"
+    provider["api_base"] = OnlineDisposableMailProvider._normalize_api_base(
+        provider.get("api_base") or ONLINE_DISPOSABLEMAIL_DEFAULT_BASE
+    )
+    provider["service_id"] = OnlineDisposableMailProvider._normalize_id(
+        provider.get("service_id"), "service_id"
+    )
+    provider["email_type_id"] = OnlineDisposableMailProvider._normalize_id(
+        provider.get("email_type_id"), "email_type_id"
+    )
+    try:
+        provider["capacity"] = max(0, min(1000, int(provider.get("capacity") or 50)))
+    except (TypeError, ValueError):
+        provider["capacity"] = 50
+    provider.setdefault("mailboxes", "")
+    provider.pop("register_child", None)
     return provider != before
 
 
@@ -2153,6 +2203,12 @@ from web.routes.accounts_rebind import (  # noqa: E402,F401
     account_rebind_stop,
 )
 
+@app.get("/static/vue/new.html", include_in_schema=False)
+async def legacy_static_vue_new_entry():
+    # 旧灰度静态入口已下线（新前端已转正为唯一 index.html），书签/历史链接统一回主入口
+    return RedirectResponse(url="/", status_code=302)
+
+
 if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -2285,6 +2341,11 @@ def _request_client_ip(request: Request) -> str:
     client_host = str(getattr(request.client, "host", "") or "unknown").strip()
     if client_host.lower() not in _trusted_proxy_hosts():
         return client_host or "unknown"
+    # nginx 覆写的 X-Real-IP 最可信(用 $remote_addr 覆写,客户端无法伪造);
+    # cf-connecting-ip / x-forwarded-for 可被直连攻击者伪造,仅作兜底。
+    real_ip = str(request.headers.get("x-real-ip") or "").strip()
+    if real_ip:
+        return real_ip
     forwarded = str(request.headers.get("cf-connecting-ip") or "").strip()
     if not forwarded:
         forwarded = str(request.headers.get("x-forwarded-for") or "").split(",", 1)[0].strip()
@@ -2387,6 +2448,12 @@ async def public_home(request: Request = None):  # type: ignore[assignment]
             "Expires": "0",
         },
     )
+
+
+@app.get("/new.html", include_in_schema=False)
+async def legacy_new_entry():
+    # 旧灰度入口已下线，统一回主入口
+    return RedirectResponse(url="/", status_code=302)
 
 
 @app.get("/api/health")
@@ -2616,6 +2683,11 @@ async def put_config(body: ConfigUpdate):
                 elif ptype == "smsbower_mail":
                     try:
                         _sanitize_smsbower_mail_provider_entry(provider)
+                    except ValueError as exc:
+                        raise HTTPException(400, str(exc)) from exc
+                elif ptype == "online_disposablemail":
+                    try:
+                        _sanitize_online_disposablemail_provider_entry(provider)
                     except ValueError as exc:
                         raise HTTPException(400, str(exc)) from exc
         return {"ok": True, "config": _redact_config_for_api(current)}

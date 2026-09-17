@@ -2401,7 +2401,7 @@ class RedactionTests(unittest.TestCase):
         red = redact_config_for_api(cfg)
         self.assertEqual(red["chatgpt2api"]["key"], "")
         self.assertEqual(red["web"]["password"], "")
-        self.assertEqual(mask_secret("abcdefghijk"), "ab…")
+        self.assertEqual(mask_secret("abcdefghijk"), "…(11)")
 
         merge_config_preserving_secrets(cfg, {"chatgpt2api": {"key": ""}, "web": {"password": "••••••••"}})
         self.assertEqual(cfg["chatgpt2api"]["key"], "c2a-secret-value")
@@ -4555,6 +4555,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
                 {"continue_url": "https://auth.openai.com/about-you"},
             ]
         )
+        registrar._resend_email_otp = MagicMock(return_value=True)
         registrar._diagnostic = MagicMock()
         registrar._navigate_auth_step = MagicMock()
         registrar._set_registration_password = MagicMock(
@@ -4577,7 +4578,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
         }
         candidates = iter(["111222", "333444"])
 
-        def read_code(active_mailbox, register_proxy=""):
+        def read_code(active_mailbox, register_proxy="", **_kwargs):
             code = next(candidates)
             active_mailbox["_seen_otp_codes"].append(code)
             return code
@@ -4601,7 +4602,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
         self.assertEqual(mailbox["_seen_otp_codes"], ["111222", "333444"])
         self.assertTrue(
             any(
-                "已排除本次候选" in str(call.args[1])
+                "已重发验证码" in str(call.args[1])
                 for call in protocol_step.call_args_list
                 if len(call.args) > 1
             )
@@ -4643,7 +4644,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
         }
         candidates = iter(["111222", "333444"])
 
-        def read_code(active_mailbox, register_proxy=""):
+        def read_code(active_mailbox, register_proxy="", **_kwargs):
             code = next(candidates)
             active_mailbox["_seen_otp_codes"].append(code)
             return code
@@ -6487,6 +6488,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
         token = protocol._PROXY_CONFIG.set(task_proxy_config)
         try:
             with (
+                patch.object(PlatformRegistrar, "_cf_lightweight_recovery", return_value=False),
                 patch("register.protocol_registrar.refresh_clearance", return_value=None) as refresh,
                 patch("register.protocol_registrar.clearance_error", return_value="fixture error"),
                 patch("register.protocol_registrar.step"),
@@ -6505,8 +6507,42 @@ class ProtocolAndHealthTests(unittest.TestCase):
             "http://proxy.example:8080",
         )
 
+    def test_protocol_clearance_prefers_lightweight_recovery(self):
+        from register.protocol import PlatformRegistrar
+
+        registrar = PlatformRegistrar.__new__(PlatformRegistrar)
+        registrar.proxy = "http://proxy.example:8080"
+        registrar.session = MagicMock()
+        registrar.fingerprint = {}
+        registrar.device_id = "test-device-id"
+        registrar.clearance_user_agent = ""
+
+        probe = MagicMock()
+        probe.status_code = 200
+        probe.text = "<html>ok</html>"
+        with (
+            patch(
+                "register.protocol_registrar.request_with_local_retry",
+                return_value=(probe, ""),
+            ),
+            patch("register.protocol_registrar.time.sleep") as sleep,
+            patch("register.protocol_registrar.refresh_clearance") as refresh,
+            patch("register.protocol_registrar.step"),
+        ):
+            result = registrar._refresh_cloudflare_clearance(
+                "https://chatgpt.com/",
+                1,
+            )
+
+        # 轻量算法层成功时直接返回占位 bundle，不再启动 FlareSolverr
+        self.assertIsNotNone(result)
+        self.assertEqual(result.cookies, {})
+        refresh.assert_not_called()
+        sleep.assert_called_once()
+
     def test_protocol_fingerprint_variants_remain_internally_consistent(self):
         from register.protocol import _make_browser_fingerprint
+        from register.protocol_fingerprint import REGISTER_BROWSER_PROFILES
 
         screens = {
             "1920x1080", "1536x864", "1366x768", "1707x960",
@@ -6515,13 +6551,19 @@ class ProtocolAndHealthTests(unittest.TestCase):
         }
         samples = [_make_browser_fingerprint() for _ in range(40)]
         families = set()
+        # 2026-09 起 Chrome 147+ 的 TLS/H2 指纹与 146 一致（curl_cffi 上游仅在
+        # 指纹变化时新增目标），impersonate 固定 chrome146、UA/Client Hints 抬到
+        # 150/151；impersonate 与 major 的映射以 REGISTER_BROWSER_PROFILES 为准。
+        profile_by_key = {
+            (p["browser_family"], p["major"]): p
+            for p in REGISTER_BROWSER_PROFILES
+        }
         for fingerprint in samples:
             family = fingerprint["browser_family"]
             families.add(family)
             self.assertIn(family, {"firefox", "chrome"})
-            self.assertEqual(
-                fingerprint["impersonate"], f"{family}{fingerprint['major']}"
-            )
+            profile = profile_by_key[(family, fingerprint["major"])]
+            self.assertEqual(fingerprint["impersonate"], profile["impersonate"])
             self.assertIn(fingerprint["screen"], screens)
             if family == "firefox":
                 self.assertIn(
@@ -6557,6 +6599,10 @@ class ProtocolAndHealthTests(unittest.TestCase):
 
     def test_us_proxy_uses_stable_us_language_and_new_york_clock(self):
         from register.protocol import _make_browser_fingerprint
+        from register.protocol_fingerprint import (
+            COUNTRY_TIMEZONE_CHOICES,
+            _timezone_offset_for_timezone,
+        )
 
         with patch.dict(os.environ, {"REGISTER_PROXY_COUNTRY": "JP"}):
             fingerprint = _make_browser_fingerprint(
@@ -6564,8 +6610,14 @@ class ProtocolAndHealthTests(unittest.TestCase):
             )
         self.assertEqual(fingerprint["accept_language"], "en-US,en;q=0.9")
         self.assertEqual(fingerprint["locale"], "en-US")
-        self.assertEqual(fingerprint["timezone"], "America/New_York")
-        self.assertIn(fingerprint["timezone_offset_min"], {"240", "300"})
+        # 2026-09 起美国按人口权重采样多时区（ET/CT/MT/PT/Phoenix），
+        # 偏移量与所采时区实时一致（含夏令时）。
+        us_zones = {zone for zone, _w in COUNTRY_TIMEZONE_CHOICES["US"]}
+        self.assertIn(fingerprint["timezone"], us_zones)
+        self.assertEqual(
+            int(fingerprint["timezone_offset_min"]),
+            _timezone_offset_for_timezone(fingerprint["timezone"]),
+        )
         self.assertIn(fingerprint["webgl_vendor"], {"Intel Inc.", "NVIDIA Corporation", "AMD"})
         self.assertIn("ANGLE (", fingerprint["webgl_renderer"])
 
@@ -8023,6 +8075,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
         registrar._enroll_totp.assert_called_once_with(
             registrar._read_chatgpt_session.return_value,
             1,
+            replace_existing=True,
         )
 
     def test_protocol_registration_follows_password_continue_step_before_otp(self):
@@ -8235,7 +8288,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
             registrar._read_chatgpt_session.call_args_list[1].args[:2],
             ("callback@example.com", "Aa1!callback-test"),
         )
-        registrar._enroll_totp.assert_called_once_with(final_tokens, 1)
+        registrar._enroll_totp.assert_called_once_with(final_tokens, 1, replace_existing=True)
         self.assertEqual(result["password"], "Aa1!callback-test")
         self.assertTrue(result["password_set"])
 
@@ -9371,7 +9424,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
         self.assertEqual([assigned[index] for index in sorted(assigned)], emails)
         self.assertEqual([item["email"] for item in result], emails)
 
-    def test_protocol_alias_pairs_wait_for_both_complete_before_next_pair(self):
+    def test_protocol_alias_pairs_sequential_within_pair_parallel_across(self):
         from register.protocol import run_protocol_register
 
         emails = [
@@ -9425,12 +9478,10 @@ class ProtocolAndHealthTests(unittest.TestCase):
         first_pair = emails[:2]
         second_pair = emails[2:]
         self.assertEqual({item["email"] for item in result}, set(emails))
-        self.assertLess(abs(started[first_pair[0]] - started[first_pair[1]]), 0.1)
-        self.assertLess(abs(started[second_pair[0]] - started[second_pair[1]]), 0.1)
-        self.assertGreaterEqual(
-            min(started[email] for email in second_pair),
-            max(finished[email] for email in first_pair),
-        )
+        # 并行化新行为:对内顺序(主→split,同邮箱收码隔离),对间并行
+        self.assertGreaterEqual(started[first_pair[1]], finished[first_pair[0]])
+        self.assertGreaterEqual(started[second_pair[1]], finished[second_pair[0]])
+        self.assertLess(started[second_pair[0]], finished[first_pair[1]])
 
     def test_protocol_fixed_primary_starts_one_alias(self):
         from register.protocol import run_protocol_register
@@ -10081,7 +10132,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
         self.assertEqual(assigned, ["static@example.com", "", ""])
         self.assertEqual(len(result), 3)
 
-    def test_browser_alias_pairs_wait_for_both_complete_before_next_pair(self):
+    def test_browser_alias_pairs_sequential_within_pair_parallel_across(self):
         from register.batch import run_register
 
         emails = [
@@ -10134,12 +10185,10 @@ class ProtocolAndHealthTests(unittest.TestCase):
         first_pair = emails[:2]
         second_pair = emails[2:]
         self.assertEqual({item["email"] for item in result}, set(emails))
-        self.assertLess(abs(started[first_pair[0]] - started[first_pair[1]]), 0.1)
-        self.assertLess(abs(started[second_pair[0]] - started[second_pair[1]]), 0.1)
-        self.assertGreaterEqual(
-            min(started[email] for email in second_pair),
-            max(finished[email] for email in first_pair),
-        )
+        # 并行化新行为:对内顺序(主→split,同邮箱收码隔离),对间并行
+        self.assertGreaterEqual(started[first_pair[1]], finished[first_pair[0]])
+        self.assertGreaterEqual(started[second_pair[1]], finished[second_pair[0]])
+        self.assertLess(started[second_pair[0]], finished[first_pair[1]])
 
     def test_browser_fixed_primary_uses_one_alias_concurrency(self):
         from register.batch import run_register
@@ -10814,17 +10863,8 @@ class ProtocolAndHealthTests(unittest.TestCase):
             return item
 
         def get_response(url, **_kwargs):
-            if url.endswith("/backend-api/me"):
-                return response({"email": "identity@example.com", "id": "user-1"})
-            return response(
-                {
-                    "accounts": {
-                        "default": {
-                            "account": {"account_id": "acct-1", "plan_type": "plus"}
-                        }
-                    }
-                }
-            )
+            # 2026-09 起测活只探 me/init，不再请求 v4 套餐接口
+            return response({"email": "identity@example.com", "id": "user-1"})
 
         def post_response(_url, **_kwargs):
             return response(
@@ -10852,17 +10892,16 @@ class ProtocolAndHealthTests(unittest.TestCase):
             result = fetch_remote_account_info(record)
 
         self.assertEqual(result["health_status"], "alive")
-        self.assertEqual(result["plan_type"], "plus")
+        # 可用性探测不改变套餐：记录自带 plan_type 原样保留（套餐/资格是独立任务）
+        self.assertEqual(result["plan_type"], "free")
         self.assertEqual(session.headers["OAI-Device-Id"], "stable-device-id")
         self.assertEqual(session.headers["OAI-Language"], "en-US")
         self.assertEqual(
             session.post.call_args.kwargs["json"]["timezone_offset_min"], 420
         )
-        get_urls = [item.args[0] for item in session.get.call_args_list]
-        self.assertTrue(any("timezone_offset_min=420" in url for url in get_urls))
         session.close.assert_called_once_with()
 
-    def test_health_check_marks_http_200_deactivated_account_invalid(self):
+    def test_health_check_http_200_account_stays_valid(self):
         from common.account_health import check_account
 
         def response(data):
@@ -10870,24 +10909,12 @@ class ProtocolAndHealthTests(unittest.TestCase):
             item.json.return_value = data
             return item
 
+        # 2026-09 起封号判定只来自 me/init 的 401/响应体；
+        # HTTP 200 一律视为可用，v4 接口的 is_deactivated 不再参与测活。
         session = MagicMock()
         session.headers = {}
-        session.get.side_effect = lambda url, **_kwargs: (
-            response({"email": "deactivated-200@example.com", "id": "user-1"})
-            if url.endswith("/backend-api/me")
-            else response(
-                {
-                    "accounts": {
-                        "default": {
-                            "account": {
-                                "account_id": "acct-1",
-                                "plan_type": "free",
-                                "is_deactivated": True,
-                            }
-                        }
-                    }
-                }
-            )
+        session.get.side_effect = lambda url, **_kwargs: response(
+            {"email": "deactivated-200@example.com", "id": "user-1"}
         )
         session.post.return_value = response({"limits_progress": []})
         source = {
@@ -10899,11 +10926,10 @@ class ProtocolAndHealthTests(unittest.TestCase):
         with patch("common.account_health._session", return_value=session):
             checked = check_account(source, persist=False)
 
-        self.assertEqual(checked["status"], "已封号")
-        self.assertEqual(checked["health_status"], "invalid")
-        self.assertEqual(checked["reauth_blocked_reason"], "account_deactivated")
-        self.assertIn("account_deactivated", checked["health_error"])
-        self.assertTrue(checked["last_invalid_at"])
+        self.assertEqual(checked["status"], "正常")
+        self.assertEqual(checked["health_status"], "alive")
+        self.assertFalse(checked.get("reauth_blocked_reason"))
+        self.assertTrue(checked["health_checked_at"])
         session.close.assert_called_once_with()
 
     def test_parallel_health_check_prioritizes_invalid_token_error(self):

@@ -29,6 +29,7 @@ def registration(monkeypatch):
         "_send_otp", "_send_passwordless_otp", "_send_password_reset_otp",
         "_reset_auth_cookies", "login", "_passwordless_login", "_register_user",
         "_complete_post_registration_password", "_authorize_continue_login",
+        "_register_passwordless_existing_account",
     ):
         setattr(registrar, name, MagicMock())
     registrar._complete_chatgpt_session = MagicMock(return_value={
@@ -56,6 +57,10 @@ def registration(monkeypatch):
     monkeypatch.setattr(module, "begin_attempt", effects.begin)
     monkeypatch.setattr(module, "mark_smsbower_otp_accepted", effects.accepted)
     monkeypatch.setattr(module, "mark_mailbox_code_boundary", MagicMock())
+    monkeypatch.setattr(module, "release_mailbox", MagicMock())
+    monkeypatch.setattr(module, "request_with_local_retry", MagicMock(
+        side_effect=AssertionError("all registration HTTP must be mocked"),
+    ))
     monkeypatch.setattr(module, "step", MagicMock())
     monkeypatch.setattr(module, "current_runtime_settings", lambda: SimpleNamespace(enable_totp_after_register=False))
     return registrar, mailbox, effects
@@ -67,8 +72,13 @@ def registration(monkeypatch):
     {"final_url": "https://auth.openai.com/authorize", "page": {"type": "password_verification"}},
 ])
 @pytest.mark.parametrize("role", ["primary", "child"])
-def test_existing_candidate_skips_before_any_credentials_or_otp(registration, initial_state, role):
+@pytest.mark.parametrize("provider", ["smsbower_mail", "online_disposablemail"])
+def test_existing_password_route_is_skipped_before_any_account_action(
+    registration, initial_state, role, provider,
+):
+    """A purchased existing identity must never enter login or credential reset."""
     registrar, mailbox, effects = registration
+    mailbox["provider"] = provider
     mailbox["_smsbower_pair_role"] = role
     registrar._complete_chatgpt_session.return_value = initial_state
     partial = MagicMock()
@@ -78,15 +88,33 @@ def test_existing_candidate_skips_before_any_credentials_or_otp(registration, in
 
     assert raised.value.email == mailbox["address"]
     assert mailbox["_registration_outcome"] == "already_registered"
+    assert not mailbox.get("_registration_identity_created")
+    assert "_registration_existing_takeover_detail" not in mailbox
     for name in (
         "_authorize_continue_login", "_set_registration_password", "_register_user",
         "_send_otp", "_send_passwordless_otp", "_send_password_reset_otp",
         "_validate_otp", "_create_account", "_read_chatgpt_session", "login",
         "_passwordless_login", "_complete_post_registration_password",
+        "_register_passwordless_existing_account", "_enroll_totp",
     ):
         getattr(registrar, name).assert_not_called()
     effects.wait.assert_not_called()
     partial.assert_not_called()
+    effects.finalize.assert_called_once_with(mailbox, success=False, error="already_registered")
+
+
+def test_existing_mfa_route_still_rejects_before_any_action(registration):
+    """An MFA challenge is an existing identity, so registration stops."""
+    registrar, mailbox, effects = registration
+    registrar._complete_chatgpt_session.return_value = {
+        "final_url": "https://auth.openai.com/mfa-challenge",
+    }
+    with pytest.raises(RegisteredEmailDetected) as raised:
+        registrar.register(1)
+    assert raised.value.email == mailbox["address"]
+    assert mailbox["_registration_outcome"] == "already_registered"
+    effects.wait.assert_not_called()
+    registrar._register_passwordless_existing_account.assert_not_called()
     effects.finalize.assert_called_once_with(mailbox, success=False, error="already_registered")
 
 
@@ -102,6 +130,7 @@ def test_identifier_continuation_checks_before_navigating_login(registration):
     registrar._authorize_continue_login.assert_called_once_with(
         mailbox["address"], 1, passwordless=False, restart_invalid_state=False,
     )
+    registrar._register_passwordless_existing_account.assert_not_called()
     registrar._navigate_auth_step.assert_not_called()
     registrar._set_registration_password.assert_not_called()
     effects.wait.assert_not_called()
@@ -109,6 +138,13 @@ def test_identifier_continuation_checks_before_navigating_login(registration):
 
 def test_fresh_password_signup_proceeds_and_uses_preleased_mailbox(registration):
     registrar, mailbox, effects = registration
+    confirmed_result = registrar._set_registration_password.return_value
+
+    def confirm_creation(*_args, **_kwargs):
+        assert not mailbox.get("_registration_identity_created")
+        return confirmed_result
+
+    registrar._set_registration_password.side_effect = confirm_creation
     result = registrar.register(1, mailbox_override=mailbox)
     assert result["email"] == mailbox["address"]
     effects.create.assert_not_called()
@@ -124,6 +160,73 @@ def test_fresh_password_signup_proceeds_and_uses_preleased_mailbox(registration)
     assert "_registration_outcome" not in mailbox
 
 
+UNCONFIRMED_CREATION_RESPONSES = [
+    pytest.param(None, id="missing-response"),
+    pytest.param({}, id="empty-object"),
+    pytest.param({"success": True}, id="success-without-next-step"),
+    pytest.param({
+        "error": {"code": "invalid_request"},
+        "continue_url": "https://auth.openai.com/api/accounts/email-otp/send",
+    }, id="business-error-with-next-step"),
+    pytest.param({
+        "continue_url": "https://untrusted.example.test/email-verification",
+        "page": {"type": "email_otp_verification"},
+    }, id="untrusted-continuation"),
+    pytest.param({
+        "continue_url": "https://auth.openai.com/api/accounts/email-otp/send",
+        "page": {"type": "about_you"},
+    }, id="conflicting-route-and-page"),
+    pytest.param({
+        "continue_url": "https://auth.openai.com/api/accounts/email-otp/send",
+        "page": {"type": "email_otp_verification", "payload": {
+            "url": "https://auth.openai.com/about-you",
+        }},
+    }, id="conflicting-continuations"),
+]
+
+
+@pytest.mark.parametrize("payload", UNCONFIRMED_CREATION_RESPONSES)
+def test_register_does_not_claim_creation_from_unconfirmed_password_response(registration, payload):
+    registrar, mailbox, effects = registration
+    registrar._set_registration_password = PlatformRegistrar._set_registration_password.__get__(registrar)
+    registrar._register_user.return_value = payload
+    partial = MagicMock()
+
+    expected_error = (
+        "set_password_failed: invalid_request"
+        if isinstance(payload, dict) and payload.get("error")
+        else "registration_identity_response_unconfirmed"
+    )
+    with pytest.raises(RuntimeError, match=expected_error):
+        registrar.register(1, mailbox_override=mailbox, partial_sink=partial)
+
+    registrar._register_user.assert_called_once()
+    assert not mailbox.get("_registration_identity_created")
+    assert mailbox.get("_registration_outcome") != "already_registered"
+    partial.assert_not_called()
+    effects.wait.assert_not_called()
+    effects.accepted.assert_not_called()
+    for name in ("_navigate_auth_step", "_validate_otp", "_create_account", "_read_chatgpt_session", "_enroll_totp"):
+        getattr(registrar, name).assert_not_called()
+
+
+def test_confirmed_password_response_allows_creation_marker_and_original_otp_flow(registration):
+    registrar, mailbox, effects = registration
+    registrar._set_registration_password = PlatformRegistrar._set_registration_password.__get__(registrar)
+    registrar._register_user.return_value = {
+        "continue_url": "https://auth.openai.com/api/accounts/email-otp/send",
+        "page": {"type": "email_otp_send"},
+    }
+
+    result = registrar.register(1, mailbox_override=mailbox)
+
+    assert result["email"] == mailbox["address"]
+    assert mailbox["_registration_identity_created"] is True
+    registrar._register_user.assert_called_once()
+    effects.wait.assert_called_once()
+    effects.accepted.assert_called_once_with(mailbox)
+
+
 def test_other_mail_provider_keeps_original_route_and_behavior(registration):
     registrar, mailbox, effects = registration
     mailbox["provider"] = "icloud_api"
@@ -137,13 +240,14 @@ def test_other_mail_provider_keeps_original_route_and_behavior(registration):
     effects.accepted.assert_called_once_with(mailbox)
 
 
-def test_normal_smsbower_registration_starts_metrics_before_auth(registration):
+def test_skipped_smsbower_registration_starts_metrics_before_auth(registration):
     registrar, mailbox, effects = registration
     registrar._complete_chatgpt_session.return_value = {"final_url": "https://auth.openai.com/log-in/password"}
     with pytest.raises(RegisteredEmailDetected):
         registrar.register(1)
     effects.create.assert_called_once()
     effects.begin.assert_called_once_with(mailbox)
+    registrar._register_passwordless_existing_account.assert_not_called()
     effects.accepted.assert_not_called()
 
 
@@ -278,18 +382,35 @@ def test_network_failure_does_not_claim_already_registered(registration):
     with pytest.raises(RuntimeError, match="SSL_connect"):
         registrar.register(1)
     assert "_registration_outcome" not in mailbox
+    assert not mailbox.get("_registration_identity_created")
     effects.wait.assert_not_called()
 
 
 def test_ambiguous_otp_route_fails_without_consuming_otp(registration):
+    """A genuinely unrecognized route still fails without consuming the OTP."""
     registrar, mailbox, effects = registration
-    registrar._complete_chatgpt_session.return_value = {"final_url": "https://auth.openai.com/email-verification"}
-    registrar._authorize_continue_login.return_value = {"page": {"type": "email_otp_verification"}}
+    registrar._complete_chatgpt_session.return_value = {"final_url": "https://auth.openai.com/log-in"}
+    registrar._authorize_continue_login.return_value = {"page": {"type": "some_new_page"}}
     with pytest.raises(RuntimeError, match="registration_password_route_unavailable"):
         registrar.register(1)
     assert "_registration_outcome" not in mailbox
     registrar._set_registration_password.assert_not_called()
     effects.wait.assert_not_called()
+
+
+def test_bare_otp_initial_route_proceeds_like_icloud_flow(registration):
+    """OpenAI 新流程: 新邮箱初始认证直接进入邮箱验证路由，按 iCloud 渠道同款放行。
+
+    回收邮箱身份仍由 user/register 的 duplicate 错误码兜底识别。"""
+    registrar, mailbox, effects = registration
+    registrar._complete_chatgpt_session.return_value = {"final_url": "https://auth.openai.com/email-verification"}
+    registrar.register(1)
+    assert "_registration_outcome" not in mailbox
+    assert mailbox.get("_registration_identity_created")
+    registrar._authorize_continue_login.assert_not_called()
+    registrar._register_passwordless_existing_account.assert_not_called()
+    registrar._set_registration_password.assert_called_once()
+    effects.wait.assert_called_once()
 
 
 def test_recovery_after_own_identity_creation_is_not_existing_account(registration):
@@ -318,7 +439,7 @@ def test_own_password_callback_does_not_repeat_password_add_or_reset(registratio
     assert "_registration_outcome" not in mailbox
 
 
-def test_protocol_signup_selects_password_connection_without_password_login(registration, monkeypatch):
+def test_protocol_signup_keeps_icloud_signin_shape_without_password_connection(registration, monkeypatch):
     import register.protocol_registrar as module
 
     registrar, mailbox, _effects = registration
@@ -339,7 +460,10 @@ def test_protocol_signup_selects_password_connection_without_password_login(regi
         registrar, mailbox["address"], "", 1, start_only=True, registration_password_flow=True,
     )
     signin_query = parse_qs(urlsplit(request.call_args_list[1].args[2]).query)
-    assert signin_query["connection"] == ["password"]
+    # 新邮箱注册与 iCloud 渠道保持同一 signin 形态：不带 connection=password，
+    # 否则 OpenAI 新流程会把新地址直接路由到 /email-verification。
+    assert "connection" not in signin_query
+    assert "max_age" not in signin_query
     assert signin_query["screen_hint"] == ["login_or_signup"]
     assert "reauth" not in signin_query
     assert result["page"]["type"] == "password_verification"
@@ -427,6 +551,38 @@ def test_browser_fresh_identity_allows_otp_and_own_recovery():
         page = SimpleNamespace(evaluate=AsyncMock(return_value="https://auth.openai.com/log-in/password"))
         await check_fresh_registration_page(page, mailbox)
         assert "_registration_outcome" not in mailbox
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("payload", UNCONFIRMED_CREATION_RESPONSES)
+def test_browser_unconfirmed_create_response_cannot_enable_otp_or_recovery(payload):
+    from register.page import check_fresh_registration_page, install_fresh_registration_guard
+
+    async def run():
+        mailbox = {"address": "candidate@example.test", "provider": "smsbower_mail"}
+        context = SimpleNamespace(route=AsyncMock())
+        await install_fresh_registration_guard(context, mailbox)
+        handler = context.route.await_args_list[1].args[1]
+        creation = browser_route(
+            "https://auth.openai.com/api/accounts/user/register",
+            referer="https://auth.openai.com/create-account/password", payload=payload,
+        )
+        await handler(creation)
+        creation.fetch.assert_awaited_once()
+        creation.continue_.assert_not_awaited()
+        assert not mailbox.get("_registration_identity_created")
+        assert mailbox.get("_registration_guard_error")
+        assert mailbox.get("_registration_outcome") != "already_registered"
+
+        otp = browser_route("https://auth.openai.com/api/accounts/email-otp/send")
+        await handler(otp)
+        otp.abort.assert_awaited_once()
+        otp.fetch.assert_not_awaited()
+        otp.continue_.assert_not_awaited()
+        page = SimpleNamespace(evaluate=AsyncMock(return_value="https://auth.openai.com/email-verification"))
+        with pytest.raises(RuntimeError, match="registration_identity_response_un"):
+            await check_fresh_registration_page(page, mailbox)
 
     asyncio.run(run())
 

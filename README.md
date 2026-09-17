@@ -103,6 +103,36 @@ mail:
 Token 或 TOTP 密钥；永久密码错误、邮箱不可用或需要手机验证时停止并保留待补全记录。
 恢复流程不重新购买邮箱，不重新注册，也不会重置已有账号密码。
 
+### OnlineDisposableMail 临时邮箱（`type: online_disposablemail`）
+
+OnlineDisposableMail（docs.online-disposablemail.com）按需购买邮箱，订单创建后轮询
+`/api/latest/code` 读取最新验证码；订单无法从客户端取消或结算，超时由远端自动关闭。
+
+```yaml
+mail:
+  providers:
+    - type: online_disposablemail
+      enable: false
+      label: Online DisposableMail
+      api_base: https://api.online-disposablemail.com
+      # 可直接填写，或留空并设置进程环境变量 ONLINE_DISPOSABLEMAIL_API_KEY
+      api_key: ""
+      # 242 = OpenAi；面板里可「加载服务列表」搜索后点选
+      service_id: "242"
+      # 当前 OpenAi 可售 Gmail_1 为 26；以按服务加载的可售列表为准
+      email_type_id: "26"
+      capacity: 50
+```
+
+购买前先读取按服务筛选的公开可售目录，类型不可售、库存为零或目录不可用时停止。
+每次购买只提交一次购单请求、不自动重试，响应缺失 email/orderId 时直接报错。业务码 `42001` 表示
+验证码未到、继续轮询；`42002/42003/42004/42006` 表示订单已关闭、邮箱失效或超时，立即
+终止等待。`data.code` 为空时自动从 `data.content` 邮件 HTML 中提取验证码。`code` 为 6
+位数字才接受；同一订单反复返回旧验证码时跳过旧值。`mail.online_disposablemail_wait_timeout`
+默认且最低为 180 秒。容量取 `capacity` 和当前服务库存的较小值，类型不可售、目录查询失败
+或余额为 0 时容量为 0。可售目录成功结果缓存 30 秒，面板手动加载会刷新；旧 `/api/types`
+类型字典不再作为可购买的依据。邮箱注册统计支持按渠道（SMSBower / ODM）切换查看。
+
 运维页显示该渠道的尝试数、已注册、未收到验证码、成功、其他失败、取消及进行中数量，
 并支持主号/子号及 Gmail/iCloud 分组。比例以实际开始的账号尝试为分母，未启动子号不计入。
 验证码平均、最短、最长耗时按“开始等待到收到有效格式验证码”计算；超时单列，不进入均值。

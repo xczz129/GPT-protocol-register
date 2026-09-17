@@ -656,8 +656,8 @@ async def operations():
 
 @router.get("/api/operations/mail-registration-stats")
 async def mail_registration_stats(provider: str = "smsbower_mail"):
-    if provider != "smsbower_mail":
-        raise HTTPException(400, "邮箱注册统计仅支持 SMSBower 渠道")
+    if provider not in ("smsbower_mail", "online_disposablemail"):
+        raise HTTPException(400, "邮箱注册统计仅支持 SMSBower / OnlineDisposableMail 渠道")
     return await asyncio.to_thread(mail_registration_summary, provider)
 
 

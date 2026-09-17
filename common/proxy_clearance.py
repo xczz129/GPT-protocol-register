@@ -5,9 +5,12 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib import request as urllib_request
 from urllib.parse import unquote, urlparse
@@ -24,6 +27,13 @@ class ClearanceBundle:
 _CACHE: dict[tuple[str, str], ClearanceBundle] = {}
 _LOCK = threading.Lock()
 _ERROR_STATE = threading.local()
+
+# 内嵌 FlareSolverr(项目 third_party/)自动拉起支持。
+_SPAWN_LOCK = threading.Lock()
+_SPAWN_STATE: dict[str, float] = {"last_try": 0.0}
+_EMBEDDED_ENTRY = (
+    Path(__file__).resolve().parent.parent / "third_party" / "flaresolverr" / "src" / "flaresolverr.py"
+)
 
 
 def _set_error(message: str = "") -> None:
@@ -107,7 +117,69 @@ def _settings(
         "proxy": clearance_proxy,
         "timeout": max(1, int(clearance.get("timeout_sec") or 60)),
         "refresh_interval": max(0, int(clearance.get("refresh_interval") or 3600)),
+        "autostart": bool(clearance.get("autostart", True)),
     }
+
+
+def _flaresolverr_alive(url: str) -> bool:
+    """探测 FlareSolverr 根端点(Docker 版/已有实例均适用)。"""
+    try:
+        with urllib_request.urlopen(url + "/", timeout=1.5) as response:
+            return 200 <= response.status < 500
+    except Exception:
+        return False
+
+
+def _spawn_embedded_flaresolverr(url: str) -> bool:
+    """从项目 third_party/ 拉起内嵌 FlareSolverr 常驻子进程。
+
+    崩溃由下一次 ensure 的"探测失败→重新拉起"自愈;日志写入
+    data/logs/flaresolverr_embedded.log。
+    """
+    parsed = urlparse(url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 8191
+    if not _EMBEDDED_ENTRY.exists():
+        _set_error(f"内嵌 FlareSolverr 缺失: {_EMBEDDED_ENTRY}")
+        return False
+    log_dir = _EMBEDDED_ENTRY.parents[3] / "data" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "flaresolverr_embedded.log"
+    try:
+        with open(log_path, "ab") as log_file:
+            subprocess.Popen(
+                [sys.executable, str(_EMBEDDED_ENTRY), "--host", host, "--port", str(port)],
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                cwd=str(_EMBEDDED_ENTRY.parent),
+            )
+    except Exception as error:
+        _set_error(f"内嵌 FlareSolverr 拉起失败: {str(error)[:200]}")
+        return False
+    # 首次拉起含 chromedriver 下载与 Chrome 冷启动,给足 60s
+    deadline = time.time() + 60.0
+    while time.time() < deadline:
+        if _flaresolverr_alive(url):
+            return True
+        time.sleep(0.5)
+    _set_error("内嵌 FlareSolverr 启动超时(60s),详见 data/logs/flaresolverr_embedded.log")
+    return False
+
+
+def _ensure_flaresolverr(settings: dict[str, Any]) -> None:
+    """清障请求前确保服务在线:已有实例(如 Docker 版)直接复用,否则自动拉起内嵌副本。"""
+    url = str(settings.get("url") or "")
+    if not url or _flaresolverr_alive(url):
+        return
+    if not settings.get("autostart"):
+        return
+    with _SPAWN_LOCK:
+        # 节流:60s 内不重复尝试,避免 CF 高频期反复拉起拖慢请求
+        if time.time() - _SPAWN_STATE["last_try"] < 60.0:
+            return
+        _SPAWN_STATE["last_try"] = time.time()
+        _spawn_embedded_flaresolverr(url)
 
 
 def _domain_matches(host: str, domain: str) -> bool:
@@ -160,6 +232,7 @@ def refresh_clearance(
     if not settings["enabled"] or settings["mode"] != "flaresolverr" or not settings["url"]:
         _set_error("FlareSolverr 清障未启用或地址为空")
         return None
+    _ensure_flaresolverr(settings)
     payload: dict[str, Any] = {
         "cmd": "request.get",
         "url": target_url,

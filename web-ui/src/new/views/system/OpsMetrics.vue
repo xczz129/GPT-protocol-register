@@ -3,7 +3,7 @@
 import { computed, ref } from "vue";
 import { RefreshCw } from "@lucide/vue";
 import AppButton from "../../components/ui/AppButton.vue";
-import MailRegistrationStats from "../../../components/MailRegistrationStats.vue";
+import MailRegistrationStats from "../../components/MailRegistrationStats.vue";
 import { useOperationsStore } from "../../stores/operations";
 import { useUiStore } from "../../stores/ui";
 

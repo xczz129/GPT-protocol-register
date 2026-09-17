@@ -17,10 +17,9 @@ export default defineConfig(({ mode }) => {
       emptyOutDir: true,
       sourcemap: false,
       rollupOptions: {
+        // 唯一入口：原新前端（src/new）已转正，旧 UI（src/main.js）已删除
         input: {
           main: resolve(__dirname, "index.html"),
-          // 重构中的新前端，独立入口，灰度期间与旧 UI 并存
-          "new": resolve(__dirname, "new.html"),
         },
       },
     },

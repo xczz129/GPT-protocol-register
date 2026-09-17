@@ -197,7 +197,7 @@ async function removeOne(id: string, name: string) {
       <AppButton
         variant="accent" size="sm"
         :disabled="!accounts.activeCount || accounts.loading || accounts.health.running"
-        :title="`测活全部账号（共 ${accounts.activeCount} 个未封号，跳过已封号）`"
+        :title="`检查账号是否可用（共 ${accounts.activeCount} 个未封号，跳过已封号）`"
         @click="emit('healthAll')"
       >
         <Activity :size="14" /><span>{{ accounts.health.running ? "测活中…" : `测活全部(${accounts.activeCount})` }}</span>
@@ -224,7 +224,7 @@ async function removeOne(id: string, name: string) {
         title="检测全部账号的 Plus 免费试用资格"
         @click="emit('trialAll')"
       >
-        <Sparkles :size="14" /><span>{{ batch.trial.running ? "检测中…" : "检测全部试用资格" }}</span>
+        <Sparkles :size="14" /><span>{{ batch.trial.running ? "试用资格检测中…" : "试用资格（全部）" }}</span>
       </AppButton>
 
       <span class="batch-row-spacer" aria-hidden="true"></span>

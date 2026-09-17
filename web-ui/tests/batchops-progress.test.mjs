@@ -193,3 +193,78 @@ test("trial start forwards the selected v4 or nerver channel", async () => {
   await h.api.trialStart(["key"], false, false, 4, "unsupported");
   assert.equal(JSON.parse(h.calls.at(-1).options.body).channel, "v4");
 });
+
+test("reauth: one skipped account does not stop the remaining 94 or count as failed", async () => {
+  const h = harness();
+  let completed = 0;
+  h.store.setOnFinished(() => completed++);
+  const skippedItem = { email: "banned@example.test", status: "skipped", message: "已封号，跳过重新登录" };
+  h.responses.push({ ok: true }, { job: {
+    job_id: "reauth-95", status: "running", running: true, total: 95, done: 1,
+    success: 0, failed: 0, skipped: 1, cancelled: 0, items: [skippedItem],
+    last: skippedItem.email, last_status: "skipped", last_message: skippedItem.message,
+  } });
+  await h.store.startReauthBatch("reauth", Array.from({ length: 95 }, (_, i) => `key-${i}`), { concurrency: 3 });
+  assert.equal(h.store.reauth.running, true);
+  assert.equal(h.store.reauth.total, 95);
+  assert.equal(h.store.reauth.done, 1);
+  assert.equal(h.store.reauth.skipped, 1);
+  assert.equal(h.store.reauth.failed, 0);
+  assert.equal(h.store.reauth.lastStatus, "skipped");
+  assert.equal(h.store.reauth.lastMessage, skippedItem.message);
+  assert.equal(h.timers.size, 1);
+
+  h.responses.push({ job: {
+    job_id: "reauth-95", status: "completed", running: false, total: 95, done: 95,
+    success: 94, failed: 0, skipped: 1, cancelled: 0, items: [skippedItem],
+  } });
+  await [...h.timers.values()][0]();
+  assert.equal(h.store.reauth.running, false);
+  assert.equal(h.store.reauth.done, 95);
+  assert.equal(h.store.reauth.success, 94);
+  assert.equal(h.store.reauth.skipped, 1);
+  assert.equal(h.store.reauth.failed, 0);
+  assert.equal(h.timers.size, 0);
+  assert.equal(completed, 1);
+});
+
+test("reauth: completed all-skipped job retains full progress and zero failures", async () => {
+  const h = harness();
+  h.responses.push({ job: {
+    job_id: "all-skipped", status: "completed", running: false, total: 95, done: 95,
+    success: 0, failed: 0, skipped: 95, cancelled: 0,
+    items: [{ email: "banned@example.test", status: "skipped", message: "已封号，跳过重新登录" }],
+  } });
+  await h.store.refreshReauthProgress();
+  assert.equal(h.store.reauth.running, false);
+  assert.equal(h.store.reauth.total, 95);
+  assert.equal(h.store.reauth.done, 95);
+  assert.equal(h.store.reauth.skipped, 95);
+  assert.equal(h.store.reauth.failed, 0);
+  assert.equal(h.store.reauth.items[0].status, "skipped");
+  assert.equal(h.timers.size, 0);
+});
+
+test("reauth: a new older-format job resets skipped counters, rows and last diagnostics", async () => {
+  const h = harness();
+  h.responses.push({ job: {
+    job_id: "old-skipped", status: "completed", running: false, total: 1, done: 1,
+    success: 0, failed: 0, skipped: 1, cancelled: 0,
+    items: [{ email: "banned@example.test", status: "skipped" }],
+    last: "banned@example.test", last_status: "skipped", last_message: "已封号，跳过重新登录",
+  } });
+  await h.store.refreshReauthProgress();
+  h.responses.push({ job: {
+    job_id: "new-legacy", status: "running", running: true, total: 2, done: 0,
+    success: 0, failed: 0,
+  } });
+  await h.store.refreshReauthProgress();
+  assert.equal(h.store.reauth.job_id, "new-legacy");
+  assert.equal(h.store.reauth.running, true);
+  assert.equal(h.store.reauth.skipped, 0);
+  assert.equal(h.store.reauth.failed, 0);
+  assert.equal(h.store.reauth.items.length, 0);
+  assert.equal(h.store.reauth.last, "");
+  assert.equal(h.store.reauth.lastStatus, "");
+  assert.equal(h.store.reauth.lastMessage, "");
+});

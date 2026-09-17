@@ -12,21 +12,32 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 from urllib.parse import parse_qsl, unquote, urlencode, urldefrag, urljoin, urlsplit
 from common.proxy_clearance import clearance_error, refresh_clearance
+
+
+class _LightweightClearanceOk:
+    """轻量算法恢复成功的占位 bundle：Cookie 已直接写入当前会话。"""
+
+    cookies: dict = {}
 from common.session_export import build_account_record, parse_jwt_payload
 from common.totp import totp_code
-from common.team_workspace import select_team_workspace, validate_team_session, workspace_entries
+from common.team_workspace import _personal_workspace, select_personal_workspace, select_team_workspace, validate_team_session, workspace_entries
 from common.mail_registration_metrics import begin_attempt
 from register.sessions import JobCancelled
 from mail import mark_mailbox_code_boundary, mark_mailbox_result, mark_smsbower_otp_accepted, release_mailbox
 from mail.parsing import CANONICAL_PROVIDER_TYPES, normalize_provider_type
-from proxy_util import is_rate_limit_error, proxy_brief
+from proxy_util import is_auth_identity_error, is_rate_limit_error, is_tls_transient_error, proxy_brief
+from register.protocol_fingerprint import REGISTER_BROWSER_PROFILES, _header_fingerprint
 from register.protocol_pkce import generate_pkce as _generate_pkce
 from register.protocol_sentinel import build_sentinel_with_so_token
 from register.protocol_runtime import current_runtime_settings
 from register.auth_diagnostics import auth_route_diagnostic, read_auth_response
+from register.initial_auth_response import read_initial_auth_response
 from register.registration_outcome import (
+    PasswordlessAccountDetected,
     RegisteredEmailDetected,
+    registration_creation_confirmed,
     is_duplicate_registration_error,
+    is_password_login_route,
     registration_auth_state,
     reject_registered_mailbox,
     requires_fresh_registration,
@@ -37,6 +48,7 @@ from register.protocol_context import (
     _FIXED_EMAIL,
     _PASSWORD_AUTH_FLOW_GATE,
     _PROXY_CONFIG,
+    _effective_proxy_config,
     _REGISTRATION_TRACE,
     _STOP_CHECK,
     _add_task_event_secrets,
@@ -73,6 +85,7 @@ from register.protocol_fingerprint import (
     _header_fingerprint,
     _make_browser_fingerprint,
     _proxy_country_code,
+    _sec_fetch_site_value,
     common_headers,
     navigate_headers,
 )
@@ -151,11 +164,63 @@ def _is_workspace_recovery_page(url: str) -> bool:
     return not path.startswith("/api/") and ("workspace" in path or path.endswith("/consent"))
 
 
+class _TlsRotateSessionProxy:
+    """TLS 握手持续失败时同家族轮换指纹（UA/Client Hints 同步联动）。
+
+    借鉴 Regert888/gpt-auto-register：curl(35) 类 TLS 瞬断多为链路级偶发
+    （request_with_local_retry 已做同会话短退避重试），但当同一出口对
+    特定 ClientHello 持续握手失败时，换 TLS 指纹才是出路。轮换只在
+    本家族内换 impersonate（chrome→chrome），并同步重写请求头里的
+    UA / sec-ch-ua*，避免「UA 说 151、CH 说 136」的自相矛盾——那是
+    CF 最容易抓的特征。session 保持原对象（cookie 不丢），只更新其
+    impersonate 属性。
+    """
+
+    def __init__(self, session, registrar) -> None:
+        object.__setattr__(self, "_inner", session)
+        object.__setattr__(self, "_registrar", registrar)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_inner"), name)
+
+    def __setattr__(self, name, value):
+        setattr(object.__getattribute__(self, "_inner"), name, value)
+
+    def _call(self, verb: str, *args, **kwargs):
+        inner = object.__getattribute__(self, "_inner")
+        try:
+            return getattr(inner, verb)(*args, **kwargs)
+        except Exception as error:
+            if not is_tls_transient_error(str(error)):
+                raise
+            registrar = object.__getattribute__(self, "_registrar")
+            if registrar is None or not registrar._rotate_tls_fingerprint():
+                raise
+            headers = kwargs.get("headers")
+            if isinstance(headers, dict):
+                kwargs = dict(kwargs)
+                kwargs["headers"] = _header_fingerprint(
+                    dict(headers), registrar.fingerprint
+                )
+            return getattr(inner, verb)(*args, **kwargs)
+
+    def request(self, *args, **kwargs):
+        return self._call("request", *args, **kwargs)
+
+    def get(self, *args, **kwargs):
+        return self._call("get", *args, **kwargs)
+
+    def post(self, *args, **kwargs):
+        return self._call("post", *args, **kwargs)
+
+
 class PlatformRegistrar:
     def __init__(self, proxy: str = "") -> None:
         self.proxy = str(proxy or "").strip()
         self.fingerprint = _make_browser_fingerprint(self.proxy)
-        self.session = create_session(self.proxy, self.fingerprint)
+        self.session = _TlsRotateSessionProxy(
+            create_session(self.proxy, self.fingerprint), self
+        )
         self.clearance_user_agent = ""
         self.clearance_failure_reason = ""
         self.device_id = str(uuid.uuid4())
@@ -167,6 +232,50 @@ class PlatformRegistrar:
 
     def close(self) -> None:
         self.session.close()
+
+    def _rotate_tls_fingerprint(self) -> bool:
+        """TLS 持续失败时在本家族内轮换 impersonate，返回是否还有候选。
+
+        UA / Client Hints 由 _sync_session_identity 按新指纹重写，
+        保证 TLS、UA、CH 三者版本自洽（chrome146 → chrome145 →
+        chrome142 → chrome136，每个 registrar 实例至多轮换一轮）。
+        """
+        state = getattr(self, "_tls_rotation_state", None)
+        if state is None:
+            fp = _browser_fingerprint(self.fingerprint)
+            current_imp = str(fp.get("impersonate") or "")
+            family = str(fp.get("browser_family") or "chrome")
+            candidates: list[dict[str, str]] = []
+            seen = {current_imp}
+            for profile in REGISTER_BROWSER_PROFILES:
+                imp = str(profile.get("impersonate") or "")
+                if (
+                    str(profile.get("browser_family")) == family
+                    and imp
+                    and imp not in seen
+                ):
+                    seen.add(imp)
+                    candidates.append(profile)
+            state = candidates
+            self._tls_rotation_state = candidates
+        if not state:
+            return False
+        profile = state.pop(0)
+        new_fp = dict(self.fingerprint)
+        new_fp.update(
+            {
+                "impersonate": str(profile.get("impersonate") or ""),
+                "browser_family": str(profile.get("browser_family") or ""),
+                "major": str(profile.get("major") or ""),
+                "full_version": str(profile.get("full_version") or ""),
+            }
+        )
+        # 清掉版本派生字段，让补全逻辑按新 major 重新生成 UA / sec-ch-ua
+        for key in ("user_agent", "sec_ch_ua", "sec_ch_ua_full_version_list"):
+            new_fp.pop(key, None)
+        self.fingerprint = new_fp
+        self._sync_session_identity()
+        return True
 
     def _sync_session_identity(self) -> None:
         """Keep the HTTP session identity aligned with the current profile."""
@@ -230,10 +339,13 @@ class PlatformRegistrar:
             f"proxy={proxy_brief(self.proxy) if self.proxy else 'direct'}",
         )
 
-    def _navigate_headers(self, referer: str = "") -> dict[str, str]:
+    def _navigate_headers(self, referer: str = "", target_url: str = "") -> dict[str, str]:
         headers = _header_fingerprint(navigate_headers, self.fingerprint)
         if referer:
             headers["referer"] = referer
+        # 真实导航的 sec-fetch-site 取决于来源与目标关系：
+        # 无来源 = none（首跳/地址栏），chatgpt.com → auth.openai.com = cross-site
+        headers["sec-fetch-site"] = _sec_fetch_site_value(referer, target_url)
         return headers
 
     def _json_headers(self, referer: str) -> dict[str, str]:
@@ -243,15 +355,84 @@ class PlatformRegistrar:
         headers.update(_make_trace_headers())
         return headers
 
+    def _cf_lightweight_recovery(self, target_url: str, index: int) -> bool:
+        """算法层轻量过盾 v2：不启动浏览器，三轮逐级升级。
+
+        第1轮：短抖动后同会话导航重试（挑战 Cookie 已吸收，直接重访）
+        第2轮：更长退避 + 先预热域名根路径刷新 __cf_bm，再重访目标
+        第3轮：同会话换 TLS 指纹族（JA4 变化，UA 不变）重访
+        任一轮探针通过即返回 True；全部失败返回 False 交给 FlareSolverr。
+        """
+        try:
+            parts = urlsplit(target_url)
+            origin = f"{parts.scheme}://{parts.netloc}"
+        except Exception:
+            origin = platform_base
+        plans = (
+            {"delay": (1.2, 3.0), "warm": False, "impersonate": None},
+            {"delay": (3.0, 6.0), "warm": True, "impersonate": None},
+            {"delay": (6.0, 10.0), "warm": True, "impersonate": "chrome131"},
+        )
+        for attempt, plan in enumerate(plans, 1):
+            if _STOP_CHECK.get()():
+                return False
+            lo, hi = plan["delay"]
+            time.sleep(lo + random.random() * (hi - lo))
+            try:
+                if plan["warm"]:
+                    try:
+                        warm_headers = self._navigate_headers(f"{platform_base}/", origin + "/")
+                        warm, _ = request_with_local_retry(
+                            self.session,
+                            "get",
+                            origin + "/",
+                            headers=warm_headers,
+                            allow_redirects=True,
+                            verify=_tls_verify(),
+                        )
+                        self._diagnostic(
+                            index,
+                            f"CF 轻量恢复第{attempt}轮域名预热 status={getattr(warm, 'status_code', 'unknown')}",
+                        )
+                    except Exception:
+                        pass
+                probe_headers = self._navigate_headers(f"{platform_base}/", target_url)
+                probe_kwargs: dict[str, Any] = {}
+                if plan["impersonate"]:
+                    probe_kwargs["impersonate"] = plan["impersonate"]
+                probe, _ = request_with_local_retry(
+                    self.session,
+                    "get",
+                    target_url,
+                    headers=probe_headers,
+                    allow_redirects=True,
+                    verify=_tls_verify(),
+                    **probe_kwargs,
+                )
+            except Exception as probe_error:
+                self._diagnostic(index, f"CF 轻量恢复第{attempt}轮异常: {probe_error}")
+                continue
+            probe_status = getattr(probe, "status_code", "unknown")
+            if probe is not None and not _is_cloudflare_challenge(probe):
+                self._diagnostic(
+                    index,
+                    f"CF 轻量算法恢复成功（第{attempt}轮 status={probe_status}）",
+                )
+                return True
+            self._diagnostic(
+                index,
+                f"CF 轻量恢复第{attempt}轮仍被拦截（status={probe_status}）",
+            )
+        return False
+
     def _refresh_cloudflare_clearance(self, target_url: str, index: int):
         self.clearance_failure_reason = ""
+        # 轻量算法层优先：同会话抖动重试，不启动浏览器
+        if self._cf_lightweight_recovery(target_url, index):
+            step(index, "CF 轻量算法恢复成功，重试当前请求", "yellow")
+            return _LightweightClearanceOk()
         step(index, "检测到 Cloudflare 拦截，正在通过 FlareSolverr 清障", "yellow")
-        scoped_proxy_config = _PROXY_CONFIG.get()
-        proxy_config = (
-            scoped_proxy_config
-            if isinstance(scoped_proxy_config, dict)
-            else config.get("proxy_config")
-        )
+        proxy_config = _effective_proxy_config(_PROXY_CONFIG.get())
         bundle = refresh_clearance(
             proxy_config,
             target_url,
@@ -312,14 +493,14 @@ class PlatformRegistrar:
             f"challenge={code_challenge[:16]}... method=S256",
         )
         target_url = f"{auth_base}/api/accounts/authorize?{urlencode(params)}"
-        headers = self._navigate_headers(f"{platform_base}/")
+        headers = self._navigate_headers(f"{platform_base}/", target_url)
         headers = _headers_with_clearance(headers, target_url, self.proxy, self.clearance_user_agent)
         resp, error = request_with_local_retry(self.session, "get", target_url, headers=headers, allow_redirects=True, verify=_tls_verify())
         if _is_cloudflare_challenge(resp):
             bundle = self._refresh_cloudflare_clearance(target_url, index)
             if bundle is None:
                 raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
-            retry_headers = _headers_with_clearance(self._navigate_headers(f"{platform_base}/"), target_url, self.proxy, self.clearance_user_agent)
+            retry_headers = _headers_with_clearance(self._navigate_headers(f"{platform_base}/", target_url), target_url, self.proxy, self.clearance_user_agent)
             resp, error = request_with_local_retry(self.session, "get", target_url, headers=retry_headers, allow_redirects=True, verify=_tls_verify())
             if _is_cloudflare_challenge(resp):
                 raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 重试仍被拦截"))
@@ -364,6 +545,7 @@ class PlatformRegistrar:
         account/workspace exists.  The NextAuth session and /backend-api/me are
         the completion boundary used by the actual ChatGPT web application.
         """
+        self._initial_auth_diagnostic = {}
         step(index, "开始建立 ChatGPT 会话")
         fp = _browser_fingerprint(self.fingerprint)
         common = {
@@ -486,11 +668,14 @@ class PlatformRegistrar:
             "screen_hint": "login_or_signup",
             "login_hint": email,
         }
-        if registration_password_flow or str(password or "").strip():
+        if str(password or "").strip():
             # A login_hint identifies the account but does not require the
             # password connection.  Without this hint some existing accounts
             # are routed into email OTP and password/verify then fails with
             # invalid_state even though a password is stored locally.
+            # (Fresh registration keeps the iCloud-identical signin shape:
+            # OpenAI's new flow routes connection=password on a new address
+            # straight to /email-verification before any password page.)
             signin_params.update({"connection": "password", "max_age": "0"})
         if str(password or "").strip():
             # ChatGPT uses the same NextAuth transaction for account
@@ -646,11 +831,22 @@ class PlatformRegistrar:
                     else "ChatGPT NextAuth 初始化完成，准备检查后续认证步骤"
                 ),
             )
+            auth_payload, self._initial_auth_diagnostic = read_initial_auth_response(
+                authorize_response, expected_email=email,
+            )
+            self._diagnostic(
+                index, "初始化认证响应: " + json.dumps(
+                    self._initial_auth_diagnostic, ensure_ascii=False, sort_keys=True,
+                ),
+            )
             return {
                 "authorize_url": authorize_url,
                 "final_url": final_url,
                 "device_id": self.device_id,
-                "page": _response_json(authorize_response).get("page") or {},
+                "page": auth_payload.get("page", {}),
+                **{key: auth_payload[key] for key in (
+                    "continue_url", "email_verification_mode", "login_methods", "error",
+                ) if key in auth_payload},
             }
 
         return self._read_chatgpt_session(email, password, index)
@@ -660,7 +856,7 @@ class PlatformRegistrar:
         if not target:
             return None
         headers = _headers_with_clearance(
-            self._navigate_headers(referer),
+            self._navigate_headers(referer, target),
             target,
             self.proxy,
             self.clearance_user_agent,
@@ -684,7 +880,7 @@ class PlatformRegistrar:
                     )
                 )
             headers = _headers_with_clearance(
-                self._navigate_headers(referer),
+                self._navigate_headers(referer, target),
                 target,
                 self.proxy,
                 self.clearance_user_agent,
@@ -807,7 +1003,7 @@ class PlatformRegistrar:
                 raise JobCancelled("stop requested")
             visited.add(url)
             headers = _headers_with_clearance(
-                self._navigate_headers(request_referer), url,
+                self._navigate_headers(request_referer, url), url,
                 self.proxy, self.clearance_user_agent,
             )
             response, error = request_with_local_retry(
@@ -925,9 +1121,17 @@ class PlatformRegistrar:
             workspaces = self._auth_session_workspaces(refreshed, *auth_payloads)
             referer = getattr(self, "_workspace_recovery_referer", "") or referer
         if not workspaces:
-            raise RuntimeError("workspace_page_without_workspaces: 同步认证会话后仍无工作区，未选择个人空间")
+            raise RuntimeError(
+                "team_workspace_unavailable: 认证会话未提供工作区列表"
+                if require_team_workspace
+                else "personal_workspace_unavailable: 认证会话未提供个人工作区"
+            )
         wanted = str(workspace_name or "").strip().lower()
-        selected = select_team_workspace(workspaces, workspace_name) if require_team_workspace else None
+        selected = (
+            select_team_workspace(workspaces, workspace_name)
+            if require_team_workspace
+            else select_personal_workspace(workspaces, workspace_name)
+        )
         if wanted and selected is None:
             for item in workspaces:
                 label = str(
@@ -954,12 +1158,13 @@ class PlatformRegistrar:
                     f"未找到工作区「{workspace_name}」，可用工作区: {available[:200]}"
                 )
         if selected is None:
-            selected = workspaces[0]
+            selected = select_personal_workspace(workspaces, workspace_name)
         workspace_id = str(selected.get("id"))
         label = str(
             selected.get("name") or selected.get("title") or selected.get("label") or workspace_id
         )
-        step(index, f"检测到工作区选择页(Team)，选择工作区: {label}", "yellow")
+        mode_label = "Team" if require_team_workspace else "个人"
+        step(index, f"检测到工作区选择页({mode_label})，选择工作区: {label}", "yellow")
         url = f"{auth_base}/api/accounts/workspace/select"
         data = self._post_auth_json(
             url,
@@ -2093,6 +2298,94 @@ class PlatformRegistrar:
             raise RuntimeError(f"passwordless token 换取失败: {detail}")
         return tokens
 
+    def _wait_registration_otp_rounds(self, mailbox: dict, index: int) -> str | None:
+        """Wait for the registration OTP in two 90-second rounds, resending every 45s.
+
+        与登录侧 _wait_login_otp_rounds 同一策略:
+        45s -> resend -> 45s (第1轮) -> resend -> 45s -> resend -> 45s (第2轮),
+        共 180 秒,每 45 秒一次重发,避免邮件迟投时整个窗口无中途重发。
+        """
+        rounds = 2
+        segments_per_round = 2
+        segment_timeout = 45.0
+        total_segments = rounds * segments_per_round
+        for segment_no in range(1, total_segments + 1):
+            round_no = (segment_no - 1) // segments_per_round + 1
+            if (segment_no - 1) % segments_per_round == 0:
+                step(
+                    index,
+                    f"开始等待注册验证码（{round_no}/{rounds} 轮，"
+                    f"每轮 {int(segment_timeout * segments_per_round)}s，45s 一次重发）",
+                )
+            code = wait_for_code(
+                mailbox,
+                register_proxy=self.proxy,
+                wait_timeout=segment_timeout,
+            )
+            if code:
+                return code
+            if segment_no < total_segments:
+                step(
+                    index,
+                    f"第 {segment_no} 段（{int(segment_no * segment_timeout)}s）未收到验证码，重发注册验证码",
+                    "yellow",
+                )
+                try:
+                    self._resend_email_otp(index)
+                except RuntimeError as otp_error:
+                    if "invalid_state" not in str(otp_error).lower():
+                        raise
+                    step(index, "验证码已自动发送，无需重复请求", "yellow")
+                mark_mailbox_code_boundary(mailbox, grace_seconds=0)
+        return None
+
+    def _wait_login_otp_rounds(self, mailbox: dict, index: int) -> str | None:
+        """Wait for the login OTP in two 90-second rounds, resending every 45s.
+
+        Timeline: wait 45s -> resend -> wait 45s (round 1 done) -> resend
+        -> wait 45s -> resend -> wait 45s (round 2 done) -> give up.  That is
+        180 seconds total with a fresh code request every 45 seconds.  A
+        resend that answers 409 invalid_state means the code was already
+        (re)sent, so it is tolerated.  Returning None means all rounds
+        expired.
+        """
+        rounds = 2
+        segments_per_round = 2
+        segment_timeout = 45.0
+        total_segments = rounds * segments_per_round
+        for segment_no in range(1, total_segments + 1):
+            round_no = (segment_no - 1) // segments_per_round + 1
+            if (segment_no - 1) % segments_per_round == 0:
+                step(
+                    index,
+                    f"开始等待 passwordless 登录验证码（{round_no}/{rounds} 轮，"
+                    f"每轮 {int(segment_timeout * segments_per_round)}s，45s 一次重发）",
+                )
+            code = wait_for_code(
+                mailbox,
+                register_proxy=self.proxy,
+                wait_timeout=segment_timeout,
+            )
+            if code:
+                return code
+            if segment_no < total_segments:
+                # No code after this 45s segment: request a fresh one.
+                step(
+                    index,
+                    f"第 {segment_no} 段（{int(segment_no * segment_timeout)}s）未收到验证码，重发登录验证码",
+                    "yellow",
+                )
+                try:
+                    self._send_passwordless_otp(index)
+                except RuntimeError as otp_error:
+                    if "invalid_state" not in str(otp_error).lower():
+                        raise
+                    # The auth transaction already advanced; keep polling —
+                    # a resend racing the auto-send shows up as 409.
+                    step(index, "验证码已自动发送，无需重复请求", "yellow")
+                mark_mailbox_code_boundary(mailbox, grace_seconds=0)
+        return None
+
     def _passwordless_login(self, email: str, mailbox: dict, index: int) -> dict:
         provider = str(mailbox.get("provider") or "").strip().lower()
         if normalize_provider_type(provider) not in CANONICAL_PROVIDER_TYPES:
@@ -2118,10 +2411,9 @@ class PlatformRegistrar:
                 if attempt == 0 and "invalid_state" in str(error).lower():
                     continue
                 raise
-            step(index, "开始等待 passwordless 登录验证码")
-            code = wait_for_code(mailbox, register_proxy=self.proxy)
+            code = self._wait_login_otp_rounds(mailbox, index)
             if not code:
-                raise RuntimeError("等待 passwordless 登录验证码超时")
+                raise RuntimeError("等待 passwordless 登录验证码超时（两轮共180秒）")
             step(index, "收到 passwordless 登录验证码")
             try:
                 tokens = self._complete_passwordless_login(code, index)
@@ -2277,6 +2569,8 @@ class PlatformRegistrar:
         if not str(password or "").strip():
             raise RuntimeError("set_password_failed: generated password is empty")
         result = self._register_user(email, password, index)
+        if not isinstance(result, dict) or not result:
+            raise RuntimeError("registration_identity_response_unconfirmed")
         error_data = result.get("error")
         if error_data:
             code_value = (
@@ -2285,6 +2579,11 @@ class PlatformRegistrar:
                 else str(error_data)
             )
             raise RuntimeError(f"set_password_failed: {code_value or error_data}")
+        url, page_type = _auth_step_details(result)
+        if registration_auth_state(url, page_type, auth_response=result) == "existing":
+            raise RegisteredEmailDetected("registration_response_existing_identity", email=email)
+        if not registration_creation_confirmed(result):
+            raise RuntimeError("registration_identity_response_unconfirmed")
         return result
 
     def _start_password_add_authorize(self, email: str, index: int) -> str:
@@ -2546,7 +2845,7 @@ class PlatformRegistrar:
                 except RuntimeError as error:
                     if authorize_attempt >= 1:
                         raise
-                    if is_rate_limit_error(error):
+                    if is_auth_identity_error(error) or is_rate_limit_error(error):
                         raise
                     reset_transaction_identity()
                     mark_mailbox_code_boundary(
@@ -2663,6 +2962,8 @@ class PlatformRegistrar:
                 )
                 break
             except RuntimeError as error:
+                if is_auth_identity_error(error):
+                    raise
                 if is_rate_limit_error(error):
                     step(index, "认证服务限流，已停止本轮补密码操作", "yellow")
                     raise
@@ -2788,13 +3089,13 @@ class PlatformRegistrar:
     def _send_otp(self, index: int) -> None:
         step(index, "开始发送验证码")
         url = f"{auth_base}/api/accounts/email-otp/send"
-        headers = _headers_with_clearance(self._navigate_headers(f"{auth_base}/create-account/password"), url, self.proxy, self.clearance_user_agent)
+        headers = _headers_with_clearance(self._navigate_headers(f"{auth_base}/create-account/password", url), url, self.proxy, self.clearance_user_agent)
         resp, error = request_with_local_retry(self.session, "get", url, headers=headers, allow_redirects=True, verify=_tls_verify())
         if _is_cloudflare_challenge(resp):
             bundle = self._refresh_cloudflare_clearance(url, index)
             if bundle is None:
                 raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
-            headers = _headers_with_clearance(self._navigate_headers(f"{auth_base}/create-account/password"), url, self.proxy, self.clearance_user_agent)
+            headers = _headers_with_clearance(self._navigate_headers(f"{auth_base}/create-account/password", url), url, self.proxy, self.clearance_user_agent)
             resp, error = request_with_local_retry(self.session, "get", url, headers=headers, allow_redirects=True, verify=_tls_verify())
             if _is_cloudflare_challenge(resp):
                 raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 重试仍被拦截"))
@@ -2827,6 +3128,46 @@ class PlatformRegistrar:
             raise RuntimeError(error or f"validate_otp_http_{getattr(resp, 'status_code', 'unknown')}_body={body}")
         step(index, "验证码校验完成")
         return _response_json(resp)
+
+    def _resend_email_otp(self, index: int) -> bool:
+        """POST email-otp/resend 刷新 challenge（重置 check 尝试计数）。
+
+        OpenAI 对同一 challenge 的 validate 次数有上限（max_check_attempts）。
+        错码后只等新邮件而不刷新 challenge，后续提交会继续叠加在旧计数上，
+        直至 "Too many tries"。resend 失败不影响主流程（退化为原有的等待
+        新码行为）。
+        """
+        url = f"{auth_base}/api/accounts/email-otp/resend"
+        headers = self._json_headers(f"{auth_base}/email-verification")
+        try:
+            fp = _browser_fingerprint(self.fingerprint)
+            sentinel_token, so_token, _oai_sc = build_sentinel_with_so_token(
+                self.session,
+                self.device_id,
+                "email_otp_resend",
+                user_agent=fp["user_agent"],
+                sec_ch_ua=fp["sec_ch_ua"],
+                diagnostic=lambda message: self._diagnostic(index, message),
+                sid=str(fp.get("sentinel_sid") or ""),
+                device_profile=fp,
+            )
+            headers["openai-sentinel-token"] = sentinel_token
+            if so_token:
+                headers["openai-sentinel-so-token"] = so_token
+            _set_oai_sc_cookie(self.session, _oai_sc)
+        except Exception as error:
+            self._diagnostic(index, f"resend sentinel 准备失败: {str(error)[:160]}")
+        headers = _headers_with_clearance(headers, url, self.proxy, self.clearance_user_agent)
+        try:
+            resp, _error = request_with_local_retry(
+                self.session, "post", url, json={}, headers=headers, verify=_tls_verify()
+            )
+        except Exception as error:
+            self._diagnostic(index, f"email-otp/resend 异常: {str(error)[:160]}")
+            return False
+        status = int(getattr(resp, "status_code", 0) or 0)
+        self._diagnostic(index, f"email-otp/resend http={status or 'unknown'}")
+        return 200 <= status < 300
 
     def _create_account(
         self,
@@ -3022,42 +3363,118 @@ class PlatformRegistrar:
         initial_state: dict[str, Any],
         index: int,
     ) -> None:
-        """Stop purchased existing identities before password, OTP or login actions."""
+        """Only a confirmed signup step may proceed for a fresh candidate."""
         if not requires_fresh_registration(mailbox):
             return
+        initial_diagnostic = getattr(self, "_initial_auth_diagnostic", None)
+        self._last_authorize_continue_diagnostic = (
+            dict(initial_diagnostic) if isinstance(initial_diagnostic, dict) else {}
+        )
+
+        def stop_unknown(data: dict[str, Any], url: str, page_type: str) -> None:
+            diagnostic = dict(self._last_authorize_continue_diagnostic)
+            diagnostic.update(auth_route_diagnostic(url, page_type, auth_response=data))
+            has_auth_fields = (
+                diagnostic.get("page_type") not in (None, "missing")
+                or diagnostic.get("email_verification_mode") not in (None, "missing")
+                or bool(diagnostic.get("login_methods"))
+            )
+            # This is diagnostic only: an empty parsed wrapper is not usable
+            # authentication evidence, even though its Python shape is valid.
+            diagnostic["auth_response_valid"] = bool(
+                diagnostic.get("auth_response_valid")
+                and diagnostic.get("auth_payload_parsed", True)
+                and has_auth_fields
+                and not diagnostic.get("initial_auth_state_rejected")
+            )
+            diagnostic["auth_state_confirmed"] = False
+            self._diagnostic(
+                index, "注册分支未确认，已停止: "
+                + json.dumps(diagnostic, ensure_ascii=False, sort_keys=True),
+            )
+            if is_auth_identity_error(data):
+                mailbox["_registration_identity_error"] = "username_not_found"
+                raise RuntimeError("registration_auth_identity_unconfirmed: username_not_found")
+            mailbox["_registration_guard_error"] = "registration_password_route_unavailable"
+            # Diagnostic values are fixed labels; arbitrary upstream messages
+            # must not become retry or already-registered control markers.
+            context = {key: value for key, value in diagnostic.items() if not key.startswith("api_error")}
+            raise RuntimeError(
+                "registration_password_route_unavailable: "
+                + json.dumps(context, ensure_ascii=False, sort_keys=True)
+            )
+
         state_data = initial_state if isinstance(initial_state, dict) else {}
         if is_duplicate_registration_error(state_data):
             reject_registered_mailbox(mailbox, "duplicate_identity_response")
         continue_url, page_type = _auth_step_details(state_data)
         route_url = str(continue_url or state_data.get("final_url") or "")
-        state = registration_auth_state(route_url, page_type)
+        if self._last_authorize_continue_diagnostic.get("initial_auth_state_rejected"):
+            stop_unknown(state_data, route_url, page_type)
+        state = registration_auth_state(route_url, page_type, auth_response=state_data)
         if state == "existing":
-            reject_registered_mailbox(mailbox, "existing_password_login_route")
+            reject_registered_mailbox(mailbox, "existing_identity_auth_step")
         if state != "signup":
-            # Some NextAuth responses stop at the email identifier step. With
-            # the password connection selected, this only routes the identity;
-            # it does not verify a password or request passwordless OTP.
-            self._last_authorize_continue_diagnostic = {}
-            state_data = self._authorize_continue_login(
-                email, index, passwordless=False, restart_invalid_state=False,
+            evidence = auth_route_diagnostic(route_url, page_type, auth_response=state_data)
+            # OpenAI 新流程: 新邮箱的初始认证可能直接进入邮箱验证路由(不再先返回
+            # 注册密码页)。与 iCloud 渠道一致放行, 由 user/register 的 duplicate
+            # 错误码识别回收邮箱(passwordless_login 等已注册信号在上方拦截)。
+            parsed_ok = (
+                bool(self._last_authorize_continue_diagnostic.get("auth_payload_parsed", True))
+                and not self._last_authorize_continue_diagnostic.get("initial_auth_state_rejected")
             )
-            if is_duplicate_registration_error(state_data):
-                reject_registered_mailbox(mailbox, "duplicate_identity_response")
-            continue_url, page_type = _auth_step_details(state_data)
-            state = registration_auth_state(continue_url, page_type)
-            if state == "existing":
-                reject_registered_mailbox(mailbox, "existing_password_login_route")
-            if state != "signup":
-                diagnostic = dict(self._last_authorize_continue_diagnostic)
-                diagnostic.update(auth_route_diagnostic(continue_url, page_type))
-                self._diagnostic(index, "注册分支未确认: " + json.dumps(diagnostic, ensure_ascii=False, sort_keys=True))
-                # Error-code strings are also consumed by retry policies. Keep
-                # the upstream code in diagnostics only, preserving decisions.
-                error_context = {key: value for key, value in diagnostic.items() if not key.startswith('api_error')}
-                raise RuntimeError("registration_password_route_unavailable: " + json.dumps(error_context, ensure_ascii=False, sort_keys=True))
-            if continue_url:
-                self._navigate_auth_step(continue_url, f"{auth_base}/log-in", index)
-        step(index, "邮箱检测为新账号，继续设置密码并注册")
+            otp_route_for_signup = (
+                str(evidence.get("route") or "")
+                in {"/email-verification", "/verify-email", "/email-otp"}
+                and parsed_ok
+                and str(evidence.get("email_verification_mode") or "missing")
+                in {"missing", "passwordless_signup"}
+                and not evidence.get("login_methods")
+            )
+            # Only the initial identifier page needs one email submission.
+            # Malformed responses and conflicting modes are terminal.
+            needs_identifier = (
+                evidence["route"] in {"/log-in", "/login", "/signup", "/sign-up", "/create-account"}
+                and evidence["page_type"] in {"missing", "login", "signup"}
+                and evidence["auth_response_valid"]
+                and evidence["email_verification_mode"] == "missing"
+                and not evidence["login_methods"]
+                and not state_data.get("error")
+            )
+            if otp_route_for_signup:
+                step(
+                    index,
+                    "初始认证指向邮箱验证路由，按 iCloud 同款流程继续提交注册密码",
+                    "yellow",
+                )
+            elif not needs_identifier:
+                stop_unknown(state_data, route_url, page_type)
+            if not otp_route_for_signup:
+                state_data = self._authorize_continue_login(
+                    email, index, passwordless=False, restart_invalid_state=False,
+                )
+                if is_duplicate_registration_error(state_data):
+                    reject_registered_mailbox(mailbox, "duplicate_identity_response")
+                continue_url, page_type = _auth_step_details(state_data)
+                state = registration_auth_state(continue_url, page_type, auth_response=state_data)
+                if state == "existing":
+                    reject_registered_mailbox(mailbox, "existing_identity_auth_step")
+                if state != "signup":
+                    stop_unknown(state_data, continue_url, page_type)
+                if continue_url:
+                    self._navigate_auth_step(continue_url, f"{auth_base}/log-in", index)
+        step(index, "认证响应指向注册密码步骤，继续当前注册任务")
+
+    def _register_passwordless_existing_account(
+        self,
+        email: str,
+        mailbox: dict[str, Any],
+        index: int,
+        *,
+        partial_sink: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict:
+        """Legacy entry point: registration never converts an existing identity."""
+        reject_registered_mailbox(mailbox, "existing_identity_conversion_disabled")
 
     def register(
         self,
@@ -3189,7 +3606,7 @@ class PlatformRegistrar:
             max_otp_attempts = 3
             for otp_attempt in range(max_otp_attempts):
                 step(index, f"开始等待注册验证码 ({otp_attempt + 1}/{max_otp_attempts})")
-                code = wait_for_code(mailbox, register_proxy=self.proxy)
+                code = self._wait_registration_otp_rounds(mailbox, index)
                 if not code:
                     ensure_running()
                     raise RuntimeError(
@@ -3206,9 +3623,15 @@ class PlatformRegistrar:
                     break
                 except RuntimeError as error:
                     if _is_wrong_email_otp_error(error) and otp_attempt + 1 < max_otp_attempts:
+                        # 错码已消耗 challenge 的 check 次数；只等新码而不刷新
+                        # challenge 会让后续提交叠加在旧计数上直至
+                        # max_check_attempts。显式 resend 刷新 challenge（重置
+                        # 计数），并把 code boundary 推进到 resend 时刻作废旧邮件。
+                        self._resend_email_otp(index)
+                        mark_mailbox_code_boundary(mailbox, grace_seconds=0)
                         step(
                             index,
-                            "注册验证码被服务端判定错误，已排除本次候选并继续等待新码",
+                            "注册验证码被服务端判定错误，已重发验证码并重置校验计数，等待新码",
                             "yellow",
                         )
                         ensure_running()
@@ -3352,7 +3775,10 @@ class PlatformRegistrar:
                     persist_security_pending(tokens)
 
                 security = self._enroll_totp(
-                    tokens, index, **({"credential_sink": persist_mfa_progress} if callable(partial_sink) else {}),
+                    tokens, index,
+                    # 复用邮箱可能带旧 2FA:已开则先关再设新,确保 TOTP 密钥是本批次生成的
+                    replace_existing=True,
+                    **({"credential_sink": persist_mfa_progress} if callable(partial_sink) else {}),
                 )
                 mfa_result.update(security)
             else:

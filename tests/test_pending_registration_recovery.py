@@ -68,6 +68,25 @@ def run(recovery, **overrides):
     return ops.recover_pending_registration_one(1, **options)
 
 
+def test_recycled_passwordless_identity_is_skipped_as_already_registered(recovery):
+    """恢复时密码路由不存在 => 回收邮箱身份按已注册跳过，不挂起失败。"""
+    from register.pending_recovery import recover_registration
+    from register.registration_outcome import RegisteredEmailDetected
+
+    recovery.mailbox["_otp_accepted_by_server"] = True
+    recovery.registrar.login_pending_with_password.side_effect = RuntimeError(
+        "pending_recovery_password_route_unavailable"
+    )
+    with pytest.raises(RegisteredEmailDetected):
+        recover_registration(
+            1,
+            account=recovery.account,
+            mailbox=recovery.mailbox,
+            mail_config={},
+        )
+    assert recovery.mailbox["_registration_outcome"] == "already_registered"
+
+
 def test_historical_pending_without_password_set_restores_tokens_before_mfa(recovery):
     snapshots = []
     effects = Mock()
@@ -178,6 +197,37 @@ def test_transient_login_retry_preserves_password_and_never_registers(recovery, 
     assert recovery.registrar.close.call_count == 2
     recovery.registrar.register.assert_not_called()
     recovery.registrar.change_password.assert_not_called()
+
+
+@pytest.mark.parametrize("suffix", ["invalid_state", "http_503", "invalid_state; curl: (35) connection reset"])
+def test_missing_identity_overrides_session_and_transport_retries(recovery, monkeypatch, suffix):
+    recovery.account.update(totp_secret=SECRET, mfa_enabled=True, refresh_token="saved-refresh-fixture")
+    original = dict(recovery.account)
+    saved = dict(original)
+    error = RuntimeError(f"username_not_found: {suffix}; password={PASSWORD}")
+    recovery.registrar.login_pending_with_password.side_effect = error
+    sleep = Mock()
+    monkeypatch.setattr(ops.time, "sleep", sleep)
+
+    with pytest.raises(RuntimeError, match="username_not_found") as caught:
+        run(recovery, proxy="http://fixture-proxy.example.test:8080", max_attempts=2, partial_sink=saved.update)
+
+    recovery.factory.assert_called_once_with("http://fixture-proxy.example.test:8080")
+    recovery.registrar.login_pending_with_password.assert_called_once_with(
+        EMAIL, PASSWORD, 1, mailbox=recovery.mailbox, totp_secret=SECRET,
+    )
+    recovery.registrar.close.assert_called_once()
+    recovery.prepare.assert_called_once_with(recovery.mailbox)
+    sleep.assert_not_called()
+    assert caught.value.__cause__ is error
+    assert recovery.account == original
+    assert saved["registration_state"] == "security_pending"
+    assert "username_not_found" in saved["last_security_error"]
+    assert PASSWORD not in str(caught.value) and PASSWORD not in saved["last_security_error"]
+    for field in ("password", "totp_secret", "mfa_enabled", "refresh_token"):
+        assert saved[field] == original[field]
+    for name in ("register", "change_password", "_send_password_reset_otp", "_enroll_totp", "_chatgpt_mfa_request"):
+        getattr(recovery.registrar, name).assert_not_called()
 
 
 def test_stop_before_recovery_performs_no_authentication(recovery):

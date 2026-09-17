@@ -250,7 +250,6 @@ def account_deactivation_reason(record: Any) -> str:
         "reauth_blocked_reason",
         "health_error",
         "last_reauth_error",
-        "trial_eligibility_error",
         "error",
         "message",
         "code",
@@ -1808,7 +1807,8 @@ def account_public_view(record: dict[str, Any]) -> dict[str, Any]:
     browser_type = _s(record.get("browser_type")).lower()
     health_status = normalized_health_status(record)
     health_error = _s(record.get("health_error")).lower()
-    registration_state = _s(record.get("registration_state") or "complete").lower()
+    stored_registration_state = _s(record.get("registration_state")).lower()
+    registration_state = stored_registration_state or "security_pending"
     is_deactivated = account_is_deactivated(record) or _s(record.get("status")) == "已封号"
     reauth_available = (
         bool(_norm_email(record.get("email")))
@@ -1846,6 +1846,19 @@ def account_public_view(record: dict[str, Any]) -> dict[str, Any]:
         or _s(session.get("accessToken"))
         or _s(session.get("access_token"))
     )
+    # A missing/optimistic state must not make a partial record look complete.
+    # A TOTP seed is only a local secret; the server must have confirmed MFA.
+    credential_set_complete = bool(
+        has_access_token
+        and _s(record.get("account_id"))
+        and password_confirmed
+        and totp_secret
+        and record.get("mfa_enabled") is True
+    )
+    if not credential_set_complete:
+        registration_state = "security_pending"
+    elif not stored_registration_state:
+        registration_state = "complete"
     trial_status = _s(record.get("trial_eligibility_status"))
     trial_campaign = _s(record.get("trial_eligibility_campaign_id"))
     # Older rows stored every non-free-trial campaign as ``ineligible``.
@@ -1862,7 +1875,8 @@ def account_public_view(record: dict[str, Any]) -> dict[str, Any]:
         "has_password": bool(password),
         "password_confirmed": password_confirmed,
         "password_masked": _mask_account_secret(password),
-        "mfa_enabled": bool(record.get("mfa_enabled")) or bool(totp_secret),
+        "mfa_enabled": record.get("mfa_enabled") is True,
+        "mfa_confirmed": record.get("mfa_enabled") is True,
         "has_totp": bool(totp_secret),
         "totp_secret_masked": _mask_account_secret(totp_secret),
         "mfa_factor_type": _s(record.get("mfa_factor_type")),

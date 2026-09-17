@@ -1,4 +1,4 @@
-"""Mailbox domain: mail stats, mailbox pool and mail routes."""
+﻿"""Mailbox domain: mail stats, mailbox pool and mail routes."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import time
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from typing import Any
+from mail import OnlineDisposableMailError
 from web.routes.auth import MailMessagesRequest
 from register.mail_channel_options import option_enabled
 
@@ -45,6 +46,8 @@ class MailboxesUpdate(BaseModel):
     api_token: str | None = None
     admin_key: str | None = None
     service: str | None = None
+    service_id: str | None = None
+    email_type_id: str | None = None
     max_price: str | float | None = None
     accounts: str | None = None
     default_domain: str | None = None
@@ -227,6 +230,60 @@ def _mail_stats(cfg: dict[str, Any]) -> dict[str, Any]:
             }
             if inventory_error:
                 provider_details["inventory_error"] = inventory_error
+        elif ptype == "online_disposablemail":
+            try:
+                configured_capacity = max(0, min(1000, int(item.get("capacity") or 50)))
+            except (TypeError, ValueError):
+                configured_capacity = 50
+            summary: dict[str, Any] = {}
+            inventory_error = ""
+            available = configured_capacity
+            if bool(item.get("enable", True)):
+                conf = _state()._make_config(mail_cfg)
+                conf["request_timeout"] = min(
+                    float(conf.get("request_timeout") or 30), 6.0
+                )
+                conf["capacity"] = configured_capacity
+                odm_provider = _state().OnlineDisposableMailProvider(dict(item), conf)
+                try:
+                    summary = odm_provider.availability_summary()
+                    available = max(0, int(summary.get("capacity") or 0))
+                except Exception as exc:
+                    inventory_error = odm_provider._safe_detail(exc)[:200]
+                finally:
+                    odm_provider.close()
+            local_rows = [
+                {"email": email}
+                for email, entry in state.items()
+                if isinstance(entry, dict)
+                and _state().normalize_provider_type(str(entry.get("provider") or ""))
+                == "online_disposablemail"
+            ]
+            local_stats = _state()._pool_stats_for(local_rows, state)
+            stats = {
+                "total": available,
+                "available": available,
+                "used": local_stats["used"],
+                "failed": local_stats["failed"],
+                "in_use": local_stats["in_use"],
+                "token_invalid": local_stats["token_invalid"],
+                "cooldown": local_stats["cooldown"],
+            }
+            provider_details = {
+                "service_id": str(
+                    summary.get("service_id")
+                    or item.get("service_id")
+                    or _state().ONLINE_DISPOSABLEMAIL_DEFAULT_SERVICE_ID
+                ),
+                "email_type_id": str(
+                    summary.get("email_type_id")
+                    or item.get("email_type_id")
+                    or _state().ONLINE_DISPOSABLEMAIL_DEFAULT_EMAIL_TYPE_ID
+                ),
+                "balance": summary.get("balance"),
+            }
+            if inventory_error:
+                provider_details["inventory_error"] = inventory_error
         else:
             pool = _state().parse_outlook_credentials(lines)
             stats = _state()._pool_stats_for(pool, state)
@@ -241,7 +298,7 @@ def _mail_stats(cfg: dict[str, Any]) -> dict[str, Any]:
                     item.get("mode")
                     or (
                         "api"
-                        if ptype in {"icloud_api", "maddy_webui", "fastmail_api", "smsbower_mail"}
+                        if ptype in {"icloud_api", "maddy_webui", "fastmail_api", "smsbower_mail", "online_disposablemail"}
                         else "imap"
                     )
                 ),
@@ -367,7 +424,7 @@ def _mailbox_items(
                 if email not in known:
                     pool.append({"email": email})
                     known.add(email)
-        elif ptype in {"fastmail_api", "smsbower_mail"}:
+        elif ptype in {"fastmail_api", "smsbower_mail", "online_disposablemail"}:
             pool = _state().parse_domain_mailboxes(lines)
             # Dynamic providers own their remote pool; locally we index only
             # addresses acquired by this configured provider.
@@ -422,7 +479,7 @@ def _mailbox_items(
                     provider.get("mode")
                     or (
                         "api"
-                        if ptype in {"icloud_api", "maddy_webui", "fastmail_api", "smsbower_mail"}
+                        if ptype in {"icloud_api", "maddy_webui", "fastmail_api", "smsbower_mail", "online_disposablemail"}
                         else "imap"
                     )
                 ),
@@ -466,6 +523,21 @@ def _find_mailbox_credential(
                 return dict(provider, type=ptype), {
                     "email": target,
                     "mail_id": str(state_entry.get("mail_id") or ""),
+                }
+            continue
+        if ptype == "online_disposablemail":
+            state_entry = _state()._load_state_file().get(target)
+            if isinstance(state_entry, dict) and (
+                _state().normalize_provider_type(str(state_entry.get("provider") or ""))
+                == "online_disposablemail"
+            ):
+                return dict(provider, type=ptype), {
+                    "email": target,
+                    "order_id": str(
+                        state_entry.get("order_id")
+                        or state_entry.get("mail_id")
+                        or ""
+                    ),
                 }
             continue
         if ptype == "fastmail_api":
@@ -671,6 +743,30 @@ def _fetch_mailbox_messages_sync(
             "SMSBower 临时邮箱仅支持注册任务中的验证码轮询，不提供历史收件箱",
         )
 
+    if ptype == "online_disposablemail":
+        provider = _state().OnlineDisposableMailProvider(provider_entry, conf)
+        mailbox = {
+            "provider": "online_disposablemail",
+            "provider_ref": str(provider_entry.get("provider_ref") or "preview"),
+            "address": cred["email"],
+            "login_address": cred["email"],
+            "base_address": _state().base_mailbox_address(cred["email"]),
+            "label": str(provider_entry.get("label") or "Online DisposableMail"),
+            "api_base": str(provider_entry.get("api_base") or ""),
+            "order_id": str(cred.get("order_id") or ""),
+        }
+        try:
+            messages = provider.fetch_recent_messages(mailbox)[: body.limit]
+            return {
+                "ok": True,
+                "provider_type": ptype,
+                "email": cred["email"],
+                "mode": "api",
+                "items": [_state()._message_preview(m) for m in messages],
+            }
+        finally:
+            provider.close()
+
     provider = _state().ICloudApiProvider(provider_entry, conf)
     mailbox = {
         "provider": "icloud_api",
@@ -833,7 +929,7 @@ def _mailbox_provider_map(cfg: dict[str, Any]) -> dict[str, str]:
         ptype = _state().normalize_provider_type(str(provider.get("type") or ""))
         if ptype not in _state().CANONICAL_PROVIDER_TYPES:
             continue
-        if ptype in {"maddy_webui", "fastmail_api", "smsbower_mail"}:
+        if ptype in {"maddy_webui", "fastmail_api", "smsbower_mail", "online_disposablemail"}:
             parser = _state().parse_domain_mailboxes
         else:
             parser = _state().parse_icloud_credentials if ptype == "icloud_api" else _state().parse_outlook_credentials
@@ -846,7 +942,7 @@ def _mailbox_provider_map(cfg: dict[str, Any]) -> dict[str, str]:
         if not isinstance(entry, dict):
             continue
         ptype = _state().normalize_provider_type(str(entry.get("provider") or ""))
-        if ptype in {"fastmail_api", "smsbower_mail"}:
+        if ptype in {"fastmail_api", "smsbower_mail", "online_disposablemail"}:
             address = str(email or "").strip().lower()
             if address:
                 result.setdefault(address, ptype)
@@ -858,7 +954,7 @@ def _filter_mailbox_text(
 ) -> tuple[str, int]:
     kept: list[str] = []
     removed = 0
-    if ptype in {"maddy_webui", "fastmail_api", "smsbower_mail"}:
+    if ptype in {"maddy_webui", "fastmail_api", "smsbower_mail", "online_disposablemail"}:
         parser = _state().parse_domain_mailboxes
     else:
         parser = (
@@ -866,7 +962,7 @@ def _filter_mailbox_text(
         )
     valid = {item["email"].strip().lower() for item in parser(raw)}
     for line in str(raw or "").splitlines():
-        if ptype in {"maddy_webui", "fastmail_api", "smsbower_mail"}:
+        if ptype in {"maddy_webui", "fastmail_api", "smsbower_mail", "online_disposablemail"}:
             email = line.split("----", 1)[0].strip().lower()
         else:
             email = line.split("----", 1)[0].strip().lower() if "----" in line else ""
@@ -884,7 +980,7 @@ def _filter_mailbox_text(
 def _serialize_mailbox_credential(item: dict[str, str], ptype: str) -> str:
     if ptype == "icloud_api":
         return f"{item['email']}----{item['api_key']}"
-    if ptype in {"maddy_webui", "fastmail_api", "smsbower_mail"}:
+    if ptype in {"maddy_webui", "fastmail_api", "smsbower_mail", "online_disposablemail"}:
         remote_id = str(item.get("id") or "").strip()
         return f"{item['email']}----{remote_id}" if remote_id else item["email"]
     return "----".join(
@@ -900,7 +996,7 @@ def _serialize_mailbox_credential(item: dict[str, str], ptype: str) -> str:
 def _merge_mailbox_credentials(
     existing: str, incoming: str, ptype: str, *, append: bool = True
 ) -> tuple[str, dict[str, int]]:
-    if ptype in {"maddy_webui", "fastmail_api", "smsbower_mail"}:
+    if ptype in {"maddy_webui", "fastmail_api", "smsbower_mail", "online_disposablemail"}:
         parser = _state().parse_domain_mailboxes
     else:
         parser = (
@@ -953,6 +1049,7 @@ def _delete_mailboxes_from_config(
         "maddy_webui": set(),
         "fastmail_api": set(),
         "smsbower_mail": set(),
+        "online_disposablemail": set(),
     }
     for item in body.items or []:
         email = str(item.get("email") or "").strip().lower()
@@ -977,7 +1074,7 @@ def _delete_mailboxes_from_config(
         if want and ptype != want:
             continue
         raw = str(provider.get("mailboxes") or "")
-        if ptype in {"maddy_webui", "fastmail_api", "smsbower_mail"}:
+        if ptype in {"maddy_webui", "fastmail_api", "smsbower_mail", "online_disposablemail"}:
             pool = _state().parse_domain_mailboxes(raw)
             targets = selected.get(ptype, set())
             if body.delete_all:
@@ -1006,7 +1103,7 @@ def _delete_mailboxes_from_config(
                 local_removed = {email for email in targets if email in valid}
                 removed += len(local_removed - remote_removed)
                 removed_emails.update(local_removed)
-            if ptype in {"maddy_webui", "fastmail_api", "smsbower_mail"} and targets:
+            if ptype in {"maddy_webui", "fastmail_api", "smsbower_mail", "online_disposablemail"} and targets:
                 state = _state()._load_state_file()
                 state_targets = {
                     email
@@ -1149,6 +1246,63 @@ def _maddy_allowed_domains(entry: dict[str, Any] | None, values: Any) -> list[st
     return [domain for domain in _state()._normalize_domain_list(values) if domain not in blocked]
 
 
+def _odm_update_settings(saved: dict[str, Any], body: MailboxesUpdate) -> dict[str, Any]:
+    candidate = {"type": "online_disposablemail"}
+    for field in ("api_base", "service_id", "email_type_id", "capacity"):
+        value = getattr(body, field)
+        candidate[field] = value if value is not None else saved.get(field)
+    try:
+        _state()._sanitize_online_disposablemail_provider_entry(candidate)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return candidate
+
+
+def _odm_lookup_required(
+    saved: dict[str, Any], body: MailboxesUpdate, candidate: dict[str, Any]
+) -> bool:
+    was_enabled = option_enabled(saved.get("enable", True))
+    enabled = body.enable if body.enable is not None else was_enabled
+    if not enabled:
+        return False
+    if not saved or not was_enabled:
+        return True
+    try:
+        previous = _odm_update_settings(saved, MailboxesUpdate())
+    except HTTPException:
+        # A corrected selection must be verified even if the old config was invalid.
+        return True
+    return any(
+        candidate[field] != previous[field]
+        for field in ("api_base", "service_id", "email_type_id")
+    )
+
+
+def _odm_selection_stamp(entry: dict[str, Any]) -> tuple[str, ...]:
+    return tuple(str(entry.get(field)) for field in ("api_base", "service_id", "email_type_id", "enable"))
+
+
+def _odm_preflight_update(body: MailboxesUpdate) -> tuple[Any, ...] | None:
+    cfg = _state()._read_config()
+    saved = dict(_state()._find_provider(cfg, "online_disposablemail") or {})
+    candidate = _odm_update_settings(saved, body)
+    if not _odm_lookup_required(saved, body, candidate):
+        return None
+    stamp = (_odm_selection_stamp(saved), _odm_selection_stamp(candidate))
+    conf = _state()._make_config(cfg.get("mail") if isinstance(cfg.get("mail"), dict) else {})
+    conf["request_timeout"] = min(float(conf.get("request_timeout") or 30), 10.0)
+    provider = _state().OnlineDisposableMailProvider(dict(saved, **candidate), conf)
+    try:
+        provider.validate_selection()
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except OnlineDisposableMailError as exc:
+        raise HTTPException(503, f"OnlineDisposableMail 目录校验失败，配置未保存：{provider._safe_detail(exc)}") from exc
+    finally:
+        provider.close()
+    return stamp
+
+
 @router.put("/api/mailboxes")
 async def put_mailboxes(body: MailboxesUpdate):
     # Mailbox imports are additive configuration writes.  Registration and
@@ -1156,13 +1310,24 @@ async def put_mailboxes(body: MailboxesUpdate):
     # edit transaction serializes concurrent writers.  Do not block importing
     # new credentials just because an unrelated batch is active.
     def _do():
+        ptype = _state().normalize_provider_type(body.provider_type or "outlook_token")
+        # External directory lookups must not hold the shared config write lock.
+        odm_checked = _odm_preflight_update(body) if ptype == "online_disposablemail" else None
         with _state()._edit_config() as cfg:
-            ptype = _state().normalize_provider_type(body.provider_type or "outlook_token")
             if ptype not in _state().CANONICAL_PROVIDER_TYPES:
                 raise HTTPException(400, f"unsupported provider_type: {body.provider_type}")
+            if ptype == "online_disposablemail":
+                saved = _state()._find_provider(cfg, ptype) or {}
+                candidate = _odm_update_settings(saved, body)
+                if odm_checked is not None or _odm_lookup_required(saved, body, candidate):
+                    if odm_checked != (
+                        _odm_selection_stamp(saved), _odm_selection_stamp(candidate)
+                    ):
+                        raise HTTPException(409, "OnlineDisposableMail 配置在校验期间已变化，请刷新后重试")
             prov = _state()._ensure_provider(cfg, ptype)
             prov["type"] = ptype
             smsbower_settings: dict[str, Any] | None = None
+            odm_settings: dict[str, Any] | None = None
             if ptype == "smsbower_mail":
                 if body.domains is not None and not body.domains:
                     raise HTTPException(
@@ -1204,6 +1369,11 @@ async def put_mailboxes(body: MailboxesUpdate):
                     key: candidate[key]
                     for key in ("mode", "api_base", "service", "domains", "max_price", "register_child")
                 }
+            elif ptype == "online_disposablemail":
+                odm_settings = {
+                    key: candidate[key]
+                    for key in ("mode", "api_base", "service_id", "email_type_id", "capacity")
+                }
             merged_text, import_stats = _merge_mailbox_credentials(
                 str(prov.get("mailboxes") or ""),
                 body.mailboxes,
@@ -1223,6 +1393,8 @@ async def put_mailboxes(body: MailboxesUpdate):
                     if ptype == "icloud_api"
                     else "SMSBower 邮箱配置"
                     if ptype == "smsbower_mail"
+                    else "OnlineDisposableMail 配置"
+                    if ptype == "online_disposablemail"
                     else "Maddy WebUI 配置"
                     if ptype == "maddy_webui"
                     else "Fastmail 配置"
@@ -1251,6 +1423,13 @@ async def put_mailboxes(body: MailboxesUpdate):
                 if api_key:
                     prov["api_key"] = api_key
                     prov.pop("key", None)
+            elif ptype == "online_disposablemail":
+                prov.update(odm_settings or {})
+                api_key = _maddy_secret_input(body.api_key)
+                if api_key:
+                    prov["api_key"] = api_key
+                    prov.pop("key", None)
+                    prov.pop("apiKey", None)
             elif ptype == "maddy_webui":
                 prov["mode"] = "api"
                 if body.api_base is not None:
@@ -1375,6 +1554,73 @@ def _maddy_webui_domains_payload(cfg: dict[str, Any], body: MaddyWebuiDomainsReq
 async def maddy_webui_domains(body: MaddyWebuiDomainsRequest):
     def _do():
         return _state()._maddy_webui_domains_payload(_state()._read_config(), body)
+
+    return await asyncio.to_thread(_do)
+
+
+class OnlineDisposableMailInfoRequest(BaseModel):
+    api_base: str | None = None
+    api_key: str | None = None
+    service_id: str | int | None = None
+
+
+@router.post("/api/online-disposablemail/services")
+async def online_disposablemail_services(body: OnlineDisposableMailInfoRequest):
+    """List purchasable services and mailbox types for the settings form."""
+
+    def _do():
+        cfg = _state()._read_config()
+        saved = _state()._find_provider(cfg, "online_disposablemail") or {}
+        entry = dict(saved, type="online_disposablemail")
+        if body.api_base is not None:
+            entry["api_base"] = (body.api_base or "").strip()
+        if body.service_id is not None:
+            entry["service_id"] = body.service_id
+        api_key = _maddy_secret_input(body.api_key)
+        if api_key:
+            entry["api_key"] = api_key
+        conf = _state()._make_config(
+            cfg.get("mail") if isinstance(cfg.get("mail"), dict) else {}
+        )
+        conf["request_timeout"] = min(float(conf.get("request_timeout") or 30), 10.0)
+        try:
+            provider = _state().OnlineDisposableMailProvider(entry, conf)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        try:
+            services = provider.get_services()
+            types = provider.get_types(force=True)
+        except OnlineDisposableMailError as exc:
+            raise HTTPException(503, f"OnlineDisposableMail 目录查询失败：{provider._safe_detail(exc)}") from exc
+        finally:
+            provider.close()
+        return {
+            "ok": True,
+            "services": [
+                {
+                    "service_id": item["id"],
+                    "name": item["name"],
+                    "items": [
+                        {
+                            "service_item_id": str(sub.get("serviceItemId") or ""),
+                            "name": str(sub.get("serviceItemName") or ""),
+                        }
+                        for sub in item.get("items") or []
+                        if isinstance(sub, dict)
+                    ],
+                }
+                for item in services
+            ],
+            "types": [
+                {
+                    "email_type_id": str(item.get("id") or ""),
+                    "name": str(item.get("name") or ""),
+                    "available_num": item.get("availableNum"),
+                    "price": item.get("price"),
+                }
+                for item in types
+            ],
+        }
 
     return await asyncio.to_thread(_do)
 

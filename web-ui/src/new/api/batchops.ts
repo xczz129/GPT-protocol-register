@@ -169,6 +169,7 @@ export interface ReauthProgress {
   success: number;
   failed: number;
   cancelled?: number;
+  skipped?: number;
   last?: string;
   lastStatus?: string;
   lastMessage?: string;

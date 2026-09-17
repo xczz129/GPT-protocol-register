@@ -42,7 +42,7 @@ const config = computed(() => {
     case "reauth":
       return {
         title: "重新登录",
-        message: `将 ${n} 个账号使用已保存的密码和 TOTP 2FA 重新登录（协议登录，不读取邮箱验证码）。`,
+        message: `将 ${n} 个账号使用已保存的密码和 TOTP 2FA 重新登录（协议登录，不读取邮箱验证码）。已封号账号会自动跳过，继续处理其他账号。`,
         defaultConcurrency: 3,
       };
     case "security_repair":
@@ -73,7 +73,7 @@ const config = computed(() => {
       };
     case "trial":
       return {
-        title: "Plus 试用检测",
+        title: "检测 Plus 试用资格",
         message: props.all
           ? "检测全部账号的 Plus 免费试用资格。"
           : `检测 ${n} 个账号的 Plus 免费试用资格。`,
@@ -192,7 +192,7 @@ async function submit() {
     <template #footer>
       <AppButton variant="ghost" @click="emit('close')">取消</AppButton>
       <AppButton variant="primary" :disabled="Boolean(passwordInvalid) || settingsLoading" :loading="submitting" @click="submit">
-        启动任务
+        {{ kind === "trial" ? "开始检测试用资格" : "启动任务" }}
       </AppButton>
     </template>
   </AppModal>

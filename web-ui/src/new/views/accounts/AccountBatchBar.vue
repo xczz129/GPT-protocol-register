@@ -137,7 +137,7 @@ function openStart(kind: BatchKind) {
       <span class="batch-count">已选 <b>{{ count }}</b> 个账号</span>
 
       <div class="batch-actions">
-        <AppButton variant="primary" size="sm" :disabled="busy || accounts.health.running" @click="healthSelected">
+        <AppButton variant="primary" size="sm" :disabled="busy || accounts.health.running" title="检查选中账号是否可用" @click="healthSelected">
           <Activity :size="14" /><span>测活</span>
         </AppButton>
         <AppButton variant="ghost" size="sm" :disabled="busy || batch.codex.running || batch.codexStartBusy" title="设置选中账号的接码参数并预检" aria-label="设置选中账号的接码任务" @click="codexSelected">
@@ -162,7 +162,7 @@ function openStart(kind: BatchKind) {
           <Zap :size="14" /><span>刷新AT</span>
         </AppButton>
         <AppButton variant="ghost" size="sm" :disabled="busy || batch.trial.running" title="检测选中账号的 Plus 免费试用资格" @click="openStart('trial')">
-          <Sparkles :size="14" /><span>试用检测</span>
+          <Sparkles :size="14" /><span>试用资格</span>
         </AppButton>
         <AppButton variant="ghost" size="sm" :disabled="busy || batch.reauth.running" title="使用已保存的密码和 2FA 重新登录" @click="openStart('reauth')">
           <LogIn :size="14" /><span>重新登录</span>

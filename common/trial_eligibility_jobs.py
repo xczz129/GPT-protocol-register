@@ -241,9 +241,6 @@ class TrialEligibilityJobs:
                         "trial_eligibility_method": "accounts_check_v4",
                         "trial_eligibility_proxy_mode": route_mode,
                         "trial_eligibility_error": str(error)[:500],
-                        "health_status": "invalid",
-                        "health_error": str(error)[:500],
-                        "last_invalid_at": _now(),
                     }
                     update_account_record_fields(
                         {account_delete_key(record): fields}, include_records=False

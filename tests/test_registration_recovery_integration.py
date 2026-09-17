@@ -102,7 +102,7 @@ def integration(monkeypatch, tmp_path):
         settings = {
             "mail": {"providers": [{"type": "smsbower_mail", "enable": True, "register_child": child}]},
             "registration": {"engine": engine, "total": 2, "threads": 2,
-                             "max_transient_retries": 0, "browser_protocol_security_after_register": True},
+                             "max_transient_retries": 0, "browser_protocol_security_after_register": True, "post_register_health_check": False},
             "proxy": {"enabled": False},
         }
         callback = protocol.run_protocol_register if engine == "protocol" else browser.run_register

@@ -66,6 +66,25 @@ _PROXY_CONFIG: contextvars.ContextVar[dict[str, Any] | None] = contextvars.Conte
 )
 
 
+def _effective_proxy_config(scoped: dict[str, Any] | None) -> dict[str, Any]:
+    """把 ContextVar 中的 proxy 配置解析成可用于清障的 dict。
+
+    ContextVar 在部分异步/恢复路径中会丢失；模块级 config["proxy_config"] 是
+    永远为空的占位符，直接回退会误判「FlareSolverr 清障未启用」而无法过 CF。
+    因此回退改为读取当前应用配置的 proxy 段。
+    """
+    if isinstance(scoped, dict) and scoped:
+        return scoped
+    try:
+        from config_loader import load_config
+
+        app_cfg = load_config() or {}
+        proxy = app_cfg.get("proxy")
+        return proxy if isinstance(proxy, dict) else {}
+    except Exception:
+        return {}
+
+
 _REGISTRATION_TRACE: contextvars.ContextVar[RegistrationTrace | None] = contextvars.ContextVar(
     "protocol_registration_trace", default=None
 )
@@ -584,7 +603,11 @@ def create_mailbox(
 
 
 
-def wait_for_code(mailbox: dict, register_proxy: str = "") -> str | None:
+def wait_for_code(
+    mailbox: dict,
+    register_proxy: str = "",
+    wait_timeout: float | None = None,
+) -> str | None:
     mail_config = _mail_config(register_proxy)
     fallback_code = str(
         mailbox.get("_post_registration_otp_fallback") or ""
@@ -595,6 +618,13 @@ def wait_for_code(mailbox: dict, register_proxy: str = "") -> str | None:
             60.0,
             float(mail_config.get("wait_timeout") or 90),
         )
+    if wait_timeout is not None:
+        # Segment override (e.g. login OTP rounds): cap every provider's
+        # receive window at the same value so the caller controls pacing.
+        mail_config = dict(mail_config)
+        mail_config["wait_timeout"] = float(wait_timeout)
+        mail_config["smsbower_wait_timeout"] = float(wait_timeout)
+        mail_config["online_disposablemail_wait_timeout"] = float(wait_timeout)
     code = read_mail_code(
         mail_config,
         mailbox,

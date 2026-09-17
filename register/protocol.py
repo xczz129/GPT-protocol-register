@@ -32,7 +32,7 @@ from zoneinfo import ZoneInfo
 from curl_cffi import requests
 
 from common.account_health import check_account
-from common.account_store import ACCOUNTS_FILE, upsert_account_record
+from common.account_store import (ACCOUNTS_FILE, account_delete_key, delete_account_records, upsert_account_record)
 from common.country_identity import COUNTRY_IDENTITIES, country_code_from_proxy, country_identity
 from common.proxy_clearance import clearance_error, headers_with_clearance, refresh_clearance
 from common.session_export import build_account_record, parse_jwt_payload
@@ -56,6 +56,8 @@ from mail.parsing import (
 )
 from proxy_util import (
     compute_proxy_retry_limit,
+    is_auth_identity_error,
+    is_cloudflare_block_error,
     is_proxy_transport_error,
     is_rate_limit_error,
     normalize_proxy_url,
@@ -74,14 +76,14 @@ from register.protocol_runtime import (
 )
 from register.scheduling import build_registration_waves
 from register.mail_channel_options import (
+    dynamic_mail_is_on_demand,
     is_smsbower_selected,
     needs_dynamic_mail_coordinator,
     smsbower_child_enabled,
-    validate_smsbower_job,
-)
+    validate_dynamic_mail_job,)
 from register.smsbower_batch import run_dynamic_mail_groups
 from register.registration_outcome import RegisteredEmailDetected
-from register.pending_recovery import can_recover_registration, merge_registration_progress, recover_registration
+from register.pending_recovery import can_recover_registration, is_registration_guard_error, merge_registration_progress, recover_registration
 from register.util import _append_account
 
 from register.protocol_context import (    # noqa: F401 - 兼容 re-export
@@ -357,6 +359,23 @@ def register_one(
             candidate = dict(partial_account)
             if isinstance(result, dict):
                 merge_registration_progress(candidate, result)
+            if is_auth_identity_error(initial_error) or is_registration_guard_error(initial_error):
+                if isinstance(actual_mailbox, dict):
+                    if is_auth_identity_error(initial_error):
+                        actual_mailbox["_registration_identity_error"] = "username_not_found"
+                    else:
+                        actual_mailbox["_registration_guard_error"] = "registration_auth_identity_unconfirmed"
+                    actual_mailbox["_registration_recovery_pending"] = False
+                if candidate:
+                    detail = _redact_operation_error(initial_error, *(candidate.get(key) for key in (
+                        "password", "totp_secret", "access_token", "refresh_token", "session_token")),
+                        (actual_mailbox or {}).get("_smsbower_api_key"), (actual_mailbox or {}).get("api_key"))
+                    if is_auth_identity_error(initial_error):
+                        detail = "username_not_found: " + detail
+                    persist_partial({"registration_initial_error": detail,
+                        "registration_recovery_state": "identity_unconfirmed",
+                        "registration_recovery_error": detail})
+                raise
             if candidate:
                 initial_detail = _redact_operation_error(initial_error, *(candidate.get(key) for key in (
                     "password", "totp_secret", "access_token", "refresh_token", "session_token")),
@@ -464,6 +483,22 @@ def register_one(
         )
         return result
     except (PasswordResetRequired, RegisteredEmailDetected) as error:
+        if isinstance(error, RegisteredEmailDetected) and partial_account.get("email"):
+            # 已注册跳过意味着该身份不是本事务创建的（回收邮箱）；密码阶段写入的
+            # 待补全记录没有可用凭据（无密码路由、无 token），留在账号库会误导
+            # 面板，直接清理。
+            try:
+                delete_account_records(
+                    [account_delete_key(dict(partial_account))],
+                    path=ACCOUNTS_FILE,
+                    include_records=False,
+                )
+            except Exception as cleanup_error:
+                log(
+                    f"{partial_account.get('email')} 已注册跳过，清理待补全记录失败: "
+                    f"{str(cleanup_error)[:200]}",
+                    "yellow",
+                )
         cost = time.time() - start
         with stats_lock:
             stats["done"] += 1
@@ -491,7 +526,8 @@ def register_one(
         return None
     except Exception as e:
         cost = time.time() - start
-        rate_limited = is_rate_limit_error(e)
+        identity_missing = is_auth_identity_error(e)
+        rate_limited = not identity_missing and is_rate_limit_error(e)
         transport_error = is_proxy_transport_error(e)
         failure_mailbox = mailbox_override or getattr(registrar, "registration_mailbox", None) or {}
         if not isinstance(failure_mailbox, dict):
@@ -499,6 +535,8 @@ def register_one(
         failure_detail = _redact_operation_error(e, *(partial_account.get(key) for key in (
             "password", "totp_secret", "access_token", "refresh_token", "session_token")),
             failure_mailbox.get("api_key"), failure_mailbox.get("_smsbower_api_key"))
+        if identity_missing and not failure_detail.startswith("username_not_found:"):
+            failure_detail = "username_not_found: " + failure_detail
         if rate_limited and not is_rate_limit_error(failure_detail):
             failure_detail = "auth_rate_limit_exceeded: " + failure_detail
         with stats_lock:
@@ -553,6 +591,34 @@ def register_one(
 
 
 
+# --- Cloudflare 爆发熔断（批次级） -----------------------------------------
+# 同一批注册里 CF 拦截在短窗口内集中出现，说明整个代理池的出口 IP 正被
+# Cloudflare 风控（而非个别坏代理）。此时继续以满并发撞墙只会加深封锁，
+# 正确做法是让整批任务冷却一段时间再继续。
+_CF_STRIKE_WINDOW_SEC = 180.0
+_CF_STRIKE_THRESHOLD = 8
+_CF_COOLDOWN_SEC = 300.0
+
+
+def _new_cf_block_state() -> dict[str, Any]:
+    return {"times": [], "lock": threading.Lock()}
+
+
+def _note_cf_block(state: dict[str, Any]) -> float:
+    """记录一次 CF 拦截；窗口内达到阈值时清零并返回批次冷却秒数。"""
+    now = time.monotonic()
+    with state["lock"]:
+        times = state["times"]
+        times.append(now)
+        cutoff = now - _CF_STRIKE_WINDOW_SEC
+        while times and times[0] < cutoff:
+            times.pop(0)
+        if len(times) >= _CF_STRIKE_THRESHOLD:
+            times.clear()
+            return _CF_COOLDOWN_SEC
+    return 0.0
+
+
 def worker(index: int) -> dict:
     result = register_one(
         index,
@@ -604,10 +670,10 @@ async def run_protocol_register(
     paused = pause_check if callable(pause_check) else (lambda: False)
     n = max(1, int(total if total is not None else reg_cfg.get("total") or 1))
     conc = max(1, int(concurrency if concurrency is not None else reg_cfg.get("threads") or 1))
-    validate_smsbower_job(mail_config, provider_type, n, conc, fixed_email=fixed_email)
+    validate_dynamic_mail_job(mail_config, provider_type, n, conc, fixed_email=fixed_email)
     max_retries = max(0, int(reg_cfg.get("max_transient_retries") or 0))
     post_register_health_check = _truthy(
-        reg_cfg.get("post_register_health_check"), False
+        reg_cfg.get("post_register_health_check"), True
     )
 
     release_stale_in_use()
@@ -640,8 +706,12 @@ async def run_protocol_register(
     elif fixed_email:
         n = conc = 1
     else:
-        n = min(n, available)
-        conc = min(conc, n, available)
+        if dynamic_mail_is_on_demand(provider_type):
+            n = max(1, n)
+            conc = min(conc, n)
+        else:
+            n = min(n, available)
+            conc = min(conc, n, available)
         if is_smsbower_selected(provider_type) and smsbower_child_enabled(mail_config):
             if smsbower_child_enabled(mail_config):
                 n -= n % 2
@@ -680,6 +750,24 @@ async def run_protocol_register(
                     latest_cfg = dict(loaded)
             except Exception as error:
                 print(f"  [代理调度] 刷新代理配置失败，继续使用当前池: {str(error)[:160]}")
+
+        # 国家池锁定：批次启动后，面板把 selected_country 切到其他国家时，
+        # 本批次不跟随切换（避免运行中换到未经验证/失效的代理池）。
+        # 需要换池时请先停止任务，再选择国家重新启动。
+        if (
+            str(latest_cfg.get("mode") or "").strip().lower() == "country_pool"
+            and str(proxy_cfg.get("mode") or "").strip().lower() == "country_pool"
+            and str(latest_cfg.get("selected_country") or "").strip().upper()
+            != str(proxy_cfg.get("selected_country") or "").strip().upper()
+        ):
+            print(
+                "  [代理调度] 面板代理国家已切换为 "
+                + str(latest_cfg.get("selected_country") or "").strip().upper()
+                + "，本批次锁定 "
+                + str(proxy_cfg.get("selected_country") or "").strip().upper()
+                + " 池不跟随；需要换池请停止任务后重启"
+            )
+            latest_cfg = proxy_cfg
 
         enabled = bool(latest_cfg.get("enabled"))
         latest_pool = resolve_proxy_pool(latest_cfg) if enabled else []
@@ -729,6 +817,7 @@ async def run_protocol_register(
     )
     retry_email_lock = threading.Lock()
     batch_bad_proxies: set[str] = set()
+    cf_block_state = _new_cf_block_state()
     batch_bad_proxy_lock = threading.Lock()
     auth_rate_limited = threading.Event()
     attempted_indices: set[int] = set()
@@ -742,7 +831,7 @@ async def run_protocol_register(
     has_alias_pairs = any(is_pair for _indices, is_pair in task_waves)
     semaphore = asyncio.Semaphore(max(conc, 2 if has_alias_pairs else 1))
     if has_alias_pairs and not fixed_alias_batch:
-        print("  [协议调度] 双别名按主邮箱分波执行；每对完整注册结束后再启动下一对")
+        print("  [协议调度] 双别名并行执行:对内顺序(主→split,同邮箱收码隔离),对间并行,并发受全局信号量控制")
         if callable(task_event):
             first_wave = set(task_waves[0][0]) if task_waves else set()
             for task_index, email in enumerate(schedule_emails, start=1):
@@ -758,7 +847,7 @@ async def run_protocol_register(
                     "queued",
                     email=email,
                     group_id=task_group_id,
-                    step="等待前一双别名完整注册",
+                    step="等待并发槽位",
                 )
 
     def claim_retry_email(current: str | None) -> str | None:
@@ -1049,6 +1138,8 @@ async def run_protocol_register(
                     break
                 if record:
                     break
+                if is_auth_identity_error(attempt_error) or is_registration_guard_error(attempt_error):
+                    break
                 if is_rate_limit_error(attempt_error):
                     auth_rate_limited.set()
                     break
@@ -1065,6 +1156,26 @@ async def run_protocol_register(
                     # a consumed/closed activation as a fresh registration.
                     break
                 proxy_failed = is_proxy_transport_error(attempt_error)
+                if is_cloudflare_block_error(attempt_error):
+                    cf_cooldown = _note_cf_block(cf_block_state)
+                    if cf_cooldown > 0:
+                        print(
+                            f"  [协议调度] 任务{index} Cloudflare 拦截在"
+                            f"{_CF_STRIKE_WINDOW_SEC:.0f}s 内集中爆发，"
+                            f"整批冷却 {cf_cooldown:.0f}s 后再试（避免加深 IP 风控）"
+                        )
+                        if callable(task_event):
+                            task_event(
+                                index,
+                                "running",
+                                group_id=task_group_id,
+                                step=f"CF 拦截集中爆发，批次冷却 {cf_cooldown:.0f} 秒后继续",
+                            )
+                        cooldown_end = time.monotonic() + cf_cooldown
+                        while time.monotonic() < cooldown_end:
+                            if task_stopped():
+                                break
+                            await asyncio.sleep(min(0.5, cooldown_end - time.monotonic()))
                 alias_pinned = fixed_alias_batch or paired_alias
                 if alias_pinned and not alias_proxy_retryable(attempt_error):
                     break
@@ -1214,21 +1325,38 @@ async def run_protocol_register(
         index for index in range(1, n + 1)
         if not schedule_emails[index - 1] and needs_dynamic_mail_coordinator(mail_config, provider_type)
     }
-    for wave_number, (indices, is_alias_pair) in enumerate(task_waves, start=1):
+
+    async def run_alias_pair_wave(indices: list[int]) -> None:
+        """双别名对:主任务完整结束后再启动 split。
+
+        同一邮箱的两个地址顺序注册,收码窗口天然隔离,无需 Barrier 同步;
+        对与对之间并行,由全局 semaphore 统一限流。
+        """
+        for index in indices:
+            if stopped():
+                break
+            await run_task(index, None, True)
+
+    launch_coros: list[Any] = []
+    for _wave_number, (indices, is_alias_pair) in enumerate(task_waves, start=1):
         indices = [index for index in indices if index not in dynamic_indices]
         if not indices:
             continue
-        if stopped():
-            break
-        if is_alias_pair and wave_number > 1:
-            print(
-                f"  [协议调度] 上一双别名已完整结束，启动下一对 "
-                f"({indices[0]}-{indices[-1]}/{n})"
+        if is_alias_pair:
+            launch_coros.append(run_alias_pair_wave(indices))
+        else:
+            launch_coros.extend(
+                run_task(index, None, False) for index in indices
             )
-        barrier = asyncio.Barrier(2) if is_alias_pair and len(indices) == 2 else None
-        await asyncio.gather(
-            *(run_task(index, barrier, is_alias_pair) for index in indices)
-        )
+    if launch_coros:
+        gather_outcomes = await asyncio.gather(*launch_coros, return_exceptions=True)
+        for gather_error in gather_outcomes:
+            if isinstance(gather_error, BaseException) and not isinstance(
+                gather_error, asyncio.CancelledError
+            ):
+                print(
+                    "  [协议调度] 任务协程异常退出: " + str(gather_error)[:200]
+                )
     if dynamic_indices and not stopped():
         async def run_allocated(index: int, mailbox: dict[str, Any]) -> None:
             await run_task(index, paired_alias=True, mailbox_override=mailbox)

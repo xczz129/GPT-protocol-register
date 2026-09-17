@@ -105,7 +105,10 @@ async def account_reauthenticate_start(body: AccountReauthBatchRequest):
         if account is None:
             raise HTTPException(404, "所选账号中存在已删除记录，请刷新列表后重试")
         if _state().account_public_view(account).get("is_deactivated"):
-            raise HTTPException(409, f"{account.get('email') or key} 已封号，不支持重新登录")
+            # Keep the requested row in the batch so its skip is visible in
+            # progress. It must not reject the other accounts or need credentials.
+            selected.append(account)
+            continue
         account_protocol = _state()._account_requires_protocol_reauth(account)
         if (reauth_mode == "protocol" or account_protocol) and not _state()._protocol_reauth_credentials_ready(account):
             raise HTTPException(
@@ -115,7 +118,11 @@ async def account_reauthenticate_start(body: AccountReauthBatchRequest):
                 else f"{account.get('email') or key} 协议重新登录要求同时保存密码和 TOTP 2FA",
             )
         selected.append(account)
-    if any(_state()._account_requires_protocol_reauth(account) for account in selected):
+    if any(
+        _state()._account_requires_protocol_reauth(account)
+        for account in selected
+        if not _state().account_public_view(account).get("is_deactivated")
+    ):
         reauth_mode = "protocol"
     try:
         job = await asyncio.to_thread(
@@ -162,6 +169,9 @@ async def account_reauthenticate_by_email_start(body: AccountEmailReauthRequest)
         account = record_map.get(email)
         if account is None:
             not_found.append(email)
+            continue
+        if _state().account_public_view(account).get("is_deactivated"):
+            selected.append(account)
             continue
         missing: list[str] = []
         if not str(account.get("password") or "").strip():
@@ -213,7 +223,7 @@ async def account_reauthenticate_by_email_start(body: AccountEmailReauthRequest)
         **job,
         "requested": len(requested),
         "matched": len(requested) - len(not_found),
-        "submitted": len(selected),
+        "submitted": int(job.get("submitted", len(selected))),
         "invalid_format": invalid_format,
         "not_found": not_found,
         "missing_credentials": missing_credentials,

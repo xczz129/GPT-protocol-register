@@ -172,6 +172,58 @@ def test_group_only_change_survives_successful_health_write(db, monkeypatch):
     assert not result["items"][0].get("health_write_skipped")
 
 
+def test_health_preserves_trial_result_written_while_probe_is_running(db, monkeypatch):
+    original = store.upsert_account_record(account(trial_eligibility_status="pending"), db)
+    key = store.account_delete_key(original)
+    trial_fields = {
+        "trial_eligibility_status": "ineligible",
+        "trial_eligibility_label": "无免费试用",
+        "trial_eligibility_checked_at": "2099-01-02T00:00:00Z",
+    }
+
+    def probe(_record):
+        store.update_account_record_fields({key: trial_fields}, path=db, include_records=False)
+        return metadata()
+
+    monkeypatch.setattr(health, "fetch_remote_account_info", Mock(side_effect=probe))
+    checked = health.check_accounts([original], path=db)["items"][0]
+    saved = store.load_accounts(db)[0]
+
+    assert checked["health_status"] == saved["health_status"] == "alive"
+    assert {field: saved[field] for field in trial_fields} == trial_fields
+    assert checked["trial_eligibility_status"] == "ineligible"
+
+
+@pytest.mark.parametrize("explicit_health_verdict", [
+    {},
+    {"health_error": "account_deactivated: confirmed by official me"},
+    {"status": "已封号"},
+    {"reauth_blocked_reason": "account_deactivated"},
+])
+def test_trial_errors_do_not_derive_deactivation_but_explicit_health_still_does(db, explicit_health_verdict):
+    store.upsert_account_record(account(
+        health_status="alive",
+        status="正常",
+        trial_eligibility_status="invalid",
+        trial_eligibility_label="账号已停用",
+        trial_eligibility_reason="account_deactivated",
+        trial_eligibility_result="banned",
+        trial_eligibility_error="account_deactivated: old trial request rejected",
+    ) | explicit_health_verdict, db)
+    saved = store.load_accounts(db)[0]
+    public = store.account_public_view(saved)
+    selected, skipped = health.select_health_check_records([saved])
+    deactivated = bool(explicit_health_verdict)
+
+    assert store.account_is_deactivated(saved) is deactivated
+    assert public["is_deactivated"] is deactivated
+    assert public["health_status"] == ("invalid" if deactivated else "alive")
+    assert public["trial_eligibility_status"] == "invalid"
+    assert len(skipped) == int(deactivated)
+    assert len(selected) == int(not deactivated)
+    assert store.account_is_usable(saved) is not deactivated
+
+
 def test_valid_team_refresh_still_saves_fresh_token_and_health(db, monkeypatch):
     original = store.upsert_account_record(account(expired=True), db)
     fresh_token = token()

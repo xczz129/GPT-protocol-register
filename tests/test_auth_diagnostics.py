@@ -61,6 +61,43 @@ def test_route_diagnostics_omit_urls_and_opaque_path_data(url,expected):
     assert 'secret' not in json.dumps(diagnostic) and 'private' not in json.dumps(diagnostic)
 
 
+@pytest.mark.parametrize('mode', ['passwordless_login', 'password_reset', 'passwordless_signup'])
+@pytest.mark.parametrize('full_response', [False, True])
+def test_identity_diagnostics_keep_only_fixed_modes_and_login_method_types(mode, full_response):
+    payload = {
+        'email_verification_mode': mode,
+        'login_methods': [
+            {'type': 'passwordless_otp', 'email': 'private@example.test'},
+            {'type': 'password', 'credential': 'private-credential'},
+        ],
+        'otp': '123456', 'access_token': 'private-token',
+    }
+    data = {'page': {'type': 'email_otp_verification', 'payload': payload}} if full_response else payload
+    diagnostic = auth_route_diagnostic(
+        'https://auth.openai.com/email-verification?code=private-code',
+        'email_otp_verification', auth_response=data,
+    )
+    assert diagnostic['email_verification_mode'] == mode
+    assert set(diagnostic['login_methods']) == {'passwordless_otp', 'password'}
+    assert diagnostic['auth_response_valid'] is True
+    rendered = json.dumps(diagnostic)
+    assert 'private' not in rendered and '123456' not in rendered
+
+
+def test_identity_diagnostics_redact_unrecognized_mode_and_method_labels():
+    diagnostic = auth_route_diagnostic(
+        'https://auth.openai.com/email-verification', 'email_otp_verification',
+        auth_response={'page': {'payload': {
+            'email_verification_mode': 'private-mode',
+            'login_methods': [{'type': 'private-method', 'token': 'private-token'}],
+        }}},
+    )
+    assert diagnostic['email_verification_mode'] == 'unrecognized'
+    assert diagnostic['login_methods'] == ['unrecognized']
+    assert diagnostic['auth_response_valid'] is False
+    assert 'private' not in json.dumps(diagnostic)
+
+
 @pytest.fixture
 def guard(monkeypatch):
     import register.protocol_registrar as module
@@ -87,7 +124,8 @@ def guard(monkeypatch):
 @pytest.mark.parametrize('reply,kind,page',[
     (response(error=ValueError('private-html'),content_type='text/html'),'not_json','missing'),
     (response([]),'json_non_object','missing'),
-    (response({'page':{'type':'email_otp_verification'},'continue_url':'https://auth.openai.com/email-verification?code=private-code'}),'json_object','email_otp_verification'),
+    (response({'page':{'type':'email_otp_verification'},
+        'continue_url':'https://auth.openai.com/email-verification'}),'json_object','email_otp_verification'),
     (response({'error':{'code':'invalid_state','message':'private-error'}}),'json_object','missing'),
     (response({'error':{'code':'invalid_auth_step'}}),'json_object','missing'),
     (response({'error':{'code':'invalid_state','type':'user_already_exists'}}),'json_object','missing'),
@@ -115,14 +153,52 @@ def test_ambiguous_responses_still_stop_with_safe_context(guard,reply,kind,page)
 
 
 @pytest.mark.parametrize('payload',[
-    {'continue_url':'https://auth.openai.com/log-in/password','page':{'type':'password_verification'}},
     {'error':{'code':'user_already_exists'}},
 ])
 def test_explicit_existing_identity_is_still_rejected(guard,payload):
     registrar,request,mailbox=guard
     request.return_value=(response(payload),'')
     with pytest.raises(RegisteredEmailDetected):
-        registrar._check_fresh_registration(mailbox['address'],mailbox,{},1)
+        registrar._check_fresh_registration(mailbox['address'],mailbox,
+            {'final_url':'https://auth.openai.com/log-in'},1)
+
+
+def test_existing_password_route_is_rejected_before_navigation(guard):
+    """A password login page is an existing candidate, never a reset trigger."""
+    registrar,request,mailbox=guard
+    request.return_value=(response({'continue_url':'https://auth.openai.com/log-in/password',
+        'page':{'type':'password_verification'}}),'')
+    with pytest.raises(RegisteredEmailDetected) as raised:
+        registrar._check_fresh_registration(mailbox['address'],mailbox,
+            {'final_url':'https://auth.openai.com/log-in'},1)
+    assert raised.value.email == mailbox['address']
     assert mailbox['_registration_outcome']=='already_registered'
+    assert '_registration_existing_takeover_detail' not in mailbox
+    assert not mailbox.get('_registration_identity_created')
     registrar._navigate_auth_step.assert_not_called()
+    assert request.call_count==1
+
+
+def test_existing_mfa_route_is_rejected_not_converted(guard):
+    """Registration candidates at an MFA challenge are skipped."""
+    registrar,request,mailbox=guard
+    request.return_value=(response({'continue_url':'https://auth.openai.com/mfa-challenge',
+        'page':{'type':'mfa_challenge'}}),'')
+    with pytest.raises(RegisteredEmailDetected):
+        registrar._check_fresh_registration(mailbox['address'],mailbox,
+            {'final_url':'https://auth.openai.com/log-in'},1)
+
+
+def test_otp_route_without_identity_mode_stops_without_repeating_auth(guard):
+    """A verification page alone is not evidence that an account has no password."""
+    registrar,request,mailbox=guard
+    request.return_value=(response({'page':{'type':'email_otp_verification'},
+        'continue_url':'https://auth.openai.com/email-verification?code=private-code'}),'')
+    with pytest.raises(RuntimeError,match='registration_password_route_unavailable') as caught:
+        registrar._check_fresh_registration(mailbox['address'],mailbox,
+            {'final_url':'https://auth.openai.com/log-in'},1)
+    assert '_registration_identity_created' not in mailbox
+    assert '_registration_outcome' not in mailbox
+    registrar._navigate_auth_step.assert_not_called()
+    assert 'private-code' not in str(caught.value)
     assert request.call_count==1

@@ -29,7 +29,7 @@ function loadApi(requests) {
   return exports;
 }
 
-test("new account API submits the selected health channel for start and resume", async () => {
+test("health API preserves legacy channel arguments for start and resume", async () => {
   const requests = [];
   const api = loadApi(requests);
 
@@ -46,19 +46,4 @@ test("new account API submits the selected health channel for start and resume",
       body: { workers: 4, channel: "nerver" },
     },
   ]);
-});
-
-test("both account-health dialogs expose v4 and nerver as detection channels", () => {
-  const legacy = readFileSync(new URL("../src/App.vue", import.meta.url), "utf8");
-  const modern = readFileSync(new URL("../src/new/views/accounts/HealthStartDialog.vue", import.meta.url), "utf8");
-  const concurrency = readFileSync(new URL("../src/components/ConcurrencyDialog.vue", import.meta.url), "utf8");
-
-  for (const source of [legacy, modern]) {
-    assert.match(source, /v4 接口/);
-    assert.match(source, /nerver 接口/);
-    assert.match(source, /检测渠道/);
-  }
-  assert.match(legacy, /workers, channel/);
-  assert.match(modern, /accounts\.startHealth\([^\n]+channel\.value\)/);
-  assert.match(concurrency, /:aria-label="modeLabel"/);
 });

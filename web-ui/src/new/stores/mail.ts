@@ -6,7 +6,7 @@ import { defineStore } from "pinia";
 import { fetchConfig } from "../api/config";
 import {
   deleteMailboxes, fetchFastmailAccounts, fetchMailboxes, fetchMaddyDomains,
-  isMaskedSecret, parseDomainList, saveMailboxes, updateMailboxState,
+  fetchOdmServices, isMaskedSecret, parseDomainList, saveMailboxes, updateMailboxState,
   type FastmailPoolRow, type Mailbox, type MailSaveResult,
 } from "../api/mail";
 
@@ -26,6 +26,13 @@ export const useMailStore = defineStore("mail", () => {
     smsbowerService: "dr",
     smsbowerDomains: ["gmail.com", "icloud.com"] as string[],
     smsbowerMaxPrice: "",
+    odmEnable: false,
+    odmApiBase: "https://api.online-disposablemail.com",
+    odmApiKey: "",
+    odmApiKeyConfigured: false,
+    odmServiceId: "242",
+    odmEmailTypeId: "26",
+    odmCapacity: 50,
     maddyEnable: false,
     maddyApiBase: "https://120.53.232.195/api",
     maddyApiToken: "",
@@ -58,6 +65,7 @@ export const useMailStore = defineStore("mail", () => {
     const outlook = provider("outlook_token");
     const icloud = provider("icloud_api");
     const smsbower = provider("smsbower_mail");
+    const odm = provider("online_disposablemail");
     const maddy = provider("maddy_webui");
     const fastmail = provider("fastmail_api");
 
@@ -84,6 +92,18 @@ export const useMailStore = defineStore("mail", () => {
       .filter((domain) => ["gmail.com", "icloud.com"].includes(domain));
     forms.smsbowerDomains = configuredDomains.length ? configuredDomains : ["gmail.com", "icloud.com"];
     forms.smsbowerMaxPrice = smsbower.max_price == null ? "" : String(smsbower.max_price);
+
+    forms.odmEnable = odm.enable === true;
+    forms.odmApiBase = String(odm.api_base || "https://api.online-disposablemail.com");
+    const odmMasked = String(odm.api_key_masked || "");
+    const odmReturned = String(odm.api_key || "");
+    forms.odmApiKey = "";
+    forms.odmApiKeyConfigured = Boolean(
+      odm.has_api_key || odmMasked || odmReturned,
+    );
+    forms.odmServiceId = String(odm.service_id || "242");
+    forms.odmEmailTypeId = String(odm.email_type_id || "26");
+    forms.odmCapacity = Number(odm.capacity || 50);
 
     forms.maddyEnable = maddy.enable === true;
     forms.maddyApiBase = String(maddy.api_base || "https://120.53.232.195/api");
@@ -126,6 +146,12 @@ export const useMailStore = defineStore("mail", () => {
   /** SMSBower 密钥 payload：脱敏值和空值都不得写回配置。 */
   function smsbowerKeyPayload(): Record<string, string> {
     const value = forms.smsbowerApiKey.trim();
+    return value && !isMaskedSecret(value) ? { api_key: value } : {};
+  }
+
+  /** OnlineDisposableMail 密钥 payload：同上，不回写脱敏值。 */
+  function odmKeyPayload(): Record<string, string> {
+    const value = forms.odmApiKey.trim();
     return value && !isMaskedSecret(value) ? { api_key: value } : {};
   }
 
@@ -175,6 +201,38 @@ export const useMailStore = defineStore("mail", () => {
     if (result.ok !== false) {
       if (Object.keys(keyPayload).length) forms.smsbowerApiKeyConfigured = true;
       forms.smsbowerApiKey = "";
+      await load();
+    }
+    return result;
+  }
+
+  async function loadOdmServices() {
+    return fetchOdmServices(
+      forms.odmApiBase,
+      odmKeyPayload().api_key,
+      forms.odmServiceId,
+    );
+  }
+
+  async function saveOdm(): Promise<MailSaveResult> {
+    const serviceId = forms.odmServiceId.trim();
+    if (!serviceId || !/^\d+$/.test(serviceId)) throw new Error("OnlineDisposableMail 服务 ID 必须是数字");
+    const emailTypeId = forms.odmEmailTypeId.trim();
+    if (!emailTypeId || !/^\d+$/.test(emailTypeId)) throw new Error("OnlineDisposableMail 邮箱类型 ID 必须是数字");
+    const keyPayload = odmKeyPayload();
+    const result = await saveMailboxes({
+      provider_type: "online_disposablemail", mailboxes: "",
+      ...(forms.odmApiBase.trim() ? { api_base: forms.odmApiBase.trim() } : {}),
+      ...keyPayload,
+      enable: forms.odmEnable,
+      service_id: serviceId,
+      email_type_id: emailTypeId,
+      capacity: Number(forms.odmCapacity) || 50,
+      append: true,
+    });
+    if (result.ok !== false) {
+      if (Object.keys(keyPayload).length) forms.odmApiKeyConfigured = true;
+      forms.odmApiKey = "";
       await load();
     }
     return result;
@@ -267,7 +325,8 @@ export const useMailStore = defineStore("mail", () => {
   return {
     forms, mailboxes, loading, loadError,
     fillForms, load,
-    saveOutlook, saveIcloud, saveSmsbower, loadMaddyDomains, saveMaddy, loadFastmailPool, saveFastmail,
+    saveOutlook, saveIcloud, saveSmsbower, loadOdmServices, saveOdm,
+    loadMaddyDomains, saveMaddy, loadFastmailPool, saveFastmail,
     remove, setState,
   };
 });

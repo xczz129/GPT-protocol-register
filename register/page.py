@@ -17,11 +17,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from common.browser import react_fill, js_click
+from proxy_util import is_auth_identity_error
 from register.cf import _switch_cf_node
 from register.log import _log
 from register.util import ROOT as PROJECT_ROOT, _COOKIE_BTNS
 from register.registration_outcome import (
     RegisteredEmailDetected,
+    registration_creation_confirmed,
     is_duplicate_registration_error,
     registration_auth_state,
     reject_registered_mailbox,
@@ -156,6 +158,9 @@ async def install_fresh_registration_guard(context, mailbox: dict) -> None:
         if mailbox.get("_registration_outcome") == RegisteredEmailDetected.code:
             await route.abort("blockedbyclient")
             return
+        if mailbox.get("_registration_guard_error"):
+            await route.abort("blockedbyclient")
+            return
         if path.startswith((
             "/api/accounts/password/", "/api/accounts/passwordless/",
             "/api/accounts/email-otp/",
@@ -182,11 +187,28 @@ async def install_fresh_registration_guard(context, mailbox: dict) -> None:
             page_state = payload.get("page") if isinstance(payload.get("page"), dict) else {}
             state = registration_auth_state(
                 str(payload.get("continue_url") or ""), str(page_state.get("type") or ""),
+                auth_response=payload,
             )
-            if is_duplicate_registration_error(payload) or state == "existing":
+            if is_auth_identity_error(payload):
+                mailbox["_registration_identity_error"] = "username_not_found"
+                mailbox["_registration_guard_error"] = "registration_auth_failed: username_not_found"
+            elif is_duplicate_registration_error(payload):
                 mailbox["_registration_outcome"] = RegisteredEmailDetected.code
-            elif path == "/api/accounts/user/register" and 200 <= response.status < 300 and not payload.get("error"):
+            elif not 200 <= response.status < 300:
+                mailbox["_registration_guard_error"] = f"registration_auth_http_{response.status}"
+            elif state == "existing":
+                mailbox["_registration_outcome"] = RegisteredEmailDetected.code
+            elif path == "/api/accounts/authorize/continue" and state != "signup":
+                mailbox["_registration_guard_error"] = "registration_password_route_unavailable"
+            elif (
+                path == "/api/accounts/user/register" and 200 <= response.status < 300
+                and registration_creation_confirmed(payload)
+            ):
                 mailbox["_registration_identity_created"] = True
+            elif path == "/api/accounts/user/register":
+                mailbox["_registration_guard_error"] = "registration_identity_response_unconfirmed"
+        else:
+            mailbox["_registration_guard_error"] = "registration_identity_response_unavailable"
         await route.fulfill(response=response)
 
     await context.route("https://chatgpt.com/api/auth/signin/openai*", route_auth)

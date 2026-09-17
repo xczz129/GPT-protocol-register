@@ -141,44 +141,54 @@ const allChecked = computed(() => pageKeys.value.length > 0 && pageKeys.value.ev
           </td>
 
           <td class="col-actions">
-            <button
-              class="row-action" type="button"
-              title="刷新 Access Token（通过 Session 重签 AT）"
-              :disabled="!account.has_session_token || account.is_deactivated"
-              @click="emit('refresh-at', account)"
-            >
-              <RefreshCw :size="14" />
-            </button>
-            <button
-              class="row-action" type="button"
-              :title="account.has_refresh_token ? '检查中转、补同步或重新授权' : '授权并补齐中转'"
-              :aria-label="`设置 ${account.email} 的接码任务`"
-              :disabled="account.is_deactivated"
-              @click="emit('codex', account)"
-            >
-              <Smartphone :size="14" />
-            </button>
-            <button class="row-action" type="button" title="查看设备信息（注册环境 / 指纹）" @click="emit('device', account)">
-              <Laptop :size="14" />
-            </button>
-            <button class="row-action" type="button" title="复制凭据（邮箱----密码----2FA）" @click="copyCredential(account)">
-              <Check v-if="copiedKey === `cred-${account.delete_key}`" :size="14" class="copied" />
-              <Clipboard v-else :size="14" />
-            </button>
-            <button class="row-action" type="button" title="复制 Access Token" :disabled="!account.has_access_token" @click="copyAccessToken(account)">
-              <Check v-if="copiedKey === `at-${account.delete_key}`" :size="14" class="copied" />
-              <KeyRound v-else :size="14" />
-            </button>
-            <button class="row-action" type="button" title="复制 Session Token" :disabled="!account.has_session_token" @click="copySessionToken(account)">
-              <Check v-if="copiedKey === `session_token-${account.delete_key}`" :size="14" class="copied" />
-              <Monitor v-else :size="14" />
-            </button>
-            <button class="row-action" type="button" title="操作日志" @click="emit('logs', account.delete_key)">
-              <ClipboardList :size="14" />
-            </button>
-            <button class="row-action danger" type="button" title="删除账号" @click="emit('delete', account.delete_key, account.email)">
-              <Trash2 :size="14" />
-            </button>
+            <div class="row-actions-grid">
+              <button
+                class="row-action" type="button"
+                title="刷新 Access Token（通过 Session 重签 AT）"
+                :disabled="!account.has_session_token || account.is_deactivated"
+                @click="emit('refresh-at', account)"
+              >
+                <RefreshCw :size="14" />
+                <span>刷新AT</span>
+              </button>
+              <button
+                class="row-action" type="button"
+                :title="account.has_refresh_token ? '检查中转、补同步或重新授权' : '授权并补齐中转'"
+                :aria-label="`设置 ${account.email} 的接码任务`"
+                :disabled="account.is_deactivated"
+                @click="emit('codex', account)"
+              >
+                <Smartphone :size="14" />
+                <span>接码</span>
+              </button>
+              <button class="row-action" type="button" title="查看设备信息（注册环境 / 指纹）" @click="emit('device', account)">
+                <Laptop :size="14" />
+                <span>设备</span>
+              </button>
+              <button class="row-action" type="button" title="复制凭据（邮箱----密码----2FA）" @click="copyCredential(account)">
+                <Check v-if="copiedKey === `cred-${account.delete_key}`" :size="14" class="copied" />
+                <Clipboard v-else :size="14" />
+                <span>凭据</span>
+              </button>
+              <button class="row-action" type="button" title="复制 Access Token" :disabled="!account.has_access_token" @click="copyAccessToken(account)">
+                <Check v-if="copiedKey === `at-${account.delete_key}`" :size="14" class="copied" />
+                <KeyRound v-else :size="14" />
+                <span>AT</span>
+              </button>
+              <button class="row-action" type="button" title="复制 Session Token" :disabled="!account.has_session_token" @click="copySessionToken(account)">
+                <Check v-if="copiedKey === `session_token-${account.delete_key}`" :size="14" class="copied" />
+                <Monitor v-else :size="14" />
+                <span>Session</span>
+              </button>
+              <button class="row-action" type="button" title="操作日志" @click="emit('logs', account.delete_key)">
+                <ClipboardList :size="14" />
+                <span>日志</span>
+              </button>
+              <button class="row-action danger" type="button" title="删除账号" @click="emit('delete', account.delete_key, account.email)">
+                <Trash2 :size="14" />
+                <span>删除</span>
+              </button>
+            </div>
           </td>
         </tr>
       </tbody>
@@ -450,17 +460,26 @@ const allChecked = computed(() => pageKeys.value.length > 0 && pageKeys.value.ev
   white-space: nowrap;
 }
 
+.row-actions-grid {
+  display: grid;
+  grid-template-columns: repeat(4, auto);
+  gap: 4px 4px;
+  justify-content: start;
+}
+
 .row-action {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 28px;
-  margin-right: 2px;
+  gap: 4px;
+  height: 26px;
+  padding: 0 8px;
   border-radius: 8px;
   border: 1px solid transparent;
   background: none;
   color: var(--text-muted);
+  font-size: 0.72rem;
+  white-space: nowrap;
   cursor: pointer;
   transition: var(--transition-fast);
 }

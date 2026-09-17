@@ -77,6 +77,29 @@ class SmsBowerMailProviderTests(unittest.TestCase):
         finally:
             provider.close()
 
+    def test_others_domain_adopts_returned_domain(self):
+        """domain=others 买到随机域名邮箱时直接采用返回的域名。"""
+        provider = self._provider(domains=["others"])
+        session = MagicMock()
+        session.get.side_effect = [
+            response(
+                {"status": 1, "mail": "picked@mailburstx.com", "mailId": "oth-1"}
+            ),
+        ]
+        provider.session = session
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            mail, "STATE_FILE", Path(temp_dir) / "state.json"
+        ):
+            try:
+                mailbox = provider.create_mailbox()
+            finally:
+                provider.close()
+
+        self.assertEqual(mailbox["domain"], "mailburstx.com")
+        self.assertEqual(
+            session.get.call_args_list[0].kwargs["params"]["domain"], "others"
+        )
+
     def test_non_finite_max_price_is_rejected(self):
         for value in (float("nan"), float("inf"), float("-inf"), "Infinity"):
             with self.subTest(value=value):
@@ -697,6 +720,47 @@ class SmsBowerMailProviderTests(unittest.TestCase):
         self.assertNotIn("smsbower_pending_status", state)
         self.assertEqual(session.get.call_count, 1)
         self.assertTrue(session.get.call_args.args[0].endswith("/getStatus"))
+
+    def test_provider_closed_status_6_is_terminal(self):
+        provider = self._provider(domains=["gmail.com"])
+        pending = "provider-closed@gmail.com"
+        mailbox = provider._settlement_mailbox(pending, "mail-closed", "gmail.com")
+        session = MagicMock()
+        session.get.return_value = response({"status": 1, "data": {"status": 6}})
+        provider.session = session
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            mail, "STATE_FILE", Path(temp_dir) / "state.json"
+        ):
+            mail._update_smsbower_settlement_state(mailbox, pending_status=2)
+            recovered = provider._recover_pending_settlements()
+            state = mail._load_state()[pending]
+        provider.close()
+
+        self.assertEqual(recovered, 1)
+        self.assertNotIn("smsbower_pending_status", state)
+        self.assertEqual(session.get.call_count, 1)
+        self.assertTrue(session.get.call_args.args[0].endswith("/getStatus"))
+
+    def test_unsupported_remote_status_stops_blocking_after_window(self):
+        provider = self._provider(domains=["gmail.com"])
+        pending = "stale-unsupported@gmail.com"
+        mailbox = provider._settlement_mailbox(pending, "mail-unsupported", "gmail.com")
+        session = MagicMock()
+        session.get.return_value = response({"status": 1, "data": {"status": 7}})
+        provider.session = session
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            mail, "STATE_FILE", Path(temp_dir) / "state.json"
+        ):
+            mail._update_smsbower_settlement_state(mailbox, pending_status=2)
+            with patch.object(
+                mail, "_smsbower_settlement_age_seconds", return_value=600.0
+            ):
+                recovered = provider._recover_pending_settlements()
+            state = mail._load_state()[pending]
+        provider.close()
+
+        self.assertEqual(recovered, 1)
+        self.assertNotIn("smsbower_pending_status", state)
 
     def test_provider_reordering_uses_stable_hashed_identity(self):
         old_provider = self._provider(provider_ref="smsbower_mail#9")

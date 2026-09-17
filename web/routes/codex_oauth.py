@@ -2230,6 +2230,10 @@ def _import_one(
             "registration_method": "protocol",
             "source_type": "imported",
             "registration_state": "complete",
+            # Workspace mode is an explicit operator choice. A plan slug such
+            # as prolite cannot override the selected personal/team mode.
+            "import_account_type": account_type,
+            "workspace_selection_mode": account_type,
             "proxy": proxy,
         }
         # Team is a verified workspace constraint, never a fallback display label.
@@ -2343,8 +2347,6 @@ async def codex_oauth_import(body: CodexOauthImportRequest):
         if account_type != "team":
             account_type = "personal"
         workspace = str(body.workspace or "").strip()
-        if account_type == "team" and not workspace:
-            raise HTTPException(400, "Team 账号请填写工作区名称")
         if account_type != "team":
             workspace = ""
         concurrency = int(body.concurrency or 1)

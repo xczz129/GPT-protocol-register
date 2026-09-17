@@ -21,9 +21,13 @@ class _Response:
 
 
 class _Session:
-    def __init__(self, *, me_status: int = 200):
+    def __init__(self, *, me_status: int = 200, init_payload=None):
         self.headers = {}
         self.me_status = me_status
+        self.init_payload = init_payload if init_payload is not None else {
+            "default_model_slug": "auto",
+            "limits_progress": [{"feature_name": "image_gen", "remaining": 2}],
+        }
         self.calls: list[tuple[str, str]] = []
         self.closed = False
 
@@ -41,12 +45,7 @@ class _Session:
         if url.endswith("/backend-api/conversation/init"):
             return _Response(
                 200,
-                {
-                    "default_model_slug": "auto",
-                    "limits_progress": [
-                        {"feature_name": "image_gen", "remaining": 2}
-                    ],
-                },
+                self.init_payload,
             )
         raise AssertionError(f"unexpected POST {url}")
 
@@ -64,36 +63,39 @@ def _record():
     }
 
 
-def test_nerver_channel_still_requires_chatgpt_me_and_init(monkeypatch):
+@pytest.mark.parametrize("channel", ["v4", "nerver"])
+def test_health_checks_only_official_availability_without_trial_calls(monkeypatch, channel):
     session = _Session()
-    nerver = Mock(
-        return_value={
-            "plan_type": "plus",
-            "eligible": False,
-            "has_active_subscription": True,
-        }
-    )
+    nerver = Mock(side_effect=AssertionError("health must not call trial API"))
+    trial = Mock(side_effect=AssertionError("health must not call trial API"))
     monkeypatch.setattr(health, "_session", Mock(return_value=session))
     monkeypatch.setattr(
         "common.trial_eligibility.check_trial_eligibility_nerver", nerver,
     )
+    monkeypatch.setattr("common.trial_eligibility.check_trial_eligibility", trial)
 
-    result = health.fetch_remote_account_info(_record(), channel="nerver")
+    record = {**_record(), "trial_eligibility_status": "ineligible"}
+    result = health.fetch_remote_account_info(record, channel=channel)
 
     assert result["health_status"] == "alive"
-    assert result["health_probe_channel"] == "nerver"
-    assert result["plan_type"] == "plus"
+    assert result["health_probe_channel"] == channel
+    assert result["plan_type"] == "free"
+    assert result["account_id"] == record["account_id"]
+    assert not any(field.startswith("trial_") for field in result)
+    assert len(session.calls) == 2
     assert any(url.endswith("/backend-api/me") for _method, url in session.calls)
     assert any(
         url.endswith("/backend-api/conversation/init")
         for _method, url in session.calls
     )
     assert not any("/backend-api/accounts/check/" in url for _method, url in session.calls)
-    nerver.assert_called_once_with("synthetic.access.token", timeout=8)
+    nerver.assert_not_called()
+    trial.assert_not_called()
     assert session.closed is True
 
 
-def test_nerver_success_cannot_mask_chatgpt_token_rejection(monkeypatch):
+@pytest.mark.parametrize("channel", ["v4", "nerver"])
+def test_official_token_rejection_remains_invalid_for_legacy_channels(monkeypatch, channel):
     session = _Session(me_status=401)
     nerver = Mock(return_value={"plan_type": "plus", "eligible": True})
     monkeypatch.setattr(health, "_session", Mock(return_value=session))
@@ -102,29 +104,81 @@ def test_nerver_success_cannot_mask_chatgpt_token_rejection(monkeypatch):
     )
 
     with pytest.raises(health.InvalidAccessTokenError):
-        health.fetch_remote_account_info(_record(), channel="nerver")
+        health.fetch_remote_account_info(_record(), channel=channel)
 
     assert any(
         url.endswith("/backend-api/conversation/init")
         for _method, url in session.calls
     )
-    nerver.assert_called_once()
+    nerver.assert_not_called()
     assert session.closed is True
 
 
-def test_nerver_plan_failure_does_not_turn_valid_chatgpt_session_dead(monkeypatch):
-    session = _Session()
+@pytest.mark.parametrize("limits", [
+    [], [{"feature_name": "image_gen"}],
+    [{"feature_name": "image_gen", "remaining": None}],
+    [{"feature_name": "image_gen", "remaining": "unknown"}],
+    [{"feature_name": "image_gen", "remaining": False}],
+])
+def test_missing_or_unknown_image_quota_does_not_mark_valid_account_limited(monkeypatch, limits):
+    session = _Session(init_payload={"limits_progress": limits})
     monkeypatch.setattr(health, "_session", Mock(return_value=session))
-    monkeypatch.setattr(
-        "common.trial_eligibility.check_trial_eligibility_nerver",
-        Mock(side_effect=RuntimeError("nerver unavailable")),
-    )
 
-    result = health.fetch_remote_account_info(_record(), channel="nerver")
+    result = health.fetch_remote_account_info(_record())
 
     assert result["health_status"] == "alive"
+    assert result["status"] == "正常"
     assert result["plan_type"] == "free"
-    assert result["health_probe_error"] == "nerver unavailable"
+    assert result["image_quota_unknown"] is True
+    assert result["health_probe_error"] == ""
+
+
+def test_explicit_exhausted_image_quota_remains_limited(monkeypatch):
+    session = _Session(init_payload={
+        "limits_progress": [{"feature_name": "image_gen", "remaining": 0}],
+    })
+    monkeypatch.setattr(health, "_session", Mock(return_value=session))
+
+    result = health.fetch_remote_account_info(_record())
+
+    assert result["health_status"] == "limited"
+    assert result["image_quota_unknown"] is False
+
+
+@pytest.mark.parametrize("metadata", [
+    {},
+    {"account_id": "workspace-team", "plan_type": "self_serve_business_prolite", "type": "team"},
+])
+def test_health_preserves_saved_workspace_and_plan_without_defaulting(monkeypatch, metadata):
+    session = _Session()
+    monkeypatch.setattr(health, "_session", Mock(return_value=session))
+    record = {key: value for key, value in _record().items() if key not in {"account_id", "plan_type"}}
+    record.update(metadata)
+
+    result = health.fetch_remote_account_info(record)
+
+    assert {key: result[key] for key in ("account_id", "plan_type", "type") if key in result} == metadata
+    assert result["health_status"] == "alive"
+
+
+@pytest.mark.parametrize("endpoint", ["me", "init"])
+@pytest.mark.parametrize("payload", ["html", None, [], "not an object"])
+def test_success_status_with_invalid_json_cannot_report_alive(monkeypatch, endpoint, payload):
+    session = _Session()
+    response = _Response(200, payload)
+    if payload == "html":
+        response.text = "<html>upstream error</html>"
+        response.json = Mock(side_effect=ValueError("invalid JSON"))
+    if endpoint == "me":
+        session.get = Mock(return_value=response)
+    else:
+        session.post = Mock(return_value=response)
+    monkeypatch.setattr(health, "_session", Mock(return_value=session))
+
+    with pytest.raises(RuntimeError, match="health_invalid_json"):
+        health.fetch_remote_account_info(_record())
+
+    assert session.closed is True
 
 
 def test_check_accounts_passes_normalized_channel_to_each_account(monkeypatch):

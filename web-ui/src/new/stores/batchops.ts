@@ -366,7 +366,7 @@ export const useBatchOpsStore = defineStore("batchops", () => {
 
   /* --- reauth 家族批次（重新登录/安全修复/改密/改2FA 共用一个后端任务槽） --- */
   const reauth = reactive<ReauthProgress>({
-    running: false, total: 0, done: 0, success: 0, failed: 0, items: [],
+    running: false, total: 0, done: 0, success: 0, failed: 0, cancelled: 0, skipped: 0, items: [],
   });
   const reauthDialogOpen = ref(false);
   const reauthConnection = ref<"connected" | "reconnecting" | "offline">("connected");
@@ -384,6 +384,13 @@ export const useBatchOpsStore = defineStore("batchops", () => {
     }
     const status = String(job.status || "").toLowerCase();
     Object.assign(reauth, job, {
+      // Older jobs do not carry skipped; never retain another batch's count
+      // or skipped rows when applying a complete progress snapshot.
+      skipped: number(job.skipped),
+      cancelled: number(job.cancelled),
+      items: Array.isArray(job.items) ? job.items : [],
+      current: job.current || "",
+      last: job.last || "",
       // Keep the backend's snake_case diagnostics available to components
       // using the existing camelCase fields.
       lastStatus: job.lastStatus || job.last_status || "",

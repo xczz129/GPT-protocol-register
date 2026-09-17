@@ -7,6 +7,7 @@ Supported:
   - maddy_webui:   auto-created maddy mailboxes via maddy-webui automation API
   - fastmail_api:  server-managed Fastmail alias pool via mailcode-api
   - smsbower_mail: purchased temporary Gmail/iCloud mailboxes via SMSBower
+  - online_disposablemail: purchased on-demand mailboxes via online-disposablemail.com
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ import string
 import time
 import warnings
 from contextlib import nullcontext
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from email import message_from_bytes, policy
 from email.header import decode_header, make_header
@@ -153,7 +155,16 @@ _FASTMAIL_CAPACITY_CACHE: dict[tuple[str, str], tuple[float, dict[str, int]]] = 
 
 SMSBOWER_MAIL_DEFAULT_BASE = "https://smsbower.page"
 SMSBOWER_MAIL_DEFAULT_SERVICE = "dr"
-SMSBOWER_MAIL_DOMAINS = {"gmail.com", "icloud.com"}
+SMSBOWER_MAIL_DOMAINS = {
+    "gmail.com",
+    "icloud.com",
+    "mailnestpro.com",
+    "hihinail.com",
+    "flytempbox.com",
+    "mailburstx.com",
+    # "others" = 平台随机域名池（API 文档 domains 表），返回域名不可预知
+    "others",
+}
 SMSBOWER_MAIL_PENDING_ERRORS = (
     "code has not been received yet",
     "code not received",
@@ -164,10 +175,35 @@ SMSBOWER_MAIL_TERMINAL_NOT_FOUND_ERRORS = (
     "no activation found",
     "already canceled",
     "bad actual activation status",
+    # An unhandled remote status must not block purchases forever either:
+    # once the uncertain-activation window has passed, treat the recorded
+    # settlement as stale and clear it like the not-found errors above.
+    "unsupported activation status",
 )
 SMSBOWER_MAIL_CAPACITY_CACHE_TTL = 40.0
 SMSBOWER_MAIL_UNCERTAIN_ACTIVATION_BLOCK_SECONDS = 5 * 60
 SMSBOWER_MAIL_MIN_WAIT_SECONDS = 180.0
+ONLINE_DISPOSABLEMAIL_DEFAULT_BASE = "https://api.online-disposablemail.com"
+# The service-specific sales catalog lists Gmail_1 as type 26 for OpenAi.
+# The historical /api/types dictionary still lists Gmail type 3, which is
+# not evidence that that type is currently sold for this service.
+ONLINE_DISPOSABLEMAIL_DEFAULT_SERVICE_ID = "242"
+ONLINE_DISPOSABLEMAIL_DEFAULT_EMAIL_TYPE_ID = "26"
+ONLINE_DISPOSABLEMAIL_MIN_WAIT_SECONDS = 180.0
+ONLINE_DISPOSABLEMAIL_CAPACITY_CACHE_TTL = 40.0
+ONLINE_DISPOSABLEMAIL_TYPES_CACHE_TTL = 30.0
+# Business response codes: 42001 keeps polling; the 42xxx codes below mean the
+# order can never deliver a code anymore (closed/expired/not found/timeout).
+ONLINE_DISPOSABLEMAIL_CODE_PENDING = 42001
+ONLINE_DISPOSABLEMAIL_CODE_TERMINAL = {42002, 42003, 42004, 42006}
+_ONLINE_DISPOSABLEMAIL_CAPACITY_CACHE_LOCK = Lock()
+_ONLINE_DISPOSABLEMAIL_CAPACITY_CACHE: dict[
+    tuple[str, str, str, str, str], tuple[float, dict[str, Any]]
+] = {}
+_ONLINE_DISPOSABLEMAIL_TYPES_CACHE_LOCK = Lock()
+_ONLINE_DISPOSABLEMAIL_TYPES_CACHE: dict[
+    tuple[str, str], tuple[float, list[dict[str, Any]]]
+] = {}
 _SMSBOWER_MAIL_CAPACITY_CACHE_LOCK = Lock()
 _SMSBOWER_MAIL_CAPACITY_CACHE: dict[
     tuple[str, str, str, tuple[str, ...], str], tuple[float, dict[str, Any]]
@@ -581,6 +617,23 @@ class SmsBowerMailError(RuntimeError):
         self.activation_outcome_uncertain = bool(activation_outcome_uncertain)
         self.activation_id = str(activation_id or "").strip()
         self.activation_address = str(activation_address or "").strip().lower()
+
+
+class OnlineDisposableMailError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        business_code: int = 0,
+        business_error: str = "",
+        order_id: str = "",
+        address: str = "",
+    ):
+        super().__init__(message)
+        self.business_code = int(business_code or 0)
+        self.business_error = str(business_error or "").strip()
+        self.order_id = str(order_id or "").strip()
+        self.address = str(address or "").strip().lower()
 
 
 def _fastmail_capacity_cache_key(api_base: str, admin_key: str) -> tuple[str, str]:
@@ -1644,6 +1697,18 @@ class ICloudApiProvider:
                     marker in subject_lower
                     for marker in ("new sign-in", "new login", "security alert")
                 )
+                # tm1.openai.com 是 OpenAI 当前坏掉的影子发码域,投递的码全部
+                # 无效(参考项目实测固定返回 493682,validate 必拒)。在候选
+                # 阶段硬过滤,避免当有效码提交、白白消耗 check 次数。
+                if code == "493682":
+                    if code not in exclude:
+                        seen_codes.append(code)
+                        exclude.append(code)
+                        print(
+                            f"  [iCloud] {mailbox.get('address', '?')} "
+                            f"已忽略 tm1 影子发码: {code}"
+                        )
+                    continue
                 if not re.fullmatch(r"\d{6}", code) or rejected_notice:
                     if code not in exclude:
                         seen_codes.append(code)
@@ -2886,6 +2951,9 @@ class SmsBowerMailProvider:
     ``api_base`` is an origin (for example ``https://smsbower.page``), not the
     phone API's ``handler_api.php`` URL. Mail activation statuses are a
     separate protocol: 2 cancels, 3 completes, and 5 requests the next code.
+    Status 6 is a provider-side terminal close that happens on its own after
+    the receive window ends (refund without a code, or auto-complete with a
+    late code); no client transition is possible from it.
     """
 
     name = "smsbower_mail"
@@ -3542,6 +3610,18 @@ class SmsBowerMailProvider:
                             remote_status,
                             desired,
                         )
+                elif remote_status == 6:
+                    # Status 6 is a provider-side terminal close: after the
+                    # receive window ends SMSBower either refunds (no code) or
+                    # auto-completes the activation (late code). Either way no
+                    # client transition is possible; drop the pending intent.
+                    logger.warning(
+                        "[%s] activation %s already ended with provider-closed "
+                        "status 6; pending status %s dropped",
+                        self.name,
+                        mail_id,
+                        desired,
+                    )
                 elif remote_status in {1, 5}:
                     self.set_status(mail_id, desired)
                 else:
@@ -3585,7 +3665,9 @@ class SmsBowerMailProvider:
                 ) from error
             _update_smsbower_settlement_state(mailbox, pending_status=None)
             _complete_smsbower_pair_recovery(
-                address, state_entry, remote_status if remote_status in {2, 3} else desired,
+                address,
+                state_entry,
+                remote_status if remote_status in {2, 3, 6} else desired,
             )
             recovered += 1
         return recovered
@@ -3702,9 +3784,15 @@ class SmsBowerMailProvider:
         mail_id = str(
             activation.get("mailId") or activation.get("mail_id") or ""
         ).strip()
-        mailbox = self._settlement_mailbox(address, mail_id, selected_domain)
         returned_domain = address.rsplit("@", 1)[-1] if "@" in address else ""
-        if returned_domain != selected_domain:
+        # domain=others 走平台随机域名池，返回地址的域名不可预知，直接采用返回值
+        mailbox_domain = (
+            returned_domain
+            if selected_domain == "others" and returned_domain
+            else selected_domain
+        )
+        mailbox = self._settlement_mailbox(address, mail_id, mailbox_domain)
+        if returned_domain != mailbox_domain:
             cancel_error: Exception | None = None
             try:
                 self.set_status(mail_id, 2)
@@ -3740,7 +3828,7 @@ class SmsBowerMailProvider:
             )
         try:
             original_domain = self.domain
-            self.domain = selected_domain
+            self.domain = mailbox_domain
             try:
                 self._reserve_address(address, mail_id, allow_used=allow_used)
             finally:
@@ -3935,6 +4023,827 @@ class SmsBowerMailProvider:
                 mailbox["_smsbower_wait_cancelled"] = True
                 return None
         return None
+
+
+class OnlineDisposableMailProvider:
+    """On-demand purchased mailboxes from online-disposablemail.com.
+
+    ``api_base`` is the API origin (default
+    ``https://api.online-disposablemail.com``). Every response carries a
+    business ``code``: 200 is success, 42001 means the verification code has
+    not arrived yet, and 42002/42003/42004/42006 mean the order is closed and
+    can never deliver. Orders cannot be canceled or completed from the client,
+    so there is no settlement journal: a purchase either yields a mailbox or
+    raises, and terminal cleanup only touches local state.
+    """
+
+    name = "online_disposablemail"
+
+    def __init__(self, entry: dict, conf: dict):
+        self.conf = conf
+        self.provider_ref = str(entry.get("provider_ref") or "")
+        self.label = str(
+            entry.get("label") or self.provider_ref or "Online DisposableMail"
+        )
+        self.api_base = self._normalize_api_base(
+            entry.get("api_base") or entry.get("base_url")
+        )
+        self.public_catalog_base = self._public_catalog_origin(
+            self.api_base, entry.get("public_catalog_base")
+        )
+        self.api_key = self._resolve_api_key(entry)
+        self.service_id = self._normalize_id(
+            entry.get("service_id"), "service_id"
+        )
+        self.email_type_id = self._normalize_id(
+            entry.get("email_type_id"), "email_type_id"
+        )
+        try:
+            requested_wait = float(
+                conf.get("online_disposablemail_wait_timeout")
+                or ONLINE_DISPOSABLEMAIL_MIN_WAIT_SECONDS
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "mail.online_disposablemail_wait_timeout must be a positive number"
+            ) from error
+        if not math.isfinite(requested_wait) or requested_wait <= 0:
+            raise ValueError(
+                "mail.online_disposablemail_wait_timeout must be a positive number"
+            )
+        self.wait_timeout = max(
+            ONLINE_DISPOSABLEMAIL_MIN_WAIT_SECONDS, requested_wait
+        )
+        self.session = _http_session()
+
+    @staticmethod
+    def _normalize_api_base(raw: Any) -> str:
+        value = str(raw or ONLINE_DISPOSABLEMAIL_DEFAULT_BASE).strip().rstrip("/")
+        if not value:
+            value = ONLINE_DISPOSABLEMAIL_DEFAULT_BASE
+        if "://" not in value:
+            value = f"https://{value}"
+        parsed = urlparse(value)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+            raise ValueError(
+                "OnlineDisposableMail api_base must be an HTTP(S) origin"
+            )
+        return f"{parsed.scheme.lower()}://{parsed.netloc}"
+
+    @classmethod
+    def _public_catalog_origin(cls, api_base: str, configured: Any = None) -> str:
+        if configured:
+            origin = cls._normalize_api_base(configured)
+        elif api_base == ONLINE_DISPOSABLEMAIL_DEFAULT_BASE:
+            origin = "https://online-disposablemail.com"
+        else:
+            # Custom providers keep their own origin. Never send their
+            # configuration or credentials to the official storefront.
+            origin = api_base
+        parsed = urlparse(origin)
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError(
+                "OnlineDisposableMail public catalog origin must not contain credentials"
+            )
+        return origin
+
+    @staticmethod
+    def _normalize_id(raw: Any, field: str) -> str:
+        value = str(raw or "").strip()
+        if not value:
+            default = (
+                ONLINE_DISPOSABLEMAIL_DEFAULT_SERVICE_ID
+                if field == "service_id"
+                else ONLINE_DISPOSABLEMAIL_DEFAULT_EMAIL_TYPE_ID
+            )
+            return default
+        if not re.fullmatch(r"\d{1,10}", value):
+            raise ValueError(
+                f"OnlineDisposableMail {field} must be a numeric ID"
+            )
+        return value
+
+    @staticmethod
+    def _resolve_api_key(entry: dict) -> str:
+        env_name = str(entry.get("api_key_env") or "").strip()
+        for raw in (
+            entry.get("api_key"),
+            entry.get("apiKey"),
+            os.environ.get(env_name) if env_name else "",
+            os.environ.get("ONLINE_DISPOSABLEMAIL_API_KEY"),
+        ):
+            value = str(raw or "").strip()
+            if not value:
+                continue
+            if value in {
+                "ONLINE_DISPOSABLEMAIL_API_KEY",
+                "${ONLINE_DISPOSABLEMAIL_API_KEY}",
+            }:
+                continue
+            if value.startswith("<") and value.endswith(">"):
+                continue
+            return value
+        return ""
+
+    def close(self) -> None:
+        self.session.close()
+
+    def _safe_detail(self, value: Any) -> str:
+        text = _redact_secrets(value)
+        if self.api_key:
+            text = text.replace(self.api_key, "***")
+        return text
+
+    def _require_api_key(self) -> str:
+        if not self.api_key:
+            raise OnlineDisposableMailError(
+                "OnlineDisposableMail API key missing: configure "
+                "mail.providers[].api_key or ONLINE_DISPOSABLEMAIL_API_KEY"
+            )
+        return self.api_key
+
+    def _request_json(
+        self,
+        path: str,
+        *,
+        action: str,
+        params: dict[str, Any] | None = None,
+        auth: bool = True,
+        base: str | None = None,
+        session: requests.Session | None = None,
+    ) -> dict[str, Any]:
+        query: dict[str, Any] = {}
+        if auth:
+            query["apiKey"] = self._require_api_key()
+        query.update(
+            {
+                key: value
+                for key, value in (params or {}).items()
+                if value not in (None, "")
+            }
+        )
+        try:
+            # One request only: purchases are state-changing GETs and must
+            # never be blindly replayed, including by following a redirect.
+            redirect_options = {"allow_redirects": False} if action == "purchase" else {}
+            response = (session if session is not None else self.session).get(
+                f"{base if base is not None else self.api_base}{path}",
+                params=query,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": self.conf["user_agent"],
+                },
+                timeout=max(3.0, min(float(self.conf["request_timeout"]), 30.0)),
+                **redirect_options,
+            )
+        except Exception as error:
+            raise OnlineDisposableMailError(
+                f"OnlineDisposableMail {action} request failed: "
+                f"{self._safe_detail(error)}"
+            ) from error
+        try:
+            data = response.json()
+        except Exception as error:
+            body = self._safe_detail(str(getattr(response, "text", ""))[:240])
+            raise OnlineDisposableMailError(
+                f"OnlineDisposableMail {action} returned invalid JSON"
+                + (f": {body}" if body else "")
+            ) from error
+        if not isinstance(data, dict):
+            raise OnlineDisposableMailError(
+                f"OnlineDisposableMail {action} returned a non-object response"
+            )
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        if not 200 <= status_code < 300:
+            detail = data.get("msg") or data.get("message") or data
+            raise OnlineDisposableMailError(
+                f"OnlineDisposableMail {action} HTTP {status_code}: "
+                f"{self._safe_detail(detail)[:300]}"
+            )
+        return data
+
+    def _business_payload(
+        self,
+        path: str,
+        *,
+        action: str,
+        params: dict[str, Any] | None = None,
+        auth: bool = True,
+        base: str | None = None,
+        session: requests.Session | None = None,
+    ) -> Any:
+        data = self._request_json(
+            path, action=action, params=params, auth=auth, base=base, session=session
+        )
+        code = data.get("code")
+        try:
+            business_code = int(code)
+        except (TypeError, ValueError):
+            business_code = -1
+        if business_code != 200:
+            detail = str(
+                data.get("msg") or data.get("message") or "unknown API error"
+            ).strip()
+            raise OnlineDisposableMailError(
+                f"OnlineDisposableMail {action} failed (code {business_code}): "
+                f"{self._safe_detail(detail)[:300]}",
+                business_code=business_code,
+                business_error=detail,
+            )
+        return data.get("data")
+
+    def get_balance(self) -> float:
+        payload = self._business_payload("/api/balance", action="balance")
+        try:
+            value = float(payload)
+        except (TypeError, ValueError):
+            raise OnlineDisposableMailError(
+                "OnlineDisposableMail balance returned a non-numeric value"
+            )
+        return value if math.isfinite(value) else 0.0
+
+    @staticmethod
+    def _normalize_catalog(
+        payload: Any, *, action: str, id_alias: str, name_alias: str
+    ) -> list[dict[str, Any]]:
+        if not isinstance(payload, list):
+            raise OnlineDisposableMailError(
+                f"OnlineDisposableMail {action} returned a non-list response"
+            )
+        entries: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in payload:
+            if not isinstance(item, dict):
+                raise OnlineDisposableMailError(
+                    f"OnlineDisposableMail {action} returned an invalid catalog entry"
+                )
+            ids: set[str] = set()
+            for field in ("id", id_alias):
+                value = item.get(field)
+                if value is None or value == "":
+                    continue
+                text = str(value).strip()
+                if not re.fullmatch(r"[0-9]{1,10}", text) or int(text) <= 0:
+                    raise OnlineDisposableMailError(
+                        f"OnlineDisposableMail {action} returned an invalid catalog ID"
+                    )
+                ids.add(str(int(text)))
+            raw_name = item.get("name") or item.get(name_alias)
+            name = raw_name.strip() if isinstance(raw_name, str) else ""
+            if len(ids) != 1 or not name:
+                raise OnlineDisposableMailError(
+                    f"OnlineDisposableMail {action} returned missing or conflicting catalog fields"
+                )
+            item_id = ids.pop()
+            if item_id in seen:
+                raise OnlineDisposableMailError(
+                    f"OnlineDisposableMail {action} returned a duplicate catalog ID"
+                )
+            if "items" in item and not isinstance(item["items"], list):
+                raise OnlineDisposableMailError(
+                    f"OnlineDisposableMail {action} returned invalid service items"
+                )
+            seen.add(item_id)
+            entries.append(dict(item, id=item_id, name=name))
+        return entries
+
+    def get_services(self) -> list[dict[str, Any]]:
+        payload = self._business_payload(
+            "/api/services", action="services", auth=False
+        )
+        return self._normalize_catalog(
+            payload, action="services", id_alias="serviceId", name_alias="serviceName"
+        )
+
+    def get_types(self, *, force: bool = False) -> list[dict[str, Any]]:
+        """Read the service's sales catalog, never the historical type dictionary."""
+        key = (self.public_catalog_base, self.service_id)
+        now = time.monotonic()
+        with _ONLINE_DISPOSABLEMAIL_TYPES_CACHE_LOCK:
+            cached = _ONLINE_DISPOSABLEMAIL_TYPES_CACHE.get(key)
+            if cached is not None and not force and now - cached[0] < ONLINE_DISPOSABLEMAIL_TYPES_CACHE_TTL:
+                return deepcopy(cached[1])
+            # An expired/forced refresh failure must not revive an old result.
+            _ONLINE_DISPOSABLEMAIL_TYPES_CACHE.pop(key, None)
+
+        # This public endpoint is hosted separately from the paid API. A fresh
+        # session prevents purchase cookies or Authorization from crossing over.
+        public_session = _http_session()
+        try:
+            payload = self._business_payload(
+                "/api/guest/type/selects",
+                action="sales types",
+                params={"pageSize": 10000, "pageNum": 1, "serviceId": self.service_id},
+                auth=False,
+                base=self.public_catalog_base,
+                session=public_session,
+            )
+        finally:
+            public_session.close()
+        entries = self._normalize_catalog(
+            payload, action="sales types", id_alias="emailTypeId", name_alias="emailTypeName"
+        )
+        for item in entries:
+            stock = item.get("availableNum")
+            if isinstance(stock, bool) or not re.fullmatch(r"[0-9]+", str(stock)):
+                raise OnlineDisposableMailError(
+                    "OnlineDisposableMail sales types returned invalid availableNum"
+                )
+            item["availableNum"] = int(stock)
+        with _ONLINE_DISPOSABLEMAIL_TYPES_CACHE_LOCK:
+            _ONLINE_DISPOSABLEMAIL_TYPES_CACHE[key] = (time.monotonic(), deepcopy(entries))
+        return entries
+
+    def _selected_type(self, *, force: bool = False) -> dict[str, Any]:
+        for item in self.get_types(force=force):
+            if item["id"] == str(int(self.email_type_id)):
+                return item
+        raise ValueError(
+            f"OnlineDisposableMail email_type_id={self.email_type_id} 不在服务 "
+            f"{self.service_id} 的当前销售目录中，请重新加载列表并选择"
+        )
+
+    def _invalidate_type_catalog(self) -> None:
+        with _ONLINE_DISPOSABLEMAIL_TYPES_CACHE_LOCK:
+            _ONLINE_DISPOSABLEMAIL_TYPES_CACHE.pop(
+                (self.public_catalog_base, self.service_id), None
+            )
+
+    def validate_selection(self) -> None:
+        """Validate the parent service and its current sales types without buying."""
+        services = self.get_services()
+        types = self.get_types()
+        for field, selected, entries in (
+            ("service_id", self.service_id, services),
+            ("email_type_id", self.email_type_id, types),
+        ):
+            if str(int(selected)) not in {item["id"] for item in entries}:
+                raise ValueError(
+                    f"OnlineDisposableMail {field}={selected} 不在当前服务的销售目录中，请重新加载列表并选择"
+                )
+
+    def availability_summary(self, *, force: bool = False) -> dict[str, Any]:
+        """Gate configured capacity on current sales stock and account balance."""
+        key = (
+            self.api_base,
+            self.public_catalog_base,
+            hashlib.sha256(self.api_key.encode("utf-8")).hexdigest(),
+            self.service_id,
+            self.email_type_id,
+        )
+        try:
+            configured_capacity = max(0, int(self.conf.get("capacity", 50)))
+        except (TypeError, ValueError):
+            configured_capacity = 50
+        summary = {
+            "service_id": self.service_id,
+            "email_type_id": self.email_type_id,
+            "capacity": 0,
+            "balance": None,
+            "available_num": 0,
+            "error": "",
+        }
+        try:
+            selected = self._selected_type(force=force)
+            summary["available_num"] = selected["availableNum"]
+            if selected["availableNum"] <= 0:
+                summary["error"] = "OnlineDisposableMail 当前服务所选邮箱类型暂无库存"
+                return summary
+        except Exception as error:
+            summary["error"] = self._safe_detail(error)[:200]
+            return summary
+
+        # Recheck the sales catalog even when the balance is cached. Its TTL
+        # is shorter, and an explicit failed refresh must stop scheduling.
+        now = time.monotonic()
+        with _ONLINE_DISPOSABLEMAIL_CAPACITY_CACHE_LOCK:
+            cached = _ONLINE_DISPOSABLEMAIL_CAPACITY_CACHE.get(key)
+            cached_balance = (
+                cached[1].get("balance")
+                if cached is not None and not force and now - cached[0] < ONLINE_DISPOSABLEMAIL_CAPACITY_CACHE_TTL
+                else None
+            )
+        try:
+            summary["balance"] = cached_balance if cached_balance is not None else self.get_balance()
+            if summary["balance"] > 0:
+                summary["capacity"] = min(configured_capacity, selected["availableNum"])
+            else:
+                summary["error"] = "OnlineDisposableMail 账户余额不足"
+        except Exception as error:
+            summary["error"] = self._safe_detail(error)[:200]
+            with _ONLINE_DISPOSABLEMAIL_CAPACITY_CACHE_LOCK:
+                _ONLINE_DISPOSABLEMAIL_CAPACITY_CACHE.pop(key, None)
+            return summary
+        if cached_balance is None:
+            with _ONLINE_DISPOSABLEMAIL_CAPACITY_CACHE_LOCK:
+                _ONLINE_DISPOSABLEMAIL_CAPACITY_CACHE[key] = (time.monotonic(), dict(summary))
+        return summary
+
+    def buy_mailbox(self) -> dict[str, str]:
+        self._require_api_key()
+        try:
+            selected = self._selected_type()
+        except ValueError as error:
+            raise OnlineDisposableMailError(str(error)) from error
+        if selected["availableNum"] <= 0:
+            raise OnlineDisposableMailError(
+                "OnlineDisposableMail purchase blocked: 当前服务所选邮箱类型暂无库存"
+            )
+        try:
+            payload = self._business_payload(
+                "/api/mailbox",
+                action="purchase",
+                params={
+                    "serviceId": self.service_id,
+                    "emailTypeId": self.email_type_id,
+                    # The official createOrder demo specifies 0 for API orders;
+                    # the summary endpoint table omits this purchase-mode field.
+                    "buyMode": 0,
+                    "quantity": 1,
+                },
+            )
+        except OnlineDisposableMailError as error:
+            if error.business_code in {41001, 41003}:
+                self._invalidate_type_catalog()
+            raise
+        orders = payload.get("orders") if isinstance(payload, dict) else None
+        if not isinstance(orders, list) or not orders:
+            raise OnlineDisposableMailError(
+                "OnlineDisposableMail purchase response missing orders"
+            )
+        order = orders[0] if isinstance(orders[0], dict) else {}
+        address = str(order.get("email") or "").strip().lower()
+        order_id = str(order.get("orderId") or "").strip()
+        if "@" not in address or not order_id:
+            raise OnlineDisposableMailError(
+                "OnlineDisposableMail purchase response missing email/orderId",
+                order_id=order_id,
+                address=address,
+            )
+        return {"address": address, "order_id": order_id}
+
+    def _latest_code_payload(self, order_id: str) -> dict[str, Any]:
+        """Return {'code': str|None, 'content': str} or raise on hard errors.
+
+        The top-level ``code`` is the business status (200 success, 42001
+        still waiting); ``data.code`` is the verification code itself.
+        """
+        data = self._request_json(
+            "/api/latest/code",
+            action="latest code",
+            params={"orderId": order_id},
+        )
+        try:
+            business_code = int(data.get("code"))
+        except (TypeError, ValueError):
+            business_code = -1
+        if business_code != 200:
+            detail = str(data.get("msg") or data.get("message") or "").strip()
+            raise OnlineDisposableMailError(
+                f"OnlineDisposableMail latest code failed (code {business_code}): "
+                f"{self._safe_detail(detail)[:300]}",
+                business_code=business_code,
+                business_error=detail,
+                order_id=order_id,
+            )
+        payload = data.get("data") if isinstance(data.get("data"), dict) else {}
+        return {
+            "code": str(payload.get("code") or "").strip() or None,
+            "content": str(payload.get("content") or "") or "",
+        }
+
+    @staticmethod
+    def _order_id(mailbox: dict[str, Any]) -> str:
+        return str(
+            mailbox.get("order_id")
+            or mailbox.get("orderId")
+            or mailbox.get("mail_id")
+            or ""
+        ).strip()
+
+    def _reserve_address(self, address: str, order_id: str) -> None:
+        target = str(address or "").strip().lower()
+        target_base = base_mailbox_address(target)
+        known = _known_mailbox_bindings()
+        if any(
+            base_mailbox_address(bound) == target_base for bound in known
+        ):
+            raise OnlineDisposableMailError(
+                "OnlineDisposableMail mailbox is already bound to a local account",
+                business_error="already_registered",
+                order_id=order_id,
+                address=target,
+            )
+        with _mailbox_state_lock:
+            with _with_state_file_lock():
+                store = _load_state_unlocked()
+                previous = store.get(target)
+                if not _entry_available(previous):
+                    current = str((previous or {}).get("state") or "unavailable")
+                    raise RuntimeError(
+                        f"[{self.label}] OnlineDisposableMail mailbox unavailable: "
+                        f"{target} ({current})"
+                    )
+                store[target] = {
+                    "state": "in_use",
+                    "reason": "",
+                    "_prev_state": str((previous or {}).get("state") or ""),
+                    "updated_at": datetime.now(BJ_TZ).strftime(
+                        "%Y-%m-%d %H:%M:%S%z"
+                    ),
+                    "provider": self.name,
+                    "provider_ref": self.provider_ref,
+                    "label": self.label,
+                    "api_base": self.api_base,
+                    "service_id": self.service_id,
+                    "email_type_id": self.email_type_id,
+                    "mail_id": order_id,
+                    "order_id": order_id,
+                }
+                _save_state_unlocked(store)
+
+    def create_mailbox(
+        self,
+        username: str | None = None,
+        *,
+        allow_used: bool = False,
+    ) -> dict[str, Any]:
+        requested = str(username or "").strip()
+        if requested:
+            if allow_used:
+                reused = self._reuse_existing_binding(requested)
+                if reused is not None:
+                    return reused
+            raise RuntimeError(
+                f"[{self.label}] OnlineDisposableMail cannot allocate a "
+                "requested address; leave the fixed email empty"
+            )
+        purchase = self.buy_mailbox()
+        address = purchase["address"]
+        order_id = purchase["order_id"]
+        domain = address.rsplit("@", 1)[-1] if "@" in address else ""
+        mailbox = {
+            "provider": self.name,
+            "provider_ref": self.provider_ref,
+            "address": address,
+            "login_address": address,
+            "base_address": address,
+            "label": self.label,
+            "password": "",
+            "api_base": self.api_base,
+            "service_id": self.service_id,
+            "email_type_id": self.email_type_id,
+            "domain": domain,
+            "register_child": False,
+            "order_id": order_id,
+            "mail_id": order_id,
+            # Kept in memory only; persistence stores a SHA-256 fingerprint.
+            "_odm_api_key": self.api_key,
+        }
+        self._reserve_address(address, order_id)
+        return mailbox
+
+    def _reuse_existing_binding(self, address: str) -> dict[str, Any] | None:
+        """按 mail state 存档复用已购临时邮箱（协议登录补全半成品号）。
+
+        一次性邮箱无法按地址重新分配，但已购邮箱在服务方下线前仍能按
+        order_id 收信；从 state 复原绑定即可完成验证码登录。用于注册中断
+        （登录补全失败后被清理）但 OpenAI 侧账号已创建的场景。
+        """
+        target = str(address or "").strip().lower()
+        if not target or "@" not in target:
+            return None
+        entry: dict[str, Any] = {}
+        with _mailbox_state_lock:
+            with _with_state_file_lock():
+                store = _load_state_unlocked()
+                stored = store.get(target)
+                if not isinstance(stored, dict):
+                    return None
+                if str(stored.get("provider") or "") != self.name:
+                    return None
+                order_id = str(
+                    stored.get("order_id") or stored.get("mail_id") or ""
+                ).strip()
+                if not order_id:
+                    return None
+                state = str(stored.get("state") or "").lower()
+                if state not in {"available", "used", "in_use", "failed"}:
+                    return None
+                entry = dict(stored)
+                store[target] = {
+                    **stored,
+                    "state": "in_use",
+                    "reason": "protocol_login_reuse",
+                    "_prev_state": state,
+                    "updated_at": datetime.now(BJ_TZ).strftime(
+                        "%Y-%m-%d %H:%M:%S%z"
+                    ),
+                }
+                _save_state_unlocked(store)
+        # 预置"当前最新码"为已见：API 的 latest code 是注册时的旧码，
+        # 不预置会立即返回旧码导致 wrong_email_otp_code；跳过它等新码。
+        seen_codes: list[str] = []
+        try:
+            payload = self._latest_code_payload(order_id)
+            prior = str((payload or {}).get("code") or "").strip()
+            if prior and re.fullmatch(r"\d{4,8}", prior):
+                seen_codes.append(prior)
+        except OnlineDisposableMailError:
+            pass
+        domain = target.rsplit("@", 1)[-1] if "@" in target else ""
+        return {
+            "provider": self.name,
+            "provider_ref": str(entry.get("provider_ref") or self.provider_ref),
+            "address": target,
+            "login_address": target,
+            "base_address": target,
+            "label": self.label,
+            "password": "",
+            "api_base": str(entry.get("api_base") or self.api_base),
+            "service_id": str(entry.get("service_id") or self.service_id),
+            "email_type_id": str(entry.get("email_type_id") or self.email_type_id),
+            "domain": domain,
+            "register_child": False,
+            "order_id": order_id,
+            "mail_id": order_id,
+            # Kept in memory only; persistence stores a SHA-256 fingerprint.
+            "_odm_api_key": self.api_key,
+            # 该身份由本系统的事务创建（注册中断补登录），非回收邮箱
+            "_registration_identity_created": True,
+            # 预置已见码：跳过注册时的旧验证码，等待本次登录的新码
+            "_odm_seen_codes": seen_codes,
+        }
+
+    @staticmethod
+    def _sleep_until_next_poll(seconds: float, stop_check=None) -> bool:
+        ticks = max(1, int(max(0.2, seconds) * 5))
+        for _ in range(ticks):
+            if callable(stop_check) and stop_check():
+                return False
+            time.sleep(0.2)
+        return True
+
+    @staticmethod
+    def _jittered_poll_delay(seconds: float) -> float:
+        try:
+            base = float(seconds)
+        except (TypeError, ValueError):
+            base = 3.0
+        return max(0.2, base + random.uniform(-0.35, 0.35))
+
+    def wait_for_code(
+        self,
+        mailbox: dict[str, Any],
+        stop_check=None,
+    ) -> str | None:
+        order_id = self._order_id(mailbox)
+        if not order_id:
+            raise OnlineDisposableMailError(
+                "OnlineDisposableMail mailbox missing orderId"
+            )
+        if callable(stop_check) and stop_check():
+            mailbox["_odm_wait_cancelled"] = True
+            return None
+        started = time.monotonic()
+        wait_id = secrets.token_hex(16)
+        mailbox["_odm_wait_cancelled"] = False
+        mailbox["_odm_wait_timed_out"] = False
+        mailbox.pop("_last_code_wait_error", None)
+        mailbox["_code_wait_attempts"] = 0
+        deadline = time.monotonic() + self.wait_timeout
+        attempt = 0
+        code = None
+        while time.monotonic() < deadline:
+            if callable(stop_check) and stop_check():
+                mailbox["_odm_wait_cancelled"] = True
+                return None
+            attempt += 1
+            mailbox["_code_wait_attempts"] = attempt
+            try:
+                payload = self._latest_code_payload(order_id)
+            except OnlineDisposableMailError as error:
+                detail = str(error)
+                mailbox["_last_code_wait_error"] = detail[:300]
+                if error.business_code == ONLINE_DISPOSABLEMAIL_CODE_PENDING:
+                    # Waiting for the code; keep polling.
+                    pass
+                elif "waiting to receive verification code" in (
+                    error.business_error or ""
+                ).lower():
+                    # 远端等待态有时以业务码 401 + Waiting 文案返回；
+                    # 按 42001 同样处理，静默继续轮询，避免每次轮询刷 WARNING。
+                    pass
+                elif "no longer valid" in (error.business_error or "").lower():
+                    # 邮箱已被远端关闭（业务码 403 + no longer valid），
+                    # 继续轮询毫无意义，立即按终态终止等待。
+                    raise
+                elif error.business_code in ONLINE_DISPOSABLEMAIL_CODE_TERMINAL:
+                    raise
+                elif any(
+                    marker in detail.lower()
+                    for marker in ("api key", "unauthorized", "http 401", "http 403")
+                ):
+                    raise
+                else:
+                    logger.warning(
+                        "[%s] code poll #%d failed for %s: %s",
+                        self.name,
+                        attempt,
+                        mailbox.get("address", "?"),
+                        self._safe_detail(detail)[:200],
+                    )
+            else:
+                candidate = payload.get("code")
+                if not candidate and payload.get("content"):
+                    candidate = _extract_code(
+                        {"html_content": payload["content"]}
+                    )
+                    if not candidate:
+                        # Generic fallback for provider-undecoded mail HTML:
+                        # the first standalone 4-8 digit number after tags
+                        # are stripped. OpenAI's own template is handled by
+                        # _extract_code; this covers other service mails.
+                        stripped = re.sub(r"<[^>]+>", " ", payload["content"])
+                        match = re.search(r"(?<!\d)\d{4,8}(?!\d)", stripped)
+                        if match:
+                            candidate = match.group(0)
+                if candidate:
+                    if not re.fullmatch(r"\d{6}", candidate):
+                        mailbox["_last_code_wait_error"] = (
+                            "OnlineDisposableMail returned a non-6-digit code"
+                        )
+                    elif candidate in (
+                        mailbox.get("_odm_seen_codes") or []
+                    ):
+                        mailbox["_last_code_wait_error"] = (
+                            "OnlineDisposableMail is still returning the previous code"
+                        )
+                    else:
+                        code = candidate
+                        mailbox["_odm_seen_codes"] = [
+                            *(mailbox.get("_odm_seen_codes") or []), code
+                        ][-64:]
+                        mailbox.pop("_last_code_wait_error", None)
+                        break
+            if not self._sleep_until_next_poll(
+                self._jittered_poll_delay(self.conf["wait_interval"]),
+                stop_check,
+            ):
+                mailbox["_odm_wait_cancelled"] = True
+                return None
+        if code:
+            mailbox["_registration_code_received"] = True
+            from common.mail_registration_metrics import record_otp_wait
+
+            record_otp_wait(
+                mailbox.get("_registration_metric_attempt_id"),
+                wait_id,
+                max(0.0, time.monotonic() - started),
+                received=True,
+            )
+            return code
+        if not mailbox.get("_odm_wait_cancelled"):
+            from common.mail_registration_metrics import record_otp_wait
+
+            record_otp_wait(
+                mailbox.get("_registration_metric_attempt_id"),
+                wait_id,
+                max(0.0, time.monotonic() - started),
+                received=False,
+            )
+            mailbox["_odm_wait_timed_out"] = True
+            if mailbox.get("_registration_outcome") != "already_registered":
+                mailbox["_registration_outcome"] = "otp_timeout"
+        return None
+
+    def fetch_recent_messages(self, mailbox: dict[str, Any]) -> list[dict[str, Any]]:
+        """The API exposes only the latest code/content for an order."""
+        order_id = self._order_id(mailbox)
+        if not order_id:
+            return []
+        try:
+            payload = self._latest_code_payload(order_id)
+        except OnlineDisposableMailError as error:
+            if error.business_code == ONLINE_DISPOSABLEMAIL_CODE_PENDING:
+                return []
+            raise
+        code = payload.get("code") or ""
+        content = payload.get("content") or ""
+        if not code and not content:
+            return []
+        return [
+            {
+                "subject": f"最新验证码 {code}".strip(),
+                "from": "",
+                "to": mailbox.get("address", ""),
+                "text_content": code or "",
+                "html_content": content,
+                "received_at": datetime.now(BJ_TZ).strftime(
+                    "%Y-%m-%d %H:%M:%S%z"
+                ),
+            }
+        ]
 
 
 _SMSBOWER_SHARED_CODE_FIELDS = (
@@ -4211,9 +5120,13 @@ def _mail_registration_outcome(mailbox: dict[str, Any], success: bool, error: An
         return "success"
     if reason in {"cancelled", "cancellederror", "stop requested", "partial_registration_otp_already_sent"} or "stop requested" in reason:
         return "cancelled"
-    if mailbox.get("_smsbower_wait_timed_out") or any(part in reason for part in (
-        "验证码超时", "otp_timeout", "verification code timeout", "email code timeout",
-    )):
+    if (
+        mailbox.get("_smsbower_wait_timed_out")
+        or mailbox.get("_odm_wait_timed_out")
+        or any(part in reason for part in (
+            "验证码超时", "otp_timeout", "verification code timeout", "email code timeout",
+        ))
+    ):
         return "otp_timeout"
     return "other_failed"
 
@@ -4544,6 +5457,10 @@ def _make_config(mail_config: dict) -> dict:
             mail_config.get("smsbower_wait_timeout")
             or SMSBOWER_MAIL_MIN_WAIT_SECONDS
         ),
+        "online_disposablemail_wait_timeout": float(
+            mail_config.get("online_disposablemail_wait_timeout")
+            or ONLINE_DISPOSABLEMAIL_MIN_WAIT_SECONDS
+        ),
         "wait_interval": float(mail_config.get("wait_interval") or 3),
         "wait_chunk": float(mail_config.get("wait_chunk") or 30),
         "icloud_resync_interval": float(
@@ -4577,6 +5494,8 @@ def _iter_provider_entries(
         want = "fastmail_api"
     elif want in {"smsbower_email", "sms_bower_mail"}:
         want = "smsbower_mail"
+    elif want in {"odm", "online_dispo", "onlinedispomail", "disposablemail"}:
+        want = "online_disposablemail"
     elif want in {"auto", "any", "all", ""}:
         want = ""
 
@@ -4609,6 +5528,8 @@ def _build_provider(entry: dict, conf: dict):
         return FastmailApiProvider(entry, conf)
     if ptype == "smsbower_mail":
         return SmsBowerMailProvider(entry, conf)
+    if ptype == "online_disposablemail":
+        return OnlineDisposableMailProvider(entry, conf)
     raise RuntimeError(f"Unsupported mail provider type: {entry.get('type')}")
 
 
@@ -4716,7 +5637,7 @@ def reconcile_registered_mailbox_states(
             pool = parse_icloud_credentials(lines)
         elif ptype == "maddy_webui":
             pool = parse_domain_mailboxes(lines)
-        elif ptype == "smsbower_mail":
+        elif ptype in {"smsbower_mail", "online_disposablemail"}:
             pool = []
         else:
             pool = parse_outlook_credentials(lines)
@@ -4990,6 +5911,41 @@ def count_pool_capacity(
                 stats["split_available"] = int(stats["split_available"]) + dynamic_capacity
                 stats["split_total"] = int(stats["split_total"]) + dynamic_capacity
             continue
+        elif ptype == "online_disposablemail":
+            # Orders are bought on demand and cannot satisfy a fixed address
+            # request. Sales availability and balance gate configured capacity.
+            if requested:
+                continue
+            try:
+                configured_capacity = max(0, int(entry.get("capacity") or 0))
+            except (TypeError, ValueError):
+                configured_capacity = 0
+            conf = _make_config(mail_config)
+            conf["request_timeout"] = min(
+                float(conf.get("request_timeout") or 30), 6.0
+            )
+            conf["capacity"] = configured_capacity
+            odm_provider = OnlineDisposableMailProvider(entry, conf)
+            try:
+                summary = odm_provider.availability_summary()
+                dynamic_capacity = max(
+                    0, int(summary.get("capacity") or 0)
+                )
+            except Exception as error:
+                logger.warning(
+                    "[online_disposablemail] availability check failed; "
+                    "scheduling capacity=0: %s",
+                    odm_provider._safe_detail(error)[:200],
+                )
+                dynamic_capacity = 0
+            finally:
+                odm_provider.close()
+            stats["total"] = int(stats["total"]) + dynamic_capacity
+            stats["total_slots"] = int(stats["total_slots"]) + dynamic_capacity
+            stats["primary_available"] = (
+                int(stats["primary_available"]) + dynamic_capacity
+            )
+            continue
         else:
             pool = parse_outlook_credentials(lines)
         for item in pool:
@@ -5154,6 +6110,7 @@ def create_mailbox(
       - "maddy" / "maddy_webui"
       - "fastmail" / "fastmail_api"
       - "smsbower_mail" / "smsbower_email"
+      - "online_disposablemail" / "odm"
     """
     entries = _iter_provider_entries(mail_config, provider_type=provider_type)
     if not entries:
@@ -5161,7 +6118,8 @@ def create_mailbox(
         raise RuntimeError(
             f"No mail provider found for type={want!r}. "
             f"Enable outlook_token, icloud_api, maddy_webui, "
-            f"fastmail_api, or smsbower_mail under mail.providers"
+            f"fastmail_api, smsbower_mail, or online_disposablemail "
+            f"under mail.providers"
         )
 
     conf = _make_config(mail_config)
@@ -5215,8 +6173,13 @@ def create_mailbox(
             return mailbox
         except RuntimeError as error:
             if (
+                isinstance(error, (SmsBowerMailError, OnlineDisposableMailError))
+                and error.business_error == "already_registered"
+            ):
+                raise
+            if (
                 isinstance(error, SmsBowerMailError)
-                and (error.activation_outcome_uncertain or error.business_error == "already_registered")
+                and error.activation_outcome_uncertain
             ):
                 raise
             last_error = str(error)
@@ -5225,8 +6188,13 @@ def create_mailbox(
             # 网络层等非 RuntimeError 异常同样换下一个 provider，
             # 避免单个 provider 内部状态（已写 in_use）外泄成未释放预约
             if (
+                isinstance(error, (SmsBowerMailError, OnlineDisposableMailError))
+                and error.business_error == "already_registered"
+            ):
+                raise
+            if (
                 isinstance(error, SmsBowerMailError)
-                and (error.activation_outcome_uncertain or error.business_error == "already_registered")
+                and error.activation_outcome_uncertain
             ):
                 raise
             last_error = str(error)
@@ -5320,6 +6288,8 @@ def _is_transient_registration_error(reason: str) -> bool:
         "open browser",
         "registration_disallowed",
         "验证码获取超时",
+        "等待注册验证码超时",
+        "登录验证码超时",
         "创建账号失败",
         "浏览器进程已断开",
         "create browser failed",
@@ -5385,13 +6355,18 @@ def mark_mailbox_result(
     address = str(mailbox.get("address") or "").strip()
     if not address:
         return
-    if provider == "smsbower_mail":
+    if provider in {"smsbower_mail", "online_disposablemail"}:
         outcome = _mail_registration_outcome(mailbox, success, error)
         mailbox["_registration_outcome"] = outcome
         _record_mail_registration_outcome(mailbox, outcome)
-        if _defer_smsbower_pair_result(mailbox, outcome, consumed=success and outcome != "already_registered"):
+        if provider == "smsbower_mail" and _defer_smsbower_pair_result(mailbox, outcome, consumed=success and outcome != "already_registered"):
             return
-    if success and (provider != "smsbower_mail" or outcome != "already_registered"):
+        if provider == "online_disposablemail" and outcome == "already_registered":
+            # A purchased address bound to an existing account must never be
+            # bought or selected again; the remote order cannot be refunded.
+            _set_state(address, "used", "already_registered")
+            return
+    if success and (provider not in {"smsbower_mail", "online_disposablemail"} or outcome != "already_registered"):
         if provider == "smsbower_mail":
             _set_smsbower_mailbox_status(mailbox, 3)
         _set_state(address, "used")
@@ -5526,6 +6501,13 @@ def release_mailbox(mailbox: dict) -> None:
             )
             return
         if outcome == "already_registered" or mailbox.get("_otp_accepted_by_server"):
+            _set_state(address, "used", outcome)
+            return
+    if provider == "online_disposablemail":
+        outcome = _mail_registration_outcome(mailbox, False, "cancelled")
+        mailbox["_registration_outcome"] = outcome
+        _record_mail_registration_outcome(mailbox, outcome)
+        if outcome == "already_registered":
             _set_state(address, "used", outcome)
             return
     _release_state(address)

@@ -14,7 +14,21 @@ def _text(value: Any) -> str:
 
 def _team_plan(value: Any) -> bool:
     plan = _text(value).lower()
-    return any(part in plan for part in ("team", "business", "prolite", "enterprise"))
+    # Plan labels such as ``self_serve_business_prolite`` are subscription
+    # identifiers, not proof of the selected workspace type. Workspace
+    # metadata/ID is the authority for personal vs Team selection.
+    return plan in {"team", "business", "enterprise"}
+
+
+def _explicit_team_workspace(item: dict[str, Any]) -> bool:
+    if not isinstance(item, dict):
+        return False
+    account = item.get("account") if isinstance(item.get("account"), dict) else {}
+    for source in (item, account):
+        for key in ("type", "kind", "account_type", "workspace_type", "structure"):
+            if _text(source.get(key)).lower() in {"team", "business", "enterprise", "organization", "org"}:
+                return True
+    return False
 
 
 def workspace_entries(payload: Any) -> list[dict[str, Any]]:
@@ -82,7 +96,10 @@ def select_team_workspace(workspaces: list[dict[str, Any]], workspace_name: str 
     if not items:
         raise RuntimeError("team_workspace_unavailable: 认证会话未提供工作区列表，未选择个人空间")
     if wanted:
-        named = [item for item in items if _text(item.get("name") or item.get("title") or item.get("label")).casefold() == wanted]
+        # Accept either a displayed workspace name or its stable ID.
+        named = [item for item in items if _text(item.get("id")).casefold() == wanted]
+        if not named:
+            named = [item for item in items if _text(item.get("name") or item.get("title") or item.get("label")).casefold() == wanted]
         matches = [item for item in named if not _personal_workspace(item)]
         if named and not matches:
             raise RuntimeError("team_workspace_personal_forbidden: 指定的是个人空间，Team 导入已停止")
@@ -94,6 +111,26 @@ def select_team_workspace(workspaces: list[dict[str, Any]], workspace_name: str 
         reason = "没有可用团队工作区" if not matches else "存在多个候选工作区，请指定团队工作区名称"
         raise RuntimeError("team_workspace_ambiguous: " + reason)
     return matches[0]
+
+
+def select_personal_workspace(workspaces: list[dict[str, Any]], workspace_name: str = "") -> dict[str, Any]:
+    """Select a real personal workspace without inferring it from plan_type."""
+    items = [item for item in workspaces if isinstance(item, dict) and item.get("id")]
+    wanted = _text(workspace_name).casefold()
+    personal = [item for item in items if _personal_workspace(item)]
+    if wanted:
+        matches = [item for item in personal if (
+            _text(item.get("id")).casefold() == wanted
+            or _text(item.get("name") or item.get("title") or item.get("label")).casefold() == wanted
+        )]
+        if not matches:
+            raise RuntimeError(f"personal_workspace_not_found: 未找到指定个人工作区「{workspace_name}」")
+        return matches[0]
+    if len(personal) == 1:
+        return personal[0]
+    if not personal:
+        raise RuntimeError("personal_workspace_unavailable: 当前会话没有可识别的个人工作区；若账号只有 Team/Business，请选择 Team")
+    raise RuntimeError("personal_workspace_ambiguous: 检测到多个个人工作区，请指定 Workspace ID")
 
 
 def validate_team_session(record: dict[str, Any], *, selected_workspace_id: str = "", expected_user_id: str = "") -> dict[str, str]:
@@ -115,10 +152,11 @@ def validate_team_session(record: dict[str, Any], *, selected_workspace_id: str 
     plan = token_plan or session_plan
     if not token or not plan:
         raise RuntimeError("team_workspace_unverified: 缺少真实工作区套餐信息，未按 Team 导入成功")
-    if not _team_plan(plan) or _personal_workspace(account):
+    if _personal_workspace(account) or (not _team_plan(plan) and not _explicit_team_workspace(account)):
         raise RuntimeError(f"team_workspace_personal_forbidden: 实际会话套餐为 {plan}，未接受个人空间")
     declared_plan = _text(record.get("plan_type"))
-    if (session_plan and not _team_plan(session_plan)) or (declared_plan and not _team_plan(declared_plan)):
+    if ((session_plan and not _team_plan(session_plan) and not _explicit_team_workspace(account))
+            or (declared_plan and not _team_plan(declared_plan) and not _explicit_team_workspace(account))):
         raise RuntimeError("team_workspace_plan_mismatch: 登录或测活结果回到了个人套餐，未覆盖已有账号")
     account_id = _text(auth.get("chatgpt_account_id") or account.get("id") or account.get("account_id"))
     if not account_id:
@@ -168,8 +206,14 @@ def session_identity(record: dict[str, Any]) -> dict[str, str]:
 
 def requires_team_workspace(record: dict[str, Any]) -> bool:
     """Keep an imported/verified team constraint across later credential changes."""
+    mode = _text(record.get("workspace_selection_mode")).lower()
+    import_type = _text(record.get("import_account_type")).lower()
+    if mode == "personal" or import_type == "personal":
+        return False
+    if mode == "team" or import_type == "team":
+        return True
     return (
-        _text(record.get("import_account_type")).lower() == "team"
+        import_type == "team"
         or _team_plan(record.get("plan_type"))
         or _team_plan(session_identity(record)["plan_type"])
         or bool(record.get("workspace_selection_verified") is True and _text(record.get("selected_workspace_id")))

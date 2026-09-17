@@ -138,8 +138,9 @@ async function start() {
     if (!value.job_id) {
       ui.notify(value.message || "预检完成，没有可提交账号", "warning");
     } else {
-      const skipped = (value.not_found?.length || 0) + (value.missing_credentials?.length || 0) + (value.invalid_format?.length || 0);
-      ui.notify(`协议登录已启动：提交 ${value.submitted || 0} 个${skipped ? `，跳过 ${skipped} 个` : ""}`, "success");
+      const skipped = Number(value.skipped || 0) + (value.not_found?.length || 0) + (value.missing_credentials?.length || 0) + (value.invalid_format?.length || 0);
+      const state = value.status === "completed" ? "已结束" : "已启动";
+      ui.notify(`协议登录${state}：提交 ${value.submitted || 0} 个${skipped ? `，已跳过 ${skipped} 个` : ""}`, "success");
     }
   } catch (error) {
     ui.notify(error instanceof Error ? error.message : "协议登录批次启动失败", "error");
@@ -255,6 +256,8 @@ onMounted(async () => {
         <span>{{ progress.current || (progress.running ? "队列处理中" : "已完成") }}</span>
         <span class="ok-text">成功 {{ progress.success || 0 }}</span>
         <span class="error-text">失败 {{ progress.failed || 0 }}</span>
+        <span>已跳过 {{ progress.skipped || 0 }}</span>
+        <span>已取消 {{ progress.cancelled || 0 }}</span>
         <AppButton v-if="progress.running" variant="danger" size="sm" :disabled="progress.stopping" @click="stopJob">
           <Square :size="12" /><span>停止</span>
         </AppButton>
@@ -297,7 +300,8 @@ onMounted(async () => {
             <td><AppTag :kind="row.account?.is_deactivated ? 'error' : 'default'">{{ row.matching ? '正在匹配' : healthLabel(row.account) }}</AppTag></td>
             <td>
               <span :class="['job-status', `is-${row.job?.status || (row.account ? 'ready' : 'not-found')}`]">
-                {{ row.job?.message || (row.matching ? "等待账号库加载" : row.account ? (row.missing.length ? "跳过：缺少凭据" : "待提交") : "未找到本地账号，请先导入") }}
+                <template v-if="row.job?.status === 'skipped'">已跳过{{ row.job.message ? `：${row.job.message}` : '' }}</template>
+                <template v-else>{{ row.job?.message || (row.matching ? "等待账号库加载" : row.account ? (row.missing.length ? "跳过：缺少凭据" : "待提交") : "未找到本地账号，请先导入") }}</template>
               </span>
             </td>
             <td><span :class="['plan-text', `is-${rowPlan(row)}`]">{{ planLabel(row) }}</span></td>

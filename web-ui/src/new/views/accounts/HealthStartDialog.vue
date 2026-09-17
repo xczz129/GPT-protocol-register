@@ -18,7 +18,6 @@ const emit = defineEmits<{ close: []; started: [workers: number] }>();
 const accounts = useAccountsStore();
 const ui = useUiStore();
 const concurrency = ref(10);
-const channel = ref<"v4" | "nerver">("v4");
 const loadingSettings = ref(false);
 const submitting = ref(false);
 let openGeneration = 0;
@@ -37,7 +36,6 @@ watch(() => props.open, (open) => {
   }
   const generation = ++openGeneration;
   submitting.value = false;
-  channel.value = "v4";
   loadingSettings.value = true;
   void fetchUiSettings()
     .then((settings) => {
@@ -56,8 +54,8 @@ async function submit() {
   submitting.value = true;
   const workers = clampWorkers(concurrency.value);
   try {
-    const completion = accounts.startHealth(props.keys, Boolean(props.all), workers, channel.value);
-    ui.notify(`测活请求已提交（${channel.value}，并发 ${workers}）`, "success");
+    const completion = accounts.startHealth(props.keys, Boolean(props.all), workers);
+    ui.notify(`账号测活请求已提交（并发 ${workers}）`, "success");
     emit("close");
     await completion;
     emit("started", workers);
@@ -71,20 +69,11 @@ async function submit() {
 
 <template>
   <AppModal :open="open" title="启动账号测活" :subtitle="scopeText" width="460px" @close="emit('close')">
-    <p class="start-message">ChatGPT /me 与会话接口负责检查账号有效性；所选渠道只影响资格与套餐探测。已封号账号会自动跳过。</p>
-
-    <div class="field-row channel-row">
-      <span class="field-label">检测渠道</span>
-      <div class="segmented" role="radiogroup" aria-label="检测渠道">
-        <button type="button" :class="{ active: channel === 'v4' }" :aria-checked="channel === 'v4'" role="radio" :disabled="submitting" @click="channel = 'v4'">v4 接口</button>
-        <button type="button" :class="{ active: channel === 'nerver' }" :aria-checked="channel === 'nerver'" role="radio" :disabled="submitting" @click="channel = 'nerver'">nerver 接口</button>
-      </div>
-    </div>
-    <p class="channel-note">{{ channel === "nerver" ? "nerver 仅辅助探测资格与套餐，不会单独把账号判为存活。" : "v4 通过 ChatGPT 账号接口探测资格与套餐。" }}</p>
+    <p class="start-message">检查账号是否可用，区分存活、凭据失效、封号和检测异常。已封号账号会自动跳过。</p>
 
     <div class="field-row">
-      <span class="field-label">并发数</span>
-      <input v-model.number="concurrency" class="field-input" type="number" min="1" max="20" step="1" :disabled="loadingSettings || submitting" />
+      <label class="field-label" for="health-workers">并发数</label>
+      <input id="health-workers" v-model.number="concurrency" class="field-input" type="number" min="1" max="20" step="1" :disabled="loadingSettings || submitting" />
       <span class="field-hint">1–20</span>
     </div>
     <p v-if="loadingSettings" class="settings-note">正在读取并发默认值…</p>
@@ -109,47 +98,6 @@ async function submit() {
   align-items: center;
   gap: 10px;
   margin-bottom: 8px;
-}
-
-.channel-row {
-  align-items: flex-start;
-}
-
-.segmented {
-  display: inline-flex;
-  min-height: 34px;
-  padding: 2px;
-  border: 1px solid var(--field-border);
-  border-radius: var(--radius-sm);
-  background: var(--field-bg);
-}
-
-.segmented button {
-  min-width: 92px;
-  padding: 6px 10px;
-  border: 0;
-  border-radius: calc(var(--radius-sm) - 2px);
-  background: transparent;
-  color: var(--text-muted);
-  font-size: 0.78rem;
-  cursor: pointer;
-}
-
-.segmented button.active {
-  background: var(--accent-bg);
-  color: var(--accent);
-}
-
-.segmented button:disabled {
-  cursor: not-allowed;
-  opacity: 0.55;
-}
-
-.channel-note {
-  margin: 0 0 14px 70px;
-  color: var(--text-muted);
-  font-size: 0.72rem;
-  line-height: 1.55;
 }
 
 .field-label {

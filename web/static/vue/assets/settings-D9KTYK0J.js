@@ -1,1 +1,0 @@
-import{a as e,n as t}from"./client-C3wdkiRP.js";function n(){return t(`/api/ui-settings`)}function r(n){return t(`/api/ui-settings`,{method:`PUT`,body:e(n)})}export{r as n,n as t};

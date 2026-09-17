@@ -97,6 +97,29 @@ export function fetchFastmailAccounts(apiBase: string, adminKey?: string) {
   });
 }
 
+/* --- OnlineDisposableMail --- */
+export interface OdmService {
+  service_id: number | string;
+  name: string;
+  [key: string]: unknown;
+}
+
+export interface OdmEmailType {
+  email_type_id: number | string;
+  name: string;
+  [key: string]: unknown;
+}
+
+export function fetchOdmServices(apiBase: string, apiKey?: string, serviceId?: string) {
+  const payload: Record<string, unknown> = { api_base: apiBase };
+  if (apiKey) payload.api_key = apiKey;
+  if (serviceId?.trim()) payload.service_id = serviceId.trim();
+  return api<{ ok?: boolean; error?: string; services?: OdmService[]; types?: OdmEmailType[] }>("/api/online-disposablemail/services", {
+    method: "POST",
+    body: jsonBody(payload),
+  });
+}
+
 /* --- 工具：域名列表解析 / 脱敏密钥判断（对齐旧版行为） --- */
 export function parseDomainList(text: string): string[] {
   return [...new Set(String(text || "").split(/[\n,;]+/).map((v) => v.trim()).filter(Boolean))];

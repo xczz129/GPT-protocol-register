@@ -32,7 +32,7 @@ def mask_secret(value: str, *, head: int = 6, tail: int = 4) -> str:
     if not text:
         return ""
     if len(text) <= head + tail + 3:
-        return text[:2] + "…" if len(text) > 2 else "…"
+        return f"…({len(text)})"
     return f"{text[:head]}…{text[-tail:]}"
 
 

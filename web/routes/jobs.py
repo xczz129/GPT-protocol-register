@@ -1,4 +1,4 @@
-"""Job domain: JobState, AccountReauthBatchJobs and registration job routes."""
+﻿"""Job domain: JobState, AccountReauthBatchJobs and registration job routes."""
 
 from __future__ import annotations
 
@@ -20,10 +20,10 @@ import re
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from register.mail_channel_options import (
+    dynamic_mail_is_on_demand,
     is_smsbower_selected,
     smsbower_child_enabled,
-    validate_smsbower_job,
-)
+    validate_dynamic_mail_job,)
 
 router = APIRouter()
 
@@ -48,6 +48,17 @@ def _account_still_exists(account: dict[str, Any]) -> bool:
         return account_record_exists(account, _state().ACCOUNTS_FILE)
     except Exception:
         return True
+
+
+def _current_reauth_record(account: dict[str, Any]) -> dict[str, Any] | None:
+    """Recheck the exact member immediately before a queued login starts."""
+    key = _state()._account_key(account)
+    current = _state()._records_by_keys_with_fallback([key]).get(key)
+    # Older in-memory batch integrations/tests use records without a store,
+    # matching the existing existence-check compatibility above.
+    if current is None and _TEST_RUNTIME:
+        return dict(account)
+    return current
 
 
 def _state() -> Any:
@@ -440,12 +451,16 @@ class AccountReauthBatchJobs:
         record: dict[str, Any],
         operation: str = "reauth",
     ) -> dict[str, Any]:
+        skipped = operation == "reauth" and bool(
+            _state().account_public_view(record).get("is_deactivated")
+        )
         return {
             "key": _state()._account_key(record),
             "email": str(record.get("email") or ""),
             "account_id": str(record.get("account_id") or ""),
-            "status": "queued",
-            "message": f"等待{cls._operation_label(operation)}",
+            "status": "skipped" if skipped else "queued",
+            "message": "已封号，已跳过重新登录" if skipped else f"等待{cls._operation_label(operation)}",
+            **({"finished_at": _state()._now_iso()} if skipped else {}),
         }
 
     def start(
@@ -460,17 +475,21 @@ class AccountReauthBatchJobs:
             raise ValueError("没有可处理的账号")
         operation = _state()._normalize_account_security_operation(operation)
         requested_mode = _state()._normalize_reauth_mode(mode)
+        items = [self._account_item(record, operation) for record in records]
+        runnable = [record for record, item in zip(records, items) if item["status"] == "queued"]
+        skipped_count = len(records) - len(runnable)
         reauth_mode = (
             "protocol"
-            if any(_state()._account_requires_protocol_reauth(record) for record in records)
+            if any(_state()._account_requires_protocol_reauth(record) for record in runnable)
             else requested_mode
         )
         operation_label = self._operation_label(operation)
-        requested_workers = min(len(records), max(1, int(concurrency or 3)))
-        budget_workers, resource_mode = _state()._account_reauth_resource_budget(
-            requested_workers
+        requested_workers = min(len(runnable), max(1, int(concurrency or 3)))
+        budget_workers, resource_mode = (
+            _state()._account_reauth_resource_budget(requested_workers)
+            if runnable else (0, "normal")
         )
-        worker_count = min(len(records), budget_workers)
+        worker_count = min(len(runnable), budget_workers)
         with self.lock:
             if self.active_job_id:
                 active = self.jobs.get(self.active_job_id)
@@ -495,12 +514,14 @@ class AccountReauthBatchJobs:
                 "throttled": worker_count < requested_workers,
                 "resource_mode": resource_mode,
                 "total": len(records),
-                "done": 0,
+                "submitted": len(runnable),
+                "done": skipped_count,
                 "current": f"正在创建 {worker_count} 路{operation_label}队列",
                 "current_items": [],
                 "success": 0,
                 "failed": 0,
                 "cancelled": 0,
+                "skipped": skipped_count,
                 "last": "",
                 "last_status": "",
                 "last_message": "",
@@ -508,10 +529,7 @@ class AccountReauthBatchJobs:
                 "started_at": "",
                 "finished_at": "",
                 "finished_epoch": 0.0,
-                "items": [
-                    self._account_item(record, operation)
-                    for record in records
-                ],
+                "items": items,
             }
             self.jobs[job_id] = item
             raw_options = operation_options if isinstance(operation_options, dict) else {}
@@ -527,6 +545,25 @@ class AccountReauthBatchJobs:
             self.stop_events[job_id] = threading.Event()
             self.active_job_id = job_id
             self._trim_locked()
+            if not runnable:
+                item.update(
+                    status="completed", running=False, current="",
+                    message=f"{operation_label}完成：成功 0，失败 0，已跳过 {skipped_count}（已封号）",
+                    started_at=_state()._now_iso(), finished_at=_state()._now_iso(),
+                    finished_epoch=time.time(),
+                    last=items[-1]["email"] or items[-1]["key"],
+                    last_status="skipped", last_message=items[-1]["message"],
+                )
+                self.operation_options.pop(job_id, None)
+                self.stop_events.pop(job_id, None)
+        for index, skipped_item in enumerate(items):
+            if skipped_item["status"] == "skipped":
+                _state().JOB.append_log(
+                    f"[{operation_label}批次] {index + 1}/{len(records)} · "
+                    f"已封号，已跳过 · {skipped_item['email'] or skipped_item['key']}"
+                )
+        if not runnable:
+            return self.snapshot(job_id) or dict(item)
         thread = threading.Thread(
             target=self._run,
             args=(
@@ -609,6 +646,8 @@ class AccountReauthBatchJobs:
                 return
             items = job.get("items")
             if isinstance(items, list) and 0 <= index < len(items):
+                if items[index].get("status") in {"success", "failed", "cancelled", "skipped"}:
+                    return
                 items[index].update(
                     status=status,
                     message=message,
@@ -621,7 +660,8 @@ class AccountReauthBatchJobs:
                 int(job.get("total") or 0),
                 int(job.get("success") or 0)
                 + int(job.get("failed") or 0)
-                + int(job.get("cancelled") or 0),
+                + int(job.get("cancelled") or 0)
+                + int(job.get("skipped") or 0),
             )
             current_items = job.get("current_items")
             if isinstance(current_items, list):
@@ -661,6 +701,7 @@ class AccountReauthBatchJobs:
             success = int(job.get("success") or 0)
             failed = int(job.get("failed") or 0)
             cancelled = int(job.get("cancelled") or 0)
+            skipped = int(job.get("skipped") or 0)
             label = self._operation_label(str(job.get("operation") or "reauth"))
             job.update(
                 status="stopped",
@@ -670,7 +711,7 @@ class AccountReauthBatchJobs:
                 done=int(job.get("total") or 0),
                 message=(
                     f"{label}已停止：成功 {success}，失败 {failed}，"
-                    f"已停止 {cancelled}"
+                    f"已停止 {cancelled}，已跳过 {skipped}"
                 ),
                 finished_at=_state()._now_iso(),
                 finished_epoch=time.time(),
@@ -785,7 +826,24 @@ class AccountReauthBatchJobs:
                         f"已停止，未执行 · {label}"
                     )
                     return
-                if not _account_still_exists(account):
+                if operation == "reauth":
+                    try:
+                        current = _current_reauth_record(account)
+                    except Exception as error:
+                        message = _state()._redact_security_detail(error, account)
+                        self._record_terminal(job_id, index, label, "failed", f"读取当前账号失败：{message}")
+                        return
+                    if current is not None and _state().account_public_view(current).get("is_deactivated"):
+                        self._record_terminal(job_id, index, label, "skipped", "已封号，已跳过重新登录")
+                        _state().JOB.append_log(
+                            f"[{operation_label}批次] {index + 1}/{len(records)} · 已封号，已跳过 · {label}"
+                        )
+                        return
+                    if current is not None:
+                        account = current
+                else:
+                    current = account
+                if current is None or (operation != "reauth" and not _account_still_exists(account)):
                     self._record_terminal(
                         job_id,
                         index,
@@ -853,7 +911,11 @@ class AccountReauthBatchJobs:
                             account,
                             str(operation_options.get("new_password") or ""),
                         )
-                        terminal_status = "failed"
+                        if operation == "reauth" and re.search(r"\baccount_deactivated\b", str(error), re.IGNORECASE):
+                            terminal_status = "skipped"
+                            message = "登录时确认账号已封号，已跳过"
+                        else:
+                            terminal_status = "failed"
                 else:
                     terminal_status = "success"
                     message = f"{operation_label}成功"
@@ -885,6 +947,10 @@ class AccountReauthBatchJobs:
                         f"[{operation_label}批次] {index + 1}/{len(records)} · "
                         f"已停止 · {label}"
                     )
+                elif terminal_status == "skipped":
+                    _state().JOB.append_log(
+                        f"[{operation_label}批次] {index + 1}/{len(records)} · 已跳过 · {label} · {message}"
+                    )
                 else:
                     _state().JOB.append_log(
                         f"[{operation_label}批次] {index + 1}/{len(records)} · "
@@ -908,6 +974,11 @@ class AccountReauthBatchJobs:
 
                 def submit_next() -> bool:
                     nonlocal next_index
+                    with self.lock:
+                        current_job = self.jobs.get(job_id) or {}
+                        current_items = current_job.get("items") or []
+                        while next_index < len(records) and current_items[next_index].get("status") == "skipped":
+                            next_index += 1
                     if next_index >= len(records) or stop_event.is_set():
                         return False
                     index = next_index
@@ -952,6 +1023,7 @@ class AccountReauthBatchJobs:
                 success = int(job.get("success") or 0)
                 failed = int(job.get("failed") or 0)
                 cancelled = int(job.get("cancelled") or 0)
+                skipped = int(job.get("skipped") or 0)
                 stopped = stop_event.is_set()
                 job.update(
                     status="stopped" if stopped else "completed",
@@ -961,9 +1033,9 @@ class AccountReauthBatchJobs:
                     current_items=[],
                     message=(
                         f"{operation_label}已停止：成功 {success}，失败 {failed}，"
-                        f"已停止 {cancelled}"
+                        f"已停止 {cancelled}，已跳过 {skipped}"
                         if stopped
-                        else f"{operation_label}完成：成功 {success}，失败 {failed}"
+                        else f"{operation_label}完成：成功 {success}，失败 {failed}，已跳过 {skipped}"
                     ),
                     finished_at=_state()._now_iso(),
                     finished_epoch=time.time(),
@@ -972,7 +1044,7 @@ class AccountReauthBatchJobs:
             _state().JOB.append_log(
                 f"[{operation_label}批次] {'已停止' if stopped else '完成'} · "
                 f"方式={mode} · 并发={concurrency} · 成功 {success} · "
-                f"失败 {failed} · 已停止 {cancelled}"
+                f"失败 {failed} · 已停止 {cancelled} · 已跳过 {skipped}"
             )
         except Exception as error:
             message = str(error or "重新登录批次异常")[:400]
@@ -1171,7 +1243,7 @@ async def job_start(body: StartJobRequest):
             mail_type = (out.get("mail_type") or "auto") or "auto"
             want_j = max(1, int(out.get("concurrency") or 1))
             try:
-                validate_smsbower_job(
+                validate_dynamic_mail_job(
                     mail_cfg,
                     mail_type,
                     int(out.get("total") or 1),
@@ -1217,7 +1289,8 @@ async def job_start(body: StartJobRequest):
                 )
             else:
                 want_n = int(out.get("total") or 1)
-                out["total"] = max(1, min(want_n, available))
+                on_demand = dynamic_mail_is_on_demand(mail_type)
+                out["total"] = max(1, min(want_n, 500)) if on_demand else max(1, min(want_n, available))
                 if smsbower_paired:
                     # Capacity is expressed in account slots. Never dispatch
                     # an orphan child/main when a changing inventory trims it.

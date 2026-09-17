@@ -7,6 +7,8 @@ from __future__ import annotations
 from typing import Any
 from urllib.parse import urlsplit
 
+from register.registration_outcome import auth_identity_evidence
+
 
 _PAGE_TYPES = frozenset({
     'create_account_password', 'signup_password', 'username_password_create',
@@ -30,6 +32,7 @@ _ERROR_CODES = frozenset({
     'challenge_required', 'verification_required', 'account_deactivated',
     'user_already_exists', 'username_already_exists', 'email_already_exists',
     'account_already_exists', 'email_already_registered', 'account_already_registered',
+    'username_not_found',
 })
 
 
@@ -69,7 +72,9 @@ def read_auth_response(response: Any) -> tuple[dict[str, Any], dict[str, Any]]:
     return value, metadata
 
 
-def auth_route_diagnostic(url: Any, page_type: Any) -> dict[str, str]:
+def auth_route_diagnostic(
+    url: Any, page_type: Any, *, auth_response: Any = None,
+) -> dict[str, Any]:
     """Only fixed route/type labels can be emitted; queries and bodies are omitted."""
     page = _label(page_type, _PAGE_TYPES)
     route = 'missing'
@@ -83,4 +88,7 @@ def auth_route_diagnostic(url: Any, page_type: Any) -> dict[str, str]:
                 route = path if path in _PATHS else 'unrecognized'
         except ValueError:
             route = 'malformed'
-    return {'page_type': page, 'route': route}
+    result: dict[str, Any] = {'page_type': page, 'route': route}
+    if auth_response is not None:
+        result.update(auth_identity_evidence(auth_response))
+    return result

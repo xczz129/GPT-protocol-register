@@ -18,7 +18,7 @@ const batch = useBatchOpsStore();
 const titleMap = {
   reauth: "账号批次任务",
   refreshAt: "刷新 AT",
-  trial: "Plus 试用检测",
+  trial: "Plus 试用资格检测",
 };
 
 const operationLabels: Record<string, string> = {
@@ -26,6 +26,11 @@ const operationLabels: Record<string, string> = {
   security_repair: "安全字段补全",
   password_change: "修改密码",
   totp_change: "修改 2FA",
+};
+
+const itemStatusLabels: Record<string, string> = {
+  pending: "等待中", queued: "排队中", running: "运行中", active: "运行中",
+  success: "成功", failed: "失败", cancelled: "已取消", skipped: "已跳过",
 };
 
 const title = computed(() => {
@@ -64,6 +69,7 @@ const stats = computed(() => {
       chips: [
         { label: "成功", value: p.success || 0, cls: "ok" },
         { label: "失败", value: p.failed || 0, cls: "bad" },
+        { label: "已跳过", value: p.skipped || 0, cls: "" },
         { label: "取消", value: p.cancelled || 0, cls: "" },
       ],
       message: p.lastMessage || "",
@@ -157,8 +163,8 @@ async function refreshNow() {
     <div v-if="stats.items.length" class="item-list">
       <div v-for="(item, index) in stats.items" :key="index" :class="['item-row', item.status]">
         <b>{{ item.email }}</b>
-        <span :class="['item-status', item.status]">{{ item.status }}</span>
-        <small>{{ item.message }}</small>
+        <span :class="['item-status', item.status]">{{ itemStatusLabels[item.status] || item.status }}</span>
+        <small :title="item.message">{{ item.message }}</small>
       </div>
     </div>
 

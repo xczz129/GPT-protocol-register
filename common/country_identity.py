@@ -21,7 +21,8 @@ COUNTRY_IDENTITIES: dict[str, CountryIdentity] = {
     "PH": CountryIdentity("en-PH", "en-PH,en;q=0.9,fil;q=0.8", "Asia/Manila", (-480,)),
     "TH": CountryIdentity("th-TH", "th-TH,th;q=0.9,en-US;q=0.7,en;q=0.6", "Asia/Bangkok", (-420,)),
     "AU": CountryIdentity("en-AU", "en-AU,en;q=0.9", "Australia/Sydney", (-600, -660)),
-    "BR": CountryIdentity("pt-BR", "pt-BR,pt;q=0.9,en-US;q=0.7,en;q=0.6", "America/Sao_Paulo", (180, 240)),
+    # 巴西自 2019 年起无夏令时，全年 UTC-3（JS 偏移 180）；240 已不存在
+    "BR": CountryIdentity("pt-BR", "pt-BR,pt;q=0.9,en-US;q=0.7,en;q=0.6", "America/Sao_Paulo", (180,)),
     "SG": CountryIdentity("en-SG", "en-SG,en;q=0.9,zh-SG;q=0.7", "Asia/Singapore", (-480,)),
     "KR": CountryIdentity("ko-KR", "ko-KR,ko;q=0.9,en-US;q=0.7,en;q=0.6", "Asia/Seoul", (-540,)),
     "TR": CountryIdentity("tr-TR", "tr-TR,tr;q=0.9,en-US;q=0.7,en;q=0.6", "Europe/Istanbul", (-180,)),

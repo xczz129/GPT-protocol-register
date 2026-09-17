@@ -178,6 +178,108 @@ class TrialEligibilityTests(unittest.TestCase):
                     {"email": "fixture@example.com", "access_token": "AT"}
                 )
 
+    def test_trial_status_fields_do_not_publish_account_health_verdicts(self):
+        result = {
+            "eligibility_status": "invalid",
+            "label": "账号已停用",
+            "reason": "account_deactivated",
+            "is_deactivated": True,
+        }
+
+        fields = trial_eligibility._status_fields(result)
+
+        self.assertEqual(fields["trial_eligibility_status"], "invalid")
+        self.assertEqual(fields["trial_eligibility_reason"], "account_deactivated")
+        self.assertTrue(all(field.startswith("trial_") for field in fields))
+
+    def test_scheduled_old_token_failure_preserves_new_health_and_credentials(self):
+        original = {"email": "fixture@example.com", "access_token": "OLD_AT"}
+        latest = {**original, "status": "异常", "health_status": "error"}
+        fresh_fields = {
+            "access_token": "NEW_AT",
+            "status": "正常",
+            "health_status": "alive",
+            "health_error": "",
+            "health_checked_at": "2099-01-02T00:00:00Z",
+            "reauth_blocked_reason": "",
+            "last_invalid_at": "",
+        }
+
+        def trial_probe(*_args, **_kwargs):
+            # A separate health/refresh job completes while this old AT is checked.
+            latest.update(fresh_fields)
+            raise InvalidAccessTokenError("old token rejected")
+
+        def persist(_key, fields, path):
+            latest.update(fields)
+
+        with (
+            patch.object(trial_eligibility, "_auto_check_channel", return_value="v4"),
+            patch("common.trial_proxy_pool.selected_trial_proxies", return_value=("", [])),
+            patch.object(trial_eligibility, "check_trial_eligibility", side_effect=trial_probe),
+            patch.object(trial_eligibility, "_queue_result", side_effect=persist),
+            patch.object(trial_eligibility, "_trace_trial_error"),
+            patch("common.account_operation_log.record_operation_event"),
+            patch("common.account_health.check_account") as health_probe,
+        ):
+            trial_eligibility._run_scheduled_check(original, "PATH", "KEY")
+
+        health_probe.assert_not_called()
+        self.assertEqual(latest["trial_eligibility_status"], "invalid")
+        self.assertEqual({field: latest[field] for field in fresh_fields}, fresh_fields)
+
+    def test_batch_trial_results_preserve_independent_health_and_credentials(self):
+        outcomes = (
+            {"eligibility_status": "ineligible", "label": "无免费试用"},
+            {
+                "eligibility_status": "invalid", "label": "账号已停用",
+                "is_deactivated": True, "reason": "account_deactivated",
+            },
+            InvalidAccessTokenError("old token rejected"),
+        )
+        for channel in ("v4", "nerver"):
+            for outcome in outcomes:
+                with self.subTest(channel=channel, outcome=str(outcome)):
+                    manager = TrialEligibilityJobs()
+                    record = {
+                        "email": "fixture@example.com", "account_id": "acct-1",
+                        "plan_type": "free", "access_token": "OLD_AT",
+                        "health_status": "error", "status": "异常",
+                    }
+                    latest = dict(record)
+                    fresh_fields = {
+                        "access_token": "NEW_AT", "health_status": "alive",
+                        "status": "正常", "health_error": "",
+                        "health_checked_at": "2099-01-02T00:00:00Z",
+                        "reauth_blocked_reason": "", "last_invalid_at": "",
+                    }
+
+                    def trial_probe(*_args, **_kwargs):
+                        latest.update(fresh_fields)
+                        if isinstance(outcome, Exception):
+                            raise outcome
+                        return dict(outcome)
+
+                    def persist(updates, **_kwargs):
+                        latest.update(updates["account_id:acct-1"])
+
+                    with (
+                        patch("common.trial_eligibility_jobs.selected_trial_proxies", return_value=("", [])),
+                        patch("common.trial_eligibility_jobs.check_trial_eligibility", side_effect=trial_probe),
+                        patch("common.trial_eligibility_jobs.check_trial_eligibility_nerver", side_effect=trial_probe),
+                        patch("common.trial_eligibility_jobs.update_account_record_fields", side_effect=persist),
+                        patch("common.trial_eligibility_jobs.time.sleep"),
+                        patch("common.account_health.check_account") as health_probe,
+                    ):
+                        started = manager.start([record], concurrency=1, attempts=1, channel=channel)
+                        self.assertTrue(manager.wait(started["job_id"], timeout=3))
+                        job = manager.snapshot(started["job_id"])
+
+                    health_probe.assert_not_called()
+                    self.assertEqual(job["done"], 1)
+                    self.assertIn(latest["trial_eligibility_status"], {"ineligible", "invalid", "error"})
+                    self.assertEqual({field: latest[field] for field in fresh_fields}, fresh_fields)
+
     def test_html_403_is_reported_as_retryable_edge_failure(self):
         with patch.object(
             trial_eligibility,

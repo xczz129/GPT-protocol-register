@@ -103,8 +103,8 @@ def _record_key(record: dict[str, Any]) -> str:
 
 
 def _status_fields(result: dict[str, Any]) -> dict[str, Any]:
-    """Map the probe payload to fields persisted with the account row."""
-    fields = {
+    """Persist only trial results; account availability has its own probe."""
+    return {
         "trial_eligibility_status": str(result.get("eligibility_status") or "error"),
         "trial_eligibility_label": str(result.get("label") or "检测失败"),
         "trial_eligibility_checked_at": str(result.get("checked_at") or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")),
@@ -117,17 +117,6 @@ def _status_fields(result: dict[str, Any]) -> dict[str, Any]:
         "trial_eligibility_has_promotion": bool(result.get("has_promotion")),
         "trial_eligibility_promotion_count": int(result.get("promotion_count") or 0),
     }
-    if result.get("is_deactivated"):
-        fields.update(
-            {
-                "status": "已封号",
-                "health_status": "invalid",
-                "health_error": "account_deactivated: eligibility probe confirmed deactivation",
-                "reauth_blocked_reason": "account_deactivated",
-                "last_invalid_at": fields["trial_eligibility_checked_at"],
-            }
-        )
-    return fields
 
 
 def _trace_trial_result(record: dict[str, Any], result: dict[str, Any], *, route_mode: str = "") -> None:
@@ -384,9 +373,6 @@ def _run_scheduled_check(record: dict[str, Any], path, key: str) -> None:
                 "trial_eligibility_method": method,
                 "trial_eligibility_proxy_mode": route_mode,
                 "trial_eligibility_error": str(error)[:500],
-                "health_status": "invalid",
-                "health_error": str(error)[:500],
-                "last_invalid_at": now,
             },
             path=path,
         )

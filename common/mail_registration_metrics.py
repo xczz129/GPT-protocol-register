@@ -32,8 +32,12 @@ from config import ROOT
 DEFAULT_DB_PATH = ROOT / "data" / "mail_registration_metrics.sqlite3"
 ATTEMPT_FIELD = "_registration_metric_attempt_id"
 PROVIDER = "smsbower_mail"
+PROVIDERS = ("smsbower_mail", "online_disposablemail")
 OUTCOMES = ("success", "already_registered", "otp_timeout", "other_failed", "cancelled")
-_DOMAINS = ("gmail.com", "icloud.com")
+_DOMAINS = (
+    "gmail.com", "icloud.com", "outlook.com", "hotmail.com",
+    "mail.ru", "yahoo.com", "aol.com",
+)
 _ROLES = ("primary", "child")
 _TOKEN_LOCK = threading.Lock()
 _SCHEMA_LOCK = threading.Lock()
@@ -74,8 +78,9 @@ def _open_connection() -> sqlite3.Connection:
             """
             CREATE TABLE IF NOT EXISTS mail_registration_attempts (
                 attempt_key TEXT PRIMARY KEY CHECK(length(attempt_key) = 64),
-                provider TEXT NOT NULL CHECK(provider = 'smsbower_mail'),
-                domain TEXT NOT NULL CHECK(domain IN ('gmail.com', 'icloud.com', 'unknown')),
+                provider TEXT NOT NULL CHECK(provider IN ('smsbower_mail', 'online_disposablemail')),
+                domain TEXT NOT NULL CHECK(domain IN ('gmail.com', 'icloud.com', 'outlook.com',
+                    'hotmail.com', 'mail.ru', 'yahoo.com', 'aol.com', 'unknown')),
                 role TEXT NOT NULL CHECK(role IN ('primary', 'child')),
                 outcome TEXT CHECK(outcome IN ('success', 'already_registered',
                     'otp_timeout', 'other_failed', 'cancelled')),
@@ -94,10 +99,51 @@ def _open_connection() -> sqlite3.Connection:
             );
             """
         )
+        _migrate_legacy_schema(connection)
         return connection
     except Exception:
         connection.close()
         raise
+
+
+def _migrate_legacy_schema(connection: sqlite3.Connection) -> None:
+    """Rebuild the attempts table when it still carries the old single-provider
+    CHECK constraints (SQLite cannot ALTER a CHECK away in place)."""
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' "
+        "AND name='mail_registration_attempts'"
+    ).fetchone()
+    if not row or not row[0]:
+        return
+    table_sql = str(row[0])
+    if "provider = 'smsbower_mail'" not in table_sql and "'unknown'" in table_sql:
+        return
+    connection.executescript(
+        """
+        PRAGMA foreign_keys=OFF;
+        BEGIN;
+        CREATE TABLE mail_registration_attempts_new (
+            attempt_key TEXT PRIMARY KEY CHECK(length(attempt_key) = 64),
+            provider TEXT NOT NULL CHECK(provider IN ('smsbower_mail', 'online_disposablemail')),
+            domain TEXT NOT NULL CHECK(domain IN ('gmail.com', 'icloud.com', 'outlook.com',
+                'hotmail.com', 'mail.ru', 'yahoo.com', 'aol.com', 'unknown')),
+            role TEXT NOT NULL CHECK(role IN ('primary', 'child')),
+            outcome TEXT CHECK(outcome IN ('success', 'already_registered',
+                'otp_timeout', 'other_failed', 'cancelled')),
+            started_at REAL NOT NULL,
+            finished_at REAL
+        );
+        INSERT INTO mail_registration_attempts_new
+            SELECT attempt_key, provider, domain, role, outcome, started_at, finished_at
+            FROM mail_registration_attempts;
+        DROP TABLE mail_registration_attempts;
+        ALTER TABLE mail_registration_attempts_new RENAME TO mail_registration_attempts;
+        CREATE INDEX IF NOT EXISTS mail_registration_group
+            ON mail_registration_attempts(provider, domain, role);
+        COMMIT;
+        PRAGMA foreign_keys=ON;
+        """
+    )
 
 
 @contextmanager
@@ -147,7 +193,8 @@ def begin_attempt(
     Already terminal attempts are never reopened by a replay.
     """
     try:
-        if str(mailbox.get("provider") or mailbox.get("type") or "").strip().lower() != PROVIDER:
+        provider_name = str(mailbox.get("provider") or mailbox.get("type") or "").strip().lower()
+        if provider_name not in PROVIDERS:
             return None
         account_role = role or str(mailbox.get("_smsbower_pair_role") or "primary")
         if account_role not in _ROLES:
@@ -164,13 +211,13 @@ def begin_attempt(
             connection.execute(
                 "INSERT OR IGNORE INTO mail_registration_attempts "
                 "(attempt_key, provider, domain, role, started_at) VALUES (?, ?, ?, ?, ?)",
-                (attempt_key, PROVIDER, domain, account_role, time.time()),
+                (attempt_key, provider_name, domain, account_role, time.time()),
             )
             existing = connection.execute(
-                "SELECT domain, role FROM mail_registration_attempts WHERE attempt_key = ?",
+                "SELECT provider, domain, role FROM mail_registration_attempts WHERE attempt_key = ?",
                 (attempt_key,),
             ).fetchone()
-            if existing != (domain, account_role):
+            if existing != (provider_name, domain, account_role):
                 raise ValueError("Metric identity belongs to another registration branch")
         return token
     except Exception as error:
@@ -289,11 +336,11 @@ def get_summary(provider: str = PROVIDER) -> dict[str, Any]:
     failures/successes as an observed result.
     """
     result = {
-        "ok": True, "provider": PROVIDER, **_bucket(), "by_domain": [],
+        "ok": True, "provider": provider, **_bucket(), "by_domain": [],
         "by_role": [], "groups": [], "updated_at": None,
     }
     try:
-        if provider != PROVIDER:
+        if provider not in PROVIDERS:
             raise ValueError("Unsupported metrics provider")
         with _connection() as connection, connection:
             # Both aggregations see one transaction snapshot under concurrent

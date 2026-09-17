@@ -5,11 +5,21 @@ import time
 from typing import Any, Callable
 from urllib.parse import quote
 
-from proxy_util import is_rate_limit_error
+from proxy_util import is_auth_identity_error, is_rate_limit_error
 from register.protocol_runtime import ProtocolRuntimeSettings
+from register.registration_outcome import RegisteredEmailDetected
 from register.sessions import JobCancelled
 
 CREDENTIAL_FIELDS = {"password", "access_token", "refresh_token", "session_token", "id_token", "totp_secret", "account_id", "mfa_factor_id"}
+
+
+def is_registration_guard_error(error: BaseException | str | None) -> bool:
+    """An unconfirmed registration identity must not enter a retry workflow."""
+    return any(marker in str(error or "") for marker in (
+        "registration_password_route_unavailable", "registration_identity_response_unconfirmed",
+        "registration_identity_response_unavailable", "registration_auth_identity_unconfirmed",
+        "registration_auth_http_", "registration_auth_failed",
+    ))
 
 
 def merge_registration_progress(saved: dict[str, Any], update: dict[str, Any]) -> None:
@@ -22,6 +32,16 @@ def merge_registration_progress(saved: dict[str, Any], update: dict[str, Any]) -
 
 
 def can_recover_registration(account: dict[str, Any], mailbox: dict[str, Any] | None) -> bool:
+    if (mailbox or {}).get("_registration_guard_error"):
+        return False
+    if account.get("registration_recovery_state") == "identity_unconfirmed" or any(
+        is_auth_identity_error(value) or is_registration_guard_error(value) for value in (
+            account.get("registration_initial_error"), account.get("registration_recovery_error"),
+            (mailbox or {}).get("_registration_identity_error"),
+            (mailbox or {}).get("_registration_guard_error"),
+        )
+    ):
+        return False
     if (mailbox or {}).get("_registration_outcome") == "already_registered":
         return False
     if account.get("registration_recovery_state") == "awaiting_email_verification" and not (mailbox or {}).get("_otp_accepted_by_server"):
@@ -94,15 +114,27 @@ def recover_registration(
             for value in secrets:
                 if value:
                     detail = detail.replace(value, "[REDACTED]").replace(quote(value, safe=""), "[REDACTED]")
-            rate_limited = is_rate_limit_error(error)
+            identity_missing = is_auth_identity_error(error)
+            if identity_missing and not detail.startswith("username_not_found:"):
+                detail = "username_not_found: " + detail
+            rate_limited = not identity_missing and is_rate_limit_error(error)
             if rate_limited and "rate_limit_exceeded" not in detail.lower():
                 # The status may only live on the exception.response. Keep a
                 # semantic marker when outer schedulers inspect the message.
                 detail = "rate_limit_exceeded: " + detail
             persist({
-                "registration_recovery_state": "rate_limited" if rate_limited else "pending",
+                "registration_recovery_state": "identity_unconfirmed" if identity_missing else ("rate_limited" if rate_limited else "pending"),
                 "registration_recovery_error": detail[:300],
             })
+            if identity_missing:
+                if mailbox is not None:
+                    mailbox["_registration_identity_error"] = "username_not_found"
+                    mailbox["_registration_recovery_pending"] = False
+                if callable(task_event):
+                    task_event(index, "running", email=saved["email"],
+                        step="认证接口未找到当前身份，已停止自动恢复；原有凭据已保留",
+                        error="username_not_found")
+                raise RuntimeError("registration_recovery_pending: " + detail[:300]) from error
             if rate_limited:
                 if callable(task_event):
                     task_event(
@@ -120,6 +152,23 @@ def recover_registration(
                 "account_identity_mismatch", "mailbox_identity_mismatch", "password_route_unavailable", "totp_secret_missing",
             ))
             if permanent or attempt == 3:
+                if "password_route_unavailable" in failure_text:
+                    # 密码路由不存在 => 该身份无密码（不是本事务创建的回收邮箱）。
+                    # 密码登录恢复对这类身份必然失败，按"已注册"跳过而不是失败挂起；
+                    # 我们自己的半成品重试密码已绑定，不会走到这个分支。
+                    if mailbox is not None:
+                        mailbox["_registration_outcome"] = RegisteredEmailDetected.code
+                    if callable(task_event):
+                        task_event(
+                            index,
+                            "running",
+                            email=str(saved.get("email") or ""),
+                            step="已存在身份无密码路由（回收邮箱），按已注册跳过",
+                        )
+                    raise RegisteredEmailDetected(
+                        "recovery_password_route_missing: existing_passwordless_identity",
+                        email=str(saved.get("email") or ""),
+                    ) from error
                 raise RuntimeError("registration_recovery_pending: " + detail[:300]) from error
             deadline = time.monotonic() + min(2 ** (attempt - 1), 4)
             while time.monotonic() < deadline:

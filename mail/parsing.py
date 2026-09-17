@@ -14,6 +14,8 @@ MADDY_PROVIDER_TYPES = {
     "maddy_webui_api",
     "maddy_api",
     "maddy_mail",
+    # Legacy UI option value ("仅域名邮箱"): maddy owns the domain mailboxes.
+    "domain",
 }
 FASTMAIL_PROVIDER_TYPES = {
     "fastmail",
@@ -27,12 +29,19 @@ SMSBOWER_MAIL_PROVIDER_TYPES = {
     "smsbower_email",
     "sms_bower_mail",
 }
+ONLINE_DISPOSABLEMAIL_PROVIDER_TYPES = {
+    "online_disposablemail",
+    "online_dispo_mail",
+    "onlinedispomail",
+    "disposablemail",
+}
 CANONICAL_PROVIDER_TYPES = {
     "outlook_token",
     "icloud_api",
     "maddy_webui",
     "fastmail_api",
     "smsbower_mail",
+    "online_disposablemail",
 }
 SUPPORTED_PROVIDER_TYPES = (
     OUTLOOK_PROVIDER_TYPES
@@ -40,6 +49,7 @@ SUPPORTED_PROVIDER_TYPES = (
     | MADDY_PROVIDER_TYPES
     | FASTMAIL_PROVIDER_TYPES
     | SMSBOWER_MAIL_PROVIDER_TYPES
+    | ONLINE_DISPOSABLEMAIL_PROVIDER_TYPES
 )
 
 
@@ -154,6 +164,8 @@ def normalize_provider_type(raw: str) -> str:
         return "fastmail_api"
     if ptype in SMSBOWER_MAIL_PROVIDER_TYPES:
         return "smsbower_mail"
+    if ptype in ONLINE_DISPOSABLEMAIL_PROVIDER_TYPES:
+        return "online_disposablemail"
     return ptype
 
 

@@ -48,7 +48,7 @@ async function resume() {
 
     <div class="health-stats">
       <span v-if="health.current">当前：{{ health.current }}</span>
-      <span>渠道 {{ health.channel === "nerver" ? "nerver" : "v4" }}</span>
+      <span>账号可用性检查</span>
       <span>请求 {{ health.requested || 0 }}</span>
       <span>实际检测 {{ health.checked ?? health.done ?? 0 }}</span>
       <span>跳过已封号 {{ health.skippedKnownDeactivated || 0 }}</span>

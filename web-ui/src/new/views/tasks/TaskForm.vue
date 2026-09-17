@@ -94,6 +94,7 @@ async function submit() {
           <option value="outlook">仅 Outlook</option>
           <option value="icloud">仅 iCloud</option>
           <option value="smsbower_mail">SMSBower 临时邮箱</option>
+          <option value="online_disposablemail">OnlineDisposableMail 临时邮箱</option>
           <option value="domain">仅域名邮箱</option>
           <option value="maddy">仅 Maddy</option>
           <option value="fastmail">仅 Fastmail</option>

@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """Batch registration scheduler."""
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from common.account_store import ACCOUNTS_FILE, upsert_account_record
 from common.account_operation_log import record_operation_event
 from mail import count_pool_capacity, release_stale_in_use
 from proxy_util import (
+    is_auth_identity_error,
     compute_proxy_retry_limit,
     is_proxy_transport_error,
     is_rate_limit_error,
@@ -33,13 +34,13 @@ from proxy_util import (
 from register.sessions import JobCancelled, _default_stop_check
 from register.scheduling import build_registration_waves
 from register.mail_channel_options import (
+    dynamic_mail_is_on_demand,
     is_smsbower_selected,
     needs_dynamic_mail_coordinator,
     smsbower_child_enabled,
-    validate_smsbower_job,
-)
+    validate_dynamic_mail_job,)
 from register.smsbower_batch import run_dynamic_mail_groups, _await_owned
-from register.pending_recovery import can_recover_registration, merge_registration_progress, recover_registration
+from register.pending_recovery import can_recover_registration, is_registration_guard_error, merge_registration_progress, recover_registration
 from register.registration_outcome import RegisteredEmailDetected
 from register.flow import register_one
 from register.protocol import repair_security_one
@@ -297,7 +298,7 @@ async def run_register(
         concurrency if concurrency is not None else reg_cfg.get("threads") or 1
     )
     conc = max(1, conc)
-    validate_smsbower_job(mail_config, provider_type, n, conc, fixed_email=fixed_email)
+    validate_dynamic_mail_job(mail_config, provider_type, n, conc, fixed_email=fixed_email)
     timeout = int(reg_cfg.get("timeout") or REGISTER_TIMEOUT)
     max_retries = int(reg_cfg.get("max_transient_retries") or 2)
 
@@ -375,8 +376,12 @@ async def run_register(
         return []
     else:
         orig_n, orig_conc = n, conc
-        n = max(1, min(n, available))
-        conc = max(1, min(conc, available, n))
+        if dynamic_mail_is_on_demand(provider_type):
+            n = max(1, n)
+            conc = max(1, min(conc, n))
+        else:
+            n = max(1, min(n, available))
+            conc = max(1, min(conc, available, n))
         if n != orig_n or conc != orig_conc:
             print(
                 f"  [调度] 按可用邮箱自动调整: "
@@ -434,7 +439,7 @@ async def run_register(
     has_alias_pairs = any(is_pair for _indices, is_pair in task_waves)
     sem = asyncio.Semaphore(max(conc, 2 if has_alias_pairs else 1))
     if has_alias_pairs and not fixed_alias_batch:
-        print("  [调度] 双别名按主邮箱分波执行；每对完整注册结束后再启动下一对")
+        print("  [调度] 双别名并行执行:对内顺序(主→split,同邮箱收码隔离),对间并行,并发受全局信号量控制")
 
     def alias_proxy_retryable(detail: str) -> bool:
         text = str(detail or "").lower()
@@ -621,6 +626,15 @@ async def run_register(
                         if detail:
                             attempt_error = detail.lower()
                             attempt_error_detail = detail
+                            if is_auth_identity_error(detail) or is_registration_guard_error(detail):
+                                if pending_account:
+                                    pending_account["registration_recovery_state"] = "identity_unconfirmed"
+                                if active_mailbox is not None:
+                                    if is_auth_identity_error(detail):
+                                        active_mailbox["_registration_identity_error"] = "username_not_found"
+                                    else:
+                                        active_mailbox["_registration_guard_error"] = "registration_auth_identity_unconfirmed"
+                                    active_mailbox["_registration_recovery_pending"] = False
                             if is_rate_limit_error(detail):
                                 global_rate_limited.set()
                                 if active_mailbox is not None:
@@ -628,7 +642,7 @@ async def run_register(
                         transport_error = is_proxy_transport_error(detail)
                         if callable(task_event):
                             forwarded = dict(fields)
-                            if status == "failed" and not is_rate_limit_error(detail) and not task_stopped() and can_recover_registration(pending_account, active_mailbox):
+                            if status == "failed" and not (is_auth_identity_error(detail) or is_registration_guard_error(detail)) and not is_rate_limit_error(detail) and not task_stopped() and can_recover_registration(pending_account, active_mailbox):
                                 status = "running"
                                 forwarded["step"] = "注册凭据已保存，正在准备密码登录补全"
                             if transport_error:
@@ -681,18 +695,43 @@ async def run_register(
                                     partial_sink=remember_partial,
                                     **({"mailbox_override": mailbox_override} if mailbox_override is not None else {}),
                                 )
-                            except (JobCancelled, asyncio.CancelledError, RegisteredEmailDetected):
+                            except (JobCancelled, asyncio.CancelledError):
                                 raise
+                            except RegisteredEmailDetected:
+                                # 打野模式：撞到已有账号时，用买到的邮箱接管
+                                # （邮箱验证码登录 → 设置新密码 → 上 TOTP 2FA → 入库）
+                                harvest_record = None
+                                if (
+                                    bool(reg_cfg.get("harvest_registered"))
+                                    and isinstance(active_mailbox, dict)
+                                    and str(active_mailbox.get("address") or "").strip()
+                                    and not task_stopped()
+                                ):
+                                    from register.harvest import harvest_registered_account
+
+                                    harvest_record = await harvest_registered_account(
+                                        i,
+                                        mailbox=active_mailbox,
+                                        reg_cfg=reg_cfg,
+                                        mail_config=mail_config,
+                                        proxy=proxy,
+                                        proxy_cfg=proxy_cfg,
+                                        stop_check=task_stopped,
+                                        task_event=attempt_event,
+                                    )
+                                if harvest_record is None:
+                                    raise
+                                record = upsert_account_record(harvest_record, ACCOUNTS_FILE)
                             except Exception as registration_error:
                                 # Browser cleanup/timeout may raise after the password
                                 # has been saved. Continue the same owned identity.
                                 owned_pending = bool((active_mailbox or {}).get("_registration_identity_created") and pending_account.get("password"))
-                                if skipped or task_stopped() or not (owned_pending or can_recover_registration(pending_account, active_mailbox)):
+                                if is_auth_identity_error(registration_error) or is_registration_guard_error(registration_error) or skipped or task_stopped() or not (owned_pending or can_recover_registration(pending_account, active_mailbox)):
                                     raise
                                 attempt_error_detail = str(registration_error)
                                 attempt_error = attempt_error_detail.lower()
                                 record = None
-                        if not record and not recovery_only and not task_stopped() and (active_mailbox or {}).get("_registration_identity_created") and not (active_mailbox or {}).get("_otp_accepted_by_server"):
+                        if not record and not recovery_only and not task_stopped() and not (is_auth_identity_error(attempt_error) or is_registration_guard_error(attempt_error)) and (active_mailbox or {}).get("_registration_identity_created") and not (active_mailbox or {}).get("_otp_accepted_by_server"):
                             original_error = _redact_operation_error(attempt_error_detail or attempt_error or "email_verification_incomplete",
                                 *(pending_account.get(key) for key in ("password", "totp_secret", "access_token", "refresh_token", "session_token")),
                                 (active_mailbox or {}).get("_smsbower_api_key"), (active_mailbox or {}).get("api_key"))
@@ -702,7 +741,7 @@ async def run_register(
                             security_completion_failed = True
                             emit_task(i, "failed", email=pending_account.get("email"), error=original_error,
                                 step="邮箱验证尚未完成，已保留密码和原始错误，停止自动登录补全")
-                        if not record and not recovery_only and not task_stopped() and can_recover_registration(pending_account, active_mailbox):
+                        if not record and not recovery_only and not task_stopped() and not (is_auth_identity_error(attempt_error) or is_registration_guard_error(attempt_error)) and can_recover_registration(pending_account, active_mailbox):
                             defer = bool(active_mailbox is not None and active_mailbox.get("provider") == "smsbower_mail" and active_mailbox.get("register_child", True) and active_mailbox.get("_smsbower_pair_role", "primary") == "primary" and (active_mailbox.get("_registration_code_received") or active_mailbox.get("_otp_accepted_by_server")))
                             if defer:
                                 active_mailbox["_registration_recovery_pending"] = True
@@ -874,6 +913,8 @@ async def run_register(
                         break
                     if task_stopped():
                         break
+                    if is_auth_identity_error(attempt_error) or is_registration_guard_error(attempt_error):
+                        break
                     alias_pinned = fixed_alias_batch or paired_alias
                     if alias_pinned and not alias_proxy_retryable(attempt_error):
                         break
@@ -934,43 +975,55 @@ async def run_register(
             index for index in range(1, n + 1)
             if not schedule_emails[index - 1] and needs_dynamic_mail_coordinator(mail_config, provider_type)
         }
-        for wave_number, (indices, is_alias_pair) in enumerate(task_waves, start=1):
+        async def run_alias_pair_wave(indices: list[int]) -> None:
+            """双别名对:主任务完整结束后再启动 split(同邮箱收码天然隔离)。
+
+            对与对之间并行,由 run_one 内部的全局 semaphore 统一限流。
+            """
+            for index in indices:
+                if _stop() or (cancel_event is not None and cancel_event.is_set()):
+                    break
+                await run_one(index, None, True)
+
+        tasks = []
+        for _wave_number, (indices, is_alias_pair) in enumerate(task_waves, start=1):
             indices = [index for index in indices if index not in dynamic_indices]
             if not indices:
                 continue
-            if _stop() or (cancel_event is not None and cancel_event.is_set()):
-                break
-            if is_alias_pair and wave_number > 1:
-                print(
-                    f"  [调度] 上一双别名已完整结束，启动下一对 "
-                    f"({indices[0]}-{indices[-1]}/{n})"
+            if is_alias_pair:
+                tasks.append(
+                    asyncio.create_task(
+                        run_alias_pair_wave(indices),
+                        name=f"pair-{indices[0]}-{indices[-1]}",
+                    )
                 )
-            barrier = asyncio.Barrier(2) if is_alias_pair and len(indices) == 2 else None
-            tasks = [
-                asyncio.create_task(
-                    run_one(index, barrier, is_alias_pair),
-                    name=f"reg-{index}",
+            else:
+                tasks.extend(
+                    asyncio.create_task(
+                        run_one(index, None, False),
+                        name=f"reg-{index}",
+                    )
+                    for index in indices
                 )
-                for index in indices
-            ]
 
-            async def _watch_and_cancel():
-                while True:
-                    if _stop() or (
-                        cancel_event is not None and cancel_event.is_set()
-                    ):
-                        print("  [停止] 正在取消运行中的任务…")
-                        for task in tasks:
-                            if not task.done():
-                                task.cancel()
-                        return
-                    if all(task.done() for task in tasks):
-                        return
-                    await asyncio.sleep(0.2)
+        async def _watch_and_cancel():
+            while True:
+                if _stop() or (
+                    cancel_event is not None and cancel_event.is_set()
+                ):
+                    print("  [停止] 正在取消运行中的任务…")
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    return
+                if all(task.done() for task in tasks):
+                    return
+                await asyncio.sleep(0.2)
 
+        if tasks:
             watcher = asyncio.create_task(
                 _watch_and_cancel(),
-                name=f"stop-watcher-{wave_number}",
+                name="stop-watcher",
             )
             try:
                 await asyncio.gather(*tasks, return_exceptions=True)

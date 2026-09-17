@@ -53,6 +53,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "mailboxes": "",
             },
             {
+                "type": "online_disposablemail",
+                "enable": False,
+                "label": "Online DisposableMail",
+                # OnlineDisposableMail API origin (https://docs.online-disposablemail.com).
+                "api_base": "https://api.online-disposablemail.com",
+                "api_key": "",
+                # Current OpenAi sales option: service 242, Gmail_1 type 26.
+                "service_id": "242",
+                "email_type_id": "26",
+                # Capacity is capped by the service's live sales stock and balance.
+                "capacity": 50,
+                "mailboxes": "",
+            },
+            {
                 "type": "maddy_webui",
                 "enable": False,
                 "label": "Maddy 邮箱",
@@ -82,6 +96,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "request_timeout": 30,
         "wait_timeout": 90,
         "smsbower_wait_timeout": 180,
+        "online_disposablemail_wait_timeout": 180,
         "wait_interval": 3,
         "icloud_resync_interval": 15,
         "resend_after": 45,
@@ -95,6 +110,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "selected_country": "",
         "rotate_per_task": True,
         "clearance": {
+            "autostart": True,
             "enabled": False,
             "mode": "none",
             "flaresolverr_url": "",
@@ -124,7 +140,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "protocol_account_timeout": 600,
         "protocol_login_otp_timeout": 180,
         "protocol_login_poll_chunk": 60,
-        "post_register_health_check": False,
+        "post_register_health_check": True,
         "total": 1,
         "timeout": 480,
         "max_transient_retries": 2,

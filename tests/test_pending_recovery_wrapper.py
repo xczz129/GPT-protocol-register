@@ -61,7 +61,7 @@ def test_retry_uses_new_secret_saved_before_failure_and_does_not_emit_terminal_e
     assert set(events)=={'running'}
 
 
-@pytest.mark.parametrize('message', ['invalid_password', 'invalid_username_or_password', 'pending_recovery_password_route_unavailable', 'pending_recovery_remote_totp_secret_missing'])
+@pytest.mark.parametrize('message', ['invalid_password', 'invalid_username_or_password', 'pending_recovery_remote_totp_secret_missing'])
 def test_permanent_password_failure_stops_without_erasing_credentials(monkeypatch, message):
     callback=Mock(side_effect=RuntimeError(message))
     monkeypatch.setattr(recovery,'_recover_once',callback)
@@ -73,6 +73,66 @@ def test_permanent_password_failure_stops_without_erasing_credentials(monkeypatc
     callback.assert_called_once()
     sleep.assert_not_called()
     assert account==pending()
+
+
+@pytest.mark.parametrize('message', [
+    'username_not_found',
+    'password_reset_send_otp_http_400, detail={"error":{"code":"username_not_found"}}',
+    'pending_recovery_failed: username_not_found; connection reset by peer',
+    pytest.param('upstream context: ' + 'x' * 350 + ' username_not_found', id='late-error-code'),
+])
+def test_unknown_username_stops_after_one_attempt_and_preserves_saved_credentials(
+    monkeypatch, message,
+):
+    account = {
+        **pending(), 'totp_secret': 'fixture-secret', 'mfa_enabled': True,
+        'refresh_token': 'fixture-refresh',
+    }
+    original = dict(account)
+    persisted = []
+    callback = Mock(side_effect=RuntimeError(message))
+    sleep = Mock()
+    monkeypatch.setattr(recovery, '_recover_once', callback)
+    monkeypatch.setattr(recovery.time, 'sleep', sleep)
+
+    with pytest.raises(RuntimeError, match='username_not_found') as caught:
+        recovery.recover_registration(
+            1, account=account, mailbox=None, mail_config={},
+            proxy='http://fixture-proxy:8080', partial_sink=persisted.append,
+        )
+
+    callback.assert_called_once()
+    assert callback.call_args.kwargs['max_attempts'] == 1
+    assert callback.call_args.kwargs['proxy'] == 'http://fixture-proxy:8080'
+    sleep.assert_not_called()
+    assert caught.value.__cause__ is callback.side_effect
+    assert account == original
+    saved = persisted[-1]
+    assert saved['registration_recovery_attempts'] == 1
+    assert saved['registration_state'] == 'security_pending'
+    assert saved['registration_recovery_state'] == 'identity_unconfirmed'
+    assert 'username_not_found' in saved['registration_recovery_error']
+    assert not recovery.can_recover_registration(saved, None)
+    for field in ('password', 'refresh_token', 'totp_secret', 'mfa_enabled'):
+        assert saved[field] == original[field]
+
+def test_password_route_unavailable_marks_recycled_identity_as_already_registered(monkeypatch):
+    """密码路由不存在 => 回收邮箱身份，按已注册跳过（原为失败挂起）。"""
+    from register.registration_outcome import RegisteredEmailDetected
+
+    callback = Mock(side_effect=RuntimeError('pending_recovery_password_route_unavailable'))
+    monkeypatch.setattr(recovery, '_recover_once', callback)
+    sleep = Mock()
+    monkeypatch.setattr(recovery.time, 'sleep', sleep)
+    account = pending()
+    mailbox = {'address': 'owned@example.test', 'provider': 'online_disposablemail'}
+    with pytest.raises(RegisteredEmailDetected):
+        recovery.recover_registration(1, account=account, mailbox=mailbox, mail_config={})
+    callback.assert_called_once()
+    sleep.assert_not_called()
+    assert account == pending()
+    assert mailbox['_registration_outcome'] == 'already_registered'
+
 
 
 @pytest.mark.parametrize('message', [
@@ -146,8 +206,13 @@ def test_rate_limit_http_status_survives_message_only_outer_layers(monkeypatch):
 @pytest.mark.parametrize('account,mailbox',[
     ({'email':'other@example.test','password':'random-candidate'},{}),
     (pending(),{'_registration_outcome':'already_registered','_registration_identity_created':True}),
+    ({**pending(),'registration_recovery_state':'identity_unconfirmed'},None),
+    ({**pending(),'registration_recovery_error':'username_not_found'},None),
+    ({**pending(),'registration_initial_error':'HTTP 400: username_not_found'},None),
+    (pending(),{'_registration_identity_error':'username_not_found',
+                '_registration_identity_created':True,'_otp_accepted_by_server':True}),
 ])
-def test_registered_skip_guard_cannot_be_bypassed(monkeypatch,account,mailbox):
+def test_ineligible_identity_guard_cannot_be_bypassed(monkeypatch,account,mailbox):
     callback=Mock()
     monkeypatch.setattr(recovery,'_recover_once',callback)
     with pytest.raises(RuntimeError,match='not_eligible'):

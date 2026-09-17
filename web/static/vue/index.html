@@ -1,37 +1,25 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="light">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#07090d" />
     <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate" />
-    <title>GPT Register FP</title>
-    <script type="module" crossorigin src="/static/vue/assets/main-BA6-Mj6C.js"></script>
-    <link rel="modulepreload" crossorigin href="/static/vue/assets/_plugin-vue_export-helper-C2YbSYGs.js">
-    <link rel="modulepreload" crossorigin href="/static/vue/assets/circle-check-BSAWPh-G.js">
-    <link rel="modulepreload" crossorigin href="/static/vue/assets/circle-x-D_fUkjnf.js">
-    <link rel="modulepreload" crossorigin href="/static/vue/assets/copy-BDwJdo55.js">
-    <link rel="modulepreload" crossorigin href="/static/vue/assets/clipboard-paste-BYsPy409.js">
-    <link rel="modulepreload" crossorigin href="/static/vue/assets/eraser-X9PTRbin.js">
-    <link rel="modulepreload" crossorigin href="/static/vue/assets/mailRegistration-DclvWQX-.js">
-    <link rel="modulepreload" crossorigin href="/static/vue/assets/MailRegistrationStats-WemJBGI9.js">
-    <link rel="modulepreload" crossorigin href="/static/vue/assets/zap-mSqAyhs3.js">
-    <link rel="modulepreload" crossorigin href="/static/vue/assets/triangle-alert-B4oL9l93.js">
-    <link rel="modulepreload" crossorigin href="/static/vue/assets/mail-plus-Bw1eM3l3.js">
-    <link rel="modulepreload" crossorigin href="/static/vue/assets/plus-Cvh2SeuW.js">
-    <link rel="modulepreload" crossorigin href="/static/vue/assets/square-dCxiJncK.js">
-    <link rel="modulepreload" crossorigin href="/static/vue/assets/trash-2-Cf32vDcr.js">
-    <link rel="modulepreload" crossorigin href="/static/vue/assets/taskPresentation-DAU8a8eQ.js">
-    <link rel="stylesheet" crossorigin href="/static/vue/assets/MailRegistrationStats-BkURqbQ6.css">
-    <link rel="stylesheet" crossorigin href="/static/vue/assets/main-BekQ5xaL.css">
+    <title>GPT Register FP · Console</title>
+    <script>
+      // 首屏前恢复主题，避免闪烁
+      try {
+        var t = localStorage.getItem("ui-theme-v2");
+        if (t === "dark" || t === "light") document.documentElement.dataset.theme = t;
+      } catch (e) {}
+    </script>
+    <script type="module" crossorigin src="/static/vue/assets/main-DED4dVYt.js"></script>
+    <link rel="modulepreload" crossorigin href="/static/vue/assets/_plugin-vue_export-helper-cQypK6Pq.js">
+    <link rel="modulepreload" crossorigin href="/static/vue/assets/AppButton-BXyOguwH.js">
+    <link rel="stylesheet" crossorigin href="/static/vue/assets/AppButton-qub0Jc8B.css">
+    <link rel="stylesheet" crossorigin href="/static/vue/assets/main-DeRjH5j7.css">
   </head>
   <body>
     <div id="app"></div>
-    <script>
-      try {
-        var t = localStorage.getItem("ui-theme");
-        if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
-      } catch (e) {}
-    </script>
   </body>
 </html>

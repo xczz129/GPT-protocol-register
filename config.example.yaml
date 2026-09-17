@@ -50,6 +50,21 @@ mail:
       capacity: 0
       mailboxes: ""
 
+    # ---------- OnlineDisposableMail 临时邮箱（注册时按需购买）----------
+    - type: online_disposablemail
+      enable: false
+      label: Online DisposableMail
+      # 也可留空并设置环境变量 ONLINE_DISPOSABLEMAIL_API_KEY
+      api_base: https://api.online-disposablemail.com
+      api_key: ""
+      # 242 = OpenAi（可在面板里加载服务列表后点选）
+      service_id: "242"
+      # 26 = Gmail_1；以面板加载的当前服务可售列表为准
+      email_type_id: "26"
+      # 容量取此配置和当前服务库存的较小值；不可售或余额为 0 时容量为 0
+      capacity: 50
+      mailboxes: ""
+
     # ---------- 域名邮箱（Freemail 兼容 API，自动创建）----------
     - type: domain_api
       enable: false
@@ -121,7 +136,9 @@ proxy:
   # country_pool 模式下选择国家；代理明细保存在 data/registration_proxy_pools.json
   selected_country: ""
   rotate_per_task: true
+  # 清障服务不在线时由注册机自动拉起项目内嵌副本(third_party/flaresolverr)
   clearance:
+    autostart: true
     enabled: false
     mode: none
     flaresolverr_url: ""
@@ -162,7 +179,7 @@ registration:
   rebind_client_version: ""
   rebind_client_build: ""
   # 默认延后远程测活，避免注册完成后立即 refresh 并访问 Web Backend。
-  post_register_health_check: false
+  post_register_health_check: true
   total: 1
   timeout: 480
   max_transient_retries: 2

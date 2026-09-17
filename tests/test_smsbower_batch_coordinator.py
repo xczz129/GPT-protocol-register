@@ -414,3 +414,102 @@ def test_real_schedulers_forward_the_reserved_primary_and_child(harness, monkeyp
     assert received[0][2] == received[1][2]
     assert "+split" in received[1][1]
     assert len(harness[0]) == len(harness[1]) == 1
+
+
+def test_odm_purchase_block_errors_are_recognized():
+    """实测 ODM API 返回英文消息；allocate_mailbox 包装后只剩字符串。
+
+    41003/41004/41005 为确定性无法购买（库存/余额/上限），41002 购买超时
+    文档标注可重试，不得拦截。
+    """
+    from mail import OnlineDisposableMailError
+
+    wrapped_balance = RuntimeError(
+        "OnlineDisposableMail purchase failed (code 41004): "
+        "Insufficient account balance"
+    )
+    wrapped_stock = RuntimeError(
+        "OnlineDisposableMail purchase failed (code 41003): Insufficient stock"
+    )
+    unwrapped = OnlineDisposableMailError(
+        "OnlineDisposableMail purchase failed (code 41005): purchase cap",
+        business_code=41005,
+        business_error="purchase cap",
+    )
+    retriable_timeout = RuntimeError(
+        "OnlineDisposableMail purchase failed (code 41002): purchase timeout"
+    )
+    assert batch.is_marketplace_stock_error(wrapped_balance)
+    assert batch.is_marketplace_stock_error(wrapped_stock)
+    assert batch.is_marketplace_stock_error(unwrapped)
+    assert not batch.is_marketplace_stock_error(retriable_timeout)
+
+
+def test_odm_stock_out_stops_further_purchases(harness, monkeypatch):
+    attempts = {"purchases": 0}
+
+    def allocate(config, *, provider_type=None):
+        attempts["purchases"] += 1
+        raise RuntimeError(
+            "OnlineDisposableMail purchase failed (code 41004): "
+            "Insufficient account balance"
+        )
+
+    monkeypatch.setattr(batch, "create_mailbox", allocate)
+
+    async def task(index, mailbox):
+        raise AssertionError("no account should start without a mailbox")
+
+    records, events = run(6, task)
+
+    def status(args, kwargs):
+        return str(args[1]) if len(args) > 1 else str(kwargs.get("status") or "")
+
+    assert attempts["purchases"] == 1
+    assert records == {}
+    failed = [(args, kwargs) for args, kwargs in events if status(args, kwargs) == "failed"]
+    assert len(failed) == 1
+    assert "无可用邮箱" in str(failed[0][1].get("step"))
+    assert "Insufficient account balance" in str(failed[0][1].get("error"))
+    cancelled_steps = [
+        str(kwargs.get("step"))
+        for args, kwargs in events
+        if status(args, kwargs) == "cancelled"
+    ]
+    assert any("无可用邮箱" in step for step in cancelled_steps)
+    assert not any(status(args, kwargs) == "running" for args, kwargs in events)
+
+
+def test_marketplace_stock_out_stops_further_purchases(harness, monkeypatch):
+    purchases, settlements, children = harness
+    attempts = {"purchases": 0}
+
+    def allocate(config, *, provider_type=None):
+        attempts["purchases"] += 1
+        raise RuntimeError("SMSBower Mail getActivation failed: No mails yet")
+
+    monkeypatch.setattr(batch, "create_mailbox", allocate)
+
+    async def task(index, mailbox):
+        raise AssertionError("no account should start without a mailbox")
+
+    records, events = run(6, task)
+
+    def status(args, kwargs):
+        return str(args[1]) if len(args) > 1 else str(kwargs.get("status") or "")
+
+    # 只尝试一次购买，剩余槽位不再重复同样的失败
+    assert attempts["purchases"] == 1
+    assert records == {}
+    assert purchases == [] and children == [] and settlements == []
+    failed = [(args, kwargs) for args, kwargs in events if status(args, kwargs) == "failed"]
+    assert len(failed) == 1
+    assert "无可用邮箱" in str(failed[0][1].get("step"))
+    assert "No mails yet" in str(failed[0][1].get("error"))
+    cancelled_steps = [
+        str(kwargs.get("step"))
+        for args, kwargs in events
+        if status(args, kwargs) == "cancelled"
+    ]
+    assert any("无可用邮箱" in step for step in cancelled_steps)
+    assert not any(status(args, kwargs) == "running" for args, kwargs in events)

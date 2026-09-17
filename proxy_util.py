@@ -189,9 +189,91 @@ def is_rate_limit_error(error: BaseException | str | None) -> bool:
     return False
 
 
+_AUTH_IDENTITY_ERROR_CODE = re.compile(
+    r"(?:[\"']code[\"']\s*:\s*[\"']|(?:^|[\s:])(?:code\s*=\s*)?)"
+    r"username_not_found(?=$|[\s\"',:;}])",
+    re.IGNORECASE,
+)
+
+
+def is_auth_identity_error(error: BaseException | str | dict | None) -> bool:
+    """Recognize an explicit missing-identity code, including wrapped responses."""
+    seen: set[int] = set()
+    current = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, dict):
+            payload = current.get("error", current)
+            if isinstance(payload, dict) and payload.get("code") == "username_not_found":
+                return True
+        if _AUTH_IDENTITY_ERROR_CODE.search(str(current)):
+            return True
+        if not isinstance(current, BaseException):
+            break
+        response = getattr(current, "response", None)
+        if response is not None and callable(getattr(response, "json", None)):
+            try:
+                data = response.json()
+            except Exception:
+                data = None
+            if isinstance(data, dict) and isinstance(data.get("error"), dict):
+                if data["error"].get("code") == "username_not_found":
+                    return True
+        current = current.__cause__ or (
+            current.__context__ if not current.__suppress_context__ else None
+        )
+    return False
+
+
+def is_cloudflare_block_error(error: BaseException | str | None) -> bool:
+    """Recognize a Cloudflare challenge block (managed/interstitial page).
+
+    Used by schedulers for batch-level circuit breaking: a burst of these
+    within a short window means the whole proxy pool's exit IPs are being
+    rate-flagged, and hammering further only deepens the block.
+    """
+    message = str(error or "").lower()
+    if not message:
+        return False
+    return any(
+        marker in message
+        for marker in (
+            "被 cloudflare 拦截",
+            "cf_blocked",
+            "chatgpt_home_http_403",
+        )
+    )
+
+
+def is_tls_transient_error(error: BaseException | str | None) -> bool:
+    """Link-level TLS handshake transients that recover on the same session.
+
+    代理链路偶发 curl: (35)/TLS connect error 属链路级瞬断,与指纹和凭据
+    无关,原 session 立即重试几乎必恢复(参考项目实测 8/8 一次即恢复)。
+    与代理不可达(connect 类)不同,后者才需要换代理。
+    """
+    message = str(error or "").lower()
+    return any(
+        marker in message
+        for marker in (
+            "curl: (35)",
+            "tls connect error",
+            "ssl error",
+            "sslerror",
+            "ssl connect",
+            "ssl handshake",
+            "tls handshake",
+            "tlsv1_alert",
+            "wrong_version_number",
+            "unexpected eof while reading",
+            "eof occurred in violation of protocol",
+        )
+    )
+
+
 def is_proxy_transport_error(error: BaseException | str | None) -> bool:
     """Identify failures where retrying through another proxy is useful."""
-    if is_rate_limit_error(error):
+    if is_rate_limit_error(error) or is_auth_identity_error(error):
         return False
     message = str(error or "").lower()
     if not message:
@@ -200,8 +282,10 @@ def is_proxy_transport_error(error: BaseException | str | None) -> bool:
         "curl: (28)",
         "curl: (35)",
         "tls connect error",
-        "curl: (56) connection closed abruptly",
-        "curl: (56) connect tunnel failed",
+        # curl(56)=接收网络数据失败，一律按传输层瞬断处理：
+        # 覆盖 connection closed abruptly / connect tunnel failed /
+        # BoringSSL SSL_read SSLV3_ALERT_BAD_RECORD_MAC 等所有变体
+        "curl: (56)",
         "curl: (7)",
         "wrong_version_number",
         "err_no_supported_proxies",
@@ -211,6 +295,10 @@ def is_proxy_transport_error(error: BaseException | str | None) -> bool:
         "response 407",
         "chatgpt_home_http_403",
         "cf_blocked",
+        # Cloudflare 403/503 challenge pages mean the exit IP is currently
+        # flagged; rotating to another proxy (and quarantining this one) is
+        # the correct recovery, exactly like a broken tunnel.
+        "被 cloudflare 拦截",
         # curl-cffi/OpenSSL and proxy bridges use several equivalent labels
         # for a transient TLS tunnel failure.  These errors do not say
         # anything about the account credential, so a different route should

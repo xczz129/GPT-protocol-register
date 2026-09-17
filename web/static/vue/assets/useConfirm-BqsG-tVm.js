@@ -1,0 +1,1 @@
+import{n as e}from"./AppButton-BXyOguwH.js";function t(){let t=e();return(e,n)=>t.askConfirm(e,n)}export{t};
