@@ -2586,7 +2586,9 @@ class PlatformRegistrar:
             raise RuntimeError("registration_identity_response_unconfirmed")
         return result
 
-    def _start_password_add_authorize(self, email: str, index: int) -> str:
+    def _start_password_add_authorize(
+        self, email: str, index: int, *, plain_login: bool = False
+    ) -> str:
         """Start the post-registration password-add authentication transaction."""
         fp = _browser_fingerprint(self.fingerprint)
         common = {
@@ -2686,13 +2688,33 @@ class PlatformRegistrar:
                     )
                 return self._navigate_auth_step(authorize_url, home_url, index)
 
-        self._diagnostic(
-            index,
-            "启动注册后补密码授权 "
-            "reauth=password post_login_add_password=true",
-        )
-        response = signin(
-            {
+        if plain_login:
+            # HAR(重置密码设置2fa) 的普通登录事务：prompt=login+
+            # screen_hint=login_or_signup+connection=password+login_hint 直接落在
+            # /log-in/password，密码重置在该事务内完成；post_login_add_password
+            # 事务里 password/reset 会 409 invalid session。
+            self._diagnostic(
+                index,
+                "启动普通登录授权(HAR 密码重置事务) "
+                "prompt=login screen_hint=login_or_signup",
+            )
+            authorize_params = {
+                "prompt": "login",
+                "ext-passkey-client-capabilities": "11111",
+                "ext-oai-did": self.device_id,
+                "auth_session_logging_id": str(uuid.uuid4()),
+                "screen_hint": "login_or_signup",
+                "login_hint": email,
+                "connection": "password",
+                "max_age": "0",
+            }
+        else:
+            self._diagnostic(
+                index,
+                "启动注册后补密码授权 "
+                "reauth=password post_login_add_password=true",
+            )
+            authorize_params = {
                 "connection": "password",
                 "ext-oai-did": self.device_id,
                 "login_hint": email,
@@ -2700,7 +2722,7 @@ class PlatformRegistrar:
                 "post_login_add_password": "true",
                 "reauth": "password",
             }
-        )
+        response = signin(authorize_params)
         return str(getattr(response, "url", "") or "")
 
     def _send_password_reset_otp(
@@ -2821,6 +2843,7 @@ class PlatformRegistrar:
         totp_secret: str = "",
         skip_existing_password: bool = False,
         credential_sink: Callable[[dict[str, Any]], None] | None = None,
+        existing_password_route: bool = False,
     ) -> str:
         """Run the second OTP transaction used by the password-add HAR flow."""
         def reset_transaction_identity() -> None:
@@ -2828,7 +2851,7 @@ class PlatformRegistrar:
             self._reset_auth_cookies()
             self._sync_session_identity()
 
-        def start_with_retry(*, fresh: bool) -> str:
+        def start_with_retry(*, fresh: bool, plain_login: bool = False) -> str:
             if fresh:
                 reset_transaction_identity()
             # A new password transaction may legitimately reuse the same
@@ -2841,7 +2864,9 @@ class PlatformRegistrar:
             )
             for authorize_attempt in range(2):
                 try:
-                    return self._start_password_add_authorize(email, index)
+                    return self._start_password_add_authorize(
+                        email, index, plain_login=plain_login
+                    )
                 except RuntimeError as error:
                     if authorize_attempt >= 1:
                         raise
@@ -2867,7 +2892,10 @@ class PlatformRegistrar:
             fresh: bool,
             force_password_reset: bool,
         ) -> tuple[dict[str, Any], bool]:
-            start_url = start_with_retry(fresh=fresh)
+            start_url = start_with_retry(
+                fresh=fresh,
+                plain_login=existing_password_route or force_password_reset,
+            )
             reset_existing = (
                 force_password_reset
                 or _url_path(start_url) == "/log-in/password"
