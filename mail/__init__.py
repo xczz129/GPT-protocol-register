@@ -235,7 +235,9 @@ ICLOUD_WAIT_REQUEST_MAX_SECONDS = 60
 ICLOUD_WAIT_HTTP_RETRIES = 2
 ICLOUD_TRANSIENT_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 _mailbox_state_lock = Lock()
-IN_USE_STALE_SECONDS = 15 * 60  # longer than the default 8-minute registration timeout
+# 注册含网络/会话重试时最坏可超 15 分钟；阈值须覆盖全程，否则卡住
+# 任务的邮箱会被新批次判 stale 重复分配。取 30 分钟留余量。
+IN_USE_STALE_SECONDS = 30 * 60
 UNAVAILABLE_STATES = {"used", "token_invalid", "failed"}
 RATE_LIMIT_COOLDOWN_SECONDS = 30 * 60
 BJ_TZ = timezone(timedelta(hours=8))
@@ -596,9 +598,17 @@ def _message_tracking_ref(message: dict[str, Any]) -> str:
 
 def _message_before_code_boundary(mailbox: dict[str, Any], message: dict[str, Any]) -> bool:
     boundary = _mailbox_code_boundary(mailbox)
-    received_at = message.get("received_at")
-    if not isinstance(boundary, datetime) or not isinstance(received_at, datetime):
+    if not isinstance(boundary, datetime):
+        # 没有边界标记＝没有进行中的新事务，不排除任何消息。
         return False
+    received_at = message.get("received_at")
+    if not isinstance(received_at, datetime):
+        # fail-closed：无法证明新于边界的验证码按旧码处理，
+        # 避免网关缺时间戳时重发后提交旧码（wrong_email_otp_code）。
+        parsed = _parse_received_at(received_at) if str(received_at or "").strip() else None
+        if parsed is None:
+            return True
+        received_at = parsed
     if not received_at.tzinfo:
         received_at = received_at.replace(tzinfo=timezone.utc)
     return received_at < boundary
@@ -606,8 +616,13 @@ def _message_before_code_boundary(mailbox: dict[str, Any], message: dict[str, An
 
 def _parse_received_at(value: Any) -> datetime | None:
     if isinstance(value, (int, float)):
+        seconds = float(value)
+        # 网关误用毫秒 epoch 时 fromtimestamp 必溢出返回 None，
+        # 边界判定全放行（fail-open）→ 重发后提交旧码浪费 validate 次数。
+        if seconds > 1e12:
+            seconds /= 1000.0
         try:
-            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+            return datetime.fromtimestamp(seconds, tz=timezone.utc)
         except Exception:
             return None
     text = str(value or "").strip()
@@ -5059,9 +5074,7 @@ class OnlineDisposableMailProvider:
                 "to": mailbox.get("address", ""),
                 "text_content": code or "",
                 "html_content": content,
-                "received_at": datetime.now(BJ_TZ).strftime(
-                    "%Y-%m-%d %H:%M:%S%z"
-                ),
+                "received_at": datetime.now(BJ_TZ),
             }
         ]
 
@@ -6428,6 +6441,40 @@ def create_mailbox(
     raise RuntimeError(last_error or "All mail providers exhausted")
 
 
+
+
+def _attach_pool_credentials(entry: dict[str, Any], mailbox: dict[str, Any]) -> None:
+    """给账号记录解析出的裸邮箱补上取码凭据（只读，不改池状态）。
+
+    codex-oauth 等调用方按账号记录的 provider_type + provider_ref 构建的
+    mailbox 只有 address/provider/provider_ref；outlook_token 与 icloud_api
+    取码还需要凭据字段。按地址在所属 provider 的凭据池里查找并附加，
+    不预约、不写邮箱状态文件，账号自有邮箱不产生 in_use/failed 痕迹。
+    """
+    ptype = normalize_provider_type(str(entry.get("type") or ""))
+    address = str(mailbox.get("address") or "").strip().lower()
+    if not address:
+        return
+    pool_text = str(entry.get("mailboxes") or entry.get("pool") or "")
+    base = base_mailbox_address(address)
+    if ptype == "icloud_api" and not str(mailbox.get("api_key") or "").strip():
+        for item in parse_icloud_credentials(pool_text):
+            if base_mailbox_address(item["email"].strip().lower()) == base:
+                mailbox["api_key"] = str(item.get("api_key") or "")
+                mailbox.setdefault("login_address", base)
+                mailbox.setdefault("base_address", base)
+                mailbox.setdefault("api_base", str(entry.get("api_base") or ""))
+                return
+    elif ptype == "outlook_token" and not str(mailbox.get("refresh_token") or "").strip():
+        for item in parse_outlook_credentials(pool_text):
+            if base_mailbox_address(item["email"].strip().lower()) == base:
+                mailbox.setdefault("login_address", base)
+                mailbox.setdefault("base_address", base)
+                mailbox.setdefault("password", str(item.get("password") or ""))
+                mailbox.setdefault("client_id", str(item.get("client_id") or ""))
+                mailbox.setdefault("refresh_token", str(item.get("refresh_token") or ""))
+                return
+
 def wait_for_code(mail_config: dict, mailbox: dict, stop_check=None) -> str | None:
     entries = _iter_provider_entries(mail_config, provider_type=None)
     # Also include disabled providers so wait still works if mailbox was already created
@@ -6470,6 +6517,7 @@ def wait_for_code(mail_config: dict, mailbox: dict, stop_check=None) -> str | No
             f"type={provider_type})"
         )
 
+    _attach_pool_credentials(entry, mailbox)
     conf = _make_config(mail_config)
     provider = _build_provider(entry, conf)
     try:
@@ -6776,12 +6824,15 @@ def release_all_in_use(*, include_failed: bool = True) -> int:
             return reset
 
 
-def release_failed_mailboxes(*, include_stale_in_use: bool = True) -> int:
+def release_failed_mailboxes(*, include_stale_in_use: bool = True, include_pending_settlements: bool = False) -> int:
     """Release failed mailboxes and abandoned reservations under one lock.
 
     Active ``in_use`` reservations are intentionally left alone. A running
     registration owns those addresses until its worker finalizer releases
     them; only stale reservations are eligible for recovery here.
+    ``include_pending_settlements`` explicitly drops SMSBower pending
+    settlement entries whose provider was disabled/removed: without this
+    escape hatch those rows stay ``in_use`` forever and shrink the pool.
     """
     with _mailbox_state_lock:
         with _with_state_file_lock():
@@ -6790,13 +6841,18 @@ def release_failed_mailboxes(*, include_stale_in_use: bool = True) -> int:
             for email, entry in list(store.items()):
                 if not isinstance(entry, dict):
                     continue
-                if _has_pending_smsbower_settlement(entry):
+                settlement = _has_pending_smsbower_settlement(entry)
+                if settlement and not include_pending_settlements:
                     continue
                 state = str(entry.get("state") or "").strip().lower()
-                if state == "failed" or (
-                    include_stale_in_use
-                    and state == "in_use"
-                    and _entry_available(entry)
+                if (
+                    state == "failed"
+                    or (
+                        include_stale_in_use
+                        and state == "in_use"
+                        and _entry_available(entry)
+                    )
+                    or (settlement and include_pending_settlements)
                 ):
                     reset += int(_release_local_entry(store, email))
             if reset:

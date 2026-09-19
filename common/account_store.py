@@ -301,7 +301,11 @@ def _epoch(value: Any) -> float:
     if not text:
         return 0.0
     try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            # 无时区串按 UTC 解析，避免本地时区（+8）导致排序偏差 8h。
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
     except Exception:
         return 0.0
 
@@ -1609,7 +1613,7 @@ def update_account_records(
                     placeholders = ",".join("?" for _ in chunk)
                     rows.extend(
                         connection.execute(
-                            f"SELECT payload FROM accounts WHERE canonical_key IN ({placeholders})",
+                            f"SELECT canonical_key, payload FROM accounts WHERE canonical_key IN ({placeholders})",
                             chunk,
                         ).fetchall()
                     )
@@ -1618,12 +1622,25 @@ def update_account_records(
             changed = 0
             now_iso = _utc_now_iso()
             for row in rows:
-                record = _decode_payload(row[0])
+                record = _decode_payload(row[1])
                 if record is None:
                     continue
-                record.update({str(field): value for field, value in fields.items()})
-                record["updated_at"] = now_iso
-                _store_sqlite_record(connection, record)
+                # 与 fields 版同款守卫：不允许替换用户身份；键漂移仅允许
+                # user_id 回填引发的规范迁移，目标键被占用时拒绝。
+                updated = _ensure_stable_user_id(
+                    {**record, **{str(field): value for field, value in fields.items()}, "updated_at": now_iso}
+                )
+                if account_stable_user_id(record) and account_stable_user_id(updated) != account_stable_user_id(record):
+                    raise ValueError("account_identity_conflict: 字段更新不能替换已有用户身份")
+                new_key = account_delete_key(updated)
+                if new_key != str(row[0]):
+                    occupied = connection.execute(
+                        "SELECT 1 FROM accounts WHERE canonical_key = ?", (new_key,)
+                    ).fetchone()
+                    if occupied is not None:
+                        raise ValueError("account_identity_conflict: 更新后的账号标识已存在，未覆盖原记录")
+                    connection.execute("DELETE FROM accounts WHERE canonical_key = ?", (str(row[0]),))
+                _store_sqlite_record(connection, updated)
                 changed += 1
             if changed:
                 _bump_revision(connection)
@@ -1637,12 +1654,21 @@ def update_account_records(
     with _file_lock(path):
         records = _canonical_snapshot(path)
         changed = 0
-        for record in records:
+        reserved_keys = {account_delete_key(record) for record in records}
+        for index, record in enumerate(records):
             if account_delete_key(record) not in wanted:
                 continue
-            for field, value in fields.items():
-                record[str(field)] = value
-            record["updated_at"] = _utc_now_iso()
+            updated = _ensure_stable_user_id(
+                {**record, **{str(field): value for field, value in fields.items()}, "updated_at": _utc_now_iso()}
+            )
+            if account_stable_user_id(record) and account_stable_user_id(updated) != account_stable_user_id(record):
+                raise ValueError("account_identity_conflict: 字段更新不能替换已有用户身份")
+            new_key = account_delete_key(updated)
+            if new_key != account_delete_key(record):
+                if new_key in reserved_keys:
+                    raise ValueError("account_identity_conflict: 更新后的账号标识已存在，未覆盖原记录")
+                reserved_keys.add(new_key)
+            records[index] = updated
             changed += 1
         normalized = normalize_accounts(records) if changed else records
         if changed:
@@ -1795,6 +1821,9 @@ def normalized_health_status(record: dict[str, Any]) -> str:
         return "invalid"
     if "oauth_refresh_http_401" in error:
         return "invalid"
+    if status == "invalid" and not token and "token invalidated" in error:
+        # security_pending 等缺 AT 的 token 拒绝本质是待重登而非不可用。
+        return "reauth_required"
     return status
 
 

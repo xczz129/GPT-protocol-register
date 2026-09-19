@@ -825,8 +825,8 @@ async def backups_download(name: str):
 
 @router.post("/api/backups/restore")
 async def backups_restore(body: BackupRestoreRequest):
-    if _state().JOB.running:
-        raise HTTPException(409, "任务运行时不能恢复备份")
+    if _state().any_batch_running():
+        raise HTTPException(409, "有批次任务运行时不能恢复备份")
     _state().PROGRESS.start("backup_restore", "恢复数据备份", stage="校验并覆盖数据文件")
     try:
         restored = await asyncio.to_thread(_state().restore_backup, body.name)

@@ -9,7 +9,7 @@ import json
 import re
 import threading
 import time
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 from typing import Any
 from mail import OnlineDisposableMailError
@@ -1770,11 +1770,17 @@ async def mailbox_messages(body: MailMessagesRequest):
 
 
 @router.post("/api/mail/reset-failed")
-async def reset_failed_mail():
+async def reset_failed_mail(include_pending_settlements: bool = Query(default=False)):
     with _state().JOB.lock:
         if _state().JOB.running:
             raise HTTPException(409, "任务运行时不能释放邮箱状态")
-    reset = await asyncio.to_thread(_state().release_failed_mailboxes, include_stale_in_use=True)
+    # include_pending_settlements=True 时一并清理 SMSBower 待结算卡死条目
+    # （该 provider 已禁用/删除、无人再触发结算恢复的场景）。
+    reset = await asyncio.to_thread(
+        _state().release_failed_mailboxes,
+        include_stale_in_use=True,
+        include_pending_settlements=include_pending_settlements,
+    )
     return {
         "ok": True,
         "reset": reset,

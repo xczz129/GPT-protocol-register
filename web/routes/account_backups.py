@@ -63,8 +63,8 @@ async def account_backups_download(name: str):
 
 @router.post("/api/account-backups/restore")
 async def account_backups_restore(body: AccountBackupRestoreRequest):
-    if _state().JOB.running:
-        raise HTTPException(409, "任务运行时不能恢复账号备份")
+    if _state().any_batch_running():
+        raise HTTPException(409, "有批次任务运行时不能恢复账号备份")
     mode = "replace" if str(body.mode or "").strip().lower() == "replace" else "merge"
     try:
         result = await asyncio.to_thread(restore_account_backup, body.name, mode)

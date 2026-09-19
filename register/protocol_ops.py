@@ -350,7 +350,11 @@ def repair_security_one(
     provider_token = _PROVIDER_TYPE.set(provider_type)
     mail_config_token = _MAIL_CONFIG.set(dict(mail_config))
     proxy_config_token = _PROXY_CONFIG.set(dict(proxy_config or {}))
-    runtime_context = activate_runtime(protocol_runtime or ProtocolRuntimeSettings())
+    runtime = protocol_runtime or ProtocolRuntimeSettings()
+    if runtime.deadline is None:
+        # 缺省也兜底 deadline（默认 8 分钟），防 worker 无超时挂死。
+        runtime = runtime.with_deadline(time.monotonic() + runtime.account_timeout)
+    runtime_context = activate_runtime(runtime)
     runtime_context.__enter__()
     registrar: PlatformRegistrar | None = None
     mailbox: dict[str, Any] | None = mailbox_override
@@ -1214,7 +1218,11 @@ def change_password_one(
     stop_token = _STOP_CHECK.set(stop)
     email_token = _FIXED_EMAIL.set(str(email or "").strip())
     proxy_config_token = _PROXY_CONFIG.set(dict(proxy_config or {}))
-    runtime_context = activate_runtime(protocol_runtime or ProtocolRuntimeSettings())
+    runtime = protocol_runtime or ProtocolRuntimeSettings()
+    if runtime.deadline is None:
+        # 缺省也兜底 deadline（默认 8 分钟），防 worker 无超时挂死。
+        runtime = runtime.with_deadline(time.monotonic() + runtime.account_timeout)
+    runtime_context = activate_runtime(runtime)
     runtime_context.__enter__()
     registrar: PlatformRegistrar | None = None
     try:
@@ -1325,7 +1333,11 @@ def change_totp_one(
     stop_token = _STOP_CHECK.set(stop)
     email_token = _FIXED_EMAIL.set(str(email or "").strip())
     proxy_config_token = _PROXY_CONFIG.set(dict(proxy_config or {}))
-    runtime_context = activate_runtime(protocol_runtime or ProtocolRuntimeSettings())
+    runtime = protocol_runtime or ProtocolRuntimeSettings()
+    if runtime.deadline is None:
+        # 缺省也兜底 deadline（默认 8 分钟），防 worker 无超时挂死。
+        runtime = runtime.with_deadline(time.monotonic() + runtime.account_timeout)
+    runtime_context = activate_runtime(runtime)
     runtime_context.__enter__()
     registrar: PlatformRegistrar | None = None
     try:
@@ -1427,9 +1439,11 @@ def login_email_code_one(
     provider_token = _PROVIDER_TYPE.set(provider_type)
     mail_config_token = _MAIL_CONFIG.set(dict(mail_config))
     proxy_config_token = _PROXY_CONFIG.set(dict(proxy_config or {}))
-    runtime_context = activate_runtime(
-        protocol_runtime or ProtocolRuntimeSettings()
-    )
+    runtime = protocol_runtime or ProtocolRuntimeSettings()
+    if runtime.deadline is None:
+        # 缺省也兜底 deadline（默认 8 分钟），防 worker 无超时挂死。
+        runtime = runtime.with_deadline(time.monotonic() + runtime.account_timeout)
+    runtime_context = activate_runtime(runtime)
     runtime_context.__enter__()
     registrar = None
     mailbox: dict[str, Any] | None = None
@@ -1463,11 +1477,14 @@ def login_email_code_one(
         return result
     except JobCancelled:
         if mailbox is not None:
-            mark_mailbox_result(mailbox, success=False, error="stop requested")
+            # 固定地址是账号自有邮箱：停止只释放预约，不标 failed，
+            # 避免污染池状态导致同批重试找不到可用邮箱。
+            release_mailbox(mailbox)
         raise
     except Exception as error:
         if mailbox is not None:
-            mark_mailbox_result(mailbox, success=False, error=error)
+            # 重登失败不代表邮箱本身损坏：释放而非标 failed。
+            release_mailbox(mailbox)
         if callable(error_sink):
             try:
                 error_sink(str(error))
@@ -1516,9 +1533,11 @@ def login_one(
     provider_token = _PROVIDER_TYPE.set(provider_type)
     mail_config_token = _MAIL_CONFIG.set(dict(mail_config))
     proxy_config_token = _PROXY_CONFIG.set(dict(proxy_config or {}))
-    runtime_context = activate_runtime(
-        protocol_runtime or ProtocolRuntimeSettings()
-    )
+    runtime = protocol_runtime or ProtocolRuntimeSettings()
+    if runtime.deadline is None:
+        # 缺省也兜底 deadline（默认 8 分钟），防 worker 无超时挂死。
+        runtime = runtime.with_deadline(time.monotonic() + runtime.account_timeout)
+    runtime_context = activate_runtime(runtime)
     runtime_context.__enter__()
     registrar = None
     mailbox: dict[str, Any] | None = None

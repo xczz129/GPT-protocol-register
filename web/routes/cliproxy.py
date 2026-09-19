@@ -520,8 +520,7 @@ def _sub2_export_record(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-@router.get("/api/cliproxy/accounts")
-async def list_accounts() -> dict:
+def _list_accounts_sync() -> dict:
     with _QUOTA_LOCK:
         cache = {k: dict(v) for k, v in _QUOTA_CACHE.items()}
     items: list[dict] = []
@@ -548,6 +547,12 @@ async def list_accounts() -> dict:
         "configured": AUTHS_DIR.is_dir(),
         "items": items,
     }
+
+
+@router.get("/api/cliproxy/accounts")
+async def list_accounts() -> dict:
+    # 逐文件 read+stat 是同步 I/O：量大时阻塞事件循环（SSE 心跳停顿）。
+    return await run_in_threadpool(_list_accounts_sync)
 
 
 def _safe_auth_paths(names: list[str] | None = None) -> list[Path]:
@@ -1001,17 +1006,33 @@ async def refresh_quota(body: QuotaRefreshRequest) -> dict:
     return await run_in_threadpool(refresh_quota_files, body.files or None)
 
 
+def _merged_records_sync(selected: list[Path]) -> bytes:
+    records = _auth_records(selected)
+    if not records:
+        return b""
+    return json.dumps(records, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+
+
+def _download_zip_sync(selected: list[Path]) -> io.BytesIO:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for path in selected:
+            archive.write(path, arcname=path.name)
+    buffer.seek(0)
+    return buffer
+
+
 @router.get("/api/cliproxy/download")
 async def download_auths(files: str = Query(default=""), mode: str = Query(default="individual")) -> Any:
     names = [name.strip() for name in files.split(",") if name.strip()]
-    selected = _safe_auth_paths(names)
+    # 枚举、JSON 解析、zip 打包都是同步 I/O，放线程池避免阻塞事件循环。
+    selected = await run_in_threadpool(_safe_auth_paths, names)
     if not selected:
         raise HTTPException(status_code=404, detail="未找到可下载的 auth 文件")
     if mode == "merged":
-        records = _auth_records(selected)
-        if not records:
+        data = await run_in_threadpool(_merged_records_sync, selected)
+        if not data:
             raise HTTPException(status_code=422, detail="选中的 auth 文件均无法解析")
-        data = json.dumps(records, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
         return StreamingResponse(
             io.BytesIO(data),
             media_type="application/json",
@@ -1021,11 +1042,7 @@ async def download_auths(files: str = Query(default=""), mode: str = Query(defau
         raise HTTPException(status_code=400, detail="下载模式必须是 merged 或 individual")
     if len(selected) == 1:
         return FileResponse(selected[0], filename=selected[0].name, media_type="application/json")
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        for path in selected:
-            archive.write(path, arcname=path.name)
-    buffer.seek(0)
+    buffer = await run_in_threadpool(_download_zip_sync, selected)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     return StreamingResponse(
         buffer,

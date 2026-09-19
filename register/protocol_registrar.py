@@ -2375,18 +2375,6 @@ class PlatformRegistrar:
             detail = _response_json(resp) if resp is not None else {}
             raise RuntimeError(error or f"passwordless_send_otp_http_{getattr(resp, 'status_code', 'unknown')}, detail={json.dumps(detail, ensure_ascii=False)[:300]}")
 
-    @staticmethod
-    def _is_passwordless_invalid_state(resp) -> bool:
-        if resp is None or getattr(resp, "status_code", None) != 409:
-            return False
-        data = _response_json(resp)
-        error = data.get("error") if isinstance(data, dict) else None
-        if not isinstance(error, dict):
-            return False
-        code = str(error.get("code") or "").strip().lower()
-        message = str(error.get("message") or "").strip().lower()
-        return code == "invalid_state" or "sign-in session is no longer valid" in message
-
     def _complete_passwordless_login(self, code: str, index: int) -> dict:
         """Validate one passwordless OTP and exchange the resulting OAuth code."""
         resp, error = validate_otp(
@@ -2475,13 +2463,18 @@ class PlatformRegistrar:
                     f"第 {segment_no} 段（{int(segment_no * segment_timeout)}s）未收到验证码，重发注册验证码",
                     "yellow",
                 )
+                resent = False
                 try:
-                    self._resend_email_otp(index)
+                    resent = self._resend_email_otp(index)
                 except RuntimeError as otp_error:
                     if "invalid_state" not in str(otp_error).lower():
                         raise
                     step(index, "验证码已自动发送，无需重复请求", "yellow")
-                mark_mailbox_code_boundary(mailbox, grace_seconds=0)
+                    resent = True
+                # 重发确认成功才推进收码边界：失败时保留在途旧码继续等，
+                # 否则既作废未读旧码又等不到新码，白白超时失败。
+                if resent:
+                    mark_mailbox_code_boundary(mailbox, grace_seconds=0)
         return None
 
     def _wait_login_otp_rounds(self, mailbox: dict, index: int) -> str | None:
@@ -2637,8 +2630,8 @@ class PlatformRegistrar:
                         "登录验证码被服务端判定错误，刷新验证码后继续等待新码",
                         "yellow",
                     )
-                    self._resend_email_otp(index)
-                    mark_mailbox_code_boundary(mailbox, grace_seconds=0)
+                    if self._resend_email_otp(index):
+                        mark_mailbox_code_boundary(mailbox, grace_seconds=0)
                     continue
                 raise
 
@@ -3163,11 +3156,15 @@ class PlatformRegistrar:
                         _is_wrong_email_otp_error(error)
                         and otp_attempt + 1 < max_otp_attempts
                     ):
+                        # 错码已消耗 challenge 的 check 次数；不刷新 challenge
+                        # 直接等新码，后续提交会叠加旧计数直至 max_check_attempts。
                         step(
                             index,
-                            "补密码验证码被服务端判定错误，已排除本次候选并继续等待新码",
+                            "补密码验证码被服务端判定错误，已重发验证码并重置校验计数，等待新码",
                             "yellow",
                         )
+                        self._resend_email_otp(index)
+                        mark_mailbox_code_boundary(mailbox, grace_seconds=0)
                         continue
                     raise
             if not isinstance(validated, dict):
@@ -3385,11 +3382,15 @@ class PlatformRegistrar:
                     _is_wrong_email_otp_error(error)
                     and otp_attempt + 1 < max_otp_attempts
                 ):
+                    # 错码已消耗 challenge 的 check 次数；不刷新 challenge
+                    # 直接等新码，后续提交会叠加旧计数直至 max_check_attempts。
                     step(
                         index,
-                        "密码重置验证码被服务端判定错误，已排除本次候选并继续等待新码",
+                        "密码重置验证码被服务端判定错误，已重发验证码并重置校验计数，等待新码",
                         "yellow",
                     )
+                    self._resend_email_otp(index)
+                    mark_mailbox_code_boundary(mailbox, grace_seconds=0)
                     continue
                 raise
         if not isinstance(validated, dict):

@@ -1054,9 +1054,11 @@ def check_account(
             reauth_blocked_reason="account_deactivated",
         )
     except InvalidAccessTokenError as exc:
+        token = str(current.get("access_token") or "")
+        # 缺 AT（security_pending 等）本质是待重登，不归为 invalid。
         state = (
             "reauth_required"
-            if _token_expired(str(current.get("access_token") or ""))
+            if (not token or _token_expired(token))
             else "invalid"
         )
         if state == "invalid":

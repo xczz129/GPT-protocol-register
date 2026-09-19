@@ -429,8 +429,11 @@ def _set_sms_item(email: str, batch_id: str, **updates) -> None:
     with _LOCK:
         if _STATE.get("mode") != "codex" or _STATE.get("batch_id", "") != batch_id:
             return
+        # 账号库可能保留导入时的原始大小写；不区分大小写匹配，
+        # 否则运行中的 stage/attempt/wait_deadline 更新被静默丢弃。
+        wanted = email.strip().lower()
         for item in _STATE.get("items", []):
-            if item["email"] == email:
+            if str(item.get("email") or "").strip().lower() == wanted:
                 item.update(updates, updated_at=datetime.now().isoformat(timespec="seconds"))
                 _sms_counts_locked()
                 break
@@ -911,8 +914,20 @@ class _PanelSmsBowerClient(SmsBowerClient):
             if tier:
                 params["providerIds"] = tier
             # An annotated country price must never defeat the run-wide cap.
-            caps = [p for p in (max_price, self.settings.max_price) if p]
-            price = str(min(float(p) for p in caps)) if caps else ""
+            # 存量脏值（非有限正数）直接忽略，不能让一次解析失败拖垮整批取号。
+            def _price_cap(value):
+                try:
+                    number = float(value)
+                except (TypeError, ValueError):
+                    return None
+                return number if math.isfinite(number) and number > 0 else None
+
+            caps = [
+                cap
+                for cap in (_price_cap(max_price), _price_cap(self.settings.max_price))
+                if cap is not None
+            ]
+            price = str(min(caps)) if caps else ""
             if price:
                 params["maxPrice"] = price
             self.request_guard()
@@ -1283,14 +1298,21 @@ def _process_one(
                         raise _SmsCancelled("任务已停止")
                     if segment < 3:
                         log(f"第 {segment + 1} 段（{(segment + 1) * 45} 秒）未收到验证码，重发登录验证码", "warning")
+                        # 重发确认成功（或 409 已自动发送）才推进收码边界；
+                        # 失败时保留在途旧码继续等，否则作废未读旧码后又等不到新码。
+                        resent = False
                         try:
                             client.send_passwordless_otp()
+                            resent = True
                         except OAuthHttpError as otp_error:
-                            if int(getattr(otp_error, "status_code", 0) or 0) != 409:
-                                log("重发登录验证码失败，继续等待新邮件", "warning")
-                        mark_mailbox_code_boundary(mailbox, grace_seconds=0)
+                            if int(getattr(otp_error, "status_code", 0) or 0) == 409:
+                                resent = True
+                            else:
+                                log("重发登录验证码失败，继续等待新邮件（保留未读验证码）", "warning")
+                        if resent:
+                            mark_mailbox_code_boundary(mailbox, grace_seconds=0)
                 if not code:
-                    raise RuntimeError("等待邮箱验证码超时（两轮共180秒）")
+                    raise RuntimeError("等待邮箱验证码超时（4 段×45 秒共 180 秒）")
                 log("收到邮箱验证码")
                 stage("email_code", "提交邮箱验证码")
                 otp_response = client.verify_email_otp(code)
@@ -1371,6 +1393,10 @@ def _process_one(
                         if stop_event.is_set():
                             raise _SmsCancelled("任务已停止，未获取新号码")
                         activation = sms.acquire()
+                    except _SmsCancelled:
+                        # 用户主动停止不是取号失败，不计入 acquire_failed。
+                        phone_attempt["result"] = "cancelled"
+                        raise
                     except Exception:
                         phone_attempt["result"] = "acquire_failed"
                         raise
@@ -2143,6 +2169,16 @@ async def sms_config_update(body: SmsConfigUpdate):
             for key in list(current):
                 if key.startswith("firefox_") or key == "token":
                     current.pop(key, None)
+            # 存量防线：非法 max_price 落盘后每次取号 float() 必炸，
+            # 整批账号 acquire_failed；保存时即校验（对齐运行时覆盖入口）。
+            max_price = str(body.max_price or "").strip()
+            if max_price:
+                try:
+                    price_value = float(max_price)
+                except (TypeError, ValueError):
+                    raise HTTPException(400, "每号最高价必须为正数") from None
+                if not math.isfinite(price_value) or price_value <= 0:
+                    raise HTTPException(400, "每号最高价必须为正数")
             current.update(
                 {
                     "enabled": bool(body.enabled),
@@ -2151,7 +2187,7 @@ async def sms_config_update(body: SmsConfigUpdate):
                     "country_order": str(body.country_order or "6, 4, 151"),
                     "poll_interval_ms": body.poll_interval_ms,
                     "timeout_seconds": body.timeout_seconds,
-                    "max_price": str(body.max_price or ""),
+                    "max_price": max_price,
                     "max_phone_attempts": body.max_phone_attempts,
                 }
             )

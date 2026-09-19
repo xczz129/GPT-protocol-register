@@ -66,6 +66,14 @@ def access_token_needs_refresh(record: dict[str, Any], *, window: int = NEAR_EXP
     return expires_at <= time.time() + max(0, int(window))
 
 
+def _snapshot_expectations(record: dict[str, Any]) -> dict[str, Any]:
+    """Fields a refresh worker expects unchanged between snapshot and write."""
+    return {
+        "session_token": record.get("session_token"),
+        "access_token": record.get("access_token"),
+    }
+
+
 def refresh_session_via_service(
     session_token: str,
     *,
@@ -231,7 +239,13 @@ class SessionRefreshJobs:
                     "last_token_refresh_error": message[:500],
                 }
                 if key:
-                    update_account_record_fields({key: fields}, include_records=False)
+                    # 乐观锁：快照后账号已被换绑/改密（凭据变了）就不写，
+                    # 避免旧会话的错误信息落到新凭据行上。
+                    update_account_record_fields(
+                        {key: fields},
+                        include_records=False,
+                        expected_fields={key: _snapshot_expectations(record)},
+                    )
                 return "failed", {}, message
             new_exp = jwt_expires_at(result["access_token"])
             fields: dict[str, Any] = {
@@ -262,7 +276,13 @@ class SessionRefreshJobs:
                 else:
                     fields["workspace_account_id"] = refreshed_aid
             if key:
-                update_account_record_fields({key: fields}, include_records=False)
+                # 乐观锁：刷 AT 期间若发生换绑（已提交新凭据），跳过写回，
+                # 防止旧 session 刷出的 token 覆盖新凭据并强制标 alive。
+                update_account_record_fields(
+                    {key: fields},
+                    include_records=False,
+                    expected_fields={key: _snapshot_expectations(record)},
+                )
             if new_exp > old_exp + REFRESH_MARGIN_SECONDS:
                 return (
                     "refreshed",

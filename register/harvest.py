@@ -76,11 +76,13 @@ async def harvest_registered_account(
         if callable(task_event):
             task_event(index, "running", step=f"打野失败: {str(error)[:140]}")
         return None
-    if not isinstance(security, dict) or not str(security.get("email") or "").strip():
+    if not isinstance(security, dict) or not security:
         return None
 
     record = dict(security)
-    record.setdefault("email", email)
+    # fields 不携带 email；以入参邮箱为准强制落位。原实现在 setdefault
+    # 之前先校验 email 非空，导致成功的接管记录被静默丢弃、降级为跳过。
+    record["email"] = email
     record["source_type"] = "harvest"
     record["registration_state"] = "complete"
     record["harvested_at"] = _now_iso()
@@ -143,11 +145,13 @@ def harvest_registered_account_sync(
         if callable(task_event):
             task_event(index, "running", step=f"打野失败: {str(error)[:140]}")
         return None
-    if not isinstance(security, dict) or not str(security.get("email") or "").strip():
+    if not isinstance(security, dict) or not security:
         return None
 
     record = dict(security)
-    record.setdefault("email", email)
+    # fields 不携带 email；以入参邮箱为准强制落位。原实现在 setdefault
+    # 之前先校验 email 非空，导致成功的接管记录被静默丢弃、降级为跳过。
+    record["email"] = email
     record["source_type"] = "harvest"
     record["registration_state"] = "complete"
     record["harvested_at"] = _now_iso()

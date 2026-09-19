@@ -1,8 +1,21 @@
-# 代码审查：中危问题清单
+# 代码审查：中危问题清单（已全部处理）
 
-> 2026-09-19 全量代码审查产出。高危 7 项已全部修复（见提交 `6ae2831`），
-> 以下为**未修复的中危项**，按建议修复优先级排序。行号对应当时代码版本，
-> 后续改动可能偏移，以函数/描述定位为准。
+> 2026-09-19 全量代码审查产出。高危 7 项已全部修复（见提交 `6ae2831`）。
+> **2026-09-19 深夜更新：中危 19 项已全部处理**，全量测试 2326 passed 后重启生效。
+>
+> 处理方式：
+> - **已修复（补丁落地）**：#1 接码进度 casefold、#2 max_price 校验、#3 activation_id 持久化+重启补 cancel、
+>   #4 收码边界 fail-closed+毫秒、#5 ODM datetime、#7 settlement 显式清理入口（reset-failed?include_pending_settlements=true）、
+>   #8 session_refresh 乐观锁、#9 update_account_records 身份守卫（user_id 回填迁移同 fields 版规则）、
+>   #10 测活口径（写入缺 AT→reauth_required；读时对带 token 拒绝特征的缺 AT invalid 归一）、
+>   #12/#13 OTP 重发边界与错码刷新、#14 备份/配置挡全部批次（any_batch_running）、#15 cliproxy 线程池、
+>   #16 自有邮箱失败释放、#17 PROGRESS 看门狗（30 分钟）、#18 私有 API 带降级、
+>   #19 全部子项：a 停止补 stats、b IN_USE_STALE_SECONDS 15→30 分钟、c 取消不计失败、d 文案 4 段、
+>   e 死代码删除、f 缺省 runtime deadline、g _epoch 按 UTC
+> - **已消解（核实无需改代码）**：#6 release_all_in_use 无生产调用方（仅测试引用）；
+>   #11 _mark_relay_synced 现状已带 expected_fields CAS（refresh_token）
+>
+> 各项详情保留在下方作历史参考；行号对应当时版本，以函数/描述定位为准。
 
 ## 一、资金与操作（建议优先修）
 

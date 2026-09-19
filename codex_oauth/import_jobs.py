@@ -607,6 +607,9 @@ class ImportJob:
     network_retries: int = 0
     session_retries: int = 0
     phone_attempts: int = 0
+    # 在租号码台账：acquire 成功即写入，正常释放时清空；持久化用于
+    # 服务重启后补 cancel，避免已购号码只能等供应商侧过期。
+    sms_activation_id: str = ""
     _sms_activation: SmsActivation | None = field(default=None, repr=False, compare=False)
     _sms_client: Any = field(default=None, repr=False, compare=False)
     _sms_sent: bool = field(default=False, repr=False, compare=False)
@@ -669,6 +672,7 @@ class ImportJob:
             network_retries=max(0, min(3, int(value.get("network_retries") or 0))),
             session_retries=max(0, int(value.get("session_retries") or 0)),
             phone_attempts=max(0, int(value.get("phone_attempts") or 0)),
+            sms_activation_id=str(value.get("sms_activation_id") or ""),
         )
 
     def as_persisted(self) -> dict[str, Any]:
@@ -694,6 +698,7 @@ class ImportJob:
             "network_retries": max(0, min(3, int(self.network_retries))),
             "session_retries": max(0, int(self.session_retries)),
             "phone_attempts": max(0, int(self.phone_attempts)),
+            "sms_activation_id": str(self.sms_activation_id or ""),
             "logs": [
                 {
                     "at": max(0, int(item.get("at") or 0)),
@@ -745,6 +750,8 @@ class ImportJobManager:
         self._condition = threading.Condition(self._lock)
         self._jobs: dict[str, ImportJob] = {}
         self._batches: dict[str, dict[str, Any]] = {}
+        # 重启孤儿号码台账（job_id -> activation_id）：首个可用 SMS client 补 cancel。
+        self._orphan_sms_activation_ids: dict[str, str] = {}
         self._active_workers = 0
         self.jobs_path = self.data_dir / "import-jobs.json"
         # Load audit history before creating workers.  A process restart cannot
@@ -789,6 +796,10 @@ class ImportJobManager:
                     continue
                 # No event/session/pending input is restored by design.
                 if job.status in ACTIVE_JOB_STATUSES:
+                    if job.sms_activation_id:
+                        # 重启丢上下文：记录在租号码，等首个可用 client 补 cancel。
+                        self._orphan_sms_activation_ids[job.id] = job.sms_activation_id
+                        job.sms_activation_id = ""
                     job.status = "failed"
                     job.step = "failed"
                     job.waiting_for = ""
@@ -883,14 +894,25 @@ class ImportJobManager:
         number = self.normalize_concurrency(value)
         with self._condition:
             self.concurrency = number
-            # Keep pending work in the same executor. CPython's worker limit
-            # is changed under its own shutdown lock; idle workers are lazy,
-            # so a large setting does not pre-create a large thread pool.
-            with self._executor._shutdown_lock:
-                self._executor._max_workers = number
-                queued = sum(job.status == "queued" for job in self._jobs.values())
-                for _ in range(max(0, min(number, queued + self._active_workers) - len(self._executor._threads))):
-                    self._executor._adjust_thread_count()
+            # Grow the physical pool when the new limit exceeds it: queued
+            # submissions already live in this executor, so only its worker
+            # cap can unlock them. The CPython-internal hook is guarded;
+            # if a future CPython removes it, rebuild the pool instead of
+            # 500-ing this settings endpoint.
+            executor = self._executor
+            if number > getattr(executor, "_max_workers", 0):
+                try:
+                    with executor._shutdown_lock:
+                        if number > executor._max_workers:
+                            executor._max_workers = number
+                            queued = sum(job.status == "queued" for job in self._jobs.values())
+                            for _ in range(max(0, min(number, queued + self._active_workers) - len(executor._threads))):
+                                executor._adjust_thread_count()
+                except AttributeError:
+                    self._executor = ThreadPoolExecutor(
+                        max_workers=number,
+                        thread_name_prefix="oauth-import",
+                    )
             self._condition.notify_all()
             self._persist_jobs_locked()
         return number
@@ -1556,6 +1578,8 @@ class ImportJobManager:
         settings = self._sms_settings()
         job.sms_provider = settings.provider_label
         sms_client = job._sms_client or _sms_client_for(settings, self.timeout)
+        if sms_client is not None and getattr(self, "_orphan_sms_activation_ids", None):
+            self._cancel_orphan_activations(sms_client)
         # OpenAI 2026-09 起校验页面导航:先进入 add-phone 页面,
         # 否则 add-phone/send 直接 409 session invalid
         nav_data = getattr(client, "last_auth_response", None)
@@ -1598,6 +1622,7 @@ class ImportJobManager:
             self._cancel_activation(sms_client, activation)
             if job._sms_activation is activation:
                 job._sms_activation = None
+                job.sms_activation_id = ""
                 job._sms_client = None
                 job._sms_sent = False
                 job._sms_keep_for_session_retry = False
@@ -1634,6 +1659,7 @@ class ImportJobManager:
                 try:
                     activation = sms_client.acquire()
                     job._sms_activation = activation
+                    job.sms_activation_id = str(getattr(activation, "activation_id", "") or "")
                     job._sms_client = sms_client
                     job._sms_sent = False
                     job._sms_keep_for_session_retry = False
@@ -1686,6 +1712,7 @@ class ImportJobManager:
                     if activation and sms_client and not activation.finished:
                         sms_client.finish(activation)
                     job._sms_activation = None
+                    job.sms_activation_id = ""
                     job._sms_client = None
                     job._sms_sent = False
                     job._sms_keep_for_session_retry = False
@@ -1793,6 +1820,7 @@ class ImportJobManager:
             if activation and sms_client and not activation.finished:
                 sms_client.finish(activation)
             job._sms_activation = None
+            job.sms_activation_id = ""
             job._sms_client = None
             job._sms_sent = False
             job._sms_keep_for_session_retry = False
@@ -1809,10 +1837,31 @@ class ImportJobManager:
                 job.add_log(f"consent 刷新提示：{exc}", "warning")
             return
 
+    def _cancel_orphan_activations(self, sms_client: Any) -> None:
+        """Best-effort cancel of SMS leases orphaned by a process restart."""
+        with self._lock:
+            orphans = self._orphan_sms_activation_ids
+            if not orphans:
+                return
+            self._orphan_sms_activation_ids = {}
+        for job_id, activation_id in orphans.items():
+            try:
+                sms_client.cancel(SmsActivation(
+                    activation_id=activation_id,
+                    phone="",
+                    country="",
+                    api_key="",
+                ))
+            except Exception:
+                # 供应商侧取消未确认：保留台账，等下一个可用 client 重试。
+                with self._lock:
+                    self._orphan_sms_activation_ids[job_id] = activation_id
+
     def _release_retained_activation(self, job: ImportJob) -> None:
         sms_client, activation = job._sms_client, job._sms_activation
         job._sms_client = None
         job._sms_activation = None
+        job.sms_activation_id = ""
         job._sms_sent = False
         job._sms_keep_for_session_retry = False
         self._cancel_activation(sms_client, activation)

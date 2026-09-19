@@ -449,6 +449,10 @@ def register_one(
                 persist_operation=not callable(account_log_sink),
                 secrets=tuple(result.get(key) for key in ("password", "totp_secret", "access_token", "refresh_token", "session_token")),
             )
+            # 账号已成功注册并入账：停止请求不应让本次成功从统计里消失。
+            with stats_lock:
+                stats["done"] += 1
+                stats["success"] += 1
             return result
         if post_register_health_check:
             checked = check_account(result)
@@ -574,6 +578,19 @@ def register_one(
                 ),
             )
             return harvest_record
+        if isinstance(harvest_record, dict):
+            missing = [
+                key
+                for key in ("password", "access_token", "session_token", "account_id", "totp_secret")
+                if not str(harvest_record.get(key) or "").strip()
+            ]
+            if harvest_record.get("mfa_enabled") is not True:
+                missing.append("mfa_enabled")
+            if missing:
+                log(
+                    f"任务{index} 打野接管未通过完整性校验，缺少: {', '.join(missing)}，回退为跳过",
+                    "yellow",
+                )
         if isinstance(error, RegisteredEmailDetected) and partial_account.get("email"):
             # 已注册跳过意味着该身份不是本事务创建的（回收邮箱）；密码阶段写入的
             # 待补全记录没有可用凭据（无密码路由、无 token），留在账号库会误导

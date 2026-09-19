@@ -491,6 +491,17 @@ class OperationProgressState:
     def snapshot(self) -> list[dict[str, Any]]:
         now = time.time()
         with self.lock:
+            # 运行看门狗：请求被取消时 finish 不会执行，30 分钟无更新
+            # 的 running 项自动置失败，避免进度条永久"运行中"。
+            for key, value in list(self.items.items()):
+                if (
+                    value.get("status") == "running"
+                    and now - float(value.get("updated_epoch") or now) > 1800
+                ):
+                    value["status"] = "failed"
+                    value["stage"] = "已超时"
+                    value["message"] = str(value.get("message") or "")[:200] or "30 分钟无更新，自动终止"
+                    value["finished_at"] = _now_iso()
             self.items = {
                 key: value
                 for key, value in self.items.items()
@@ -1961,6 +1972,30 @@ async def _run_register_async(cfg: dict[str, Any], params: dict[str, Any]):
 _MAINTENANCE_TASK: asyncio.Task | None = None
 
 
+def any_batch_running() -> bool:
+    """注册 / 接码 / 换绑 / 试用资格 / 刷 AT 批次任一在跑时禁止恢复备份、改配置。
+
+    此前只挡注册 JOB：批次运行中恢复备份会在活跃写事务下替换 SQLite，
+    worker 用陈旧快照 upsert 可能"复活"已删账号或损坏库。
+    """
+    if JOB.running:
+        return True
+    if ACCOUNT_REBIND_JOBS.active() is not None:
+        return True
+    if TRIAL_ELIGIBILITY_JOBS.active() is not None:
+        return True
+    from common.session_refresh import SESSION_REFRESH_JOBS
+    if SESSION_REFRESH_JOBS.active() is not None:
+        return True
+    try:
+        from web.routes.codex_oauth import _STATE as _codex_state
+        if _codex_state.get("running"):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 async def _wait_for_job_completion(poll_sec: float = 3.0) -> None:
     while True:
         with JOB.lock:
@@ -2734,7 +2769,7 @@ async def browsers_status():
 
 @app.put("/api/config")
 async def put_config(body: ConfigUpdate):
-    if JOB.running:
+    if any_batch_running():
         raise HTTPException(409, "job is running; stop it before saving config")
     if not isinstance(body.config, dict):
         raise HTTPException(400, "config must be an object")

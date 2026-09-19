@@ -925,7 +925,7 @@ class MailParsingTests(unittest.TestCase):
         }
         stale = {
             "state": "in_use",
-            "updated_at": (now - timedelta(minutes=16)).isoformat(),
+            "updated_at": (now - timedelta(minutes=31)).isoformat(),
         }
         self.assertFalse(_entry_available(active))
         self.assertTrue(_entry_available(stale))
@@ -4633,6 +4633,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
                 },
             ]
         )
+        registrar._resend_email_otp = MagicMock(return_value=True)
         registrar._diagnostic = MagicMock()
         registrar._navigate_auth_step = MagicMock()
         registrar._add_password = MagicMock(
@@ -4668,7 +4669,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
         )
         self.assertTrue(
             any(
-                "已排除本次候选" in str(call.args[1])
+                "已重发验证码并重置校验计数" in str(call.args[1])
                 for call in protocol_step.call_args_list
                 if len(call.args) > 1
             )
