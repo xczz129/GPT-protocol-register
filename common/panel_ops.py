@@ -562,6 +562,24 @@ def restore_backup(name: str) -> list[str]:
                 _import_task_runtime(data, TASK_HISTORY_FILE)
                 restored.append(arcname)
                 continue
+    if restored:
+        # 账号库/日志库可能刚被 os.replace 换成备份文件:清掉内存里按
+        # (路径,revision) 键控的行缓存与健康摘要缓存,并关闭本线程的
+        # 日志连接(其他线程由 inode 校验自动重连),避免恢复后仍返回
+        # 恢复前的旧快照、日志写入旧 inode 静默丢失。
+        try:
+            from common.account_store import invalidate_store_caches
+
+            invalidate_store_caches()
+        except Exception:
+            pass
+        try:
+            from common.account_operation_log import _close_cached_connection
+
+            _close_cached_connection()
+        except Exception:
+            pass
+        _invalidate_trash_cache()
     return restored
 
 

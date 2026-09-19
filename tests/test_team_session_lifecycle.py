@@ -208,6 +208,7 @@ def test_team_browser_batch_preflight_rejects_missing_totp_before_starting_job(r
     state.account_public_view = lambda _record: {"is_deactivated": False}
     state._account_requires_protocol_reauth = boundary.module._account_requires_protocol_reauth
     state._protocol_reauth_credentials_ready = boundary.module._protocol_reauth_credentials_ready
+    state._account_email_relogin_ready = boundary.module._account_email_relogin_ready
     state.ACCOUNT_REAUTH_JOBS = SimpleNamespace(start=Mock())
     monkeypatch.setattr(route, "_state", lambda: state)
     with pytest.raises(HTTPException) as failure:

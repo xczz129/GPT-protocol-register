@@ -24,7 +24,7 @@ def _state() -> Any:
 
 
 class AccountHealthRequest(BulkDeleteRequest):
-    workers: int = Field(10, ge=1, le=20)
+    workers: int = Field(10, ge=1)
     channel: str = "v4"
 
 
@@ -36,7 +36,7 @@ class AccountTrialEligibilityRequest(BaseModel):
     keys: list[str] = Field(default_factory=list, max_length=1000)
     all_accounts: bool = False
     force: bool = False
-    concurrency: int = Field(default=20, ge=1, le=20)
+    concurrency: int = Field(default=20, ge=1)
     channel: str = "v4"
 
 
@@ -50,7 +50,7 @@ class TokenTrialEligibilityBatchRequest(BaseModel):
     access_tokens: list[str] = Field(default_factory=list)
     use_configured_proxy: bool = True
     channel: str = "v4"
-    workers: int = Field(default=20, ge=1, le=20)
+    workers: int = Field(default=20, ge=1)
 
 
 class TrialProxyCountryItem(BaseModel):
@@ -115,7 +115,7 @@ async def accounts_trial_eligibility(body: AccountTrialEligibilityRequest):
 
 
 class TrialEligibilityResumeRequest(BaseModel):
-    concurrency: int = Field(20, ge=1, le=20)
+    concurrency: int = Field(20, ge=1)
     channel: str = "v4"
 
 
@@ -296,7 +296,7 @@ async def token_trial_eligibility_batch(body: TokenTrialEligibilityBatchRequest)
     if len(tokens) > 200:
         raise HTTPException(400, "单次最多批量检测 200 个 Access Token")
 
-    workers = max(1, min(int(body.workers), 20))
+    workers = min(body.workers, len(tokens))
     semaphore = asyncio.Semaphore(workers)
 
     async def run_one(index: int, token: str) -> dict[str, Any]:
@@ -366,6 +366,9 @@ def _account_health_response(result: dict, requested: int) -> dict:
         "invalid": result["invalid"],
         "reauth_required": result["reauth_required"],
         "error": result["error"],
+        "unknown": result.get("unknown", 0),
+        "interrupted": bool(result.get("interrupted")),
+        "stopped": result.get("stopped", 0),
         "items": (
             [_state().account_public_view(item) for item in result["items"]]
             if include_rows
@@ -411,6 +414,7 @@ def _run_account_health_worker(
             item_callback=state._mark_account_health_persisted,
             worker_limit=state._account_health_worker_limit,
             proxy_candidates=state._current_health_proxy_pool(),
+            stop_check=getattr(getattr(state, "_SERVER_SHUTDOWN_EVENT", None), "is_set", None),
         )
         return result
     except BaseException as error:
@@ -495,7 +499,7 @@ async def accounts_health(body: AccountHealthRequest):
 
 
 class AccountHealthResumeRequest(BaseModel):
-    workers: int = Field(10, ge=1, le=20)
+    workers: int = Field(10, ge=1)
     channel: str | None = None
 
 

@@ -91,8 +91,9 @@ export const useTrialStore = defineStore("trial", () => {
     if (batch.running) return 0;
     const tokens = parseBatchTokens();
     if (!tokens.length || tokens.length > 200) return tokens.length;
+    if (!Number.isSafeInteger(form.workers) || form.workers < 1) throw new Error("并发数必须为正整数");
     Object.assign(batch, { running: true, total: tokens.length, done: 0, results: [], stopped: false });
-    const workers = Math.max(1, Math.min(20, Math.floor(Number(form.workers) || 20)));
+    const workers = form.workers;
     try {
       for (let offset = 0; offset < tokens.length; offset += workers) {
         if (batch.stopped) break;

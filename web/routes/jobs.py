@@ -1,4 +1,4 @@
-﻿"""Job domain: JobState, AccountReauthBatchJobs and registration job routes."""
+"""Job domain: JobState, AccountReauthBatchJobs and registration job routes."""
 
 from __future__ import annotations
 
@@ -68,6 +68,26 @@ def _state() -> Any:
     return web_app
 
 
+def _inline_sms_snapshot(params: dict, cards: list[dict], *, running: bool, error: str = "") -> dict:
+    selected = [card for card in cards if card.get("registration_status") == "success"]
+    pending = sum(card.get("sms_status") in {"pending", "running"} for card in selected)
+    failed = sum(card.get("sms_status") in {"failed", "interrupted"} for card in selected)
+    cancelled = sum(card.get("sms_status") == "cancelled" for card in selected)
+    completed = sum(card.get("sms_status") in {"success", "failed", "cancelled", "interrupted"} for card in selected)
+    if running:
+        status = "running" if selected else "pending"
+        message = f"逐账号自动接码：已结束 {completed}，等待或执行中 {pending}" if selected else "等待首个账号注册完成后接码"
+    elif error or failed:
+        status, message = "failed", "自动接码未全部完成，已注册账号保留，请查看对应任务"
+    elif cancelled or pending:
+        status, message = "cancelled", "自动接码已停止，已注册账号保留"
+    else:
+        status, message = "completed", "各账号注册与接码已结束" if selected else "本批没有进入自动接码的账号"
+    return {"mode": "inline", "status": status, "total": len(selected), "completed": completed,
+            "failed": failed, "pending": pending, "message": message, "batch_id": "",
+            "source_batch_id": str(params.get("batch_id") or "")}
+
+
 class StartJobRequest(BaseModel):
     total: int = Field(1, ge=1, le=500)
     concurrency: int = Field(1, ge=1)
@@ -78,6 +98,7 @@ class StartJobRequest(BaseModel):
     engine: str | None = None
     group_id: str | None = None
     auto_group: bool = False
+    auto_sms_after_register: bool = False
     auto_group_size: int = Field(35, ge=1, le=500)
     group_plan: list[str] | None = None
 
@@ -150,6 +171,8 @@ class JobState:
             if str(card.get("status") or "") in {"queued", "running"}:
                 card["status"] = "cancelled"
                 card["error"] = card.get("error") or "service_restarted"
+                if card.get("registration_status") == "success":
+                    card.update(sms_status="interrupted", message="服务重启，已注册账号保留；请核对接码结果，未自动重复执行")
                 card["finished_at_epoch"] = card.get("updated_at_epoch") or time.time()
                 interrupted = True
             self.task_cards[key] = card
@@ -336,7 +359,7 @@ class JobState:
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
-            return {
+            snapshot = {
                 "running": self.running,
                 "batch_id": self.batch_id,
                 "stop_requested": self.stop_requested,
@@ -352,7 +375,26 @@ class JobState:
                 "result_count": len(self.results),
                 "task_count": len(self.task_cards),
                 "task_revision": self._task_revision,
+                "retryable_fail_count": sum(
+                    card.get("status") in {"failed", "cancelled"} and card.get("registration_status") != "success"
+                    for card in self.task_cards.values()
+                ),
             }
+            inline_cards = [dict(card) for card in self.task_cards.values()] if self.params.get("auto_sms_mode") == "inline" else None
+        if inline_cards is not None:
+            snapshot["auto_sms"] = _inline_sms_snapshot(snapshot["params"], inline_cards, running=snapshot["running"], error=snapshot["last_error"])
+            return snapshot
+        # Reading durable follow-ups may take its own lock. Never nest that
+        # lock under JOB.lock, which stop/completion also need.
+        from web.routes.codex_oauth import registration_sms_snapshot
+
+        try:
+            snapshot["auto_sms"] = registration_sms_snapshot(
+                snapshot["params"], registration_running=snapshot["running"], registration_error=snapshot["last_error"],
+            )
+        except Exception:
+            snapshot["auto_sms"] = {"status": "failed", "total": 0, "batch_id": "", "message": "自动接码队列读取失败，请检查服务日志"}
+        return snapshot
 
     def all_tasks_snapshot(self, limit: int | None = None) -> list[dict[str, Any]]:
         saved = _state().load_task_runtime(limit=limit)
@@ -451,15 +493,25 @@ class AccountReauthBatchJobs:
         record: dict[str, Any],
         operation: str = "reauth",
     ) -> dict[str, Any]:
-        skipped = operation == "reauth" and bool(
-            _state().account_public_view(record).get("is_deactivated")
+        public = _state().account_public_view(record)
+        deactivated = bool(public.get("is_deactivated"))
+        security_complete = operation == "security_repair" and not public.get(
+            "security_repair_available"
+        )
+        skipped = (operation == "reauth" and deactivated) or security_complete
+        message = (
+            "已封号，已跳过重新登录"
+            if operation == "reauth" and deactivated
+            else "安全字段已完整，已跳过修复"
+            if security_complete
+            else f"等待{cls._operation_label(operation)}"
         )
         return {
             "key": _state()._account_key(record),
             "email": str(record.get("email") or ""),
             "account_id": str(record.get("account_id") or ""),
             "status": "skipped" if skipped else "queued",
-            "message": "已封号，已跳过重新登录" if skipped else f"等待{cls._operation_label(operation)}",
+            "message": message,
             **({"finished_at": _state()._now_iso()} if skipped else {}),
         }
 
@@ -1090,6 +1142,10 @@ class AccountReauthBatchJobs:
 
 
 def _run_job_thread(params: dict[str, Any]) -> None:
+    if params.get("auto_sms_after_register") is True:
+        params["auto_sms_mode"] = "inline"
+        with _state().JOB.lock:
+            _state().JOB.params["auto_sms_mode"] = "inline"
     avail = params.get("_pool_available")
     pool_t = params.get("_pool_total")
     extra = f" 可用邮箱={avail}/{pool_t}" if avail is not None else ""
@@ -1132,7 +1188,7 @@ def _run_job_thread(params: dict[str, Any]) -> None:
                 _state().JOB.skipped_count = 0
             else:
                 n_ok = len(results or [])
-                if n_ok > _state().JOB.success_count:
+                if params.get("auto_sms_mode") != "inline" and n_ok > _state().JOB.success_count:
                     _state().JOB.success_count = n_ok
                 unfinished = max(
                     0,
@@ -1144,6 +1200,7 @@ def _run_job_thread(params: dict[str, Any]) -> None:
                 if unfinished and not _state().JOB.stop_requested:
                     _state().JOB.fail_count += unfinished
             stopped = _state().JOB.stop_requested
+            cards = [dict(card) for card in _state().JOB.task_cards.values()]
             sc, fc, sk, tot = (
                 _state().JOB.success_count,
                 _state().JOB.fail_count,
@@ -1394,7 +1451,18 @@ async def job_start(body: StartJobRequest):
     )
     with _state().JOB.lock:
         _state().JOB._thread = t
-    t.start()
+    try:
+        t.start()
+    except Exception as error:
+        # 线程启动失败(如系统线程耗尽)时必须复位 running,否则
+        # _run_job_thread 的 finally 永远不会执行,面板将永久 409。
+        with _state().JOB.lock:
+            _state().JOB.running = False
+            _state().JOB._thread = None
+            _state().JOB.last_error = f"任务线程启动失败: {error}"
+            _state().JOB.finished_at = _state()._now_iso()
+        _state().JOB.persist_runtime()
+        raise HTTPException(500, f"任务线程启动失败: {error}") from error
     return {"ok": True, "job": _state().JOB.snapshot()}
 
 
@@ -1402,6 +1470,7 @@ async def job_start(body: StartJobRequest):
 async def job_stop():
     not_running = False
     with _state().JOB.lock:
+        followup_source = str(_state().JOB.params.get("batch_id") or "") if _state().JOB.params.get("auto_sms_after_register") is True else ""
         if not _state().JOB.running:
             not_running = True
             loop = cancel_event = registration_task = None
@@ -1414,6 +1483,10 @@ async def job_stop():
             registration_task = _state().JOB._registration_task
             engine = str(_state().JOB.params.get("engine") or "protocol").strip().lower()
 
+    if followup_source:
+        from web.routes.codex_oauth import cancel_registration_sms_followup
+
+        cancel_registration_sms_followup(followup_source)
     if not_running:
         return {"ok": True, "message": "not running", "job": _state().JOB.snapshot()}
 
@@ -1488,11 +1561,12 @@ async def job_retry_failed():
             item
             for item in _state().JOB.task_cards.values()
             if str(item.get("status") or "") in {"failed", "cancelled"}
+            and item.get("registration_status") != "success"
         ]
         failed = len(failed_items)
         params = dict(_state().JOB.params)
     if failed <= 0:
-        raise HTTPException(400, "没有可重试的失败任务")
+        raise HTTPException(400, "没有可重试的注册失败任务；注册成功但接码失败的账号请从账号页继续接码")
     old_plan = params.get("group_plan")
     retry_plan: list[str] | None = None
     if isinstance(old_plan, list):
@@ -1513,6 +1587,7 @@ async def job_retry_failed():
         total=failed,
         concurrency=max(1, int(params.get("concurrency") or 1)),
         keep_on_fail=bool(params.get("keep_on_fail")),
+        auto_sms_after_register=bool(params.get("auto_sms_after_register")),
         mail_type=str(params.get("mail_type") or params.get("provider_type") or "auto"),
         engine=str(params.get("engine") or "hybrid"),
         group_id=str(params.get("group_id") or "") or None,

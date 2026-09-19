@@ -61,8 +61,9 @@ function taskFormHarness(loadError = false) {
     status.panel.mail.providers[0].register_child = false;
   };
   const scope = vue.effectScope();
-  const result = scope.run(() => execute(`${source}\nexport { form, submit, busy, registrationPolicy };`, {
-    vue,
+  const result = scope.run(() => execute(`${source}\nexport { form, submit, busy, registrationPolicy, loadSettings };`, {
+    vue: { ...vue, onMounted() {} },
+    "../../api/config": { fetchConfig: async () => ({ config: {} }) },
     "../../stores/tasks": { useTasksStore: () => ({ job: { running: false }, start: async (body) => sent.push(plain(body)) }) },
     "../../stores/groups": { useGroupsStore: () => ({ items: [] }) },
     "../../stores/ui": { useUiStore: () => ({ notify: (...args) => notifications.push(args) }) },
@@ -75,6 +76,7 @@ function taskFormHarness(loadError = false) {
 test("the real task form normalizes selection and uses the latest saved child setting at submit", async () => {
   const h = taskFormHarness();
   try {
+    await h.loadSettings();
     h.form.mailType = "smsbower_mail";
     await vue.nextTick();
     assert.equal(h.form.total, 2);
@@ -94,6 +96,7 @@ test("the real task form normalizes selection and uses the latest saved child se
 test("task creation stops when the saved mailbox setting cannot be refreshed", async () => {
   const h = taskFormHarness(true);
   try {
+    await h.loadSettings();
     h.form.mailType = "smsbower_mail";
     await h.submit();
     assert.equal(h.sent.length, 0);
@@ -136,11 +139,11 @@ test("rate and wait labels distinguish no samples from a measured zero", () => {
   assert.equal(shared.formatOtpSeconds(180.15), "180.2 秒");
 });
 
-const statsUrl = new URL("../src/components/MailRegistrationStats.vue", import.meta.url);
+const statsUrl = new URL("../src/new/components/MailRegistrationStats.vue", import.meta.url);
 const statsSource = readFileSync(statsUrl, "utf8");
 const { descriptor } = parse(statsSource, { filename: fileURLToPath(statsUrl) });
 const compiled = compileScript(descriptor, { id: "mail-registration-test", inlineTemplate: true });
-const StatsComponent = execute(compiled.content, { vue, "../shared/mailRegistration": shared }).default;
+const StatsComponent = execute(compiled.content, { vue, "../../shared/mailRegistration": shared }).default;
 
 test("rendered operations statistics include outcome denominators and received-code durations", async () => {
   const html = await renderToString(vue.createSSRApp(StatsComponent, { stats: statsFixture() }));
@@ -160,7 +163,7 @@ test("role switching selects both the matching aggregate and its domain rows", (
   const props = { stats: statsFixture() };
   const source = descriptor.scriptSetup.content;
   const h = execute(`${source}\nexport { role, summary, domainRows };`, {
-    vue, "../shared/mailRegistration": shared,
+    vue, "../../shared/mailRegistration": shared,
   }, { defineProps: () => props });
   assert.equal(h.summary.value.totals.attempted, 10);
   h.role.value = "child";

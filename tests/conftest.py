@@ -24,12 +24,18 @@ os.environ.setdefault(
     "MAIL_REGISTRATION_METRICS_DB",
     os.path.join(tempfile.mkdtemp(prefix="mail-metrics-"), "metrics.sqlite3"),
 )
+# Override (rather than inherit) a production path before any worker module
+# is imported. Tests must never append registration traces to a live store.
+os.environ["REGISTRATION_TRACE_DIR"] = tempfile.mkdtemp(prefix="registration-trace-tests-")
 
 
 @pytest.fixture(autouse=True)
 def _isolate_default_operation_log(tmp_path, monkeypatch):
     monkeypatch.setenv("MAIL_REGISTRATION_METRICS_DB", str(tmp_path / "mail_metrics.sqlite3"))
     from common import account_operation_log as oplog
+    from common import registration_trace
+
+    monkeypatch.setattr(registration_trace, "TRACE_DIR", tmp_path / "registration_logs")
 
     original = oplog.append_operation_event
     isolated = tmp_path / "operation_logs.sqlite3"

@@ -87,3 +87,70 @@ async def harvest_registered_account(
     if callable(task_event):
         task_event(index, "running", step="打野成功：已接管已有账号（新密码 + 2FA 已设置）")
     return record
+
+
+
+def harvest_registered_account_sync(
+    index: int,
+    *,
+    mailbox: dict[str, Any] | None,
+    reg_cfg: dict[str, Any] | None,
+    mail_config: dict[str, Any] | None,
+    proxy: str,
+    proxy_cfg: dict[str, Any] | None = None,
+    stop_check: Callable[[], bool] | None = None,
+    task_event=None,
+    protocol_runtime: ProtocolRuntimeSettings | None = None,
+) -> dict[str, Any] | None:
+    """同步版打野：供协议注册事务在「已注册跳过」前直接调用。
+
+    与 ``harvest_registered_account`` 完全相同的接管链路（邮箱验证码登录 →
+    补/重置密码 → 登记 TOTP 2FA → 读取 AT）；协议引擎的 register_one 是
+    同步函数，无法 await 异步版，故提供此同步入口。
+    """
+    email = str((mailbox or {}).get("address") or "").strip()
+    if not email:
+        return None
+    reg = reg_cfg if isinstance(reg_cfg, dict) else {}
+    mail = dict(mail_config if isinstance(mail_config, dict) else {})
+    provider_type = str((mailbox or {}).get("provider") or "") or None
+
+    from register.protocol_ops import repair_security_one
+
+    runtime = protocol_runtime or ProtocolRuntimeSettings.from_config(reg)
+    runtime = runtime.with_deadline(time.monotonic() + runtime.account_timeout)
+
+    def _run() -> dict[str, Any]:
+        return repair_security_one(
+            index,
+            account={
+                "email": email,
+                "provider_type": provider_type or "",
+            },
+            mail_config=mail,
+            proxy=proxy,
+            provider_type=provider_type,
+            stop_check=stop_check,
+            task_event=task_event,
+            proxy_config=proxy_cfg,
+            protocol_runtime=runtime,
+            mailbox_override=mailbox,
+        )
+
+    try:
+        security = _run()
+    except Exception as error:
+        if callable(task_event):
+            task_event(index, "running", step=f"打野失败: {str(error)[:140]}")
+        return None
+    if not isinstance(security, dict) or not str(security.get("email") or "").strip():
+        return None
+
+    record = dict(security)
+    record.setdefault("email", email)
+    record["source_type"] = "harvest"
+    record["registration_state"] = "complete"
+    record["harvested_at"] = _now_iso()
+    if callable(task_event):
+        task_event(index, "running", step="打野成功：已接管已有账号（新密码 + 2FA 已设置）")
+    return record

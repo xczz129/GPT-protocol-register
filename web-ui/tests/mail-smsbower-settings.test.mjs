@@ -158,27 +158,23 @@ test("invalid price or an empty domain selection stops before saving", async () 
   assert.equal(h.mailboxLoads, 0);
 });
 
-test("both UIs expose masked SMSBower settings and canonical task/provider choices", () => {
-  const legacyMail = readFileSync(new URL("../src/components/MailView.vue", import.meta.url), "utf8");
+test("active mail and task views expose masked SMSBower settings and bind the store save action", () => {
   const modernMail = readFileSync(new URL("../src/new/views/register/MailView.vue", import.meta.url), "utf8");
-  const legacyTask = readFileSync(new URL("../src/components/TaskView.vue", import.meta.url), "utf8");
   const modernTask = readFileSync(new URL("../src/new/views/tasks/TaskForm.vue", import.meta.url), "utf8");
   const modernTaskView = readFileSync(new URL("../src/new/views/tasks/TasksView.vue", import.meta.url), "utf8");
-  const legacyApp = readFileSync(new URL("../src/App.vue", import.meta.url), "utf8");
+  const store = readFileSync(new URL("../src/new/stores/mail.ts", import.meta.url), "utf8");
 
-  for (const source of [legacyMail, modernMail]) {
-    assert.match(source, /smsbowerApiKey[^\n]*type="password"|type="password"[^\n]*smsbowerApiKey/);
-    assert.match(source, /value="gmail\.com"/);
-    assert.match(source, /value="icloud\.com"/);
-    assert.match(source, /value="smsbower_mail"/);
-    assert.match(source, /v-model="(?:mail\.)?forms\.smsbowerRegisterChild"/);
-  }
-  for (const source of [legacyTask, modernTask]) {
-    assert.match(source, /<option value="smsbower_mail">SMSBower 临时邮箱<\/option>/);
-  }
-  assert.match(legacyApp, /@save-smsbower="saveSmsbowerMail"/);
-  assert.match(legacyApp, /provider_type: "smsbower_mail"/);
-  assert.match(legacyApp, /register_child: mailForms\.smsbowerRegisterChild/);
+  assert.match(modernMail, /smsbowerApiKey[^\n]*type="password"|type="password"[^\n]*smsbowerApiKey/);
+  assert.match(modernMail, /value="gmail\.com"/);
+  assert.match(modernMail, /value="icloud\.com"/);
+  assert.match(modernMail, /value="smsbower_mail"/);
+  assert.match(modernMail, /v-model="mail\.forms\.smsbowerRegisterChild"/);
+  assert.match(modernTask, /<option value="smsbower_mail">SMSBower 临时邮箱<\/option>/);
+  // Config writes moved from the removed root component into useMailStore.
+  // The executable tests above verify its payload and secret lifecycle.
+  assert.match(modernMail, /@click="run\(mail\.saveSmsbower,/);
+  assert.match(store, /provider_type: "smsbower_mail"/);
+  assert.match(store, /register_child: forms\.smsbowerRegisterChild/);
   assert.match(modernTaskView, /item\.type === "smsbower_mail"/);
   assert.match(modernTaskView, /SMSBower/);
 });

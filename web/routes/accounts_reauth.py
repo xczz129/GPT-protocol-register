@@ -84,7 +84,7 @@ class AccountEmailReauthRequest(BaseModel):
 
     emails: list[str] = Field(default_factory=list, max_length=5000)
     text: str = Field(default="", max_length=2_000_000)
-    concurrency: int = Field(default=3, ge=1, le=20)
+    concurrency: int = Field(default=3, ge=1)
 
 
 @router.post("/api/accounts/reauth/start")
@@ -111,12 +111,13 @@ async def account_reauthenticate_start(body: AccountReauthBatchRequest):
             continue
         account_protocol = _state()._account_requires_protocol_reauth(account)
         if (reauth_mode == "protocol" or account_protocol) and not _state()._protocol_reauth_credentials_ready(account):
-            raise HTTPException(
-                409,
-                f"{account.get('email') or key} 此账号必须使用协议重新登录，且需要同时保存密码和 TOTP 2FA"
-                if account_protocol
-                else f"{account.get('email') or key} 协议重新登录要求同时保存密码和 TOTP 2FA",
-            )
+            if not _state()._account_email_relogin_ready(account):
+                raise HTTPException(
+                    409,
+                    f"{account.get('email') or key} 此账号必须使用协议重新登录，且需要同时保存密码和 TOTP 2FA"
+                    if account_protocol
+                    else f"{account.get('email') or key} 协议重新登录要求同时保存密码和 TOTP 2FA",
+                )
         selected.append(account)
     if any(
         _state()._account_requires_protocol_reauth(account)
@@ -178,7 +179,7 @@ async def account_reauthenticate_by_email_start(body: AccountEmailReauthRequest)
             missing.append("password")
         if not str(account.get("totp_secret") or "").strip():
             missing.append("totp")
-        if missing:
+        if missing and not _state()._account_email_relogin_ready(account):
             missing_credentials.append({"email": email, "missing": missing})
             continue
         selected.append(account)
@@ -249,9 +250,13 @@ async def account_security_repair_start(body: AccountReauthBatchRequest):
         account = record_map.get(key)
         if account is None:
             raise HTTPException(404, "所选账号中存在已删除记录，请刷新列表后重试")
-        if not _state().account_public_view(account).get("security_repair_available"):
-            raise HTTPException(409, f"{account.get('email') or key} 没有缺失的安全字段")
+        # 安全字段已完整的账号交给任务层标记为「跳过」，不再中断整个批次
         selected.append(account)
+    if not any(
+        _state().account_public_view(account).get("security_repair_available")
+        for account in selected
+    ):
+        raise HTTPException(409, "所选账号的安全字段均已完整，无需修复")
     try:
         job = await asyncio.to_thread(
             _state().ACCOUNT_REAUTH_JOBS.start,
@@ -317,7 +322,12 @@ def _security_batch_password(body: Any) -> tuple[str, str]:
     return new_password, confirmation
 
 
-async def _load_security_accounts(keys: list[str], *, operation: str) -> list[dict[str, Any]]:
+async def _load_security_accounts(
+    keys: list[str],
+    *,
+    operation: str,
+    allow_complete_security: bool = False,
+) -> list[dict[str, Any]]:
     requested = list(dict.fromkeys(str(key or "").strip() for key in keys if str(key or "").strip()))
     if not requested:
         raise HTTPException(400, "没有选择账号")
@@ -348,14 +358,16 @@ async def _load_security_accounts(keys: list[str], *, operation: str) -> list[di
                     409,
                     f"{email} 缺少{missing_text}，请先补齐安全字段",
                 )
-        elif operation == "security_repair" and not public.get(
-            "security_repair_available"
+        elif (
+            operation == "security_repair"
+            and not allow_complete_security
+            and not public.get("security_repair_available")
         ):
             raise HTTPException(409, f"{email} 没有缺失的安全字段")
         elif operation == "reauth":
             if not public.get("reauth_available"):
                 raise HTTPException(409, f"{email} 当前不支持重新登录")
-            if not _state()._protocol_reauth_credentials_ready(account):
+            if not _state()._protocol_reauth_credentials_ready(account) and not _state()._account_email_relogin_ready(account):
                 raise HTTPException(
                     409,
                     f"{email} 协议重新登录要求同时保存密码和 TOTP 2FA",
@@ -374,7 +386,16 @@ async def _start_security_batch(
     force_password_confirmation: bool = False,
 ) -> dict[str, Any]:
     operation = _state()._normalize_account_security_operation(operation)
-    selected = await _load_security_accounts(keys, operation=operation)
+    selected = await _load_security_accounts(
+        keys,
+        operation=operation,
+        allow_complete_security=operation == "security_repair",
+    )
+    if operation == "security_repair" and not any(
+        _state().account_public_view(account).get("security_repair_available")
+        for account in selected
+    ):
+        raise HTTPException(409, "所选账号的安全字段均已完整，无需修复")
     options: dict[str, Any] = {}
     if operation == "password_change":
         try:
@@ -520,7 +541,9 @@ async def account_reauthenticate(body: AccountReauthRequest):
         raise HTTPException(400, str(error)) from error
     account_protocol = _state()._account_requires_protocol_reauth(account)
     if (reauth_mode == "protocol" or account_protocol) and not _state()._protocol_reauth_credentials_ready(account):
-        raise HTTPException(409, "协议重新登录要求账号同时保存密码和 TOTP 2FA")
+        # Passwordless 账号有可收信邮箱时走邮箱验证码登录,与批量端点保持一致。
+        if not _state()._account_email_relogin_ready(account):
+            raise HTTPException(409, "协议重新登录要求账号同时保存密码和 TOTP 2FA")
     if account_protocol:
         reauth_mode = "protocol"
     try:

@@ -3,7 +3,7 @@
 #
 # Codex OAuth integration for the panel: selected accounts can mint a real
 # refresh_token (offline_access scope) through the local Codex PKCE client,
-# with SMSBower / Firefox.fun SMS providers for the add-phone step when needed.
+# with SMSBower for the add-phone step when needed.
 
 from __future__ import annotations
 
@@ -18,7 +18,9 @@ import sys
 import threading
 import tempfile
 import time
-from datetime import datetime
+from contextvars import ContextVar
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import parse_qs, urljoin, urlparse
@@ -37,27 +39,31 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from common.account_store import account_delete_key, update_account_record_fields  # noqa: E402
+from proxy_util import is_rate_limit_error  # noqa: E402
 from common.team_workspace import requires_team_workspace, session_identity, validate_session_replacement  # noqa: E402
 from common.relay_recovery import (  # noqa: E402
     auth_known_invalid, read_relay_entry, relay_entry_status, relay_state, safe_stored_bundle, scan_relay,
 )
 from codex_oauth.oauth import (  # noqa: E402
+    OAuthHttpError,
     ProtocolClient,
     decode_jwt_payload,
     exchange_code,
     token_metadata,
     totp_from_secret,
 )
+from mail import (  # noqa: E402
+    CANONICAL_PROVIDER_TYPES,
+    mark_mailbox_code_boundary,
+    normalize_provider_type,
+)
+from mail import wait_for_code as wait_mail_code  # noqa: E402
 from codex_oauth.sms import (  # noqa: E402
-    FIREFOX_COUNTRY_NAMES,
-    FirefoxSmsClient,
     SmsActivation,
     SmsBowerClient,
     SmsError,
     SmsSettings,
     check_sms_balance,
-    normalize_firefox_country,
-    parse_firefox_docking_code,
     parse_phone_attempt_limit,
 )
 
@@ -228,6 +234,7 @@ _STATE: dict[str, Any] = {
     "done": 0,
     "success": 0,
     "failed": 0,
+    "cancelled": 0,
     "logs": [],
     "results": [],
     "started_at": "",
@@ -241,6 +248,18 @@ _STATE: dict[str, Any] = {
     "concurrency": 1,
 }
 _MAX_LOGS = 800
+_MAX_IMPORT_CONCURRENCY = 10
+_BATCH_THREAD: threading.Thread | None = None
+_SMS_EVENT_CALLBACK: ContextVar[Any] = ContextVar("sms_event_callback", default=None)
+_SMS_LOG_SECRETS: ContextVar[tuple] = ContextVar("sms_log_secrets", default=())
+
+
+def _sms_safe_text(value, rec: dict | None = None, sms_cfg: dict | None = None) -> str:
+    from common.account_operation_log import _redact_text
+    secrets = (*_SMS_LOG_SECRETS.get(), *((rec or {}).get(key) for key in (
+        "password", "totp_secret", "access_token", "refresh_token", "session_token",
+    )), (sms_cfg or {}).get("api_key"))
+    return _redact_text(value, secrets)
 
 
 def _reserve_batch(mode: str, total: int, batch_id: str) -> threading.Event:
@@ -253,21 +272,141 @@ def _reserve_batch(mode: str, total: int, batch_id: str) -> threading.Event:
         _STOP = stop_event
         _STATE.update(
             running=True, mode=mode, batch_id=batch_id, total=total,
-            done=0, success=0, failed=0, logs=[], results=[],
+            done=0, success=0, failed=0, cancelled=0, logs=[], results=[],
             started_at=datetime.now().isoformat(timespec="seconds"), finished_at="",
             status="running", items=[], options={}, counts={}, force=False, concurrency=1,
+            rate_limited=False, rate_limit_error="",
+            auth_retry_until=0.0, auth_retry_monotonic=0.0, auth_retry_count=0,
         )
         return stop_event
 
 
-def _finish_batch(batch_id: str) -> None:
+def _finish_batch(batch_id: str, *, failed: bool = False) -> None:
+    finished = None
     with _LOCK:
         if _STATE.get("batch_id", "") == batch_id:
             _STATE["running"] = False
             _STATE["finished_at"] = datetime.now().isoformat(timespec="seconds")
-            _STATE["status"] = "cancelled" if (
-                _STATE.get("status") == "stopping" or (_STATE.get("counts") or {}).get("cancelled")
+            _STATE["status"] = "failed" if (failed or _STATE.get("status") == "failed") else "cancelled" if (
+                _STATE.get("status") == "stopping" or _STATE.get("cancelled") or (_STATE.get("counts") or {}).get("cancelled")
             ) else "completed"
+            finished = (
+                str((_STATE.get("options") or {}).get("source_registration_batch_id") or ""),
+                _STATE["status"], int(_STATE.get("done") or 0), int(_STATE.get("failed") or 0),
+            )
+    # Queue locks and preflight work must never run under the shared slot lock.
+    if finished is not None:
+        from common.registration_sms_followup import existing_queue
+
+        pending = existing_queue()
+        if pending is not None:
+            pending.finished(finished[0], batch_id, finished[1], completed=finished[2], failed=finished[3])
+            wake_registration_sms_queue()
+
+
+def _automatic_sms_stopping() -> bool:
+    event = getattr(_state(), "_SERVER_SHUTDOWN_EVENT", None)
+    return bool(event is not None and event.is_set())
+
+
+class _AutomaticSmsStop:
+    """Carry server shutdown through the worker's existing payment guards."""
+    def __init__(self, event: threading.Event) -> None:
+        self.event = event
+
+    def is_set(self) -> bool:
+        return self.event.is_set() or _automatic_sms_stopping()
+
+    def wait(self, seconds: float) -> bool:
+        deadline = time.monotonic() + max(0, seconds)
+        while not self.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            self.event.wait(min(remaining, 0.25))
+        return True
+
+
+def wake_registration_sms_queue() -> None:
+    """Synchronous local preflight; starts the existing background SMS worker."""
+    from common.registration_sms_followup import existing_queue
+
+    pending = existing_queue()
+    if pending is not None:
+        def start(wanted, *, sms_options, **kwargs):
+            options = dict(sms_options)
+            concurrency = max(1, int(options.pop("concurrency", 1) or 1))
+            return _start_sms_batch(wanted, strategy="auto", force=False, concurrency=concurrency, sms_options=options, **kwargs)
+
+        pending.drain(
+            start,
+            _automatic_sms_stopping,
+        )
+
+
+def registration_sms_snapshot(params: dict, *, registration_running: bool = True, registration_error: str = "") -> dict:
+    source_id = str(params.get("batch_id") or "")
+    if params.get("auto_sms_after_register") is not True:
+        return {"status": "disabled", "total": 0, "message": "注册后自动接码未开启", "batch_id": "", "source_batch_id": source_id}
+    from common.registration_sms_followup import queue
+
+    result = queue().snapshot(source_id)
+    if not registration_running and not result.get("created_at"):
+        result.update(
+            status="failed" if registration_error else "interrupted",
+            message="注册未正常完成，未自动接码；请核对本批结果后手动处理",
+        )
+    return result
+
+
+def cancel_registration_sms_followup(source_id: str = "") -> None:
+    from common.registration_sms_followup import existing_queue, queue
+
+    pending = queue() if source_id else existing_queue()
+    if pending is not None:
+        pending.cancel(source_id)
+    if source_id:
+        # Covers the small interval after durable ownership is recorded but
+        # before the worker starts, and stops only this source's active SMS.
+        with _LOCK:
+            if _STATE.get("running") and (_STATE.get("options") or {}).get("source_registration_batch_id") == source_id:
+                _STOP.set()
+                _STATE["status"] = "stopping"
+
+
+def enqueue_registration_sms_followup(params: dict, results: list, cards: list, *, stopped: bool = False) -> dict:
+    """Use only this invocation's final successful records, never account history."""
+    if params.get("auto_sms_after_register") is not True:
+        return registration_sms_snapshot(params)
+    from common.registration_sms_followup import queue
+
+    source_id = str(params.get("batch_id") or "")
+    successful = {
+        str(card.get("email") or "").strip().lower() for card in cards
+        if card.get("status") == "success" and str(card.get("batch_id") or source_id) == source_id
+    }
+    emails = [
+        str(record.get("email") or "").strip().lower() for record in results
+        if isinstance(record, dict) and str(record.get("email") or "").strip()
+        and str(record.get("access_token") or "").strip()
+        and str(record.get("registration_state") or "complete") == "complete"
+        and (not cards or str(record.get("email") or "").strip().lower() in successful)
+    ]
+    error, safe = "", {}
+    cancelled = stopped or _automatic_sms_stopping()
+    if emails and not cancelled:
+        try:
+            config = _state()._read_config()
+            safe = _safe_sms_settings(_effective_sms_config(config))
+            safe["concurrency"] = max(1, int((config.get("ui_settings") or {}).get("codex_sms_workers") or 2))
+            if not safe["enabled"] or not safe["configured"]:
+                error = "自动接码未启动，请在短信设置中启用接码并配置渠道凭据"
+        except Exception:
+            error = "自动接码未启动，短信设置无效，请检查渠道、价格和最大换号次数"
+    result = queue().enqueue(source_id, emails, sms_options=safe, cancelled=cancelled, error=error)
+    if result["status"] == "pending":
+        wake_registration_sms_queue()
+    return queue().snapshot(source_id)
 
 
 def _sms_counts_locked() -> None:
@@ -284,6 +423,9 @@ def _sms_counts_locked() -> None:
 
 
 def _set_sms_item(email: str, batch_id: str, **updates) -> None:
+    for key in ("message", "error"):
+        if key in updates:
+            updates[key] = _sms_safe_text(updates[key])
     with _LOCK:
         if _STATE.get("mode") != "codex" or _STATE.get("batch_id", "") != batch_id:
             return
@@ -291,11 +433,37 @@ def _set_sms_item(email: str, batch_id: str, **updates) -> None:
             if item["email"] == email:
                 item.update(updates, updated_at=datetime.now().isoformat(timespec="seconds"))
                 _sms_counts_locked()
-                return
+                break
+    callback = _SMS_EVENT_CALLBACK.get()
+    if callable(callback):
+        callback(**updates)
 
 
 class _SmsCancelled(RuntimeError):
     pass
+
+
+class _SmsRateLimited(RuntimeError):
+    """Keep the triggering 429 a failure even after signalling batch stop."""
+
+    def __init__(self, message: str, *, phone: str = "") -> None:
+        super().__init__(message)
+        self.phone = phone
+
+
+def _sms_rate_limit_diagnostic(error, rec: dict | None = None, sms_cfg: dict | None = None) -> str:
+    diagnostic = _sms_safe_text(error, rec, sms_cfg)
+    return diagnostic if is_rate_limit_error(diagnostic) else "HTTP 429 rate_limit_exceeded: " + diagnostic
+
+
+def _stop_sms_batch_for_rate_limit(batch_id: str, error) -> None:
+    diagnostic = _sms_rate_limit_diagnostic(error)[:500]
+    with _LOCK:
+        if batch_id and _STATE.get("batch_id") == batch_id and _STATE.get("running"):
+            _STOP.set()
+            _STATE["status"] = "failed"
+            if not _STATE.get("rate_limited"):
+                _STATE.update(rate_limited=True, rate_limit_error=diagnostic)
 
 
 class _SmsAuthSessionExpired(RuntimeError):
@@ -304,16 +472,104 @@ class _SmsAuthSessionExpired(RuntimeError):
     pass
 
 
+_AUTH_RATE_LIMIT_WAIT_SECONDS = 90.0
+_AUTHORIZE_CONTINUE_PATH = "/api/accounts/authorize/continue"
+
+
+def _error_chain(error):
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        yield error
+        error = getattr(error, "__cause__", None) or getattr(error, "__context__", None)
+
+
+def _authorize_continue_rate_limit(error) -> bool:
+    for cause in _error_chain(error):
+        path = getattr(cause, "path", None)
+        if path is not None:
+            status = getattr(cause, "status_code", None)
+            if status is None:
+                status = getattr(getattr(cause, "response", None), "status_code", None)
+            # Current structured response metadata outranks an old chained
+            # exception or an unrelated rate-limit code in the response body.
+            return path == _AUTHORIZE_CONTINUE_PATH and str(status) == "429"
+        elif re.match(r"^HTTP 429 /api/accounts/authorize/continue(?=[:?\s]|$)", str(cause)):
+            # Compatibility with earlier clients; a path mentioned in an
+            # unrelated error body must not make that operation retryable.
+            return True
+    return False
+
+
+def _authorize_retry_delay(error) -> float:
+    delay = _AUTH_RATE_LIMIT_WAIT_SECONDS
+    for cause in _error_chain(error):
+        value = getattr(cause, "retry_after", None)
+        if value is None:
+            headers = getattr(getattr(cause, "response", None), "headers", None)
+            value = headers.get("Retry-After") if headers is not None else None
+        if value is None:
+            continue
+        try:
+            raw = str(value).strip()
+            if re.fullmatch(r"\d+", raw):
+                seconds = float(raw)
+            else:
+                deadline = parsedate_to_datetime(raw)
+                if deadline.tzinfo is None:
+                    deadline = deadline.replace(tzinfo=timezone.utc)
+                seconds = deadline.timestamp() - time.time()
+            if math.isfinite(seconds):
+                delay = max(delay, seconds)
+        except (ValueError, TypeError, OverflowError):
+            pass
+    return delay
+
+
+def _defer_authorize_retry(batch_id: str, error) -> float:
+    deadline = time.monotonic() + _authorize_retry_delay(error)
+    with _LOCK:
+        if batch_id and _STATE.get("batch_id") == batch_id and _STATE.get("running"):
+            shared_deadline = max(deadline, float(_STATE.get("auth_retry_monotonic") or 0))
+            _STATE.update(
+                auth_retry_monotonic=shared_deadline,
+                auth_retry_until=time.time() + max(0, shared_deadline - time.monotonic()),
+                auth_retry_count=int(_STATE.get("auth_retry_count") or 0) + 1,
+            )
+    return deadline
+
+
+def _shared_authorize_retry_deadline(batch_id: str) -> float:
+    with _LOCK:
+        if batch_id and _STATE.get("batch_id") == batch_id and _STATE.get("running"):
+            return float(_STATE.get("auth_retry_monotonic") or 0)
+    return 0.0
+
+
 def _launch_batch(target, args: tuple, *, batch_id: str, stop_event: threading.Event, name: str) -> None:
+    global _BATCH_THREAD
     try:
-        threading.Thread(target=target, args=args, name=name, daemon=True).start()
+        thread = threading.Thread(target=target, args=args, name=name, daemon=True)
+        with _LOCK:
+            _BATCH_THREAD = thread
+            thread.start()
     except Exception:
         stop_event.set()
-        _finish_batch(batch_id)
+        _finish_batch(batch_id, failed=True)
         raise
 
 
+def request_batch_shutdown() -> threading.Thread | None:
+    """Stop new/active import and SMS work and return the thread to join."""
+    with _LOCK:
+        _STOP.set()
+        if _STATE.get("running"):
+            _STATE["status"] = "stopping"
+        return _BATCH_THREAD
+
+
 def _log(message: str, level: str = "info", *, batch_id: str = "") -> None:
+    message = _sms_safe_text(message)
     stamp = datetime.now().strftime("%H:%M:%S")
     with _LOCK:
         if batch_id and _STATE.get("batch_id") != batch_id:
@@ -322,6 +578,9 @@ def _log(message: str, level: str = "info", *, batch_id: str = "") -> None:
         overflow = len(_STATE["logs"]) - _MAX_LOGS
         if overflow > 0:
             del _STATE["logs"][:overflow]
+    callback = _SMS_EVENT_CALLBACK.get()
+    if callable(callback):
+        callback(message=str(message), level=level)
 
 
 # ---------------------------------------------------------------------------
@@ -501,10 +760,8 @@ def _country_specs(sms_cfg: dict) -> list:
     preceding ``=`` token so those configs keep working.
     Returns (country, tier_ids, max_price) triples.
     """
-    provider = str(sms_cfg.get("provider") or "").strip().lower()
-    key = "firefox_country_order" if provider == "firefox" else "country_order"
     tokens: list[dict] = []
-    for raw in str(sms_cfg.get(key) or "").replace("，", ",").split(","):
+    for raw in str(sms_cfg.get("country_order") or "").replace("，", ",").split(","):
         item = raw.strip()
         if not item:
             continue
@@ -537,12 +794,8 @@ def _country_specs(sms_cfg: dict) -> list:
             except ValueError:
                 price = ""
         specs.append((country, list(token["tiers"]), price or None))
-    if provider != "firefox":
-        specs = [
-            (c, tiers, price)
-            for c, tiers, price in specs
-            if str(c).isdigit() and all(str(t).isdigit() for t in tiers)
-        ]
+    specs = [(c, tiers, price) for c, tiers, price in specs
+             if str(c).isdigit() and all(str(t).isdigit() for t in tiers)]
     return specs
 
 
@@ -581,7 +834,9 @@ def _smsbower_tier_prices(api_key: str, service: str) -> dict:
     try:
         raw = _smsbower_request(api_key, "getPricesV3", service=service)
         doc = json.loads(raw) if raw.startswith("{") else {}
-    except Exception:
+    except Exception as exc:
+        if is_rate_limit_error(exc):
+            raise
         return _SMSBOWER_PRICE_CACHE["map"]
     out: dict = {}
     for country_id, services in (doc or {}).items():
@@ -624,6 +879,8 @@ class _PanelSmsBowerClient(SmsBowerClient):
         ]
         # 轮转游标:指向下一次 acquire 的起始组合下标。
         self._cursor = 0
+        self.stop_check = lambda: False
+        self.request_guard = lambda: None
 
     def _combinations(self) -> list:
         """展平国家×档位组合,保持操作者配置的优先顺序。"""
@@ -635,10 +892,13 @@ class _PanelSmsBowerClient(SmsBowerClient):
         return combos
 
     def acquire(self) -> SmsActivation:
+        if self.stop_check():
+            raise _SmsCancelled("任务已停止，未获取新号码")
         combos = self._combinations()
         if not combos:
             raise SmsError("没有配置任何国家/档位")
         last_error = "没有可用号码"
+        self.request_guard()
         prices = _smsbower_tier_prices(self.settings.api_key, self.settings.service)
         total = len(combos)
         for offset in range(total):
@@ -655,12 +915,19 @@ class _PanelSmsBowerClient(SmsBowerClient):
             price = str(min(float(p) for p in caps)) if caps else ""
             if price:
                 params["maxPrice"] = price
+            self.request_guard()
+            if self.stop_check():
+                raise _SmsCancelled("任务已停止，未获取新号码")
             try:
                 body = self._request("getNumber", **params)
             except SmsError as exc:
+                if is_rate_limit_error(exc):
+                    raise
                 last_error = f"{exc} (country={country} tier={tier or 'any'})"
                 continue
             if not body.startswith("ACCESS_NUMBER:"):
+                if is_rate_limit_error(body):
+                    raise SmsError(body)
                 last_error = (
                     f"SMSBower 未分配号码: {body[:120]} "
                     f"(country={country} tier={tier or 'any'})"
@@ -700,66 +967,23 @@ class _PanelSmsBowerClient(SmsBowerClient):
         return label
 
 
-class _PanelFirefoxSmsClient(FirefoxSmsClient):
-    """Firefox client:对接码锁定国家+项目,取号只认对接码。
-
-    对接码一次锁定国家与项目(如 ``eng-1096-DEMO01``),不再回退国家
-    列表;未配置对接码直接报错,提示去火狐狸接码页复制。
-    """
-
-    def __init__(self, settings: SmsSettings, country_specs: list, *, timeout: float = 30.0):
-        super().__init__(settings, timeout=timeout)
-        # country_specs 仅 SMSBower 使用;火狐狸忽略。
-
-    def acquire(self) -> SmsActivation:
-        dock_country, item_id, did = parse_firefox_docking_code(self.settings.firefox_docking_code)
-        if not (dock_country and item_id and did):
-            raise SmsError("火狐狸需要配置对接码(格式: eng-1096-DEMO01,在火狐狸接码页复制)")
-        self._login()
-        params = {
-            "iid": item_id,
-            "country": dock_country,
-            "dock": "0",
-            "otpmode": "sms",
-            "did": did,
-        }
-        if self.settings.max_price:
-            params["maxPrice"] = self.settings.max_price
-        body = self._authorized_request("getPhone", **params)
-        if not body.startswith("1|"):
-            raise SmsError(f"火狐狸未分配号码：{self._failure(body)[:120]}")
-        parts = body.split("|")
-        if len(parts) < 8 or not parts[1].strip() or not parts[7].strip():
-            raise SmsError(f"火狐狸响应格式异常：{body[:160]}")
-        returned_country = normalize_firefox_country(parts[3] if len(parts) > 3 else "") or dock_country
-        returned_prefix = parts[4] if len(parts) > 4 else ""
-        phone = self._normalize_phone(parts[7], returned_prefix, returned_country)
-        label = FIREFOX_COUNTRY_NAMES.get(returned_country, returned_country)
-        return SmsActivation(
-            activation_id=parts[1].strip(),
-            phone=phone,
-            country=returned_country,
-            api_key=self._token,
-            label=label,
-            provider="firefox",
-        )
-
-
 def _sms_client(settings: SmsSettings, country_specs: list | None = None):
+    if settings.provider != "smsbower":
+        raise SmsError("此接码渠道已移除，仅支持 SMSBower")
     if not settings.enabled or not settings.credentials_configured:
         return None
     specs = list(country_specs or [])
-    if settings.provider == "firefox":
-        return _PanelFirefoxSmsClient(settings, specs, timeout=30.0)
     return _PanelSmsBowerClient(settings, specs, timeout=30.0)
 
 
 def _proxy_retryable_error(error: BaseException | str) -> bool:
+    if is_rate_limit_error(error):
+        return False
     text = str(error or "").lower()
     return any(
         marker in text
         for marker in (
-            "http 429", "http_429", "rate limit", "rate_limit", "proxy",
+            "proxy",
             "connection reset", "connection closed", "connection aborted", "timed out", "tls connect",
             "tls handshake", "ssl error", "sslerror", "ssl connect", "certificate verify failed",
             "unexpected eof", "proxy tunnel", "gateway timeout",
@@ -775,6 +999,10 @@ _MFA_CODE_RETRIES = 3
 # Route/TLS failures are independent from the paid phone-number budget.  A
 # single configured phone attempt must still get a few fresh HTTP sessions.
 _NETWORK_RETRIES = 3
+
+# 登录会话失效(auth session expired)的恢复上限:无上限时,持续返回
+# "session is no longer valid" 的账号会让 worker 死循环、批次永不结束。
+_SESSION_FAILURE_RETRIES = 5
 
 
 def _mfa_code_error(error: BaseException | str) -> bool:
@@ -809,6 +1037,7 @@ def _persist_sms_tokens(previous: dict, token: dict) -> dict:
     key = account_delete_key(previous)
     expected = {field: previous.get(field) for field in (
         "access_token", "refresh_token", "email", "selected_workspace_id",
+        "selected_workspace_metadata", "selected_workspace_evidence_source",
         "selected_workspace_name", "workspace_name", "import_account_type", "plan_type",
     )}
     changed, _ = update_account_record_fields(
@@ -852,16 +1081,56 @@ def _process_one(
     password = str(rec.get("password") or "")
     totp = str(rec.get("totp_secret") or "")
     phone_attempts = phone_attempts if phone_attempts is not None else []
+    retry_deadline = 0.0
+    current_stage = {"stage": "preparing", "message": "准备授权", "wait_deadline": None}
+
+    def wait_for_authorize_retry() -> None:
+        announced = None
+        while True:
+            if stop_event.is_set():
+                raise _SmsCancelled("任务已停止")
+            shared_deadline = _shared_authorize_retry_deadline(batch_id)
+            deadline = max(retry_deadline, shared_deadline)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            own_limit = retry_deadline > time.monotonic() and retry_deadline >= shared_deadline
+            waiting_state = (deadline, own_limit)
+            if announced != waiting_state:
+                seconds = math.ceil(remaining)
+                message = (
+                    f"本账号提交邮箱返回 HTTP 429，等待 {seconds} 秒后重试授权提交"
+                    if own_limit else
+                    f"同批其他账号触发授权限流，当前步骤「{current_stage['message']}」暂停，等待 {seconds} 秒后继续"
+                )
+                _set_sms_item(
+                    email, batch_id, status="active",
+                    stage="rate_limit_wait" if own_limit else "batch_rate_limit_wait",
+                    message=message,
+                    attempt=len(phone_attempts), wait_deadline=time.time() + remaining,
+                )
+                announced = waiting_state
+            if stop_event.wait(min(1.0, remaining)):
+                raise _SmsCancelled("任务已停止")
+        if announced is not None:
+            _set_sms_item(email, batch_id, status="active", attempt=len(phone_attempts), **current_stage)
 
     def stage(name: str, message: str, *, wait_deadline: float | None = None) -> None:
-        if stop_event.is_set():
-            raise _SmsCancelled("任务已停止")
+        current_stage.update(stage=name, message=message, wait_deadline=wait_deadline)
+        if name == "waiting_sms":
+            # Polling an already purchased number does not issue another
+            # authorization request. Keep receiving its SMS during cooldown.
+            if stop_event.is_set():
+                raise _SmsCancelled("任务已停止")
+        else:
+            wait_for_authorize_retry()
         _set_sms_item(
             email, batch_id, status="active", stage=name, message=message,
             attempt=len(phone_attempts), wait_deadline=wait_deadline,
         )
 
     def log(message: str, level: str = "info") -> None:
+        message = _sms_safe_text(message, rec, sms_cfg)
         _log(f"{email} | {message}", level, batch_id=batch_id)
         if steps is not None:
             steps.append(
@@ -872,8 +1141,10 @@ def _process_one(
                 }
             )
 
-    if not password or not totp:
-        raise RuntimeError("账号缺少密码或 2FA 密钥,无法补发")
+    # Passwordless 账号(无密码/2FA)有可收码的邮箱绑定时走邮箱验证码登录;
+    # 只有既无凭据又无收码通道的账号才无法补发。
+    if (not password or not totp) and _record_mailbox(rec) is None:
+        raise RuntimeError("账号缺少密码或 2FA 密钥,且邮箱没有可收码的绑定,无法补发")
 
     settings = SmsSettings.from_mapping(sms_cfg)
     provider_map = _provider_specs(sms_cfg)
@@ -890,6 +1161,9 @@ def _process_one(
                 merged.append(pid)
         specs.append((country, merged, max_price))
     sms = _sms_client(settings, specs)
+    if isinstance(sms, _PanelSmsBowerClient):
+        sms.stop_check = stop_event.is_set
+        sms.request_guard = wait_for_authorize_retry
 
     # Team 账号按导入时指定的工作区名选择;个人账号为空,默认第一个。
     strict_team = requires_team_workspace(rec)
@@ -957,29 +1231,91 @@ def _process_one(
         client = None
         try:
             client = ProtocolClient(email, timeout=30)
+            client.request_guard = wait_for_authorize_retry
             log("本地直连" + (f"(第 {attempt} 轮)" if attempt > 1 else ""))
             stage("login", "初始化登录会话")
             log("初始化会话与 PKCE")
             client.bootstrap()
-            stage("login", "提交账号邮箱")
-            client.submit_email()
+            while True:
+                stage("login", "提交账号邮箱")
+                try:
+                    client.submit_email()
+                    retry_deadline = 0.0
+                    break
+                except Exception as exc:
+                    if not _authorize_continue_rate_limit(exc):
+                        raise
+                    if stop_event.is_set():
+                        raise _SmsCancelled("任务已停止") from None
+                    retry_deadline = _defer_authorize_retry(batch_id, exc)
+                    log(
+                        "授权接口限流，至少等待 90 秒后重试当前账号，不增加取号次数；"
+                        + _sms_rate_limit_diagnostic(exc, rec, sms_cfg), "warning",
+                    )
             log("邮箱已提交")
-            stage("password", "验证密码")
-            client.verify_password(password)
-            log("密码验证通过")
-            stage("mfa", "验证二次认证")
-            mfa_id = client.mfa_id()
-            client.issue_mfa_challenge(mfa_id)
-            # 重试时换用相邻时间窗口的验证码,补偿本地与服务器时钟偏移
-            skew = {1: 0, 2: 1, 3: -1}.get(mfa_code_failures, 0)
-            mfa_response = client.verify_mfa(
-                mfa_id, totp_from_secret(totp, at=time.time() + 30 * skew)
-            )
-            log("2FA 验证通过")
-            try:
-                mfa_data = mfa_response.json()
-            except Exception:
-                mfa_data = {}
+            if not password or not totp:
+                # Passwordless account: log in with an emailed OTP instead of
+                # password + TOTP. Codes arrive on the mailbox provider bound
+                # to the record (e.g. icloud_api).
+                mailbox = _record_mailbox(rec)
+                if mailbox is None:
+                    raise RuntimeError("账号缺少密码/2FA，且邮箱没有可收码的通道绑定，无法重新授权")
+                stage("email_code", "等待邮箱验证码")
+                log("账号未设密码，改用邮箱验证码登录")
+                mark_mailbox_code_boundary(mailbox)
+                try:
+                    client.send_passwordless_otp()
+                except OAuthHttpError as otp_error:
+                    # The server auto-sends the code after the email step;
+                    # HTTP 409 only means it was already sent.
+                    if int(getattr(otp_error, "status_code", 0) or 0) != 409:
+                        raise
+                    log("验证码已自动发送")
+                code = ""
+                for segment in range(4):
+                    code = wait_mail_code(
+                        _mail_wait_config(), mailbox,
+                        stop_check=lambda: stop_event.is_set(),
+                    )
+                    if code:
+                        break
+                    if stop_event.is_set():
+                        raise _SmsCancelled("任务已停止")
+                    if segment < 3:
+                        log(f"第 {segment + 1} 段（{(segment + 1) * 45} 秒）未收到验证码，重发登录验证码", "warning")
+                        try:
+                            client.send_passwordless_otp()
+                        except OAuthHttpError as otp_error:
+                            if int(getattr(otp_error, "status_code", 0) or 0) != 409:
+                                log("重发登录验证码失败，继续等待新邮件", "warning")
+                        mark_mailbox_code_boundary(mailbox, grace_seconds=0)
+                if not code:
+                    raise RuntimeError("等待邮箱验证码超时（两轮共180秒）")
+                log("收到邮箱验证码")
+                stage("email_code", "提交邮箱验证码")
+                otp_response = client.verify_email_otp(code)
+                log("验证码验证通过")
+                try:
+                    mfa_data = otp_response.json()
+                except Exception:
+                    mfa_data = {}
+            else:
+                stage("password", "验证密码")
+                client.verify_password(password)
+                log("密码验证通过")
+                stage("mfa", "验证二次认证")
+                mfa_id = client.mfa_id()
+                client.issue_mfa_challenge(mfa_id)
+                # 重试时换用相邻时间窗口的验证码,补偿本地与服务器时钟偏移
+                skew = {1: 0, 2: 1, 3: -1}.get(mfa_code_failures, 0)
+                mfa_response = client.verify_mfa(
+                    mfa_id, totp_from_secret(totp, at=time.time() + 30 * skew)
+                )
+                log("2FA 验证通过")
+                try:
+                    mfa_data = mfa_response.json()
+                except Exception:
+                    mfa_data = {}
             if not isinstance(mfa_data, dict):
                 mfa_data = {}
             if not mfa_data:
@@ -1032,6 +1368,8 @@ def _process_one(
                     _set_sms_item(email, batch_id, attempt=len(phone_attempts))
                     log(f"接码获取号码(第 {attempt_label()} 次)")
                     try:
+                        if stop_event.is_set():
+                            raise _SmsCancelled("任务已停止，未获取新号码")
                         activation = sms.acquire()
                     except Exception:
                         phone_attempt["result"] = "acquire_failed"
@@ -1057,15 +1395,25 @@ def _process_one(
                     log("手机号已提交,等待短信验证码")
                     stage("waiting_sms", "等待短信验证码", wait_deadline=time.time() + settings.timeout_seconds)
                     code = sms.wait_code(activation, cancel_event=stop_event)
+                    log("已收到短信验证码，等待提交验证")
                     stage("verifying_sms", "正在验证短信")
-                    log("收到验证码,提交验证")
+                    log("开始提交短信验证码")
                     client.submit_phone_otp(code)
                     phone_attempt["result"] = "success"
                     try:
                         sms.finish(activation)
-                    except Exception:
+                    except Exception as exc:
                         # The upstream already accepted this number. A supplier
                         # acknowledgement failure must not buy another number.
+                        if is_rate_limit_error(exc):
+                            verified_phone = activation.phone
+                            activation = None
+                            phone_attempt = None
+                            phone_sent = False
+                            raise _SmsRateLimited(
+                                _sms_rate_limit_diagnostic(exc, rec, sms_cfg),
+                                phone=verified_phone,
+                            ) from None
                         log("手机验证已通过，供应商完成确认失败，请稍后核对供应商记录", "warning")
                     log("手机验证通过")
                     phone_used = activation.phone
@@ -1075,6 +1423,13 @@ def _process_one(
                     phone_sent = False
                 except Exception as exc:
                     last_error = str(exc)
+                    if is_rate_limit_error(exc):
+                        _stop_sms_batch_for_rate_limit(batch_id, exc)
+                        release_activation("failed")
+                        raise _SmsRateLimited(
+                            _sms_rate_limit_diagnostic(exc, rec, sms_cfg),
+                            phone=getattr(exc, "phone", ""),
+                        ) from None
                     cancelled = stop_event.is_set() or isinstance(exc, _SmsCancelled)
                     stale_session = isinstance(exc, _SmsAuthSessionExpired) or _signin_session_expired(exc)
                     if stale_session and not cancelled and not phone_sent and activation is not None and not activation.finished:
@@ -1113,6 +1468,7 @@ def _process_one(
             except Exception as exc:
                 if (
                     sms is not None
+                    and not is_rate_limit_error(exc)
                     and not phone_budget_exhausted()
                     and "phone" in str(exc).lower()
                 ):
@@ -1140,7 +1496,11 @@ def _process_one(
                     raise RuntimeError("中转同步未返回已写入文件")
                 _mark_relay_synced(rec, token)
             except Exception as exc:
-                relay_error = str(exc)[:220]
+                if is_rate_limit_error(exc):
+                    _stop_sms_batch_for_rate_limit(batch_id, exc)
+                    relay_error = _sms_rate_limit_diagnostic(exc, rec, sms_cfg)[:220]
+                else:
+                    relay_error = str(exc)[:220]
                 log(f"授权成功，但中转同步失败: {relay_error}；重试只同步凭据", "warning")
             return {
                 "email": email,
@@ -1157,11 +1517,29 @@ def _process_one(
             }
         except Exception as exc:
             last_error = str(exc)
+            if isinstance(exc, _SmsCancelled):
+                release_activation("cancelled")
+                raise
+            if isinstance(exc, _SmsRateLimited) or is_rate_limit_error(exc):
+                _stop_sms_batch_for_rate_limit(batch_id, exc)
+                release_activation("failed")
+                log("上游限流，本批次停止后续授权和取号；" + _sms_safe_text(exc, rec, sms_cfg), "error")
+                raise _SmsRateLimited(
+                    _sms_rate_limit_diagnostic(exc, rec, sms_cfg),
+                    phone=getattr(exc, "phone", ""),
+                ) from None
             if stop_event.is_set() or isinstance(exc, _SmsCancelled):
                 release_activation("cancelled")
                 raise _SmsCancelled("任务已停止") from exc
             if isinstance(exc, _SmsAuthSessionExpired) or _signin_session_expired(exc):
                 session_failures += 1
+                if session_failures > _SESSION_FAILURE_RETRIES:
+                    log(
+                        f"登录会话连续失效 {session_failures - 1} 次，放弃本账号，避免批次卡死"
+                        f"（最后错误: {last_error[:160]}）",
+                        "error",
+                    )
+                    raise
                 delay = min(30.0, 2.0 ** min(session_failures - 1, 5))
                 log(
                     f"登录会话失效，第 {session_failures} 次恢复，{delay:g}s 后重建完整授权"
@@ -1208,6 +1586,142 @@ def _process_one(
                 pass
 
 
+def _run_sms_record(rec: dict, sms_cfg: dict, batch_id: str, stop_event, context: dict, options: dict) -> dict:
+    """Execute one account through the same relay/SMS/history path for all callers."""
+    token = _SMS_LOG_SECRETS.set(tuple(rec.get(key) for key in (
+        "password", "totp_secret", "access_token", "refresh_token", "session_token",
+    )) + (sms_cfg.get("api_key"),))
+    try:
+        return _execute_sms_record(rec, sms_cfg, batch_id, stop_event, context, options)
+    except Exception as exc:
+        raise RuntimeError(_sms_safe_text(exc)) from None
+    finally:
+        _SMS_LOG_SECRETS.reset(token)
+
+
+def _execute_sms_record(rec: dict, sms_cfg: dict, batch_id: str, stop_event, context: dict, options: dict) -> dict:
+    with _LOCK:
+        if _STATE.get("batch_id", "") != batch_id:
+            return {"status": "cancelled", "outcome": "cancelled", "message": "接码任务已停止"}
+    email = str(rec.get("email") or "").strip()
+    steps: list = []
+    attempts: list = []
+    result: dict = {}
+    outcome = "failed"
+    action = {"action": "blocked", "relay_status": "missing", "relay_file": ""}
+    try:
+        if stop_event.is_set():
+            raise _SmsCancelled("停止时尚未执行")
+        rec = _current_sms_record(rec)
+        _SMS_LOG_SECRETS.set((*_SMS_LOG_SECRETS.get(), *(rec.get(key) for key in (
+            "password", "totp_secret", "access_token", "refresh_token", "session_token",
+        ))))
+        _set_sms_item(email, batch_id, status="active", stage="preparing", message="正在检查账号")
+        issue = _sms_account_issue(rec)
+        if issue in ("not_found", "deactivated"):
+            raise RuntimeError("选中账号在库中不存在" if issue == "not_found" else "账号已停用，无法接码")
+        strategy = (options.get("account_actions") or {}).get(email) or _run_strategy(options.get("strategy"), bool(options.get("force")))
+        current_context = _current_relay_context(rec, context)
+        action = _relay_action(rec, strategy, current_context)
+        if action["action"] == "blocked":
+            raise _RelayRequiresAuth(action["reason"])
+        if action["action"] == "ready":
+            current = current_context["by_file"][action["relay_file"]]
+            outcome = "skipped"
+            _log(f"{email} | 中转已有匹配完整凭据，未在线验证", batch_id=batch_id)
+            steps.append({
+                "t": datetime.now().strftime("%H:%M:%S"), "level": "ok",
+                "m": "中转已有匹配完整凭据，保留中转当前 Token",
+            })
+            result = {
+                "email": email, "status": "success", "skipped": True,
+                "refresh_token": str(current["record"].get("refresh_token") or ""), "expires_in": None, "error": "", "phone": "",
+                "logs": list(steps), "phone_attempts": [],
+                "action": "ready", "relay_status": "ready", "relay_file": action["relay_file"],
+                "authorization_status": "reused", "retry_action": "",
+            }
+        elif action["action"] == "sync_only":
+            _set_sms_item(email, batch_id, stage="syncing_relay", message="同步已有凭据到中转，无需接码")
+
+            def sync_log(message, level="info"):
+                message = _sms_safe_text(message)
+                _log(f"{email} | {message}", level, batch_id=batch_id)
+                steps.append({"t": datetime.now().strftime("%H:%M:%S"), "level": level, "m": str(message)[:300]})
+
+            filename, wrote = _sync_existing_relay(rec, current_context, sync_log)
+            outcome = "synced" if wrote else "skipped"
+            saved = read_relay_entry(CLIPROXY_AUTHS_DIR / filename)["record"]
+            result = {
+                "email": email, "status": "success", "skipped": not wrote,
+                "refresh_token": str(saved.get("refresh_token") or ""), "expires_in": None, "error": "", "phone": "",
+                "logs": list(steps), "phone_attempts": [], "action": "sync_only",
+                "relay_status": "synced" if wrote else "ready", "relay_file": filename,
+                "authorization_status": "reused", "retry_action": "",
+            }
+        else:
+            result = _process_one(
+                rec, sms_cfg, steps, stop_event=stop_event, batch_id=batch_id,
+                phone_attempts=attempts,
+            )
+            outcome = "success" if result.get("status") == "success" else "failed"
+            if outcome == "failed" and is_rate_limit_error(result.get("error")):
+                _stop_sms_batch_for_rate_limit(batch_id, result["error"])
+    except Exception as exc:
+        limited = not isinstance(exc, _SmsCancelled) and (isinstance(exc, _SmsRateLimited) or is_rate_limit_error(exc))
+        if limited:
+            _stop_sms_batch_for_rate_limit(batch_id, exc)
+        outcome = "failed" if limited else "cancelled" if isinstance(exc, _SmsCancelled) or stop_event.is_set() else "failed"
+        result = {
+            "email": email, "status": outcome, "refresh_token": "", "expires_in": None,
+            "phone": getattr(exc, "phone", "") if limited else "", "logs": list(steps), "error": (_sms_rate_limit_diagnostic(exc) if limited else _sms_safe_text(exc))[:260],
+            "phone_attempts": list(attempts),
+            "action": action["action"],
+            "authorization_status": "failed" if action["action"] == "reauthorize" else "not_started",
+            "relay_status": "requires_auth" if isinstance(exc, _RelayRequiresAuth) else "failed",
+            "relay_file": action.get("relay_file") or "",
+            "retry_action": "reauthorize" if isinstance(exc, _RelayRequiresAuth) or action["action"] == "reauthorize" else "sync_only",
+        }
+        _log(f"{email} | {'已取消' if outcome == 'cancelled' else '失败'}: {exc}",
+             "warning" if outcome == "cancelled" else "error", batch_id=batch_id)
+    finally:
+        result["error"] = _sms_safe_text(result.get("error") or "")
+        result["logs"] = [
+            {**entry, "m": _sms_safe_text(entry.get("m") or "")} if isinstance(entry, dict) else _sms_safe_text(entry)
+            for entry in result.get("logs") or []
+        ]
+        result.update(batch_id=batch_id, options=copy.deepcopy(options), outcome=outcome)
+        message = {
+            "success": "已重新授权并同步到中转", "synced": "已有凭据已同步到中转", "skipped": "中转已有匹配凭据", "cancelled": result.get("error") or "已取消",
+            "failed": result.get("error") or "执行失败",
+        }[outcome]
+        result["message"] = message
+        _set_sms_item(
+            email, batch_id, status=outcome, stage=outcome, message=message,
+            attempt=len(attempts), wait_deadline=None,
+            **{key: result.get(key) for key in ("action", "relay_status", "relay_file", "authorization_status", "retry_action")},
+        )
+        with _LOCK:
+            if _STATE.get("batch_id", "") == batch_id:
+                if outcome in ("success", "synced", "skipped"):
+                    _STATE["success"] += 1  # Old clients count existing RTs as success.
+                elif outcome == "failed":
+                    _STATE["failed"] += 1
+                _STATE["results"].append(result)
+                _STATE["done"] += 1
+        _append_rt_history(email, {
+            "at": datetime.now().isoformat(timespec="seconds"),
+            "status": result.get("status", outcome), "outcome": outcome,
+            "skipped": outcome == "skipped", "batch_id": batch_id, "options": copy.deepcopy(options),
+            "rt": str(result.get("refresh_token") or "")[:600],
+            "phone": str(result.get("phone") or ""), "error": result.get("error") or "",
+            "logs": _clip_history_logs(result.get("logs") or steps),
+            "phone_attempts": list(result.get("phone_attempts") or attempts),
+            **{key: result.get(key) for key in ("action", "relay_status", "relay_file", "authorization_status", "retry_action")},
+        })
+
+    return result
+
+
 def _run_batch(
     records: list, sms_cfg: dict, concurrency: int = 1,
     batch_id: str = "", stop_event: threading.Event | None = None,
@@ -1234,120 +1748,23 @@ def _run_batch(
                 ]
             _sms_counts_locked()
 
+    if options.get("source_registration_batch_id"):
+        stop_event = _AutomaticSmsStop(stop_event)
+
     def _handle(rec: dict) -> None:
-        with _LOCK:
-            if _STATE.get("batch_id", "") != batch_id:
-                return
-        email = str(rec.get("email") or "").strip()
-        steps: list = []
-        attempts: list = []
-        result: dict = {}
-        outcome = "failed"
-        action = {"action": "blocked", "relay_status": "missing", "relay_file": ""}
-        try:
-            if stop_event.is_set():
-                raise _SmsCancelled("停止时尚未执行")
-            rec = _current_sms_record(rec)
-            _set_sms_item(email, batch_id, status="active", stage="preparing", message="正在检查账号")
-            issue = _sms_account_issue(rec)
-            if issue in ("not_found", "deactivated"):
-                raise RuntimeError("选中账号在库中不存在" if issue == "not_found" else "账号已停用，无法接码")
-            strategy = (options.get("account_actions") or {}).get(email) or _run_strategy(options.get("strategy"), bool(options.get("force")))
-            current_context = _current_relay_context(rec, context)
-            action = _relay_action(rec, strategy, current_context)
-            if action["action"] == "blocked":
-                raise _RelayRequiresAuth(action["reason"])
-            if action["action"] == "ready":
-                current = current_context["by_file"][action["relay_file"]]
-                outcome = "skipped"
-                _log(f"{email} | 中转已有匹配完整凭据，未在线验证", batch_id=batch_id)
-                steps.append({
-                    "t": datetime.now().strftime("%H:%M:%S"), "level": "ok",
-                    "m": "中转已有匹配完整凭据，保留中转当前 Token",
-                })
-                result = {
-                    "email": email, "status": "success", "skipped": True,
-                    "refresh_token": str(current["record"].get("refresh_token") or ""), "expires_in": None, "error": "", "phone": "",
-                    "logs": list(steps), "phone_attempts": [],
-                    "action": "ready", "relay_status": "ready", "relay_file": action["relay_file"],
-                    "authorization_status": "reused", "retry_action": "",
-                }
-            elif action["action"] == "sync_only":
-                _set_sms_item(email, batch_id, stage="syncing_relay", message="同步已有凭据到中转，无需接码")
+        _run_sms_record(rec, sms_cfg, batch_id, stop_event, context, options)
 
-                def sync_log(message, level="info"):
-                    _log(f"{email} | {message}", level, batch_id=batch_id)
-                    steps.append({"t": datetime.now().strftime("%H:%M:%S"), "level": level, "m": str(message)[:300]})
-
-                filename, wrote = _sync_existing_relay(rec, current_context, sync_log)
-                outcome = "synced" if wrote else "skipped"
-                saved = read_relay_entry(CLIPROXY_AUTHS_DIR / filename)["record"]
-                result = {
-                    "email": email, "status": "success", "skipped": not wrote,
-                    "refresh_token": str(saved.get("refresh_token") or ""), "expires_in": None, "error": "", "phone": "",
-                    "logs": list(steps), "phone_attempts": [], "action": "sync_only",
-                    "relay_status": "synced" if wrote else "ready", "relay_file": filename,
-                    "authorization_status": "reused", "retry_action": "",
-                }
-            else:
-                result = _process_one(
-                    rec, sms_cfg, steps, stop_event=stop_event, batch_id=batch_id,
-                    phone_attempts=attempts,
-                )
-                outcome = "success" if result.get("status") == "success" else "failed"
-        except Exception as exc:
-            outcome = "cancelled" if isinstance(exc, _SmsCancelled) or stop_event.is_set() else "failed"
-            result = {
-                "email": email, "status": outcome, "refresh_token": "", "expires_in": None,
-                "phone": "", "logs": list(steps), "error": str(exc)[:260],
-                "phone_attempts": list(attempts),
-                "action": action["action"],
-                "authorization_status": "failed" if action["action"] == "reauthorize" else "not_started",
-                "relay_status": "requires_auth" if isinstance(exc, _RelayRequiresAuth) else "failed",
-                "relay_file": action.get("relay_file") or "",
-                "retry_action": "reauthorize" if isinstance(exc, _RelayRequiresAuth) or action["action"] == "reauthorize" else "sync_only",
-            }
-            _log(f"{email} | {'已取消' if outcome == 'cancelled' else '失败'}: {exc}",
-                 "warning" if outcome == "cancelled" else "error", batch_id=batch_id)
-        finally:
-            result.update(batch_id=batch_id, options=copy.deepcopy(options), outcome=outcome)
-            message = {
-                "success": "已重新授权并同步到中转", "synced": "已有凭据已同步到中转", "skipped": "中转已有匹配凭据", "cancelled": result.get("error") or "已取消",
-                "failed": result.get("error") or "执行失败",
-            }[outcome]
-            _set_sms_item(
-                email, batch_id, status=outcome, stage=outcome, message=message,
-                attempt=len(attempts), wait_deadline=None,
-                **{key: result.get(key) for key in ("action", "relay_status", "relay_file", "authorization_status", "retry_action")},
-            )
-            with _LOCK:
-                if _STATE.get("batch_id", "") == batch_id:
-                    if outcome in ("success", "synced", "skipped"):
-                        _STATE["success"] += 1  # Old clients count existing RTs as success.
-                    elif outcome == "failed":
-                        _STATE["failed"] += 1
-                    _STATE["results"].append(result)
-                    _STATE["done"] += 1
-            _append_rt_history(email, {
-                "at": datetime.now().isoformat(timespec="seconds"),
-                "status": result.get("status", outcome), "outcome": outcome,
-                "skipped": outcome == "skipped", "batch_id": batch_id, "options": copy.deepcopy(options),
-                "rt": str(result.get("refresh_token") or "")[:600],
-                "phone": str(result.get("phone") or ""), "error": result.get("error") or "",
-                "logs": _clip_history_logs(result.get("logs") or steps),
-                "phone_attempts": list(result.get("phone_attempts") or attempts),
-                **{key: result.get(key) for key in ("action", "relay_status", "relay_file", "authorization_status", "retry_action")},
-            })
-
+    batch_failed = False
     try:
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="codex-sms") as pool:
             futures = [pool.submit(_handle, rec) for rec in records]
             for future in as_completed(futures):
                 future.result()
     except Exception as exc:
+        batch_failed = True
         _log(f"接码批次异常终止: {exc}", "error", batch_id=batch_id)
     finally:
-        _finish_batch(batch_id)
+        _finish_batch(batch_id, failed=batch_failed)
 
 # ---------------------------------------------------------------------------
 # SMS provider configuration stored under config.yaml ``sms_code``
@@ -1355,7 +1772,7 @@ def _run_batch(
 
 class SmsConfigUpdate(BaseModel):
     enabled: bool = False
-    provider: str = Field(default="smsbower", max_length=20)
+    provider: Literal["smsbower"] = "smsbower"
     api_key: str = Field(default="", max_length=200)
     service: str = Field(default="dr", max_length=30)
     # 国家×档位组合串(国家=档位|档位, 多国逗号分隔)远超百字符,
@@ -1365,29 +1782,14 @@ class SmsConfigUpdate(BaseModel):
     timeout_seconds: int = Field(default=180, ge=30, le=1800)
     max_price: str = Field(default="", max_length=20)
     max_phone_attempts: int = Field(default=0, ge=0)
-    firefox_api_name: str = Field(default="", max_length=120)
-    firefox_api_password: str = Field(default="", max_length=120)
-    firefox_api_token: str = Field(default="", max_length=200)
-    firefox_docking_code: str = Field(default="", max_length=120)
-    firefox_did: str = Field(default="", max_length=60)
-    firefox_item_id: str = Field(default="1096", max_length=20)
-    firefox_country_order: str = Field(default="usa, chl, eng", max_length=2000)
 
 
 def _sms_config_section(cfg: dict) -> dict:
     raw = cfg.get("sms_code") if isinstance(cfg.get("sms_code"), dict) else {}
     provider = str(raw.get("provider") or "smsbower").strip().lower()
-    if provider in {"firefox.fun", "firefox_sms", "huohuli", "火狐狸"}:
-        provider = "firefox"
-    if provider not in {"smsbower", "firefox"}:
-        provider = "smsbower"
     countries = raw.get("country_order", "6, 4, 151")
     if isinstance(countries, (list, tuple)):
         countries = ", ".join(str(c) for c in countries)
-    ff_countries = raw.get("firefox_country_order", "usa, chl, eng")
-    if isinstance(ff_countries, (list, tuple)):
-        ff_countries = ", ".join(str(c) for c in ff_countries)
-
     def _int(value, default):
         try:
             return int(value)
@@ -1395,27 +1797,15 @@ def _sms_config_section(cfg: dict) -> dict:
             return default
 
     return {
-        "enabled": bool(raw.get("enabled")),
+        "enabled": provider == "smsbower" and bool(raw.get("enabled")),
         "provider": provider,
-        "api_key": str(raw.get("api_key") or ""),
+        "api_key": str(raw.get("api_key") or "") if provider == "smsbower" else "",
         "service": str(raw.get("service") or "dr"),
         "country_order": str(countries),
         "poll_interval_ms": _int(raw.get("poll_interval_ms"), 5000),
         "timeout_seconds": _int(raw.get("timeout_seconds"), 180),
         "max_price": str(raw.get("max_price") or ""),
         "max_phone_attempts": parse_phone_attempt_limit(raw.get("max_phone_attempts")),
-        "firefox_api_name": str(raw.get("firefox_api_name") or ""),
-        "firefox_api_password": str(raw.get("firefox_api_password") or ""),
-        "firefox_api_token": str(raw.get("firefox_api_token") or ""),
-        "firefox_docking_code": str(raw.get("firefox_docking_code") or ""),
-        "firefox_did": str(raw.get("firefox_did") or ""),
-        "firefox_item_id": str(raw.get("firefox_item_id") or "1096"),
-        "firefox_country_order": str(ff_countries),
-        "firefox_docking_code_history": [
-            str(item).strip()
-            for item in raw.get("firefox_docking_code_history") or []
-            if str(item).strip()
-        ],
     }
 
 # SMSBower country id -> (english name, chinese name, calling code).
@@ -1611,12 +2001,13 @@ async def sms_countries(provider: str = "smsbower"):
         cfg = _state()._read_config()
         section = _sms_config_section(cfg)
         want = str(provider or "smsbower").strip().lower()
+        if want != "smsbower" or section["provider"] != "smsbower":
+            raise HTTPException(400, "此接码渠道已移除，请先配置 SMSBower")
         import time as _time
 
         cache_payload = _SMS_COUNTRIES_CACHE.get("payload")
         if (
-            want != "firefox"
-            and cache_payload is not None
+            cache_payload is not None
             and _SMS_COUNTRIES_CACHE.get("version") == 2
             and _time.time() - _SMS_COUNTRIES_CACHE["at"] < 60
         ):
@@ -1624,44 +2015,6 @@ async def sms_countries(provider: str = "smsbower"):
             cached["cached"] = True
             return cached
         try:
-            if want == "firefox":
-                settings = SmsSettings.from_mapping(section)
-                from urllib.parse import urlencode
-                from urllib.request import Request, urlopen
-
-                query = {"act": "PagCountry"}
-                token = settings.firefox_api_token
-                if token:
-                    query["token"] = token
-                request = Request(
-                    settings.firefox_api_url + "?" + urlencode(query),
-                    headers={"User-Agent": "codex-oauth-local/1.0"},
-                )
-                with urlopen(request, timeout=30) as response:
-                    body = response.read().decode("utf-8", "replace").strip()
-                import json as _json
-
-                data = _json.loads(body)
-                rows = data.get("data") if isinstance(data, dict) else data
-                out = []
-                for item in rows or []:
-                    if not isinstance(item, dict):
-                        continue
-                    country_id = str(item.get("Country_ID") or item.get("id") or "").strip()
-                    if not country_id:
-                        continue
-                    out.append(
-                        {
-                            "id": country_id,
-                            "name": str(item.get("Country_Title") or country_id),
-                            "calling": "+" + str(item.get("Country_Area") or "").lstrip("+"),
-                            "count": 0,
-                            "price": "",
-                        }
-                    )
-                out.sort(key=lambda row: row["name"])
-                return {"ok": True, "provider": "firefox", "items": out}
-            # smsbower default branch
             api_key = str(section.get("api_key") or "")
             if not api_key:
                 raise HTTPException(400, "请先保存 SMSBower API Key")
@@ -1689,11 +2042,17 @@ async def sms_countries(provider: str = "smsbower"):
                         if not isinstance(info, dict):
                             continue
                         try:
+                            raw_price = info.get("price")
+                            if raw_price is None or isinstance(raw_price, bool) or not str(raw_price).strip():
+                                continue
+                            tier_price = float(raw_price)
+                            if not math.isfinite(tier_price) or tier_price <= 0:
+                                continue
                             tiers.append(
                                 {
                                     "id": str(info.get("provider_id") or pid),
                                     "count": int(info.get("count") or 0),
-                                    "price": float(info.get("price") or 0),
+                                    "price": tier_price,
                                 }
                             )
                         except (TypeError, ValueError):
@@ -1724,6 +2083,15 @@ async def sms_countries(provider: str = "smsbower"):
                 price_info = (prices.get(str(cid)) or {}).get("dr") or {}
                 count = int(price_info.get("count") or 0) if isinstance(price_info, dict) else 0
                 price = str(price_info.get("cost") or "") if isinstance(price_info, dict) else ""
+                tiers = tier_map.get(str(cid)) or []
+                available_prices = [tier["price"] for tier in tiers if tier["count"] > 0]
+                if not tiers and count > 0:
+                    try:
+                        fallback_price = float(price)
+                        if math.isfinite(fallback_price) and fallback_price > 0:
+                            available_prices = [fallback_price]
+                    except (TypeError, ValueError):
+                        pass
                 out.append(
                     {
                         "id": str(cid),
@@ -1731,7 +2099,8 @@ async def sms_countries(provider: str = "smsbower"):
                         "calling": calling,
                         "count": count,
                         "price": price,
-                        "tiers": tier_map.get(str(cid)) or [],
+                        "min_price": format(min(available_prices), ".12g") if available_prices else None,
+                        "tiers": tiers,
                     }
                 )
             out.sort(key=lambda row: (-row["count"], row["name"]))
@@ -1753,23 +2122,9 @@ async def sms_config_get():
         cfg = _state()._read_config()
         section = _sms_config_section(cfg)
         settings = SmsSettings.from_mapping(section)
-        public = dict(section)
+        public = settings.public_mapping()
         public["api_key"] = ""
-        public["firefox_api_password"] = ""
-        public["firefox_api_token"] = ""
-        public["has_api_key"] = bool(settings.api_key)
-        public["api_key_masked"] = _state()._mask_secret(settings.api_key) if settings.api_key else ""
-        public["has_firefox_token"] = bool(settings.firefox_api_token)
-        public["firefox_api_token_masked"] = (
-            _state()._mask_secret(settings.firefox_api_token) if settings.firefox_api_token else ""
-        )
-        public["provider_label"] = settings.provider_label
-        public["configured"] = settings.credentials_configured
-        public["firefox_docking_code_history"] = [
-            str(item).strip()
-            for item in section.get("firefox_docking_code_history") or []
-            if str(item).strip()
-        ]
+        public["country_order"] = section["country_order"]
         return public
 
     return await asyncio.to_thread(_do)
@@ -1781,27 +2136,13 @@ async def sms_config_update(body: SmsConfigUpdate):
         with _state()._edit_config() as cfg:
             current = cfg.setdefault("sms_code", {})
             api_key = str(body.api_key or "").strip()
-            firefox_password = str(body.firefox_api_password or "").strip()
-            firefox_token = str(body.firefox_api_token or "").strip()
+            if str(current.get("provider") or "smsbower").lower() != "smsbower" and not api_key:
+                raise HTTPException(400, "旧接码渠道已移除，请填写新的 SMSBower API Key")
             if api_key:
                 current["api_key"] = api_key
-            if firefox_password:
-                current["firefox_api_password"] = firefox_password
-            if firefox_token:
-                current["firefox_api_token"] = firefox_token
-            new_docking_code = str(body.firefox_docking_code or "").strip()
-            if new_docking_code:
-                # Keep a recency-ordered history of docking codes so the
-                # operator can switch back to a previously used country+item
-                # pair without digging through the provider console again.
-                history = [
-                    str(item).strip()
-                    for item in current.get("firefox_docking_code_history") or []
-                    if str(item).strip()
-                ]
-                history = [item for item in history if item != new_docking_code]
-                history.insert(0, new_docking_code)
-                current["firefox_docking_code_history"] = history[:20]
+            for key in list(current):
+                if key.startswith("firefox_") or key == "token":
+                    current.pop(key, None)
             current.update(
                 {
                     "enabled": bool(body.enabled),
@@ -1812,11 +2153,6 @@ async def sms_config_update(body: SmsConfigUpdate):
                     "timeout_seconds": body.timeout_seconds,
                     "max_price": str(body.max_price or ""),
                     "max_phone_attempts": body.max_phone_attempts,
-                    "firefox_api_name": str(body.firefox_api_name or ""),
-                    "firefox_docking_code": str(body.firefox_docking_code or ""),
-                    "firefox_did": str(body.firefox_did or ""),
-                    "firefox_item_id": str(body.firefox_item_id or "1096"),
-                    "firefox_country_order": str(body.firefox_country_order or "usa, chl, eng"),
                 }
             )
         return {"ok": True}
@@ -1848,40 +2184,41 @@ async def sms_config_test():
     return await asyncio.to_thread(_do)
 
 
-@router.delete("/api/sms-config/docking-history")
-async def sms_config_clear_docking_history():
-    """清空火狐狸历史对接码(演示/过期条目会一直挂在选择列表里)。"""
-
-    def _do():
-        with _state()._edit_config() as cfg:
-            section = cfg.setdefault("sms_code", {})
-            removed = len(
-                [
-                    item
-                    for item in section.get("firefox_docking_code_history") or []
-                    if str(item).strip()
-                ]
-            )
-            section["firefox_docking_code_history"] = []
-        return {"ok": True, "removed": removed}
-
-    return await asyncio.to_thread(_do)
-
-
 # ---------------------------------------------------------------------------
 # Batch run endpoints
 
 
 
 def _parse_credential_lines(text: str) -> list:
+    from common.totp import totp_code
+
     creds: list = []
-    for raw in str(text or "").splitlines():
+    seen: set[str] = set()
+    errors: list[str] = []
+    for line_number, raw in enumerate(str(text or "").splitlines(), 1):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        parts = line.split("----", 2)
-        if len(parts) == 3 and all(part.strip() for part in parts):
-            creds.append((parts[0].strip(), parts[1].strip(), parts[2].strip()))
+        parts = [part.strip() for part in line.split("----")]
+        if len(parts) != 3 or not all(parts):
+            errors.append(f"第 {line_number} 行格式错误")
+            continue
+        email, password, secret = parts
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+            errors.append(f"第 {line_number} 行邮箱格式错误")
+            continue
+        try:
+            totp_code(secret, timestamp=0)
+        except ValueError:
+            errors.append(f"第 {line_number} 行 2FA 密钥不是有效 Base32")
+            continue
+        if email.casefold() in seen:
+            errors.append(f"第 {line_number} 行邮箱重复")
+            continue
+        seen.add(email.casefold())
+        creds.append((email, password, "".join(secret.split()).upper()))
+    if errors:
+        raise HTTPException(400, "；".join(errors[:10]) + ("；还有其他错误行" if len(errors) > 10 else ""))
     return creds
 
 
@@ -2042,7 +2379,7 @@ def _persist_imported_account(
     """
     from common.account_health import check_account
     from common.account_store import upsert_account_record
-    from common.team_workspace import validate_team_session
+    from common.team_workspace import validate_personal_session, validate_team_session
 
     require_team = account.get("import_account_type") == "team"
     selected_workspace_id = str(tokens.get("selected_workspace_id") or "").strip()
@@ -2057,6 +2394,15 @@ def _persist_imported_account(
     if not access_token:
         raise RuntimeError("协议登录未返回 AT")
     login_identity = _validate_import_identity(account, tokens)
+    personal_identity = None
+    if not require_team:
+        personal_identity = validate_personal_session(
+            tokens, selected_workspace_id=selected_workspace_id,
+        )
+        # A direct callback has no chooser step. Pin the actual personal
+        # workspace nevertheless, so the health/refresh step cannot switch it.
+        selected_workspace_id = personal_identity["account_id"]
+        log(f"个人导入会话已确认，开始核对测活结果 · 套餐={personal_identity['plan_type'] or '未知'}")
     refreshed = {
         **account,
         "access_token": access_token,
@@ -2092,9 +2438,13 @@ def _persist_imported_account(
         "selected_workspace_id",
         "selected_workspace_name",
         "workspace_selection_verified",
+        "selected_workspace_metadata",
+        "selected_workspace_evidence_source",
     ):
         if key in tokens:
             refreshed[key] = tokens[key]
+    if personal_identity is not None:
+        refreshed["selected_workspace_id"] = selected_workspace_id
     try:
         checked = check_account(refreshed, persist=False, path=_state().ACCOUNTS_FILE)
     except Exception as exc:
@@ -2122,6 +2472,13 @@ def _persist_imported_account(
             expected_user_id=team_identity["user_id"],
         )
         log(f"Team 导入测活套餐={checked.get('plan_type') or '?'}，最终工作区套餐={verified['plan_type']}，允许入库")
+    else:
+        verified = validate_personal_session(
+            checked,
+            selected_workspace_id=selected_workspace_id,
+            expected_user_id=personal_identity["user_id"],
+        )
+        log(f"个人空间验证通过 · 套餐={verified['plan_type'] or '未知'}，允许入库")
     return upsert_account_record(checked, _state().ACCOUNTS_FILE, create=True)
 
 
@@ -2180,13 +2537,14 @@ def _import_one(
         captured_errors.append(str(message))
 
     if stop_event.is_set():
+        result["status"] = "cancelled"
         result["error"] = "任务已停止"
         log("任务已停止，账号未执行", "warning")
         result["logs"] = account_logs
         return result
 
     try:
-        from proxy_util import normalize_proxy_url, resolve_proxy_pool
+        from proxy_util import normalize_proxy_url, resolve_proxy_pool, is_proxy_transport_error, is_cloudflare_block_error, is_rate_limit_error
         from register.protocol_runtime import ProtocolRuntimeSettings
 
         cfg = _state()._read_config()
@@ -2199,27 +2557,37 @@ def _import_one(
         proxy = proxies[max(0, index - 1) % len(proxies)] if proxies else ""
         runtime = ProtocolRuntimeSettings.from_config(registration)
         runtime = runtime.with_deadline(time.monotonic() + runtime.account_timeout)
-        log("协议登录启动(密码 + TOTP)")
-        tokens = login_with_password_totp_one(
-            index,
-            email=email,
-            password=password,
-            totp_secret=totp,
-            proxy=proxy,
-            workspace_name=str(workspace or "").strip(),
-            require_team_workspace=account_type == "team",
-            stop_check=stop_event.is_set,
-            error_sink=error_sink,
-            account_log_sink=account_log_sink,
-            proxy_config=proxy_cfg,
-            protocol_runtime=runtime,
-        )
-        if not tokens or not str(tokens.get("access_token") or "").strip():
-            # The real failure reason arrives via error_sink; keep the generic
-            # text only as a fallback.
-            raise RuntimeError(
-                captured_errors[-1] if captured_errors else "协议登录未取得访问凭证"
+        for attempt in range(2):
+            if stop_event.is_set():
+                raise JobCancelled("stop requested")
+            captured_errors.clear()
+            log(f"协议登录启动(密码 + TOTP)，第 {attempt + 1}/2 次尝试")
+            tokens = login_with_password_totp_one(
+                index, email=email, password=password, totp_secret=totp, proxy=proxy,
+                workspace_name=str(workspace or "").strip(),
+                require_team_workspace=account_type == "team", stop_check=stop_event.is_set,
+                require_personal_workspace=account_type != "team",
+                error_sink=error_sink, account_log_sink=account_log_sink,
+                proxy_config=proxy_cfg, protocol_runtime=runtime,
             )
+            if tokens and str(tokens.get("access_token") or "").strip():
+                break
+            reason = captured_errors[-1] if captured_errors else "协议登录未取得访问凭证"
+            if stop_event.is_set() and reason.strip().lower() in {"stop requested", "任务已停止", "任务已取消"}:
+                raise JobCancelled(reason)
+            retryable = (
+                is_proxy_transport_error(reason)
+                and not is_cloudflare_block_error(reason)
+                and not is_rate_limit_error(reason)
+                and not re.search(r"(?:http[_ :=-]*|status[=: ]+)40[137]|incorrect_code|invalid_auth_step", reason, re.I)
+            )
+            if attempt or not retryable:
+                raise RuntimeError(reason)
+            log("本次连接未完成，等待 1 秒后进行最后一次登录尝试", "warning")
+            if stop_event.wait(1.0):
+                raise JobCancelled("stop requested")
+        if stop_event.is_set():
+            raise JobCancelled("stop requested")
         account = {
             "email": email,
             "password": password,
@@ -2253,6 +2621,7 @@ def _import_one(
             }
         )
     except JobCancelled:
+        result["status"] = "cancelled"
         result["error"] = "任务已停止"
         log("任务已停止", "warning")
     except Exception as exc:
@@ -2275,8 +2644,8 @@ def _run_import_batch(
 
     stop_event = stop_event if stop_event is not None else _STOP
     batch_id = batch_id or str(_STATE.get("batch_id") or "")
-    # 并发不设硬上限，实际并行数不超过待导入账号数
-    workers = max(1, min(int(concurrency or 1), len(creds) or 1))
+    workers = max(1, min(int(concurrency or 1), len(creds) or 1, _MAX_IMPORT_CONCURRENCY))
+    batch_failed = False
     try:
         with ThreadPoolExecutor(
             max_workers=workers, thread_name_prefix="import"
@@ -2303,6 +2672,8 @@ def _run_import_batch(
                         _STATE["results"].append(result)
                         if result.get("status") == "success":
                             _STATE["success"] += 1
+                        elif result.get("status") == "cancelled":
+                            _STATE["cancelled"] = int(_STATE.get("cancelled") or 0) + 1
                         else:
                             _STATE["failed"] += 1
                 _append_import_history(
@@ -2318,9 +2689,10 @@ def _run_import_batch(
                     }
                 )
     except Exception as exc:
+        batch_failed = True
         _log(f"导入批次异常终止: {exc}", "error", batch_id=batch_id)
     finally:
-        _finish_batch(batch_id)
+        _finish_batch(batch_id, failed=batch_failed)
 
 
 class CodexOauthImportRequest(BaseModel):
@@ -2329,8 +2701,7 @@ class CodexOauthImportRequest(BaseModel):
     # 套餐(free/plus/pro/team)由登录后测活自动识别，不由导入时指定。
     account_type: str = Field(default="personal", max_length=16)
     workspace: str = Field(default="", max_length=128)
-    # 同时进行协议登录的账号数(不设上限,实际并发不超过账号数)
-    concurrency: int = Field(default=1, ge=1)
+    concurrency: int = Field(default=1, ge=1, le=_MAX_IMPORT_CONCURRENCY)
 
 
 @router.post("/api/codex-oauth/import")
@@ -2369,13 +2740,13 @@ async def codex_oauth_import(body: CodexOauthImportRequest):
             f"导入任务启动:{len(creds)} 个账号 · 协议登录(密码+TOTP) · {plan} · 并发 {min(concurrency, len(creds))}",
             batch_id=batch_id,
         )
-        return {"ok": True, "total": len(creds)}
+        return {"ok": True, "total": len(creds), "batch_id": batch_id, "concurrency": min(concurrency, len(creds))}
 
     return await asyncio.to_thread(_do)
 
 
 class SmsRunOptions(BaseModel):
-    provider: Literal["smsbower", "firefox"] | None = None
+    provider: Literal["smsbower"] | None = None
     country_order: str | None = Field(default=None, max_length=4000)
     max_price: str | float | None = Field(default=None)
     max_phone_attempts: int | None = Field(default=None, ge=0)
@@ -2409,7 +2780,7 @@ def _current_sms_record(previous: dict) -> dict:
     current_id = session_identity(current)
     if old_id["user_id"] and current_id["user_id"] and old_id["user_id"] != current_id["user_id"]:
         raise RuntimeError("账号用户身份在等待期间改变，未继续操作")
-    for field in ("selected_workspace_id", "selected_workspace_name", "workspace_name", "import_account_type"):
+    for field in ("selected_workspace_id", "selected_workspace_name", "workspace_name", "import_account_type", "selected_workspace_metadata", "selected_workspace_evidence_source"):
         if previous.get(field) != current.get(field):
             raise RuntimeError("账号工作区在等待期间改变，请重新选择账号")
     return current
@@ -2459,6 +2830,8 @@ def _relay_action(rec: dict, strategy: str, context: dict) -> dict:
     if strategy == "sync_only":
         return {**action, "reason": reason, "relay_status": "requires_auth"}
     if issue == "missing_credentials":
+        if _record_mailbox(rec) is not None:
+            return {**action, "action": "reauthorize", "reason": "账号未设密码，将通过邮箱验证码重新授权"}
         return {**action, "reason": "需要重新授权，但账号缺少密码或 2FA 密钥", "relay_status": "requires_auth"}
     return {**action, "action": "reauthorize", "reason": "按所选策略重新授权" if strategy == "reauthorize" else reason}
 
@@ -2466,10 +2839,12 @@ def _relay_action(rec: dict, strategy: str, context: dict) -> dict:
 def _effective_sms_config(cfg: dict, options: SmsRunOptions | dict | None = None) -> dict:
     """Copy only supported run settings; credentials always come from saved config."""
     section = dict(_sms_config_section(cfg))
+    if str(section.get("provider") or "smsbower") != "smsbower":
+        raise HTTPException(400, "此接码渠道已移除，请先重新配置 SMSBower API Key")
     override = options.model_dump(exclude_none=True) if isinstance(options, SmsRunOptions) else dict(options or {})
     if override.get("provider") is not None:
-        if override["provider"] not in {"smsbower", "firefox"}:
-            raise HTTPException(400, "未知接码渠道")
+        if override["provider"] != "smsbower":
+            raise HTTPException(400, "此接码渠道已移除，仅支持 SMSBower")
         section["provider"] = override["provider"]
     provider = str(section.get("provider") or "smsbower")
     for key in ("max_phone_attempts", "timeout_seconds"):
@@ -2483,14 +2858,9 @@ def _effective_sms_config(cfg: dict, options: SmsRunOptions | dict | None = None
                 section[key] = override[key]
     if "country_order" in override:
         countries = str(override["country_order"] or "").strip()
-        if provider == "firefox":
-            dock_country = parse_firefox_docking_code(str(section.get("firefox_docking_code") or ""))[0]
-            if countries and countries != dock_country:
-                raise HTTPException(400, "火狐狸国家由已保存的对接码固定，请在接码设置中更换对接码")
-        else:
-            if not countries or not _country_specs({"country_order": countries, "provider": provider}):
-                raise HTTPException(400, "请填写有效的国家/档位顺序")
-            section["country_order"] = countries
+        if not countries or not _country_specs({"country_order": countries, "provider": provider}):
+            raise HTTPException(400, "请填写有效的国家/档位顺序")
+        section["country_order"] = countries
     if "max_price" in override:
         price = str(override["max_price"] if override["max_price"] is not None else "").strip()
         if price:
@@ -2500,12 +2870,7 @@ def _effective_sms_config(cfg: dict, options: SmsRunOptions | dict | None = None
                 raise HTTPException(400, "每号最高价必须为正数") from None
             if not math.isfinite(number) or number <= 0:
                 raise HTTPException(400, "每号最高价必须为正数")
-        if provider == "firefox" and price:
-            raise HTTPException(400, "火狐狸对接码接口未确认支持限价，请先在供应商端确认价格")
         section["max_price"] = price
-    if provider == "firefox":
-        # Do not imply that the supplier enforces an undocumented price field.
-        section["max_price"] = ""
     return section
 
 
@@ -2513,8 +2878,6 @@ def _safe_sms_settings(sms_cfg: dict) -> dict:
     settings = SmsSettings.from_mapping(sms_cfg)
     provider = settings.provider
     country_order = str(sms_cfg.get("country_order") or "6, 4, 151")
-    if provider == "firefox":
-        country_order = parse_firefox_docking_code(str(sms_cfg.get("firefox_docking_code") or ""))[0]
     return {
         "provider": provider, "provider_label": settings.provider_label,
         "enabled": settings.enabled, "configured": settings.credentials_configured,
@@ -2522,6 +2885,29 @@ def _safe_sms_settings(sms_cfg: dict) -> dict:
         "max_phone_attempts": parse_phone_attempt_limit(getattr(settings, "max_phone_attempts", sms_cfg.get("max_phone_attempts"))),
         "timeout_seconds": int(getattr(settings, "timeout_seconds", sms_cfg.get("timeout_seconds") or 180)),
         "price_cap_supported": provider == "smsbower",
+    }
+
+
+def _mail_wait_config() -> dict:
+    """Mail config view with a 45s per-segment OTP wait (4 segments = 180s)."""
+    source = _state()._read_config().get("mail")
+    config = dict(source if isinstance(source, dict) else {})
+    config["wait_timeout"] = 45
+    config.setdefault("wait_chunk", 20)
+    config.setdefault("request_timeout", 30)
+    return config
+
+
+def _record_mailbox(rec: dict) -> dict | None:
+    """Resolve the receivable mailbox binding stored on an account record."""
+    provider = normalize_provider_type(str(rec.get("provider_type") or rec.get("source_type") or ""))
+    ref = str(rec.get("mailbox_provider_ref") or "").strip()
+    if provider not in CANONICAL_PROVIDER_TYPES or not ref:
+        return None
+    return {
+        "address": str(rec.get("email") or "").strip(),
+        "provider": provider,
+        "provider_ref": ref,
     }
 
 
@@ -2621,6 +3007,7 @@ def _start_sms_batch(
     wanted: set[str], force: bool = False, concurrency: int = 1,
     sms_options: SmsRunOptions | dict | None = None,
     strategy: str | None = None, account_actions: dict | None = None,
+    source_registration_batch_id: str = "",
 ) -> dict:
     """按选中邮箱启动接码批次。force 时忽略已有 RT 全部重跑。"""
     sms_cfg = _effective_sms_config(_state()._read_config(), sms_options)
@@ -2631,6 +3018,14 @@ def _start_sms_batch(
     if len(preflight["not_found"]) == len(wanted):
         raise HTTPException(404, "选中账号在库中不存在")
     settings = SmsSettings.from_mapping(sms_cfg)
+    if source_registration_batch_id:
+        from common.registration_sms_followup import queue
+
+        if _automatic_sms_stopping() or not queue().may_start(source_registration_batch_id):
+            raise HTTPException(400, "自动接码已停止")
+        safe_settings = preflight["settings"]
+        if not safe_settings["enabled"] or not safe_settings["configured"]:
+            raise HTTPException(400, "自动接码需要已启用且配置完整的短信渠道")
     batch_id = "codex-" + hashlib.sha256(str(time.time_ns()).encode()).hexdigest()[:16]
     stop_event = _reserve_batch("codex", len(picked), batch_id)
     workers = max(1, min(int(concurrency or 1), len(picked) or 1))
@@ -2640,6 +3035,8 @@ def _start_sms_batch(
         "strategy": strategy, "account_actions": actions,
         "sms_options": {key: safe[key] for key in ("provider", "country_order", "max_price", "max_phone_attempts", "timeout_seconds")},
     }
+    if source_registration_batch_id:
+        options["source_registration_batch_id"] = source_registration_batch_id
     with _LOCK:
         _STATE.update(options=options, force=options["force"], concurrency=workers)
         _STATE["items"] = [
@@ -2651,6 +3048,16 @@ def _start_sms_batch(
             for rec in picked
         ]
         _sms_counts_locked()
+    if source_registration_batch_id:
+        # Persist ownership before launch: even an immediate worker completion
+        # must be associated with the right registration batch exactly once.
+        if _automatic_sms_stopping() or not queue().started(source_registration_batch_id, batch_id):
+            stop_event.set()
+            with _LOCK:
+                if _STATE.get("batch_id") == batch_id:
+                    _STATE["status"] = "stopping"
+            _finish_batch(batch_id)
+            raise HTTPException(400, "自动接码已停止")
     _launch_batch(
         _run_batch, (picked, sms_cfg, concurrency, batch_id, stop_event, context),
         batch_id=batch_id, stop_event=stop_event, name="codex-oauth-batch",
@@ -2924,6 +3331,7 @@ async def codex_oauth_import_history(limit: int = 200):
 
 @router.post("/api/codex-oauth/stop")
 async def codex_oauth_stop():
+    cancel_registration_sms_followup()
     with _LOCK:
         batch_id = str(_STATE.get("batch_id") or "")
         running = bool(_STATE.get("running"))

@@ -34,6 +34,17 @@ test('saved price cap is displayed and edited numeric input is submitted as a st
   assert.equal(h.hasUnsavedChanges.value, true);
 });
 
+test('SMS settings submit only supported provider fields', () => {
+  const h = settings();
+  h.ops.smsConfig.firefox_api_token = 'synthetic-obsolete-key';
+  h.ops.smsConfig.firefox_docking_code = 'synthetic-obsolete-code';
+  const body = h.buildBody();
+  assert.equal(body.provider, 'smsbower');
+  assert.ok(Object.keys(body).every((key) => !key.startsWith('firefox')));
+  assert.doesNotMatch(JSON.stringify(body), /synthetic-obsolete/);
+  assert.equal(Object.hasOwn(h.form, 'firefoxToken'), false);
+});
+
 test('invalid price and fractional phone limit stop before saving settings', async () => {
   const h = settings();
   h.form.maxPrice = '-1';
@@ -61,9 +72,9 @@ test('zero means unlimited and positive phone limits are not capped at twenty', 
   assert.throws(() => h.buildBody(), /非负整数/);
 });
 
-test('switching unsaved provider clearly retains saved provider for balance query', async () => {
+test('editing unsaved credentials retains the saved configuration for balance query', async () => {
   const h = settings();
-  h.form.provider = 'firefox';
+  h.form.apiKey = 'synthetic-unsaved-key';
   assert.equal(h.hasUnsavedChanges.value, true);
   assert.equal(h.savedProviderLabel.value, 'SMSBower');
   await h.testBalance();
@@ -84,10 +95,10 @@ function operations(api) {
 }
 
 test('balance retains actual queried provider, amount and timestamp', async () => {
-  const ops = operations({ testSmsConfig: async () => ({ ok: true, message: 'ok', provider: 'firefox', provider_label: '火狐狸', checked_at: '2026-09-11T01:00:00Z', balance: { balance: '12.34', points: '50' } }) });
+  const ops = operations({ testSmsConfig: async () => ({ ok: true, message: 'ok', provider: 'smsbower', provider_label: 'SMSBower', checked_at: '2026-09-11T01:00:00Z', balance: { balance: '12.34', points: '50' } }) });
   ops.smsConfig = { provider: 'smsbower', provider_label: 'SMSBower' };
   await ops.testSms();
-  assert.equal(ops.smsBalance.provider, 'firefox');
+  assert.equal(ops.smsBalance.provider, 'smsbower');
   assert.equal(ops.smsBalance.amount, '12.34');
   assert.equal(ops.smsBalance.points, '50');
   assert.equal(ops.smsBalance.checkedAt, '2026-09-11T01:00:00Z');
@@ -96,7 +107,7 @@ test('balance retains actual queried provider, amount and timestamp', async () =
 
 test('balance failure clears old amount and remains visible instead of leaving stale success', async () => {
   const ops = operations({ testSmsConfig: async () => ({ ok: false, message: 'rate limited' }) });
-  ops.smsConfig = { provider: 'firefox', provider_label: '火狐狸' };
+  ops.smsConfig = { provider: 'smsbower', provider_label: 'SMSBower' };
   ops.smsBalance = { amount: '99', error: '' };
   await ops.testSms();
   assert.equal(ops.smsBalance.amount, '');

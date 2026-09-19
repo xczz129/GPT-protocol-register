@@ -55,7 +55,8 @@ const latestFailures = computed(() => {
     const key = entry.email.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
-    if (entry.outcome === "failed" && (!query.value.trim() || key.includes(query.value.trim().toLowerCase()))) failures.push(entry);
+    const provider = entry.options?.sms_options?.provider;
+    if ((!provider || provider === "smsbower") && entry.outcome === "failed" && (!query.value.trim() || key.includes(query.value.trim().toLowerCase()))) failures.push(entry);
   }
   return failures;
 });

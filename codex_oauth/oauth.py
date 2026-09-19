@@ -231,10 +231,20 @@ def save_auth_record(token: dict, email: str, path: Path) -> dict:
     _atomic_private_json(record, path)
     return record
 
+class OAuthHttpError(RuntimeError):
+    """HTTP diagnostics needed for scheduling, without retaining credentials."""
+    def __init__(self, message: str, *, status_code: int, path: str, retry_after: str = ""):
+        super().__init__(message)
+        self.status_code = status_code
+        self.path = path
+        self.retry_after = retry_after
+
+
 class ProtocolClient:
     """纯 HTTP OAuth 流程客户端；不依赖浏览器自动化。"""
-    def __init__(self, email: str, timeout: int = 30, proxy: str = ""):
+    def __init__(self, email: str, timeout: int = 30, proxy: str = "", *, request_guard=None):
         self.email, self.timeout = email, timeout
+        self.request_guard = request_guard
         self.session = Session(impersonate="chrome")
         self.proxy = str(proxy or "").strip()
         if self.proxy:
@@ -258,6 +268,11 @@ class ProtocolClient:
             # curl-cffi versions with a restricted cookie jar still accept the
             # device id through the explicit request header below.
             pass
+
+    def _before_request(self) -> None:
+        guard = getattr(self, "request_guard", None)
+        if callable(guard):
+            guard()
 
     @staticmethod
     def _auth_cookie(cookies: Any, name: str) -> Any:
@@ -345,6 +360,7 @@ class ProtocolClient:
             return None
         phone_navigation = urlparse(current).path.rstrip("/") == "/add-phone"
         for _ in range(6):
+            self._before_request()
             response = self.session.get(
                 current,
                 allow_redirects=False,
@@ -374,6 +390,7 @@ class ProtocolClient:
             if status in (403, 503) and self._is_edge_challenge(response):
                 # 与 bootstrap 相同的 Cloudflare 兜底:按表单 POST 重放
                 form = dict(parse_qsl(urlparse(current).query, keep_blank_values=True))
+                self._before_request()
                 response = self.session.post(
                     current,
                     data=form,
@@ -426,6 +443,7 @@ class ProtocolClient:
         return any(marker in detail for marker in ("just a moment", "cloudflare", "cf-chl-"))
 
     def bootstrap(self):
+        self._before_request()
         try:
             self.consent_probe()
         except Exception:
@@ -453,6 +471,7 @@ class ProtocolClient:
                 "x-openai-document-navigation-id": self.navigation_id,
                 "oai-device-id": self.device_id,
             }
+            self._before_request()
             response = self.session.get(current, allow_redirects=False,
                                         timeout=self.timeout, headers=headers)
             self._update_navigation(response)
@@ -471,6 +490,7 @@ class ProtocolClient:
                     "Origin": "https://auth.openai.com",
                     "Referer": current,
                 })
+                self._before_request()
                 response = self.session.post(current, data=form, allow_redirects=False,
                                              timeout=self.timeout, headers=post_headers)
                 self._update_navigation(response)
@@ -489,8 +509,12 @@ class ProtocolClient:
         self._sync_auth_cookies()
 
     def post_json(self, path: str, payload: dict):
+        # The guard must precede Sentinel as well as the account POST.
+        self._before_request()
         referers = {
             "/api/accounts/authorize/continue": "https://auth.openai.com/log-in-or-create-account",
+            "/api/accounts/passwordless/send-otp": "https://auth.openai.com/log-in/password",
+            "/api/accounts/email-otp/validate": "https://auth.openai.com/email-verification",
             "/api/accounts/password/verify": "https://auth.openai.com/log-in/password",
             "/api/accounts/mfa/issue_challenge": "https://auth.openai.com/log-in/password",
             "/api/accounts/mfa/verify": "https://auth.openai.com/mfa-challenge",
@@ -510,6 +534,8 @@ class ProtocolClient:
                    "sec-fetch-dest": "empty"}
         if path == "/api/accounts/authorize/continue":
             headers["openai-sentinel-token"] = self.sentinel_header("authorize_continue")
+        elif path == "/api/accounts/email-otp/validate":
+            headers["openai-sentinel-token"] = self.sentinel_header("email_otp_validate")
         elif path == "/api/accounts/password/verify":
             headers["openai-sentinel-token"] = self.sentinel_header("password_verify")
         elif path == "/api/accounts/phone-otp/validate":
@@ -519,13 +545,19 @@ class ProtocolClient:
         # compatibility fallback, so stale data here could make a phone-send
         # response look like a completed OTP step.
         self.last_auth_response = {}
+        self._before_request()
         r = self.session.post("https://auth.openai.com" + path, json=payload,
                               allow_redirects=False, timeout=self.timeout,
                               headers=headers)
         self._update_navigation(r)
         if r.status_code >= 400:
             detail = self._response_detail(r)
-            raise RuntimeError(f"HTTP {r.status_code} {path}: {detail}")
+            headers = getattr(r, "headers", None) or {}
+            retry_after = str(headers.get("Retry-After") or headers.get("retry-after") or "")
+            raise OAuthHttpError(
+                f"HTTP {r.status_code} {path}: {detail}",
+                status_code=int(r.status_code), path=path, retry_after=retry_after,
+            )
         # Recent auth responses carry a fresh, minimized session object in
         # JSON even when the cookie jar is not updated on every step.  Keep a
         # private copy so workspace/MFA resolution remains consistent across
@@ -561,6 +593,7 @@ class ProtocolClient:
         }
         r = None
         for attempt in range(3):
+            self._before_request()
             try:
                 r = self.session.post(
                     "https://sentinel.openai.com/backend-api/sentinel/req",
@@ -595,6 +628,14 @@ class ProtocolClient:
     def verify_password(self, password: str):
         self.post_json("/api/accounts/password/verify", {"password": password})
 
+    def send_passwordless_otp(self):
+        # OpenAI auto-sends the code after the email step; a replay
+        # only answers 409 invalid_state, which callers tolerate.
+        return self.post_json("/api/accounts/passwordless/send-otp", {})
+
+    def verify_email_otp(self, code: str):
+        return self.post_json("/api/accounts/email-otp/validate", {"code": code})
+
     def issue_mfa_challenge(self, challenge_id: str):
         return self.post_json("/api/accounts/mfa/issue_challenge", {
             "id": challenge_id, "type": "totp", "force_fresh_challenge": False,
@@ -618,6 +659,7 @@ class ProtocolClient:
 
     def consent_probe(self) -> None:
         """Prime the consent route used by the current auth redirect chain."""
+        self._before_request()
         response = self.session.get(
             "https://auth.openai.com/sign-in-with-chatgpt/codex/consent.data"
             "?_routes=SIGN_IN_WITH_CHATGPT_CODEX_CONSENT",
@@ -751,6 +793,7 @@ class ProtocolClient:
                 return location
             if location.startswith("/"): location = "https://auth.openai.com" + location
             if not location: raise RuntimeError("workspace redirect missing")
+            self._before_request()
             nxt = self.session.get(location, allow_redirects=False, timeout=self.timeout)
             self._update_navigation(nxt)
             location = nxt.headers.get("location", "")

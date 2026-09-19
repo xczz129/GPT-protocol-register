@@ -91,6 +91,16 @@ test("SMS API carries only explicit per-run settings and preserves the history d
   assert.equal(history.history["a@example.test"][0].status, "success");
 });
 
+test("SMS API and retries reject retired provider options before any network call", async () => {
+  const h = harness();
+  const sms_options = { provider: "firefox", country_order: "usa" };
+  assert.throws(() => h.api.codexRun(["old@example.test"], 100, false, sms_options), /历史查看/);
+  assert.throws(() => h.api.preflightCodex({ emails: ["old@example.test"], sms_options }), /历史查看/);
+  h.store.codex.value = status({ results: [{ email: "old@example.test", status: "failed" }], options: { concurrency: 3, force: false, sms_options } });
+  await assert.rejects(h.store.retryCodexFailed(), /历史查看/);
+  assert.equal(h.calls.length, 0);
+});
+
 test("closing the modal keeps monitoring and refreshes accounts exactly once at completion", async () => {
   const h = harness();
   let accountsReloads = 0, unrelatedReloads = 0;
@@ -247,7 +257,7 @@ test("SMS retry selects failures only and preserves original settings when anoth
     { email: "cancel@example.test", status: "cancelled" },
     { email: "pending@example.test", status: "pending" },
   ] });
-  const options = { concurrency: 4, force: true, sms_options: { provider: "firefox", country_order: "usa", max_phone_attempts: 1, timeout_seconds: 60 } };
+  const options = { concurrency: 4, force: true, sms_options: { provider: "smsbower", country_order: "6", max_phone_attempts: 1, timeout_seconds: 60 } };
   Object.assign(h.store.lastCodexOptions, options);
   h.store.openCodexStart(["next@example.test"], false);
   h.store.codexStartOpen.value = false;
@@ -314,7 +324,7 @@ test("import retry requires every selected credential row and excludes stopped o
     { email: "stop@example.test", status: "failed", error: "任务已停止" },
     { email: "ok@example.test", status: "success" },
   ] });
-  h.store.lastImportLines.value.set("a@example.test", "a@example.test----synthetic-password----synthetic-totp");
+  h.store.lastImportLines.value.set("a@example.test", "a@example.test----synthetic-password----JBSWY3DPEHPK3PXP");
   assert.equal(h.store.canRetryImport(), false);
   assert.equal(h.store.canRetryImport("a@example.test"), true);
   assert.equal(h.store.canRetryImport("stop@example.test"), false);
@@ -323,7 +333,7 @@ test("import retry requires every selected credential row and excludes stopped o
   h.responses.push({ ok: true, batch_id: "import-retry" }, status({ mode: "import", batch_id: "import-retry" }));
   await h.store.retryImportFailed("a@example.test");
   assert.equal(h.calls[0].path, "/api/codex-oauth/import");
-  assert.equal(JSON.parse(h.calls[0].options.body).text, "a@example.test----synthetic-password----synthetic-totp");
+  assert.equal(JSON.parse(h.calls[0].options.body).text, "a@example.test----synthetic-password----JBSWY3DPEHPK3PXP");
 });
 
 test("a lost launch response reconciles the actual server job before exposing a retry", async () => {

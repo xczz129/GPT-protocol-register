@@ -3,7 +3,7 @@
 import { computed, ref, watch } from "vue";
 import { History, ScrollText, Search, Users } from "@lucide/vue";
 import AppModal from "../../components/ui/AppModal.vue";
-import { fetchImportHistory, type ImportHistoryEntry } from "../../api/batchops";
+import { cancelledImportResult, fetchImportHistory, type ImportHistoryEntry } from "../../api/batchops";
 import { useUiStore } from "../../stores/ui";
 
 const props = defineProps<{ open: boolean }>();
@@ -38,6 +38,7 @@ interface BatchGroup {
   items: ImportHistoryEntry[];
   success: number;
   failed: number;
+  cancelled: number;
 }
 
 const batches = computed<BatchGroup[]>(() => {
@@ -57,12 +58,14 @@ const batches = computed<BatchGroup[]>(() => {
         items: [],
         success: 0,
         failed: 0,
+        cancelled: 0,
       };
       byId.set(id, group);
       groups.push(group);
     }
     group.items.push(entry);
     if (entry.status === "success") group.success += 1;
+    else if (cancelledImportResult(entry)) group.cancelled += 1;
     else group.failed += 1;
   }
   return groups;
@@ -106,17 +109,18 @@ function logClass(level: string) {
           <Users v-if="group.accountType === 'team'" :size="12" />
           {{ group.accountType === 'team' ? `Team${group.workspace ? `「${group.workspace}」` : ""}` : "个人" }}
           · 共 {{ group.items.length }} · 成功 {{ group.success }} · 失败 {{ group.failed }}
+          · 取消 {{ group.cancelled }}
         </span>
       </div>
       <div
         v-for="(item, index) in group.items"
         :key="`${group.id}-${item.email}-${index}`"
-        :class="['account-row', item.status === 'success' ? 'ok' : 'bad']"
+        :class="['account-row', item.status === 'success' ? 'ok' : cancelledImportResult(item) ? 'cancelled' : 'bad']"
       >
         <div class="account-main">
           <b>{{ item.email }}</b>
-          <small :class="{ 'error-text': item.status !== 'success' }">
-            {{ item.status === 'success' ? '导入成功' : (item.error || '导入失败') }}
+          <small :class="{ 'error-text': item.status !== 'success' && !cancelledImportResult(item) }">
+            {{ item.status === 'success' ? '导入成功' : cancelledImportResult(item) ? '已取消' : (item.error || '导入失败') }}
           </small>
         </div>
         <button v-if="(item.logs || []).length" class="log-toggle" type="button" @click="toggle(group.id, item, index)">
@@ -198,6 +202,7 @@ function logClass(level: string) {
 
 .account-row.ok { border-left: 3px solid var(--success); }
 .account-row.bad { border-left: 3px solid var(--error); }
+.account-row.cancelled { border-left: 3px solid var(--text-muted); }
 
 .account-main {
   flex: 1;

@@ -972,6 +972,7 @@ def login_with_password_totp_one(
     proxy: str = "",
     workspace_name: str = "",
     require_team_workspace: bool = False,
+    require_personal_workspace: bool = False,
     stop_check: Callable[[], bool] | None = None,
     task_event=None,
     error_sink: Callable[[str], None] | None = None,
@@ -1030,6 +1031,7 @@ def login_with_password_totp_one(
                     index,
                     workspace_name=workspace_name,
                     require_team_workspace=require_team_workspace,
+                    **({"require_personal_workspace": True} if require_personal_workspace else {}),
                 )
                 break
             except RuntimeError as error:
@@ -1123,7 +1125,7 @@ def login_with_password_totp_one(
             reason = _redact_operation_error(error, password, totp_secret, limit=240)
             log(
                 f"任务{index} 当前代理传输失败，本次耗时{cost:.1f}s，"
-                f"代理={proxy_brief(proxy)}，原因: {reason}；调度器将切换代理重试",
+                f"代理={proxy_brief(proxy)}，原因: {reason}",
                 "yellow",
             )
         else:
@@ -1131,10 +1133,9 @@ def login_with_password_totp_one(
         if callable(task_event):
             task_event(
                 index,
-                "running" if transport_error and not stop() else "failed",
-                **({"step": "当前代理连接失败，等待切换下一条代理"}
-                   if transport_error and not stop()
-                   else {"error": safe_error[:300], "step": safe_error[:160]}),
+                "failed",
+                error=safe_error[:300],
+                step="当前连接失败，本次登录未完成" if transport_error else safe_error[:160],
             )
         return None
     finally:
@@ -1398,6 +1399,99 @@ def change_totp_one(
         _TASK_EVENT.reset(event_token)
 
 
+
+
+def login_email_code_one(
+    index: int,
+    *,
+    email: str,
+    mail_config: dict[str, Any],
+    provider_type: str | None = None,
+    proxy: str = "",
+    stop_check: Callable[[], bool] | None = None,
+    task_event=None,
+    error_sink: Callable[[str], None] | None = None,
+    proxy_config: dict[str, Any] | None = None,
+    protocol_runtime: ProtocolRuntimeSettings | None = None,
+) -> dict[str, Any]:
+    """Re-login one existing passwordless account via its emailed OTP.
+
+    Same persistence contract as login_with_password_totp_one: returns the
+    refreshed login record without writing the account store; the caller
+    owns merging it back into the existing account record.
+    """
+    stop = stop_check if callable(stop_check) else (lambda: False)
+    event_token = _TASK_EVENT.set(task_event if callable(task_event) else None)
+    stop_token = _STOP_CHECK.set(stop)
+    email_token = _FIXED_EMAIL.set(email)
+    provider_token = _PROVIDER_TYPE.set(provider_type)
+    mail_config_token = _MAIL_CONFIG.set(dict(mail_config))
+    proxy_config_token = _PROXY_CONFIG.set(dict(proxy_config or {}))
+    runtime_context = activate_runtime(
+        protocol_runtime or ProtocolRuntimeSettings()
+    )
+    runtime_context.__enter__()
+    registrar = None
+    mailbox: dict[str, Any] | None = None
+    try:
+        if stop():
+            raise JobCancelled("stop requested")
+        mailbox = create_mailbox(
+            _FIXED_EMAIL.get(),
+            register_proxy=proxy,
+            allow_used=True,
+        )
+        address = str(mailbox.get("address") or "").strip()
+        if not address:
+            raise RuntimeError("协议登录邮箱池未返回 address")
+        if callable(task_event):
+            task_event(
+                index,
+                "running",
+                proxy=proxy_brief(proxy),
+                email=address,
+                step="邮箱验证码协议登录启动",
+            )
+        registrar = PlatformRegistrar(proxy)
+        tokens = registrar.login(address, mailbox, index)
+        result = registrar.build_login_record(address, mailbox, tokens)
+        _validate_protocol_login_result(result)
+        mark_mailbox_result(mailbox, success=True)
+        log(f"{address} 验证码重新登录成功", "green")
+        if callable(task_event):
+            task_event(index, "success", email=address, step="验证码重新登录完成")
+        return result
+    except JobCancelled:
+        if mailbox is not None:
+            mark_mailbox_result(mailbox, success=False, error="stop requested")
+        raise
+    except Exception as error:
+        if mailbox is not None:
+            mark_mailbox_result(mailbox, success=False, error=error)
+        if callable(error_sink):
+            try:
+                error_sink(str(error))
+            except Exception:
+                pass
+        if callable(task_event):
+            task_event(
+                index,
+                "failed",
+                email=str(email),
+                error=str(error)[:300],
+                step=str(error)[:160],
+            )
+        raise
+    finally:
+        if registrar is not None:
+            registrar.close()
+        runtime_context.__exit__(None, None, None)
+        _PROXY_CONFIG.reset(proxy_config_token)
+        _MAIL_CONFIG.reset(mail_config_token)
+        _PROVIDER_TYPE.reset(provider_token)
+        _FIXED_EMAIL.reset(email_token)
+        _STOP_CHECK.reset(stop_token)
+        _TASK_EVENT.reset(event_token)
 
 
 def login_one(

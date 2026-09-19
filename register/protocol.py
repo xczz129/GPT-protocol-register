@@ -58,6 +58,7 @@ from proxy_util import (
     compute_proxy_retry_limit,
     is_auth_identity_error,
     is_cloudflare_block_error,
+    is_registration_access_denied,
     is_proxy_transport_error,
     is_rate_limit_error,
     normalize_proxy_url,
@@ -208,6 +209,7 @@ from register.protocol_ops import (    # noqa: F401 - 兼容 re-export
     _validate_protocol_login_result,
     change_password_one,
     change_totp_one,
+    login_email_code_one,
     login_one,
     login_with_password_totp_one,
     repair_security_one,
@@ -382,7 +384,7 @@ def register_one(
                     (actual_mailbox or {}).get("_smsbower_api_key"), (actual_mailbox or {}).get("api_key"))
                 trace.set_secrets((actual_mailbox or {}).get("api_key"))
                 persist_partial({"registration_initial_error": initial_detail})
-                if is_rate_limit_error(initial_error):
+                if is_rate_limit_error(initial_error) or is_registration_access_denied(initial_error):
                     raise
                 if (actual_mailbox or {}).get("_registration_identity_created") and not (actual_mailbox or {}).get("_otp_accepted_by_server"):
                     persist_partial({"registration_recovery_state": "awaiting_email_verification",
@@ -483,6 +485,95 @@ def register_one(
         )
         return result
     except (PasswordResetRequired, RegisteredEmailDetected) as error:
+        harvest_record = None
+        if (
+            isinstance(error, RegisteredEmailDetected)
+            and _HARVEST_ENABLED.get()
+            and not stop()
+        ):
+            harvest_mailbox = mailbox_override or (
+                getattr(registrar, "registration_mailbox", None)
+                if registrar is not None
+                else None
+            )
+            if (
+                isinstance(harvest_mailbox, dict)
+                and str(harvest_mailbox.get("address") or "").strip()
+            ):
+                # 打野前清掉「已注册」终态标记，避免收码内部把它当成已终结
+                # 邮箱而影响后续验证码读取。
+                harvest_mailbox.pop("_registration_outcome", None)
+                from register.harvest import harvest_registered_account_sync
+
+                harvest_record = harvest_registered_account_sync(
+                    index,
+                    mailbox=harvest_mailbox,
+                    reg_cfg={},
+                    mail_config=mail_config,
+                    proxy=proxy,
+                    proxy_cfg=proxy_config,
+                    stop_check=stop,
+                    task_event=forwarded_task_event,
+                    protocol_runtime=protocol_runtime,
+                )
+        if (
+            isinstance(harvest_record, dict)
+            and str(harvest_record.get("email") or "").strip()
+            and all(
+                str(harvest_record.get(key) or "").strip()
+                for key in (
+                    "password",
+                    "access_token",
+                    "session_token",
+                    "account_id",
+                    "totp_secret",
+                )
+            )
+            and harvest_record.get("mfa_enabled") is True
+        ):
+            # 打野成功：邮箱验证码已接管该已有账号（新密码 + TOTP 2FA + AT），
+            # 按注册成功收尾，不再执行「已注册跳过」的清理逻辑。
+            harvest_record["group_id"] = str(group_id or "").strip()
+            harvest_record["registration_trace_file"] = trace_file_ref
+            _append_account(dict(harvest_record))
+            cost = time.time() - start
+            with stats_lock:
+                stats["done"] += 1
+                stats["success"] += 1
+                avg = (
+                    time.time() - float(stats.get("start_time") or start)
+                ) / stats["success"]
+            log(
+                f'{harvest_record["email"]} 打野接管成功，本次耗时{cost:.1f}s，'
+                f"全局平均每个号注册耗时{avg:.1f}s",
+                "green",
+            )
+            if emit_account_events:
+                forwarded_task_event(
+                    index,
+                    "success",
+                    email=harvest_record.get("email"),
+                    account_id=harvest_record.get("account_id"),
+                    trace_file=trace_file_ref,
+                    step="打野完成：已接管已有账号（新密码 + 2FA）",
+                )
+            trace.finish(
+                "success",
+                email=harvest_record.get("email"),
+                result=harvest_record,
+                persist_operation=not callable(account_log_sink),
+                secrets=tuple(
+                    harvest_record.get(key)
+                    for key in (
+                        "password",
+                        "totp_secret",
+                        "access_token",
+                        "refresh_token",
+                        "session_token",
+                    )
+                ),
+            )
+            return harvest_record
         if isinstance(error, RegisteredEmailDetected) and partial_account.get("email"):
             # 已注册跳过意味着该身份不是本事务创建的（回收邮箱）；密码阶段写入的
             # 待补全记录没有可用凭据（无密码路由、无 token），留在账号库会误导
@@ -539,6 +630,10 @@ def register_one(
             failure_detail = "username_not_found: " + failure_detail
         if rate_limited and not is_rate_limit_error(failure_detail):
             failure_detail = "auth_rate_limit_exceeded: " + failure_detail
+        if is_cloudflare_block_error(e) and not is_cloudflare_block_error(failure_detail[:300]):
+            # The scheduler receives a bounded error. Keep the classification
+            # even when long request diagnostics push the challenge past it.
+            failure_detail = "cf_blocked: " + failure_detail
         with stats_lock:
             if not transport_error:
                 stats["done"] += 1
@@ -601,11 +696,11 @@ _CF_COOLDOWN_SEC = 300.0
 
 
 def _new_cf_block_state() -> dict[str, Any]:
-    return {"times": [], "lock": threading.Lock()}
+    return {"times": [], "cooldown_until": 0.0, "lock": threading.Lock()}
 
 
 def _note_cf_block(state: dict[str, Any]) -> float:
-    """记录一次 CF 拦截；窗口内达到阈值时清零并返回批次冷却秒数。"""
+    """Record a refusal and pause future dispatch after a burst of blocks."""
     now = time.monotonic()
     with state["lock"]:
         times = state["times"]
@@ -615,8 +710,16 @@ def _note_cf_block(state: dict[str, Any]) -> float:
             times.pop(0)
         if len(times) >= _CF_STRIKE_THRESHOLD:
             times.clear()
+            state["cooldown_until"] = max(
+                state["cooldown_until"], now + _CF_COOLDOWN_SEC,
+            )
             return _CF_COOLDOWN_SEC
     return 0.0
+
+
+def _cf_cooldown_remaining(state: dict[str, Any]) -> float:
+    with state["lock"]:
+        return max(0.0, state["cooldown_until"] - time.monotonic())
 
 
 def worker(index: int) -> dict:
@@ -629,6 +732,18 @@ def worker(index: int) -> dict:
     return {"ok": bool(result), "index": index, "result": result}
 
 
+
+
+_HARVEST_ENABLED = contextvars.ContextVar("protocol_harvest_enabled", default=False)
+
+
+def _is_csrf_cloudflare_challenge(detail: str | None) -> bool:
+    """CSRF fast-path 的 403 挑战页属于出口 IP 信誉问题，可换代理重试。
+
+    与应用层 403 拒绝（api_error_code=access_denied）区分：后者保持终态。
+    """
+    text = str(detail or "")
+    return "chatgpt_csrf_http_403" in text and "cloudflare_challenge" in text
 
 
 async def run_protocol_register(
@@ -646,6 +761,7 @@ async def run_protocol_register(
     group_id: str = "",
     group_plan: list[str] | None = None,
     proxy_config_loader=None,
+    account_ready=None,
 ) -> list[dict[str, Any]]:
     """Run the copied chatgpt2api protocol registrar with this project's pools."""
     from mail import count_pool_capacity, release_stale_in_use
@@ -804,6 +920,7 @@ async def run_protocol_register(
             )
         return latest_cfg, latest_pool, latest_fallback, latest_rotate, latest_offset
     protocol_runtime = ProtocolRuntimeSettings.from_config(reg_cfg)
+    harvest_enabled = _truthy(reg_cfg.get("harvest_registered"))
     with stats_lock:
         stats.update(
             {"done": 0, "success": 0, "fail": 0, "skipped": 0, "start_time": time.time()}
@@ -936,7 +1053,7 @@ async def run_protocol_register(
     async def wait_until_resumed(index: int, task_group_id: str, stop_override=None) -> bool:
         is_stopped = stop_override or stopped
         logged = False
-        while paused():
+        while paused() or _cf_cooldown_remaining(cf_block_state) > 0:
             if is_stopped():
                 return False
             if not logged and callable(task_event):
@@ -944,7 +1061,8 @@ async def run_protocol_register(
                     index,
                     "paused",
                     group_id=task_group_id,
-                    step="任务派发已暂停",
+                    step=("Cloudflare 连续拦截，等待批次冷却后派发"
+                          if _cf_cooldown_remaining(cf_block_state) > 0 else "任务派发已暂停"),
                 )
                 logged = True
             await asyncio.sleep(0.25)
@@ -1126,11 +1244,15 @@ async def run_protocol_register(
                     register_kwargs["mailbox_override"] = mailbox_override
                     register_kwargs["provider_type"] = str(mailbox_override.get("provider") or provider_type or "")
                 attempted_indices.add(index)
-                record = await asyncio.to_thread(
-                    register_one,
-                    index,
-                    **register_kwargs,
-                )
+                harvest_token = _HARVEST_ENABLED.set(harvest_enabled)
+                try:
+                    record = await asyncio.to_thread(
+                        register_one,
+                        index,
+                        **register_kwargs,
+                    )
+                finally:
+                    _HARVEST_ENABLED.reset(harvest_token)
                 if skipped:
                     break
                 if str(attempt_error or "").lower().find(PasswordResetRequired.code) >= 0:
@@ -1138,11 +1260,46 @@ async def run_protocol_register(
                     break
                 if record:
                     break
+                if is_cloudflare_block_error(attempt_error):
+                    cf_cooldown = _note_cf_block(cf_block_state)
+                    if cf_cooldown > 0:
+                        print(
+                            f"  [协议调度] Cloudflare 连续拦截，"
+                            f"后续任务冷却 {cf_cooldown:.0f}s 后派发；当前被拒绝账号已停止"
+                        )
                 if is_auth_identity_error(attempt_error) or is_registration_guard_error(attempt_error):
                     break
                 if is_rate_limit_error(attempt_error):
                     auth_rate_limited.set()
                     break
+                csrf_challenge_retryable = (
+                    _is_csrf_cloudflare_challenge(attempt_error)
+                    and attempt < proxy_retry_limit
+                    and bool(proxy)
+                )
+                if is_registration_access_denied(attempt_error) and not csrf_challenge_retryable:
+                    # An explicit application/edge refusal is not a broken
+                    # transport. Preserve the first failure and stop this
+                    # account instead of rerunning signup on another route.
+                    break
+                if csrf_challenge_retryable:
+                    # CSRF 403 挑战页是出口 IP 信誉问题：冷却当前代理并换代理
+                    # 重试，而不是把任务打成终态失败。
+                    failed_proxies.add(proxy)
+                    cooled = quarantine_proxy(proxy)
+                    print(
+                        f"  [协议调度] 任务{index} CSRF 被 Cloudflare 拦截，"
+                        f"本批次冷却代理 {proxy_brief(proxy)} · 冷却数={cooled}"
+                    )
+                    if callable(task_event):
+                        task_event(
+                            index,
+                            "running",
+                            group_id=task_group_id,
+                            step=f"CSRF 被 Cloudflare 拦截，切换代理重试 {attempt + 2}/{proxy_retry_limit + 1}",
+                        )
+                    await asyncio.sleep(1.0)
+                    continue
                 if "registration_recovery_pending" in attempt_error.lower():
                     # Password completion has its own retry budget. Never feed
                     # this already-created identity back into signup retries.
@@ -1156,26 +1313,6 @@ async def run_protocol_register(
                     # a consumed/closed activation as a fresh registration.
                     break
                 proxy_failed = is_proxy_transport_error(attempt_error)
-                if is_cloudflare_block_error(attempt_error):
-                    cf_cooldown = _note_cf_block(cf_block_state)
-                    if cf_cooldown > 0:
-                        print(
-                            f"  [协议调度] 任务{index} Cloudflare 拦截在"
-                            f"{_CF_STRIKE_WINDOW_SEC:.0f}s 内集中爆发，"
-                            f"整批冷却 {cf_cooldown:.0f}s 后再试（避免加深 IP 风控）"
-                        )
-                        if callable(task_event):
-                            task_event(
-                                index,
-                                "running",
-                                group_id=task_group_id,
-                                step=f"CF 拦截集中爆发，批次冷却 {cf_cooldown:.0f} 秒后继续",
-                            )
-                        cooldown_end = time.monotonic() + cf_cooldown
-                        while time.monotonic() < cooldown_end:
-                            if task_stopped():
-                                break
-                            await asyncio.sleep(min(0.5, cooldown_end - time.monotonic()))
                 alias_pinned = fixed_alias_batch or paired_alias
                 if alias_pinned and not alias_proxy_retryable(attempt_error):
                     break
@@ -1269,6 +1406,8 @@ async def run_protocol_register(
                     step_text="注册完成",
                     group_id_value=task_group_id,
                 )
+                if callable(account_ready):
+                    await account_ready(index, record, stop_check=task_stopped)
                 return
             if not record:
                 if task_stopped() and not is_rate_limit_error(last_error):
@@ -1371,7 +1510,7 @@ async def run_protocol_register(
 
         await run_dynamic_mail_groups(sorted(dynamic_indices), concurrency=conc, mail_config=mail_config, provider_type=provider_type,
                                       run_account=run_allocated, result_at=lambda index: results[index - 1], emit=emit_dynamic,
-                                      stop_check=stopped, pause_check=paused)
+                                      stop_check=stopped, pause_check=lambda: paused() or _cf_cooldown_remaining(cf_block_state) > 0)
     if auth_rate_limited.is_set():
         for index in sorted(set(range(1, n + 1)) - attempted_indices - finished_without_attempt):
             if callable(task_event):
@@ -1824,6 +1963,30 @@ async def run_protocol_relogin(
                 else:
                     break
 
+            if record:
+                # 登录成功:按字段白名单把新凭据合并写回账号库(与面板协议
+                # 重登的持久化语义一致)。身份字段(account_id/user_id)保留
+                # 原账号值,避免工作区共享 ID 覆盖造成账号塌缩。
+                now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                merged = dict(account)
+                for key in (
+                    "access_token", "refresh_token", "id_token", "session_token",
+                    "plan_type", "expires_at", "session", "cookies", "profile",
+                ):
+                    value = record.get(key)
+                    if value:
+                        merged[key] = value
+                merged.update(
+                    {
+                        "health_status": "alive",
+                        "health_error": "",
+                        "health_checked_at": now_iso,
+                        "last_reauthenticated_at": now_iso,
+                        "updated_at": now_iso,
+                    }
+                )
+                upsert_account_record(merged)
+                log(f"{email} 批量重登录成功，新凭据已写回账号库", "green")
             async with result_lock:
                 deactivated = "account_deactivated" in last_error.lower()
                 if deactivated:

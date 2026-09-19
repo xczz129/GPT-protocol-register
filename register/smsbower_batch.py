@@ -58,6 +58,11 @@ def primary_can_start_child(mailbox: dict[str, Any], record: Any) -> bool:
 
 
 ONLINE_DISPOSABLEMAIL_PURCHASE_BLOCK_CODES = {41003, 41004, 41005}
+PAID_ORDER_PERSISTENCE_FAILURE_MESSAGE = "已购订单记录保存失败，停止后续购买，需核对订单"
+
+
+class _PaidOrderPurchasesStopped(RuntimeError):
+    """A queued allocation was stopped before another paid order was purchased."""
 
 
 def is_marketplace_stock_error(error: BaseException) -> bool:
@@ -115,6 +120,27 @@ async def run_dynamic_mail_groups(
     pairs_possible = is_smsbower_selected(provider_type) and smsbower_child_enabled(mail_config)
     width = max(1, int(concurrency or 1) // (2 if pairs_possible else 1))
     marketplace_stock_out = asyncio.Event()
+    paid_order_purchases_halted = threading.Event()
+
+    def paid_mailbox_requests_halt(mailbox: dict[str, Any] | None) -> bool:
+        return bool(
+            mailbox is not None
+            and normalize_provider_type(str(mailbox.get("provider") or "")) == "online_disposablemail"
+            and mailbox.get("_paid_order_purchase_halt_reason") == "cloudflare_challenge"
+        )
+
+    def purchase_mailbox(allocation_config: dict[str, Any]) -> dict[str, Any]:
+        # Check in the owning thread too: other allocations may already be
+        # queued when a paid order fails to persist. A registration failure
+        # belongs to its own task and does not cancel independent queued work.
+        if paid_order_purchases_halted.is_set():
+            raise _PaidOrderPurchasesStopped
+        try:
+            return create_mailbox(allocation_config, provider_type=provider_type)
+        except Exception as error:
+            if getattr(error, "business_error", "") == "paid_order_persistence_failed":
+                paid_order_purchases_halted.set()
+            raise
 
     async def worker() -> None:
         worker_cancelled = threading.Event()
@@ -129,12 +155,12 @@ async def run_dynamic_mail_groups(
                 event.set()
 
         while True:
-            while callable(pause_check) and pause_check() and not cancelled():
+            while callable(pause_check) and pause_check() and not cancelled() and not paid_order_purchases_halted.is_set():
                 await asyncio.sleep(0.2)
             async with claim_lock:
                 if not pending or cancelled():
                     return
-                if marketplace_stock_out.is_set():
+                if marketplace_stock_out.is_set() or paid_order_purchases_halted.is_set():
                     return
                 index = pending.popleft()
                 reserved = pending.popleft() if pairs_possible and pending else None
@@ -180,7 +206,7 @@ async def run_dynamic_mail_groups(
                     if reserved is not None:
                         emit(reserved, "cancelled", step="已停止，子号未分配")
                     return
-                purchase = asyncio.create_task(asyncio.to_thread(create_mailbox, allocation_config, provider_type=provider_type))
+                purchase = asyncio.create_task(asyncio.to_thread(purchase_mailbox, allocation_config))
                 primary, was_cancelled = await _await_owned(purchase, request_cancel)
                 if was_cancelled:
                     raise asyncio.CancelledError
@@ -252,6 +278,11 @@ async def run_dynamic_mail_groups(
                     emit(reserved, "cancelled", step="子号未完成，任务已停止")
                 raise
             except Exception as error:
+                if isinstance(error, _PaidOrderPurchasesStopped):
+                    emit(index, "cancelled", step=PAID_ORDER_PERSISTENCE_FAILURE_MESSAGE)
+                    if reserved is not None:
+                        emit(reserved, "cancelled", step=PAID_ORDER_PERSISTENCE_FAILURE_MESSAGE)
+                    return
                 if primary is None and getattr(error, "business_error", "") == "already_registered":
                     address = str(
                         getattr(error, "activation_address", "")
@@ -265,13 +296,25 @@ async def run_dynamic_mail_groups(
                     )
                     known = {"provider": provider_name, "address": address, "_smsbower_pair_role": "primary"}
                     finish_attempt(begin_attempt(known), "already_registered")
-                    emit(index, "skipped", email=address, skip_reason="already_registered", step="邮箱已在本地登记，已取消并跳过")
+                    detail = (
+                        "邮箱已在本地登记，已购订单已保留并跳过"
+                        if provider_name == "online_disposablemail"
+                        else "邮箱已在本地登记，已取消并跳过"
+                    )
+                    emit(index, "skipped", email=address, skip_reason="already_registered", step=detail)
                     if reserved is not None:
                         emit(reserved, "cancelled" if cancelled() else "skipped", skip_reason="parent_not_registered", step="主号已注册，子号未启动")
                     continue
                 # Provider exceptions already redact their key. Do not serialize
                 # mailbox dictionaries: they contain in-memory credentials.
                 detail = str(error)[:240]
+                paid_order_failed = (
+                    primary is None
+                    and getattr(error, "business_error", "") == "paid_order_persistence_failed"
+                )
+                if paid_order_failed:
+                    paid_order_purchases_halted.set()
+                    detail = PAID_ORDER_PERSISTENCE_FAILURE_MESSAGE
                 if primary is not None:
                     for secret_field in ("_smsbower_api_key", "_odm_api_key"):
                         secret = str(primary.get(secret_field) or "")
@@ -289,17 +332,25 @@ async def run_dynamic_mail_groups(
                 if stock_out:
                     marketplace_stock_out.set()
                 target = reserved if primary_success and reserved is not None else index
+                paid_order_fields = (
+                    {
+                        "email": str(getattr(error, "address", "") or ""),
+                        "paid_order_id": str(getattr(error, "order_id", "") or ""),
+                    }
+                    if paid_order_failed else {}
+                )
                 emit(
                     target,
-                    "failed" if not cancelled() else "cancelled",
+                    "failed" if paid_order_failed or not cancelled() else "cancelled",
                     error=detail,
                     step="邮箱市场当前无可用邮箱，已停止后续邮箱分配" if stock_out else detail,
+                    **paid_order_fields,
                 )
                 if reserved is not None and target != reserved:
-                    emit(reserved, "cancelled" if cancelled() else "skipped", skip_reason="parent_not_registered", step="主号未完成，子号未启动")
+                    emit(reserved, "cancelled" if cancelled() or paid_order_failed else "skipped", skip_reason="parent_not_registered", step=PAID_ORDER_PERSISTENCE_FAILURE_MESSAGE if paid_order_failed else "主号未完成，子号未启动")
             finally:
                 try:
-                    if primary is not None and primary.get("_registration_recovery_pending") and not primary.get("_registration_recovery_attempted") and not cancelled():
+                    if primary is not None and primary.get("_registration_recovery_pending") and not primary.get("_registration_recovery_attempted") and not paid_mailbox_requests_halt(primary) and not cancelled():
                         # Collect the child's code before spending more of the
                         # shared activation window on the primary's token repair.
                         primary["_registration_recovery_only"] = True
@@ -331,7 +382,9 @@ async def run_dynamic_mail_groups(
                 pending.popleft(),
                 "cancelled",
                 step=(
-                    "邮箱市场已无可用邮箱，停止分配"
+                    PAID_ORDER_PERSISTENCE_FAILURE_MESSAGE
+                    if paid_order_purchases_halted.is_set()
+                    else "邮箱市场已无可用邮箱，停止分配"
                     if marketplace_stock_out.is_set()
                     else "已停止，未分配邮箱"
                 ),

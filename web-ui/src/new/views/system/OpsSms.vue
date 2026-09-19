@@ -1,5 +1,5 @@
 <script setup lang="ts">
-/* --- 运维中心 · 接码设置：SMSBower / 火狐狸双渠道 --- */
+/* --- 运维中心 · 接码设置：SMSBower --- */
 import { computed, reactive, ref, watch } from "vue";
 import { Globe } from "@lucide/vue";
 import AppButton from "../../components/ui/AppButton.vue";
@@ -13,12 +13,8 @@ const ui = useUiStore();
 
 const form = reactive({
   enabled: false,
-  provider: "smsbower",
   apiKey: "",
   countryOrder: "6, 4, 151",
-  firefoxApiName: "",
-  firefoxToken: "",
-  dockingCode: "",
   timeoutSeconds: 600,
   maxPhoneAttempts: 0,
   maxPrice: "" as string | number,
@@ -31,10 +27,7 @@ watch(
     if (!cfg || inited) return;
     inited = true;
     form.enabled = !!cfg.enabled;
-    form.provider = String(cfg.provider || "smsbower");
     form.countryOrder = String(cfg.country_order || "6, 4, 151");
-    form.firefoxApiName = String(cfg.firefox_api_name || "");
-    form.dockingCode = String(cfg.firefox_docking_code || "");
     form.timeoutSeconds = Number(cfg.timeout_seconds ?? 600);
     form.maxPhoneAttempts = Number(cfg.max_phone_attempts ?? 0);
     form.maxPrice = String(cfg.max_price || "");
@@ -43,16 +36,13 @@ watch(
 );
 
 const cfg = computed(() => ops.smsConfig);
-const isFirefox = computed(() => form.provider === "firefox");
-const savedProviderLabel = computed(() => cfg.value?.provider_label || "接码平台");
+const savedProviderLabel = computed(() => cfg.value?.provider === "smsbower" ? "SMSBower" : "已停用渠道");
 const hasUnsavedChanges = computed(() => {
   const c = cfg.value;
   if (!c) return false;
-  return !!(form.apiKey.trim() || form.firefoxToken.trim())
-    || form.enabled !== !!c.enabled || form.provider !== c.provider
+  return !!(form.apiKey.trim())
+    || form.enabled !== !!c.enabled || c.provider !== "smsbower"
     || form.countryOrder.trim() !== String(c.country_order || "6, 4, 151").trim()
-    || form.firefoxApiName.trim() !== String(c.firefox_api_name || "").trim()
-    || form.dockingCode.trim() !== String(c.firefox_docking_code || "").trim()
     || String(form.maxPrice ?? "").trim() !== String(c.max_price || "").trim()
     || form.timeoutSeconds !== Number(c.timeout_seconds ?? 600)
     || form.maxPhoneAttempts !== Number(c.max_phone_attempts ?? 0);
@@ -60,22 +50,6 @@ const hasUnsavedChanges = computed(() => {
 const balanceTime = computed(() => {
   const value = ops.smsBalance?.checkedAt;
   return value ? new Date(value).toLocaleString() : "";
-});
-
-/* 历史对接码：当前值置顶 + 去重，最多 20 条 */
-const dockingHistory = computed(() => {
-  const list = cfg.value?.firefox_docking_code_history || [];
-  const current = form.dockingCode.trim();
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const item of list) {
-    const code = String(item || "").trim();
-    if (!code || seen.has(code)) continue;
-    seen.add(code);
-    out.push(code);
-  }
-  if (current && !seen.has(current)) out.unshift(current);
-  return out.slice(0, 20);
 });
 
 /* --- 国家选择器：country_order 支持 id / id:price / id=pid1|pid2 三种 token --- */
@@ -133,7 +107,7 @@ async function openCountryPicker() {
     if (parsed.providerId) picker.providers[parsed.id] = parsed.providerId;
   }
   try {
-    const value = await fetchSmsCountries(form.provider);
+    const value = await fetchSmsCountries();
     picker.items = value.items || [];
     cacheCountryNames(picker.items);
   } catch (err) {
@@ -196,6 +170,7 @@ const countryChips = computed(() =>
 const statusHint = computed(() => {
   const c = cfg.value;
   if (!c) return "";
+  if (c.provider !== "smsbower") return "原接码渠道已停用，请保存 SMSBower 配置后使用";
   if (!c.configured) return "未配置接码凭证";
   return c.enabled ? `已启用 ${c.provider_label || ""}` : `已配置 ${c.provider_label || ""} 但未启用`;
 });
@@ -203,7 +178,7 @@ const statusHint = computed(() => {
 function buildBody(): Record<string, unknown> {
   const c = cfg.value;
   const price = String(form.maxPrice ?? "").trim();
-  if (!isFirefox.value && price && (!Number.isFinite(Number(price)) || Number(price) <= 0)) {
+  if (price && (!Number.isFinite(Number(price)) || Number(price) <= 0)) {
     throw new Error("每号最高价必须是大于 0 的数字，或留空不限价");
   }
   if (!Number.isInteger(form.maxPhoneAttempts) || form.maxPhoneAttempts < 0) {
@@ -211,22 +186,16 @@ function buildBody(): Record<string, unknown> {
   }
   const body: Record<string, unknown> = {
     enabled: form.enabled,
-    provider: form.provider,
+    provider: "smsbower",
     service: c?.service || "dr",
     country_order: form.countryOrder.trim(),
     poll_interval_ms: c?.poll_interval_ms ?? 2000,
     timeout_seconds: form.timeoutSeconds,
-    max_price: isFirefox.value ? c?.max_price || "" : price,
+    max_price: price,
     max_phone_attempts: form.maxPhoneAttempts,
-    firefox_api_name: form.firefoxApiName.trim(),
-    firefox_docking_code: form.dockingCode.trim(),
-    firefox_did: c?.firefox_did || "",
-    firefox_item_id: c?.firefox_item_id || "1096",
-    firefox_country_order: c?.firefox_country_order || "usa, chl, eng",
   };
   // 密钥留空表示沿用已保存值，仅在填写时提交
   if (form.apiKey.trim()) body.api_key = form.apiKey.trim();
-  if (form.firefoxToken.trim()) body.firefox_api_token = form.firefoxToken.trim();
   return body;
 }
 
@@ -234,7 +203,6 @@ async function save() {
   try {
     await ops.saveSmsConfig(buildBody());
     form.apiKey = "";
-    form.firefoxToken = "";
     ui.notify("接码设置已保存", "success");
   } catch (error) {
     ui.notify(error instanceof Error ? error.message : "接码设置保存失败", "error");
@@ -242,6 +210,7 @@ async function save() {
 }
 
 async function testBalance() {
+  if (cfg.value?.provider !== "smsbower") { ui.notify("请先保存 SMSBower 接码配置", "error"); return; }
   try {
     const result = await ops.testSms();
     ui.notify(result.message || (result.ok ? "查询成功" : "查询失败"), result.ok ? "success" : "error");
@@ -250,15 +219,6 @@ async function testBalance() {
   }
 }
 
-async function clearHistory() {
-  if (!(await ui.askConfirm("清空全部历史对接码？", { title: "清空历史", danger: true }))) return;
-  try {
-    await ops.clearDockingHistory();
-    ui.notify("历史对接码已清空", "success");
-  } catch {
-    ui.notify("清空历史失败", "error");
-  }
-}
 </script>
 
 <template>
@@ -270,15 +230,6 @@ async function clearHistory() {
 
     <div class="form-grid">
       <label class="check"><input v-model="form.enabled" type="checkbox" />启用自动接码</label>
-      <label class="field">
-        <span>接码渠道</span>
-        <select v-model="form.provider" class="input">
-          <option value="smsbower">SMSBower</option>
-          <option value="firefox">火狐狸 Firefox</option>
-        </select>
-      </label>
-
-      <template v-if="!isFirefox">
         <label class="field span-2">
           <span>SMSBower API Key</span>
           <input
@@ -306,46 +257,6 @@ async function clearHistory() {
           <input v-model="form.maxPrice" class="input" type="number" min="0" step="0.001" placeholder="留空不限价" />
           <small>取号时使用的价格上限。国家选择器中的价格筛选只影响列表展示。</small>
         </label>
-      </template>
-
-      <template v-else>
-        <label class="field span-2">
-          <span>火狐狸用户名（ApiName）</span>
-          <input v-model="form.firefoxApiName" class="input" type="text" placeholder="ApiName" autocomplete="off" />
-        </label>
-        <label class="field span-2">
-          <span>火狐狸 Token（我的密钥）</span>
-          <input
-            v-model="form.firefoxToken"
-            class="input"
-            type="password"
-            :placeholder="cfg?.has_firefox_token ? `已保存 ${cfg.firefox_api_token_masked}` : 'firefox token'"
-            autocomplete="off"
-          />
-        </label>
-        <label class="field span-2">
-          <span>对接码（一次锁定国家+项目）</span>
-          <input v-model="form.dockingCode" class="input" type="text" placeholder="格式: eng-1096-DEMO01（在火狐狸接码页复制）" />
-        </label>
-        <div v-if="dockingHistory.length" class="span-2 dock-history">
-          <div class="chips">
-            <button
-              v-for="code in dockingHistory"
-              :key="code"
-              type="button"
-              class="chip chip-btn"
-              :class="{ active: code === form.dockingCode.trim() }"
-              :title="`使用 ${code}`"
-              @click="form.dockingCode = code"
-            >{{ code }}</button>
-          </div>
-          <div class="dock-actions">
-            <small>点击历史对接码快速填入</small>
-            <AppButton size="sm" :loading="ops.busy['sms-dock-clear']" @click="clearHistory">清空历史</AppButton>
-          </div>
-        </div>
-      </template>
-
       <label class="field">
         <span>等码超时（秒）</span>
         <input v-model.number="form.timeoutSeconds" class="input" type="number" min="30" max="1800" />
@@ -359,7 +270,7 @@ async function clearHistory() {
 
     <div class="actions">
       <AppButton variant="primary" :loading="ops.busy['sms-save']" @click="save">保存接码设置</AppButton>
-      <AppButton :loading="ops.busy['sms-test']" :disabled="!cfg?.configured || ops.busy['sms-save']" @click="testBalance">查询已保存的 {{ savedProviderLabel }} 余额</AppButton>
+      <AppButton :loading="ops.busy['sms-test']" :disabled="cfg?.provider !== 'smsbower' || !cfg?.configured || ops.busy['sms-save']" @click="testBalance">查询已保存的 {{ savedProviderLabel }} 余额</AppButton>
     </div>
     <p class="hint">{{ statusHint }}</p>
     <p v-if="hasUnsavedChanges" class="draft-hint" role="status">有未保存的更改。余额查询仍使用已保存的 {{ savedProviderLabel }} 配置。</p>
@@ -379,7 +290,6 @@ async function clearHistory() {
 
   <SmsCountryPicker
     :open="picker.open"
-    :provider="form.provider"
     :items="picker.items"
     :selected="picker.selected"
     :providers="picker.providers"
@@ -479,40 +389,6 @@ async function clearHistory() {
   background: var(--glass-bg);
   border: 1px solid var(--glass-border);
   color: var(--text-secondary);
-}
-
-.chip-btn {
-  cursor: pointer;
-  transition: var(--transition-fast);
-}
-
-.chip-btn:hover {
-  border-color: var(--accent-border);
-  color: var(--accent);
-}
-
-.chip-btn.active {
-  background: var(--accent-bg);
-  color: var(--accent);
-  border-color: var(--accent-border);
-}
-
-.dock-history {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.dock-actions {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.dock-actions small {
-  font-size: 0.7rem;
-  color: var(--text-muted);
 }
 
 .actions {

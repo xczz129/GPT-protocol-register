@@ -1079,6 +1079,7 @@ _ACCOUNT_HEALTH_PROGRESS: dict[str, Any] = {
     "invalid": 0,
     "reauth_required": 0,
     "error": 0,
+    "unknown": 0,
     "requested_workers": 0,
     "workers": 0,
     "throttled": False,
@@ -1211,7 +1212,7 @@ def _account_health_checkpoint_restore() -> None:
     done_keys = {str(key) for key in (checkpoint.get("done_keys") or []) if str(key)}
     pending = [key for key in keys if key not in done_keys]
     snapshot = dict(checkpoint.get("snapshot") or {})
-    interrupted = bool(checkpoint.get("running"))
+    interrupted = bool(checkpoint.get("running") or snapshot.get("interrupted"))
     if interrupted:
         message = (
             f"服务重启，测活任务中断：已完成 {snapshot.get('done', 0)} / "
@@ -1280,6 +1281,8 @@ def _start_account_health_progress(
             invalid=0,
             reauth_required=0,
             error=0,
+            unknown=0,
+            stopped=0,
             requested_workers=requested_workers,
             workers=actual_workers,
             throttled=budget_workers < requested_workers,
@@ -1296,7 +1299,7 @@ def _update_account_health_progress(
     done: int, total: int, item: dict[str, Any]
 ) -> None:
     state = normalized_health_status(item) or "error"
-    if state not in {"alive", "limited", "invalid", "reauth_required", "error"}:
+    if state not in {"alive", "limited", "invalid", "reauth_required", "error", "unknown"}:
         state = "error"
     with _ACCOUNT_HEALTH_PROGRESS_LOCK:
         updates_enabled = bool(
@@ -1323,6 +1326,7 @@ def _update_account_health_progress(
             + int(_ACCOUNT_HEALTH_PROGRESS.get("invalid") or 0)
             + int(_ACCOUNT_HEALTH_PROGRESS.get("reauth_required") or 0)
             + int(_ACCOUNT_HEALTH_PROGRESS.get("error") or 0)
+            + int(_ACCOUNT_HEALTH_PROGRESS.get("unknown") or 0)
         )
         if account_is_deactivated(item):
             _ACCOUNT_HEALTH_PROGRESS["deactivated"] = int(
@@ -1389,6 +1393,8 @@ def _finish_account_health_progress(
                 "invalid",
                 "reauth_required",
                 "error",
+                "unknown",
+                "stopped",
             ):
                 if key in result:
                     _ACCOUNT_HEALTH_PROGRESS[key] = max(0, int(result.get(key) or 0))
@@ -1402,21 +1408,28 @@ def _finish_account_health_progress(
     # 正常完成时 pending 恒为空:被跳过的封号账号不会触发 item 回调,
     # 不能把它们算进"剩余可续跑"。
     global _ACCOUNT_HEALTH_CHECKPOINT_KEYS
+    complete = result is not None and not result.get("interrupted")
+    accounted_keys = set(_ACCOUNT_HEALTH_DONE_KEYS)
+    if result is not None:
+        accounted_keys.update(
+            _account_key(item) for item in result.get("skipped_items", [])
+            if isinstance(item, dict)
+        )
+    _ACCOUNT_HEALTH_DONE_KEYS.update(accounted_keys)
     pending = (
         []
-        if result is not None
+        if complete
         else [
             key
             for key in _ACCOUNT_HEALTH_CHECKPOINT_KEYS
-            if key not in _ACCOUNT_HEALTH_DONE_KEYS
+            if key not in accounted_keys
         ]
     )
     with _ACCOUNT_HEALTH_PROGRESS_LOCK:
         _ACCOUNT_HEALTH_PROGRESS["pending_keys"] = pending
         _ACCOUNT_HEALTH_PROGRESS["pending_count"] = len(pending)
-        if result is not None:
-            _ACCOUNT_HEALTH_PROGRESS["interrupted"] = False
-    if result is not None:
+        _ACCOUNT_HEALTH_PROGRESS["interrupted"] = not complete
+    if complete:
         _ACCOUNT_HEALTH_CHECKPOINT_KEYS = []
         _ACCOUNT_HEALTH_DONE_KEYS.clear()
         task_checkpoint.clear_checkpoint(_ACCOUNT_HEALTH_CHECKPOINT_TASK)
@@ -1458,6 +1471,7 @@ threading.Thread(target=_prewarm_config_cache, daemon=True, name="config-prewarm
 from web.routes.security_ops import (  # noqa: E402,F401
     _SECURITY_PASSWORD_MIN_LENGTH,
     _account_requires_protocol_reauth,
+    _account_email_relogin_ready,
     _account_security_operation_label,
     _change_account_password_sync,
     _change_account_totp_sync,
@@ -1593,7 +1607,7 @@ def _maintenance_config(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
         "enabled": bool(raw.get("enabled")),
         "interval_hours": max(1, min(int(raw.get("interval_hours") or 12), 168)),
-        "workers": max(1, min(int(raw.get("workers") or 10), 20)),
+        "workers": max(1, int(raw.get("workers") or 10)),
         "auto_delete_invalid": bool(raw.get("auto_delete_invalid")),
         "webhook_url": str(raw.get("webhook_url") or "").strip(),
         "notify_on_complete": bool(raw.get("notify_on_complete")),
@@ -1718,6 +1732,7 @@ def _run_account_maintenance_sync_impl(*, force: bool = False) -> dict[str, Any]
             completion_callback=_health_progress,
             worker_limit=_account_health_worker_limit,
             proxy_candidates=_current_health_proxy_pool(cfg),
+            stop_check=_SERVER_SHUTDOWN_EVENT.is_set,
         )
     except Exception as exc:
         for account in [*probe_records, *skipped_records]:
@@ -1730,6 +1745,9 @@ def _run_account_maintenance_sync_impl(*, force: bool = False) -> dict[str, Any]
             )
         PROGRESS.finish("account_maintenance", ok=False, message=str(exc))
         raise
+    if result.get("interrupted"):
+        PROGRESS.finish("account_maintenance", ok=False, message="服务退出，维护已停止")
+        return {"ok": False, **result, "deleted": 0}
     checked_by_key = {
         _account_key(item): item
         for item in result.get("items", [])
@@ -1866,6 +1884,20 @@ async def _run_register_async(cfg: dict[str, Any], params: dict[str, Any]):
         value = latest.get("proxy")
         return dict(value) if isinstance(value, dict) else {}
 
+    pipeline = None
+    if params.get("auto_sms_after_register") is True:
+        from common.account_health import check_account
+        from common.registration_pipeline import RegistrationPipeline
+        from register.batch import _truthy
+
+        pipeline = RegistrationPipeline(
+            str(params.get("batch_id") or JOB.batch_id),
+            event_callback=JOB.task_event,
+            stop_check=lambda: _job_should_stop() or _SERVER_SHUTDOWN_EVENT.is_set(),
+            health_check=check_account if _truthy((cfg.get("registration") or {}).get("post_register_health_check"), True) else None,
+            persist=JOB.schedule_persist,
+        )
+
     registration_task = asyncio.create_task(
         run_register(
             cfg,
@@ -1879,13 +1911,14 @@ async def _run_register_async(cfg: dict[str, Any], params: dict[str, Any]):
             stop_check=_job_should_stop,
             pause_check=_job_should_pause,
             cancel_event=cancel_event,
-            task_event=JOB.task_event,
+            task_event=pipeline.registration_event if pipeline is not None else JOB.task_event,
             group_id=str(params.get("group_id") or ""),
             group_plan=params.get("group_plan"),
             # The worker owns the active request, but reads the latest proxy
             # pool before each task/retry so a panel update takes effect
             # without restarting the service.
             proxy_config_loader=latest_proxy_config,
+            **({"account_ready": pipeline.account_ready} if pipeline is not None else {}),
         ),
         name="registration-root",
     )
@@ -1893,10 +1926,24 @@ async def _run_register_async(cfg: dict[str, Any], params: dict[str, Any]):
         JOB._registration_task = registration_task
 
     try:
-        return await registration_task
+        results = await registration_task
+        if pipeline is not None:
+            await pipeline.finish()
+            # SMS may rotate credentials. Return the current stored identity,
+            # never the registration snapshot from before authorization.
+            keys = [_account_key(record) for record in results or []]
+            current = await asyncio.to_thread(_records_by_keys_with_fallback, keys) if keys else {}
+            results = [current.get(_account_key(record)) or record for record in results or []]
+        return results
     except asyncio.CancelledError:
+        if pipeline is not None:
+            pipeline.cancel()
         return []
     finally:
+        if pipeline is not None:
+            if _job_should_stop() or _SERVER_SHUTDOWN_EVENT.is_set():
+                pipeline.cancel()
+            await pipeline.finish()
         if _job_should_stop():
             try:
                 n = await force_close_all_sessions()
@@ -1977,6 +2024,19 @@ async def _cliproxy_quota_loop() -> None:
 async def _shutdown_active_background_jobs() -> None:
     """Request a coordinated stop and wait briefly before the loop closes."""
     waits: list[tuple[str, threading.Thread | None, Any, str]] = []
+    from web.routes.codex_oauth import request_batch_shutdown
+
+    import_thread = request_batch_shutdown()
+    if import_thread is not None and import_thread.is_alive():
+        waits.append(("import/codex", import_thread, None, ""))
+
+    # 邮箱换绑批次同样要协调停止:硬杀 worker 会把目标邮箱留在 in_use、
+    # 账号行残留过期的换绑状态。
+    try:
+        for rebind_thread in ACCOUNT_REBIND_JOBS.request_shutdown():
+            waits.append(("email_rebind", rebind_thread, None, ""))
+    except Exception as error:
+        logger.warning("服务退出时停止邮箱换绑任务失败: %s", str(error)[:160])
 
     with JOB.lock:
         if JOB.running:
@@ -2081,6 +2141,12 @@ async def _app_lifespan(_app: FastAPI):
         thread_name_prefix="web-io",
     )
     loop.set_default_executor(web_executor)
+    from web.routes.codex_oauth import wake_registration_sms_queue
+
+    registration_sms_resume = asyncio.create_task(
+        asyncio.to_thread(wake_registration_sms_queue),
+        name="registration-sms-resume",
+    )
     # Warm the mailbox snapshot in the background so the first authenticated
     # status request does not pay the large trash-file parse cost.
     _PANEL_CACHE_WARM_TASK = asyncio.create_task(
@@ -2097,6 +2163,12 @@ async def _app_lifespan(_app: FastAPI):
         yield
     finally:
         _SERVER_SHUTDOWN_EVENT.set()
+        # The queue checks this shutdown event again before reserving a worker.
+        # Join its local preflight so shutdown cannot race a new SMS batch.
+        try:
+            await registration_sms_resume
+        except Exception:
+            logger.exception("Registration SMS queue resume failed")
         if _PANEL_CACHE_WARM_TASK is not None:
             _PANEL_CACHE_WARM_TASK.cancel()
             try:

@@ -12,6 +12,7 @@ Supported:
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import ipaddress
 import imaplib
@@ -30,7 +31,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from email import message_from_bytes, policy
 from email.header import decode_header, make_header
-from email.utils import parsedate_to_datetime
+from email.utils import getaddresses, parsedate_to_datetime
 from pathlib import Path
 from threading import Lock, RLock
 from typing import Any
@@ -436,6 +437,70 @@ def _has_pending_smsbower_settlement(entry: dict[str, Any] | None) -> bool:
     )
 
 
+def _has_paid_odm_order(entry: dict[str, Any] | None) -> bool:
+    return bool(
+        isinstance(entry, dict)
+        and normalize_provider_type(str(entry.get("provider") or "")) == "online_disposablemail"
+        and str(entry.get("order_id") or entry.get("mail_id") or "").strip()
+    )
+
+
+def _release_local_entry(store: dict[str, dict[str, Any]], address: str) -> bool:
+    """Release a reservation without turning a paid order into unused stock."""
+    entry = store.get(address)
+    if not _has_paid_odm_order(entry):
+        return store.pop(address, None) is not None
+    previous = dict(entry)
+    consumed = entry.get("state") == "used" or entry.get("_prev_state") == "used"
+    entry.pop("_prev_state", None)
+    if consumed:
+        entry["state"] = "used"
+        entry.pop("paid_order_review_required", None)
+    else:
+        entry["state"] = "failed"
+        entry["paid_order_review_required"] = True
+        if not entry.get("reason"):
+            entry["reason"] = "paid_order_retained_pending_review"
+    if entry == previous:
+        return False
+    entry["updated_at"] = datetime.now(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S%z")
+    return True
+
+
+def _record_odm_paid_order(mailbox: dict[str, Any]) -> None:
+    """Append purchase evidence before reservation checks; never store secrets.
+
+    This is an asset journal, not a source of automatically reusable mailboxes.
+    A local release or later purchase of the same address cannot erase an order.
+    """
+    parsed = urlparse(str(mailbox.get("api_base") or ""))
+    host = parsed.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    origin = f"{parsed.scheme}://{host}" if host else ""
+    if parsed.port:
+        origin += f":{parsed.port}"
+    record = {
+        "event": "purchased",
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "provider": "online_disposablemail",
+        "provider_ref": str(mailbox.get("provider_ref") or ""),
+        "api_base": origin,
+        "address": str(mailbox.get("address") or "").strip().lower(),
+        "order_id": str(mailbox.get("order_id") or mailbox.get("mail_id") or "").strip(),
+        "service_id": str(mailbox.get("service_id") or ""),
+        "email_type_id": str(mailbox.get("email_type_id") or ""),
+    }
+    with _mailbox_state_lock:
+        with _with_state_file_lock():
+            path = STATE_FILE.parent / "online_disposablemail_orders.jsonl"
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8", newline="\n") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+
+
 def _set_state(address: str, state: str, reason: str = "") -> None:
     target = str(address or "").strip().lower()
     if not target:
@@ -449,6 +514,16 @@ def _set_state(address: str, state: str, reason: str = "") -> None:
                 for key, value in previous.items()
                 if key not in {"state", "reason", "updated_at", "_prev_state"}
             }
+            if _has_paid_odm_order(previous):
+                if previous.get("state") == "used" or previous.get("_prev_state") == "used":
+                    state = "used"
+                if state == "used":
+                    metadata.pop("paid_order_review_required", None)
+                elif state != "in_use":
+                    # Cooldown expiry is not evidence that a paid address has
+                    # never received an OTP or created a remote identity.
+                    state = "failed"
+                    metadata["paid_order_review_required"] = True
             store[target] = {
                 **metadata,
                 "state": str(state),
@@ -459,7 +534,7 @@ def _set_state(address: str, state: str, reason: str = "") -> None:
 
 
 def _release_state(address: str, *, any_state: bool = False) -> None:
-    """Drop mailbox state so it becomes available again.
+    """Release local occupancy, retaining paid orders for review.
 
     By default only clears ``in_use``. Pass any_state=True to also clear
     failed/token_invalid (used for browser or network infrastructure errors).
@@ -476,6 +551,10 @@ def _release_state(address: str, *, any_state: bool = False) -> None:
             if _has_pending_smsbower_settlement(entry):
                 return
             st = str(entry.get("state") or "")
+            if _has_paid_odm_order(entry):
+                if (st == "in_use" or any_state) and _release_local_entry(store, target):
+                    _save_state_unlocked(store)
+                return
             if st == "in_use":
                 # 预约前是 used（allow_used 复用）的邮箱，释放时恢复 used 而不是
                 # 直接变回 available，否则会被当作全新邮箱重复注册
@@ -765,6 +844,7 @@ def _icloud_payload_messages(data: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _icloud_payload_code_candidates(
     data: dict[str, Any],
+    mailbox: dict[str, Any] | None = None,
 ) -> list[tuple[str, str, datetime | None]]:
     """Return top-level and nested OTP candidates from one API response."""
     candidates: list[tuple[str, str, datetime | None]] = []
@@ -780,10 +860,23 @@ def _icloud_payload_code_candidates(
         seen.add((value, title, received_key))
         candidates.append((value, title, received))
 
-    first_message = _icloud_payload_messages(data)
-    first_subject = first_message[0].get("subject") if first_message else ""
-    add(data.get("code"), first_subject, data.get("received_at"))
-    for raw in first_message:
+    messages = _icloud_payload_messages(data)
+    first_message = messages[0] if messages else data
+    # /code/wait authenticates by the parent key and may return another
+    # recipient's latest code. Bind the top-level code to its message before
+    # applying recipient and timestamp checks; never trust the echoed email.
+    if _icloud_message_matches_mailbox(first_message, mailbox):
+        nested_code = str(first_message.get("code") or first_message.get("otp") or "").strip()
+        if not nested_code or nested_code == str(data.get("code") or ""):
+            add(
+                data.get("code"),
+                first_message.get("subject"),
+                data.get("received_at") or first_message.get("received_at")
+                or first_message.get("date") or first_message.get("timestamp"),
+            )
+    for raw in messages:
+        if not _icloud_message_matches_mailbox(raw, mailbox):
+            continue
         add(
             raw.get("code") or raw.get("otp") or raw.get("verification_code"),
             raw.get("subject"),
@@ -792,6 +885,83 @@ def _icloud_payload_code_candidates(
         parsed = _icloud_message_for_code(raw)
         add(_extract_code(parsed), parsed.get("subject"), parsed.get("received_at"))
     return candidates
+
+
+def _icloud_message_matches_mailbox(
+    message: dict[str, Any], mailbox: dict[str, Any] | None,
+) -> bool:
+    """Require recipient evidence when reading a split slot via its parent."""
+    if not mailbox:
+        return True
+    target = str(mailbox.get("address") or "").strip().lower()
+    if not target:
+        return True
+    values: list[str] = []
+    has_recipient_field = False
+    for key in ("to", "to_addrs", "recipients", "recipient"):
+        value = message.get(key)
+        for item in value if isinstance(value, list) else [value]:
+            if isinstance(item, dict):
+                item = item.get("address") or item.get("email")
+            if item:
+                has_recipient_field = True
+                values.extend(_icloud_recipient_header_values(str(item)))
+    recipients = {
+        address.strip().lower()
+        for _, address in getaddresses(values)
+        if "@" in address
+    }
+    if recipients:
+        base = base_mailbox_address(target)
+        child_recipients = {
+            recipient for recipient in recipients
+            if recipient != base and base_mailbox_address(recipient) == base
+        }
+        if child_recipients:
+            # Forwarded mail may mention both parent and child. The specific
+            # child is the owner; multiple children would be ambiguous.
+            return child_recipients == {target}
+        return target in recipients
+    if has_recipient_field:
+        return False
+    # alias_email is the API's stored owner. A parent owner is insufficient
+    # evidence for a child slot; the response's top-level email is only the
+    # authenticated account and must never be treated as a recipient.
+    owner = str(message.get("alias_email") or "").strip().lower()
+    if owner:
+        return owner == target
+    return target == base_mailbox_address(target)
+
+
+def _icloud_recipient_header_values(value: str) -> list[str]:
+    """Decode legacy API To fields saved as one or more Python string lists.
+
+    The API used ``str(message.get_all(header))`` for each recipient header,
+    producing e.g. ``['child@example.test'] ['parent@example.test']``. Only
+    bounded lists of string literals in a recipient field are accepted.
+    """
+    value = value.strip()
+    if not value.startswith("["):
+        return [value]
+    if len(value) > 8192:
+        return []
+    list_literal = re.compile(r'''\[(?:'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|[\s,])*\]''')
+    result: list[str] = []
+    end = 0
+    for match in list_literal.finditer(value):
+        if value[end:match.start()].strip():
+            return []
+        try:
+            items = ast.literal_eval(match.group())
+        except (ValueError, SyntaxError):
+            return []
+        if not isinstance(items, list) or any(not isinstance(item, str) for item in items):
+            return []
+        result.extend(items)
+        if len(result) > 64:
+            return []
+        end = match.end()
+    return [] if value[end:].strip() else result
 
 
 class OutlookTokenProvider:
@@ -1378,6 +1548,12 @@ class ICloudApiProvider:
 
             tried.add(email_lower)
             login_email = base_mailbox_address(credential["email"])
+            # A manually imported split row must not override the parent
+            # credential when both are present in the same provider pool.
+            inbox_credential = next(
+                (item for item in self.pool if item["email"].strip().lower() == login_email),
+                credential,
+            )
             return {
                 "provider": self.name,
                 "provider_ref": self.provider_ref,
@@ -1386,9 +1562,38 @@ class ICloudApiProvider:
                 "base_address": login_email,
                 "label": self.label,
                 "password": "",  # ChatGPT password is generated by register_gpt
-                "api_key": credential["api_key"],
+                "api_key": inbox_credential["api_key"],
                 "api_base": self.api_base,
             }
+
+    def _api_mailbox_credentials(self, mailbox: dict[str, Any]) -> tuple[str, str]:
+        target = str(mailbox.get("address") or "").strip().lower()
+        email = base_mailbox_address(
+            mailbox.get("login_address") or mailbox.get("base_address") or target
+        )
+        if not email or "@" not in email:
+            raise ICloudApiError("iCloud mailbox missing inbox address")
+        if target and base_mailbox_address(target) != email:
+            raise ICloudApiError("iCloud mailbox inbox address does not match registration address")
+        api_key = str(mailbox.get("api_key") or "").strip()
+        if not api_key:
+            raise ICloudApiError("iCloud mailbox missing api_key")
+        return email, api_key
+
+    @staticmethod
+    def _safe_error(error: object, api_key: str) -> str:
+        # requests exceptions can contain complete query URLs; upstream JSON
+        # can also echo a key outside a query string.
+        return _redact_secrets(error).replace(api_key, "***") if api_key else _redact_secrets(error)
+
+    @staticmethod
+    def _is_hard_error(error: object) -> bool:
+        text = str(error).lower()
+        return any(marker in text for marker in (
+            "api key", "不正确",
+            "invalid key", "unauthorized", "401", "403", "app 专用密码",
+            "app-specific", "填写 icloud",
+        ))
 
     def _after_epoch(self, mailbox: dict[str, Any]) -> int | None:
         boundary = _mailbox_code_boundary(mailbox)
@@ -1405,10 +1610,7 @@ class ICloudApiProvider:
         timeout: int,
         exclude: list[str],
     ) -> dict[str, Any]:
-        api_key = str(mailbox.get("api_key") or "").strip()
-        email = str(mailbox.get("address") or "").strip()
-        if not api_key:
-            raise ICloudApiError("iCloud mailbox missing api_key")
+        email, api_key = self._api_mailbox_credentials(mailbox)
         base = str(mailbox.get("api_base") or self.api_base).rstrip("/")
         api_timeout = max(
             1,
@@ -1483,8 +1685,8 @@ class ICloudApiProvider:
                 last_error = error
                 if request_attempt + 1 >= ICLOUD_WAIT_HTTP_RETRIES:
                     raise ICloudApiError(
-                        f"iCloud wait API request failed: {error}"
-                    ) from error
+                        f"iCloud wait API request failed: {self._safe_error(error, api_key)}"
+                    ) from None
                 params["timeout"] = min(15, api_timeout)
                 http_timeout = max(
                     float(self.conf["request_timeout"]),
@@ -1493,7 +1695,7 @@ class ICloudApiProvider:
                 time.sleep(0.75 * (request_attempt + 1))
         if resp is None:
             raise ICloudApiError(
-                f"iCloud wait API request failed: {_redact_secrets(last_error or 'empty response')}"
+                f"iCloud wait API request failed: {self._safe_error(last_error or 'empty response', api_key)}"
             )
 
         try:
@@ -1505,19 +1707,19 @@ class ICloudApiProvider:
 
         if resp.status_code != 200:
             detail = data.get("error") or data.get("message") or resp.text[:300]
-            raise ICloudApiError(f"iCloud API HTTP {resp.status_code}: {detail}")
+            raise ICloudApiError(f"iCloud API HTTP {resp.status_code}: {self._safe_error(detail, api_key)}")
 
         # Some backends return 200 with ok=false for config errors
         if data.get("ok") is False:
             detail = data.get("error") or data.get("sync_error") or "unknown error"
-            raise ICloudApiError(f"iCloud API error: {detail}")
+            raise ICloudApiError(f"iCloud API error: {self._safe_error(detail, api_key)}")
 
         # sync_error with empty code — treat as soft failure for this poll
         sync_error = str(data.get("sync_error") or "").strip()
         code = str(data.get("code") or "").strip()
         if sync_error and not code and not _icloud_payload_code_candidates(data):
             # e.g. server missing App-specific password — surface clearly
-            raise ICloudApiError(f"iCloud sync_error: {sync_error}")
+            raise ICloudApiError(f"iCloud sync_error: {self._safe_error(sync_error, api_key)}")
 
         return data
 
@@ -1528,8 +1730,7 @@ class ICloudApiProvider:
         exclude: list[str],
     ) -> dict[str, Any]:
         """Read the provider cache when the long-poll response has no body."""
-        api_key = str(mailbox.get("api_key") or "").strip()
-        email = str(mailbox.get("address") or "").strip()
+        email, api_key = self._api_mailbox_credentials(mailbox)
         base = str(mailbox.get("api_base") or self.api_base).rstrip("/")
         params: dict[str, Any] = {
             "key": api_key,
@@ -1553,7 +1754,7 @@ class ICloudApiProvider:
                 timeout=min(10.0, float(self.conf["request_timeout"])),
             )
         except Exception as error:
-            raise ICloudApiError(f"iCloud messages request failed: {_redact_secrets(error)}") from error
+            raise ICloudApiError(f"iCloud messages request failed: {self._safe_error(error, api_key)}") from None
         try:
             data = resp.json()
         except Exception:
@@ -1562,10 +1763,10 @@ class ICloudApiProvider:
             data = {}
         if resp.status_code != 200:
             detail = data.get("error") or data.get("message") or resp.text[:300]
-            raise ICloudApiError(f"iCloud messages HTTP {resp.status_code}: {detail}")
+            raise ICloudApiError(f"iCloud messages HTTP {resp.status_code}: {self._safe_error(detail, api_key)}")
         if data.get("ok") is False:
             detail = data.get("error") or data.get("message") or "unknown error"
-            raise ICloudApiError(f"iCloud messages API error: {detail}")
+            raise ICloudApiError(f"iCloud messages API error: {self._safe_error(detail, api_key)}")
         return data
 
     def wait_for_code(
@@ -1618,19 +1819,8 @@ class ICloudApiProvider:
                 err_text = str(error)
                 mailbox["_last_code_wait_error"] = err_text[:300]
                 # hard config / key errors: re-raise so caller can mark mailbox
-                hard = any(
-                    m in err_text.lower()
-                    for m in (
-                        "api key",
-                        "不正确",
-                        "invalid key",
-                        "unauthorized",
-                        "401",
-                        "403",
-                        "app 专用密码",
-                        "app-specific",
-                        "填写 icloud",
-                    )
+                hard = self._is_hard_error(error) or any(
+                    marker in err_text.lower() for marker in ("mailbox missing", "inbox address")
                 )
                 logger.warning(
                     "[%s] 取码 #%d 失败 %s: %s",
@@ -1639,20 +1829,23 @@ class ICloudApiProvider:
                     mailbox.get("address", "?"),
                     err_text[:200],
                 )
-                if hard and attempt >= 2:
+                if hard:
                     raise
                 data = {}
                 if not hard:
                     try:
                         data = read_messages_cache()
                     except Exception as cache_error:
+                        if isinstance(cache_error, ICloudApiError) and self._is_hard_error(cache_error):
+                            mailbox["_last_code_wait_error"] = str(cache_error)[:300]
+                            raise
                         logger.debug(
                             "[%s] /wait 失败后的 /messages 兜底读取失败 %s: %s",
                             self.name,
                             mailbox.get("address", "?"),
                             str(cache_error)[:200],
                         )
-                if not _icloud_payload_code_candidates(data):
+                if not _icloud_payload_code_candidates(data, mailbox):
                     for _ in range(
                         max(1, int(max(0.2, self.conf["wait_interval"]) * 5))
                     ):
@@ -1661,7 +1854,7 @@ class ICloudApiProvider:
                         time.sleep(0.2)
                     continue
 
-            candidates = _icloud_payload_code_candidates(data)
+            candidates = _icloud_payload_code_candidates(data, mailbox)
             if not any(
                 re.fullmatch(r"\d{6}", code)
                 and code not in exclude
@@ -1679,8 +1872,11 @@ class ICloudApiProvider:
             ):
                 try:
                     cached = read_messages_cache()
-                    candidates.extend(_icloud_payload_code_candidates(cached))
+                    candidates.extend(_icloud_payload_code_candidates(cached, mailbox))
                 except Exception as error:
+                    if isinstance(error, ICloudApiError) and self._is_hard_error(error):
+                        mailbox["_last_code_wait_error"] = str(error)[:300]
+                        raise
                     logger.debug(
                         "[%s] /messages 兜底读取失败 %s: %s",
                         self.name,
@@ -1734,6 +1930,13 @@ class ICloudApiProvider:
                     return code
             # already used — keep waiting with exclude
             # empty / timeout chunk — loop until total wait exhausted
+            # A shared parent's latest code may belong to another child and
+            # return immediately. Pace the next poll instead of busy-looping.
+            pause_until = min(deadline, time.monotonic() + max(0.2, float(self.conf["wait_interval"])))
+            while time.monotonic() < pause_until:
+                if callable(stop_check) and stop_check():
+                    return None
+                time.sleep(min(0.2, max(0.0, pause_until - time.monotonic())))
 
         return None
 
@@ -4033,8 +4236,8 @@ class OnlineDisposableMailProvider:
     business ``code``: 200 is success, 42001 means the verification code has
     not arrived yet, and 42002/42003/42004/42006 mean the order is closed and
     can never deliver. Orders cannot be canceled or completed from the client,
-    so there is no settlement journal: a purchase either yields a mailbox or
-    raises, and terminal cleanup only touches local state.
+    so cleanup only releases local occupancy. Purchase evidence is journaled
+    separately and retained even when reservation or registration fails.
     """
 
     name = "online_disposablemail"
@@ -4538,7 +4741,7 @@ class OnlineDisposableMailProvider:
             with _with_state_file_lock():
                 store = _load_state_unlocked()
                 previous = store.get(target)
-                if not _entry_available(previous):
+                if _has_paid_odm_order(previous) or not _entry_available(previous):
                     current = str((previous or {}).get("state") or "unavailable")
                     raise RuntimeError(
                         f"[{self.label}] OnlineDisposableMail mailbox unavailable: "
@@ -4600,7 +4803,24 @@ class OnlineDisposableMailProvider:
             # Kept in memory only; persistence stores a SHA-256 fingerprint.
             "_odm_api_key": self.api_key,
         }
-        self._reserve_address(address, order_id)
+        try:
+            _record_odm_paid_order(mailbox)
+        except Exception as error:
+            raise OnlineDisposableMailError(
+                "OnlineDisposableMail paid order persistence failed; stop purchasing and reconcile the order",
+                business_error="paid_order_persistence_failed",
+                order_id=order_id,
+                address=address,
+            ) from error
+        try:
+            self._reserve_address(address, order_id)
+        except OSError as error:
+            raise OnlineDisposableMailError(
+                "OnlineDisposableMail paid order reservation persistence failed; purchase journal retained",
+                business_error="paid_order_persistence_failed",
+                order_id=order_id,
+                address=address,
+            ) from error
         return mailbox
 
     def _reuse_existing_binding(self, address: str) -> dict[str, Any] | None:
@@ -6172,6 +6392,8 @@ def create_mailbox(
             mark_mailbox_code_boundary(mailbox, grace_seconds=0)
             return mailbox
         except RuntimeError as error:
+            if isinstance(error, OnlineDisposableMailError) and error.business_error == "paid_order_persistence_failed":
+                raise
             if (
                 isinstance(error, (SmsBowerMailError, OnlineDisposableMailError))
                 and error.business_error == "already_registered"
@@ -6185,6 +6407,8 @@ def create_mailbox(
             last_error = str(error)
             continue
         except Exception as error:
+            if isinstance(error, OnlineDisposableMailError) and error.business_error == "paid_order_persistence_failed":
+                raise
             # 网络层等非 RuntimeError 异常同样换下一个 provider，
             # 避免单个 provider 内部状态（已写 in_use）外泄成未释放预约
             if (
@@ -6355,6 +6579,19 @@ def mark_mailbox_result(
     address = str(mailbox.get("address") or "").strip()
     if not address:
         return
+    if provider == "online_disposablemail" and not success:
+        failure_detail = str(error or "").lower()
+        authorize_challenge = (
+            "chatgpt authorize clearance 重试仍被拦截" in failure_detail
+            and "status=403" in failure_detail
+            and ("<title>just a moment" in failure_detail or "cf-chl-" in failure_detail)
+        )
+        if authorize_challenge or any(marker in failure_detail for marker in (
+            "cloudflare_challenge", "cloudflare challenge", "chatgpt_csrf_http_403",
+        )):
+            # Retain the paid order and block this attempt's deferred recovery.
+            # The legacy marker is local to this mailbox, not a batch stop.
+            mailbox["_paid_order_purchase_halt_reason"] = "cloudflare_challenge"
     if provider in {"smsbower_mail", "online_disposablemail"}:
         outcome = _mail_registration_outcome(mailbox, success, error)
         mailbox["_registration_outcome"] = outcome
@@ -6365,6 +6602,11 @@ def mark_mailbox_result(
             # A purchased address bound to an existing account must never be
             # bought or selected again; the remote order cannot be refunded.
             _set_state(address, "used", "already_registered")
+            return
+        if provider == "online_disposablemail" and (
+            mailbox.get("_otp_accepted_by_server") or mailbox.get("_registration_identity_created")
+        ):
+            _set_state(address, "used", outcome)
             return
     if success and (provider not in {"smsbower_mail", "online_disposablemail"} or outcome != "already_registered"):
         if provider == "smsbower_mail":
@@ -6507,7 +6749,7 @@ def release_mailbox(mailbox: dict) -> None:
         outcome = _mail_registration_outcome(mailbox, False, "cancelled")
         mailbox["_registration_outcome"] = outcome
         _record_mail_registration_outcome(mailbox, outcome)
-        if outcome == "already_registered":
+        if outcome == "already_registered" or mailbox.get("_otp_accepted_by_server") or mailbox.get("_registration_identity_created"):
             _set_state(address, "used", outcome)
             return
     _release_state(address)
@@ -6528,8 +6770,7 @@ def release_all_in_use(*, include_failed: bool = True) -> int:
                     continue
                 st = str(entry.get("state") or "")
                 if st == "in_use" or (include_failed and st == "failed"):
-                    store.pop(email, None)
-                    reset += 1
+                    reset += int(_release_local_entry(store, email))
             if reset:
                 _save_state_unlocked(store)
             return reset
@@ -6557,8 +6798,7 @@ def release_failed_mailboxes(*, include_stale_in_use: bool = True) -> int:
                     and state == "in_use"
                     and _entry_available(entry)
                 ):
-                    store.pop(email, None)
-                    reset += 1
+                    reset += int(_release_local_entry(store, email))
             if reset:
                 _save_state_unlocked(store)
             return reset
@@ -6588,12 +6828,18 @@ def update_mailbox_states(
                     if (not wanted or email.lower() in wanted) and (
                         not allowed_states or state.lower() in allowed_states
                     ) and not _has_pending_smsbower_settlement(entry):
-                        store.pop(email, None)
-                        changed += 1
+                        changed += int(_release_local_entry(store, email))
             elif command in {"failed", "cooldown", "used", "token_invalid"}:
                 for email in wanted:
                     previous = store.get(email) if isinstance(store.get(email), dict) else {}
-                    if str(previous.get("state") or "") != command:
+                    assigned = command
+                    if _has_paid_odm_order(previous):
+                        assigned = "used" if command == "used" or previous.get("state") == "used" or previous.get("_prev_state") == "used" else "failed"
+                    if str(previous.get("state") or "") != assigned or (
+                        _has_paid_odm_order(previous)
+                        and assigned == "failed"
+                        and not previous.get("paid_order_review_required")
+                    ):
                         metadata = {
                             key: value
                             for key, value in previous.items()
@@ -6601,10 +6847,15 @@ def update_mailbox_states(
                         }
                         store[email] = {
                             **metadata,
-                            "state": command,
+                            "state": assigned,
                             "reason": "panel operation",
                             "updated_at": datetime.now(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S%z"),
                         }
+                        if _has_paid_odm_order(previous):
+                            if assigned == "used":
+                                store[email].pop("paid_order_review_required", None)
+                            else:
+                                store[email]["paid_order_review_required"] = True
                         changed += 1
             else:
                 raise ValueError(f"unsupported mailbox state action: {action}")
@@ -6627,7 +6878,7 @@ def release_stale_in_use() -> int:
                 and not _has_pending_smsbower_settlement(entry)
             ]
             for email in stale:
-                store.pop(email, None)
+                _release_local_entry(store, email)
             if stale:
                 _save_state_unlocked(store)
             return len(stale)

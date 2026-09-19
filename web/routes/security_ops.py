@@ -75,6 +75,8 @@ def _persist_reauthenticated_account(
         "device_id",
         "protocol_profile_id",
         "selected_workspace_id",
+        "selected_workspace_metadata",
+        "selected_workspace_evidence_source",
         "selected_workspace_name",
         "workspace_selection_verified",
     ):
@@ -177,6 +179,30 @@ def _protocol_reauth_credentials_ready(account: dict[str, Any]) -> bool:
     )
 
 
+def _account_email_relogin_ready(account: dict[str, Any]) -> bool:
+    """Passwordless personal accounts with a receivable mailbox can re-login by OTP."""
+    if _protocol_reauth_credentials_ready(account):
+        return False
+    if requires_team_workspace(account):
+        return False
+    from mail import CANONICAL_PROVIDER_TYPES, normalize_provider_type
+
+    provider = normalize_provider_type(
+        str(account.get("provider_type") or account.get("source_type") or "")
+    )
+    if str(account.get("mailbox_provider_ref") or "").strip():
+        return provider in CANONICAL_PROVIDER_TYPES
+    email = str(account.get("email") or "").strip().lower()
+    if not email:
+        return False
+    try:
+        cfg = _state()._read_config()
+        mapped = _state()._mailbox_provider_map(cfg).get(email, "")
+    except Exception:
+        return False
+    return normalize_provider_type(mapped) in CANONICAL_PROVIDER_TYPES
+
+
 def _reauthenticate_account_sync(
     account: dict[str, Any],
     mode: str = "protocol",
@@ -186,6 +212,7 @@ def _reauthenticate_account_sync(
     from register.flow import register_one as browser_register_one
     from register.log import _LOG_SINK
     from register.protocol import (
+        login_email_code_one as protocol_email_login_one,
         login_one as protocol_login_one,
         login_with_password_totp_one as protocol_credential_login_one,
     )
@@ -248,7 +275,12 @@ def _reauthenticate_account_sync(
             "reauth",
             secrets=(credential_password, credential_totp),
         )
-        if reauth_mode == "protocol" and (not credential_password or not credential_totp):
+        email_relogin_ready = _account_email_relogin_ready(account)
+        if (
+            reauth_mode == "protocol"
+            and (not credential_password or not credential_totp)
+            and not email_relogin_ready
+        ):
             raise RuntimeError("协议模式重新登录要求账号同时具备已保存密码和 TOTP 2FA")
         _state().JOB.append_log(
             f"[重新登录] 准备 · {email} · 方式={reauth_mode} · "
@@ -351,24 +383,41 @@ def _reauthenticate_account_sync(
                 f"代理={proxy_brief(proxy) if proxy else 'direct'}"
             )
             if reauth_mode == "protocol":
-                tokens = protocol_credential_login_one(
-                    1,
-                    email=email,
-                    password=credential_password,
-                    totp_secret=credential_totp,
-                    proxy=proxy,
-                    stop_check=stop,
-                    task_event=capture_reauth_result,
-                    account_log_sink=account_event_sink,
-                    error_sink=lambda detail: capture_reauth_result(
-                        1, "failed", error=detail
-                    ),
-                    proxy_config=proxy_cfg,
-                    **({
-                        "workspace_name": str(account.get("workspace_name") or account.get("selected_workspace_name") or "").strip(),
-                        "require_team_workspace": True,
-                    } if requires_team_workspace(account) else {}),
-                )
+                if credential_password and credential_totp:
+                    tokens = protocol_credential_login_one(
+                        1,
+                        email=email,
+                        password=credential_password,
+                        totp_secret=credential_totp,
+                        proxy=proxy,
+                        stop_check=stop,
+                        task_event=capture_reauth_result,
+                        account_log_sink=account_event_sink,
+                        error_sink=lambda detail: capture_reauth_result(
+                            1, "failed", error=detail
+                        ),
+                        proxy_config=proxy_cfg,
+                        **({
+                            "workspace_name": str(account.get("workspace_name") or account.get("selected_workspace_name") or "").strip(),
+                            "require_team_workspace": True,
+                        } if requires_team_workspace(account) else {}),
+                    )
+                else:
+                    # Passwordless account with a receivable mailbox:
+                    # refresh the web session with an emailed OTP.
+                    tokens = protocol_email_login_one(
+                        1,
+                        email=email,
+                        mail_config=mail_cfg,
+                        provider_type=provider_type,
+                        proxy=proxy,
+                        stop_check=stop,
+                        task_event=capture_reauth_result,
+                        error_sink=lambda detail: capture_reauth_result(
+                            1, "failed", error=detail
+                        ),
+                        proxy_config=proxy_cfg,
+                    )
             else:
                 tokens = asyncio.run(
                     browser_register_one(

@@ -7,7 +7,6 @@ import type { SmsCountryItem } from "../../api/ops";
 const props = withDefaults(
   defineProps<{
     open: boolean;
-    provider?: string;
     items?: SmsCountryItem[];
     selected?: string[];
     providers?: Record<string, string>;
@@ -15,7 +14,6 @@ const props = withDefaults(
     error?: string;
   }>(),
   {
-    provider: "smsbower",
     items: () => [],
     selected: () => [],
     providers: () => ({}),
@@ -46,9 +44,9 @@ const filtered = computed(() => {
       const id = String(item.id || "");
       if (!name.includes(needle) && !calling.includes(needle) && id !== needle) return false;
     }
-    const price = Number(item.price);
-    if (minPrice.value && (!item.price || price < min)) return false;
-    if (maxPrice.value && (!item.price || price > max)) return false;
+    const price = lowestPrice(item);
+    if (minPrice.value && (price === null || price < min)) return false;
+    if (maxPrice.value && (price === null || price > max)) return false;
     return true;
   });
 });
@@ -61,13 +59,23 @@ function resetFilters() {
   maxPrice.value = "";
 }
 
-function roundPrice(value: number): string {
-  return String(Math.round(value * 1000) / 1000);
+function formatPrice(value: number): string {
+  return String(value);
 }
 
-function fmtCount(value: unknown): string {
-  const count = Number(value) || 0;
-  return count >= 10000 ? `${Math.round(count / 1000)}k` : String(count);
+function formatStock(value: unknown): string {
+  if (!["number", "string"].includes(typeof value) || String(value).trim() === "") return "库存未知";
+  const count = Number(value);
+  return Number.isSafeInteger(count) && count >= 0 ? `${count.toLocaleString("en-US")} 件` : "库存未知";
+}
+
+function lowestPrice(item: SmsCountryItem): number | null {
+  const validPrice = (value: unknown) => ["number", "string"].includes(typeof value) && String(value).trim() !== "" && Number.isFinite(Number(value)) && Number(value) > 0;
+  if (item.tiers?.length) {
+    const prices = item.tiers.filter((tier) => Number.isFinite(Number(tier.count)) && Number(tier.count) > 0 && validPrice(tier.price)).map((tier) => Number(tier.price));
+    return prices.length ? Math.min(...prices) : null;
+  }
+  return validPrice(item.min_price) ? Number(item.min_price) : null;
 }
 
 function toggleExpand(item: SmsCountryItem) {
@@ -117,7 +125,7 @@ function tierSummary(id: string): string {
             <div>
               <span class="picker-kicker"><Globe :size="12" aria-hidden="true" />选择国家</span>
               <h2>接码国家顺序</h2>
-              <small>{{ provider === "firefox" ? "火狐狸" : "SMSBower" }} · 点行选中国家 · 点「价位」按顺序多选价格档位</small>
+              <small>SMSBower · 点行选中国家 · 点「价位」按顺序多选价格档位</small>
             </div>
             <button class="picker-close" type="button" title="关闭" aria-label="关闭" @click="emit('close')">
               <X :size="16" aria-hidden="true" />
@@ -129,10 +137,8 @@ function tierSummary(id: string): string {
               <Search :size="14" aria-hidden="true" />
               <input v-model="search" class="input picker-search" type="text" placeholder="搜索国家 / 区号 / ID，如 +44 或 印尼" />
             </div>
-            <template v-if="provider !== 'firefox'">
               <label class="picker-price-filter">$ ≥<input v-model="minPrice" class="input picker-price-input" type="number" min="0" step="0.01" placeholder="0" /></label>
               <label class="picker-price-filter">$ ≤<input v-model="maxPrice" class="input picker-price-input" type="number" min="0" step="0.01" placeholder="不限" /></label>
-            </template>
             <button class="picker-reset" type="button" title="清空搜索与价格过滤" @click="resetFilters">
               <RotateCcw :size="13" aria-hidden="true" />重置
             </button>
@@ -157,10 +163,9 @@ function tierSummary(id: string): string {
                 <span class="picker-order">{{ selected.includes(item.id) ? selected.indexOf(item.id) + 1 : "" }}</span>
                 <span class="picker-name">{{ item.name }}</span>
                 <span v-if="item.calling" class="picker-calling">{{ item.calling }}</span>
-                <span v-if="item.price" class="picker-price">≈${{ item.price }}</span>
-                <span v-if="item.count" class="picker-stock">{{ fmtCount(item.count) }} 件</span>
+                <span v-if="lowestPrice(item) !== null" class="picker-price">最低 ${{ lowestPrice(item) }}</span>
                 <span
-                  v-if="provider !== 'firefox' && (item.tiers || []).length"
+                  v-if="(item.tiers || []).length"
                   :class="['picker-tier-btn', providerList(item.id).length ? 'picked' : '']"
                   title="展开价格档位（可按顺序多选）"
                   @click.stop="toggleExpand(item)"
@@ -184,8 +189,8 @@ function tierSummary(id: string): string {
                   @click="toggleTier(item.id, tier.id)"
                 >
                   <span class="tier-rank">{{ providerRank(item.id, tier.id) || "" }}</span>
-                  <b>${{ roundPrice(tier.price) }}</b>
-                  <small>#{{ tier.id }} · {{ fmtCount(tier.count) }} 件</small>
+                  <b>${{ formatPrice(tier.price) }}</b>
+                  <small>#{{ tier.id }} · {{ formatStock(tier.count) }}</small>
                 </button>
               </div>
             </template>
@@ -391,8 +396,7 @@ function tierSummary(id: string): string {
   color: var(--accent);
 }
 
-.picker-calling,
-.picker-stock {
+.picker-calling {
   font-size: 0.72rem;
   color: var(--text-muted);
 }

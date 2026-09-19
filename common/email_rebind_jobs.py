@@ -52,6 +52,24 @@ class EmailRebindJobs:
             if thread is None or not thread.is_alive():
                 self.threads.pop(job_id, None)
 
+    def request_shutdown(self) -> list[threading.Thread]:
+        """Signal every running batch to stop and return its worker threads.
+
+        Called from the web app's coordinated shutdown so a service restart
+        does not hard-kill rebind workers mid-operation (which would leave
+        target mailboxes reserved and account rows with stale rebind state).
+        """
+        threads: list[threading.Thread] = []
+        with self.lock:
+            for job_id, event in list(self.stop_events.items()):
+                job = self.jobs.get(job_id)
+                if job is not None and job.get("status") in {"queued", "running", "stopping"}:
+                    event.set()
+                    thread = self.threads.get(job_id)
+                    if thread is not None and thread.is_alive():
+                        threads.append(thread)
+        return threads
+
     @staticmethod
     def _record_key(record: dict[str, Any]) -> str:
         """Resolve the same stable identity used by the account store."""

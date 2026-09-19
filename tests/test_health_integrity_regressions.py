@@ -283,8 +283,8 @@ def test_session_refresh_transient_responses_do_not_invalidate_account(db, monke
         account(expired=True), persist=False, path=db,
         proxy_candidates=["http://one.example:8080", "http://two.example:8080"],
     )
-    assert checked["health_status"] == "error"
-    assert "nextauth_session" in checked["health_error"]
+    assert checked["health_status"] == "unknown"
+    assert "nextauth_session" in checked["health_probe_error"]
     health.fetch_remote_account_info.assert_not_called()
 
 

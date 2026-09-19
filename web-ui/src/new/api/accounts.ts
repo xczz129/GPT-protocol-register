@@ -68,6 +68,7 @@ export interface HealthProgress {
   invalidOther: number;
   reauthRequired: number;
   error: number;
+  unknown: number;
   skippedKnownDeactivated: number;
   pendingCount: number;
   current: string;
@@ -99,7 +100,7 @@ export function resumeHealthCheck(workers: number, channel: "v4" | "nerver" = "v
 const emptyHealthProgress = (): HealthProgress => ({
   running: false, channel: "v4", done: 0, total: 0, actualTotal: 0, requested: 0, checked: 0,
   usable: 0, alive: 0, limited: 0, invalid: 0, invalidOther: 0,
-  reauthRequired: 0, error: 0, skippedKnownDeactivated: 0, pendingCount: 0,
+  reauthRequired: 0, error: 0, unknown: 0, skippedKnownDeactivated: 0, pendingCount: 0,
   current: "", message: "", interrupted: false, workers: 0, requestedWorkers: 0,
   updates: {},
 });
@@ -130,6 +131,7 @@ export function normalizeHealthProgress(raw: Record<string, unknown> | null | un
     invalidOther: number("invalid_other", "invalidOther"),
     reauthRequired: number("reauth_required", "reauthRequired"),
     error: number("error", "error"),
+    unknown: number("unknown", "unknown"),
     skippedKnownDeactivated: number("skipped_known_deactivated", "skippedKnownDeactivated"),
     pendingCount: number("pending_count", "pendingCount"),
     workers: number("workers", "workers"), requestedWorkers: number("requested_workers", "requestedWorkers"),

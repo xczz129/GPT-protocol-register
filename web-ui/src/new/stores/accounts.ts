@@ -151,7 +151,7 @@ export const useAccountsStore = defineStore("accounts", () => {
   const health = shallowRef<HealthProgress>({
     running: false, channel: "v4", done: 0, total: 0, actualTotal: 0, requested: 0, checked: 0,
     usable: 0, alive: 0, limited: 0, invalid: 0, invalidOther: 0, reauthRequired: 0,
-    error: 0, skippedKnownDeactivated: 0, pendingCount: 0, current: "", message: "",
+    error: 0, unknown: 0, skippedKnownDeactivated: 0, pendingCount: 0, current: "", message: "",
     interrupted: false, workers: 0, requestedWorkers: 0, updates: {},
   });
   const healthError = ref("");

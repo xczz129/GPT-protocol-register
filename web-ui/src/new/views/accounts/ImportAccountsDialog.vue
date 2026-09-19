@@ -6,6 +6,7 @@ import AppModal from "../../components/ui/AppModal.vue";
 import AppButton from "../../components/ui/AppButton.vue";
 import { useBatchOpsStore } from "../../stores/batchops";
 import { useUiStore } from "../../stores/ui";
+import { IMPORT_MAX_CONCURRENCY, parseImportCredentials, validImportConcurrency } from "../../api/batchops";
 
 const props = defineProps<{ open: boolean }>();
 const emit = defineEmits<{ close: []; history: [] }>();
@@ -27,27 +28,21 @@ watch(() => props.open, (value) => {
   }
 });
 
-const lines = computed(() =>
-  String(text.value || "").split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !line.startsWith("#")),
-);
-const valid = computed(() =>
-  lines.value.filter((line) => {
-    const parts = line.split("----");
-    return parts.length === 3 && parts.every((part) => part.trim());
-  }),
-);
-const invalidCount = computed(() => lines.value.length - valid.value.length);
+const parsed = computed(() => parseImportCredentials(text.value));
+const concurrencyInvalid = computed(() => !validImportConcurrency(Number(concurrency.value)));
 const workspaceMissing = computed(() => accountType.value === "team" && !workspace.value.trim());
+const canSubmit = computed(() => parsed.value.rows.length > 0 && !parsed.value.errors.length
+  && !workspaceMissing.value && !concurrencyInvalid.value && !submitting.value);
 
 async function submit() {
-  if (!valid.value.length || workspaceMissing.value || submitting.value) return;
+  if (!canSubmit.value) return;
   submitting.value = true;
   try {
     await batch.startImport({
       text: text.value,
       accountType: accountType.value,
       workspace: workspace.value.trim(),
-      concurrency: Math.max(1, Math.floor(Number(concurrency.value) || 1)),
+      concurrency: Number(concurrency.value),
     });
     emit("close");
   } catch (error) {
@@ -75,8 +70,12 @@ async function submit() {
       spellcheck="false"
     ></textarea>
     <p class="hint">
-      已识别 <b>{{ valid.length }}</b> 个账号<template v-if="invalidCount"> · {{ invalidCount }} 行格式不符</template>
+      已识别 <b>{{ parsed.rows.length }}</b> 个账号<template v-if="parsed.errors.length"> · {{ parsed.errors.length }} 行有误，请全部修正后导入</template>
     </p>
+    <ul v-if="parsed.errors.length" class="validation-errors" role="alert">
+      <li v-for="error in parsed.errors.slice(0, 10)" :key="error">{{ error }}</li>
+      <li v-if="parsed.errors.length > 10">还有 {{ parsed.errors.length - 10 }} 行需要修正</li>
+    </ul>
 
     <div class="form-grid">
       <div class="field">
@@ -89,8 +88,9 @@ async function submit() {
         </div>
       </div>
       <div class="field">
-        <span class="field-label"><Zap :size="11" /> 并发（无上限）</span>
-        <input v-model.number="concurrency" class="field-input concurrency-input" type="number" min="1" step="1" />
+        <span class="field-label"><Zap :size="11" /> 并发（1–{{ IMPORT_MAX_CONCURRENCY }}）</span>
+        <input v-model.number="concurrency" class="field-input concurrency-input" type="number" min="1" :max="IMPORT_MAX_CONCURRENCY" step="1" />
+        <small v-if="concurrencyInvalid" class="warn-text">请输入 1–{{ IMPORT_MAX_CONCURRENCY }} 的整数</small>
       </div>
       <div v-if="accountType === 'team'" class="field field-grow">
         <span class="field-label">工作区名称</span>
@@ -101,7 +101,7 @@ async function submit() {
 
     <template #footer>
       <AppButton variant="ghost" @click="emit('close')">取消</AppButton>
-      <AppButton variant="primary" :disabled="!valid.length || workspaceMissing" :loading="submitting" @click="submit">
+      <AppButton variant="primary" :disabled="!canSubmit" :loading="submitting" @click="submit">
         开始导入
       </AppButton>
     </template>
@@ -162,6 +162,14 @@ async function submit() {
 }
 
 .hint b { color: var(--accent); }
+
+.validation-errors {
+  color: var(--error);
+  font-size: 0.75rem;
+  line-height: 1.6;
+  margin: 0 0 12px;
+  padding-left: 20px;
+}
 
 .form-grid {
   display: flex;

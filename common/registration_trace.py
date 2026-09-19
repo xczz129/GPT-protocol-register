@@ -17,9 +17,10 @@ from pathlib import Path
 from typing import Any
 
 from config import ROOT
+from common.diagnostic_codes import public_error_code
 from proxy_util import proxy_brief
 
-TRACE_DIR = ROOT / "data" / "registration_logs"
+TRACE_DIR = Path(os.environ.get("REGISTRATION_TRACE_DIR") or ROOT / "data" / "registration_logs")
 _LOCK = threading.RLock()
 
 
@@ -47,7 +48,11 @@ _SENSITIVE_KEY_NAMES = frozenset(
         "cookie",
         "cookies",
         "api_key",
+        "admin_key",
+        "license_key",
         "client_secret",
+        "csrf_token",
+        "challenge_token",
         "token",
         "code",
         "otp",
@@ -67,6 +72,8 @@ def _sensitive_key(key: Any) -> bool:
 
 
 def _safe(value: Any, limit: int = 800, *, key: str = "") -> Any:
+    if public_error_code(key, value):
+        return value
     if _sensitive_key(key):
         return "***" if value not in (None, "", [], {}) else ""
     if isinstance(value, (str, int, float, bool)) or value is None:
@@ -80,32 +87,11 @@ def _safe(value: Any, limit: int = 800, *, key: str = "") -> Any:
 
 
 def _redact(text: Any, secrets: tuple[Any, ...] = ()) -> str:
-    value = str(text or "")
-    for secret in sorted(
-        (str(item or "").strip() for item in secrets),
-        key=len,
-        reverse=True,
-    ):
-        if secret:
-            value = value.replace(secret, "***")
-    value = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._~-]+", r"\1***", value)
-    value = re.sub(
-        r"(?i)(password|passwd|passphrase|new[_-]?password|old[_-]?password|"
-        r"totp(?:[_-]?secret)?|mfa[_-]?secret|token|access[_-]?token|"
-        r"refresh[_-]?token|id[_-]?token|session[_-]?token|authorization|"
-        r"cookie|secret|otp|code)"
-        r"\s*[:=]\s*[^\s,;]+",
-        r"\1=***",
-        value,
-    )
-    value = re.sub(
-        r"(?i)([?&](?:access[_-]?token|refresh[_-]?token|id[_-]?token|"
-        r"token|code|secret|password|totp|totp[_-]?secret|otp)=)[^&\s]+",
-        r"\1***",
-        value,
-    )
-    value = re.sub(r"(?i)(https?://)([^:/\s@]+):([^@/\s]+)@", r"\1***:***@", value)
-    return value[:1200]
+    # Use the same sanitizer as the durable audit log: it handles quoted JSON,
+    # OAuth query values and the allowlist of public symbolic error codes.
+    from common.account_operation_log import _redact_text
+
+    return _redact_text(text, secrets)
 
 
 def _fingerprint_snapshot(fp: dict[str, Any] | None, device_id: str = "") -> dict[str, Any]:
@@ -248,7 +234,7 @@ class RegistrationTrace:
         for key, value in fields.items():
             if key in {"error", "step", "message", "reason", "skip_reason", "proxy"}:
                 clean[key] = _redact(value, self._secrets)
-            elif not _sensitive_key(key):
+            elif public_error_code(key, value) or not _sensitive_key(key):
                 clean[key] = _safe(value, key=str(key))
         self._write({
             "type": "event",

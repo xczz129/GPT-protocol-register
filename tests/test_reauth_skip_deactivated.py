@@ -65,6 +65,7 @@ def boundary(monkeypatch, tmp_path):
         _normalize_reauth_mode=security._normalize_reauth_mode,
         _account_requires_protocol_reauth=security._account_requires_protocol_reauth,
         _protocol_reauth_credentials_ready=security._protocol_reauth_credentials_ready,
+        _account_email_relogin_ready=security._account_email_relogin_ready,
         _normalize_account_security_operation=security._normalize_account_security_operation,
         _account_security_operation_label=security._account_security_operation_label,
         _normalize_security_password_mode=security._normalize_security_password_mode,
@@ -333,7 +334,13 @@ def test_stop_preserves_skipped_item_and_counts_every_selected_account_once(boun
     ("security_repair", "_repair_account_security_sync"),
 ])
 def test_other_security_operations_keep_runtime_ban_as_failure(boundary, operation, helper):
-    records = boundary.seed([_account(0)])
+    record = _account(0)
+    if operation == "security_repair":
+        # Accounts with complete security fields are pre-skipped by the
+        # task layer; verify the runtime-ban-is-failure semantics on an
+        # account that actually needs the repair.
+        record.pop("totp_secret", None)
+    records = boundary.seed([record])
     worker = getattr(boundary.state, helper)
     worker.side_effect = RuntimeError("account_deactivated: provider rejected account")
     started = boundary.jobs.start(
@@ -345,7 +352,6 @@ def test_other_security_operations_keep_runtime_ban_as_failure(boundary, operati
     _assert_counts(result, total=1, failed=1)
     worker.assert_called_once()
     boundary.login.assert_not_called()
-
 
 @pytest.mark.parametrize("operation", ["password_change", "totp_change", "security_repair"])
 def test_other_security_preflights_still_reject_banned_accounts(boundary, operation):

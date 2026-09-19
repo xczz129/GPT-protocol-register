@@ -33,7 +33,7 @@ const currentCatalog = () => ({
   types: [{ email_type_id: 26, name: "Gmail_1", price: "0.05", available_num: 10 }],
 });
 
-function harness(kind = "modern", provider = {}) {
+function harness(provider = {}) {
   const calls = [];
   let response = async () => currentCatalog();
   const api = async (path, options = {}) => {
@@ -54,19 +54,17 @@ function harness(kind = "modern", provider = {}) {
     "../api/mail": mailApi,
   });
   const store = vue.reactive(useMailStore());
-  const props = { forms: store.forms, mailboxes: [], progress: {}, busy: false };
-  const path = kind === "modern" ? "../src/new/views/register/MailView.vue" : "../src/components/MailView.vue";
+  const path = "../src/new/views/register/MailView.vue";
   const source = readFileSync(new URL(path, import.meta.url), "utf8").match(/<script setup(?: lang="ts")?>([\s\S]*?)<\/script>/)[1];
   const scope = vue.effectScope();
   const component = scope.run(() => execute(`${source}\nexport { lookupOdmServices, selectOdmService, odmTypes, odmTypesLoaded, odmLookup, odmSelectedTypeMissing };`, {
     vue: { ...vue, onMounted() {}, onBeforeUnmount() {} },
-    "../api.js": { api, jsonBody: JSON.stringify },
     "../../api/mail": mailApi,
     "../../stores/mail": { useMailStore: () => store },
     "../../stores/status": { useStatusStore: () => ({}) },
     "../../stores/ui": { useUiStore: () => ({ notify() {} }) },
     "../../composables/useConfirm": { useConfirm: () => async () => false },
-  }, { defineProps: () => props, defineEmits: () => () => {} }));
+  }));
   return {
     ...component, store, calls, mailApi,
     respond: (next) => { response = next; },
@@ -81,7 +79,7 @@ test("ODM config defaults to Gmail_1 and preserves an explicitly configured type
   assert.equal(fresh.store.forms.odmEmailTypeId, "26");
   fresh.dispose();
 
-  const configured = harness("modern", { email_type_id: "3", has_api_key: true, api_key_masked: "saved…abcd" });
+  const configured = harness({ email_type_id: "3", has_api_key: true, api_key_masked: "saved…abcd" });
   await configured.store.fillForms();
   assert.equal(configured.store.forms.odmEmailTypeId, "3");
   assert.equal(configured.store.forms.odmApiKey, "");
@@ -103,13 +101,23 @@ test("ODM API requests the selected service and omits an unspecified service or 
   h.dispose();
 });
 
-for (const kind of ["modern", "legacy"]) {
+// The retired App.vue no longer owns mail forms. Cover both current credential
+// paths through the real store/component, including saved-key hydration.
+async function catalogHarness(kind) {
+  const h = harness(kind === "saved key" ? { has_api_key: true, api_key_masked: "saved…abcd" } : {});
+  await h.store.fillForms();
+  if (kind === "entered key") h.store.forms.odmApiKey = "synthetic-catalog-key";
+  return h;
+}
+
+for (const kind of ["entered key", "saved key"]) {
   test(`${kind} catalog requests the current service without changing the selected SKU`, async () => {
-    const h = harness(kind);
+    const h = await catalogHarness(kind);
     h.store.forms.odmServiceId = "777";
     h.store.forms.odmEmailTypeId = "3";
     await h.lookupOdmServices();
     assert.equal(h.calls[0].body.service_id, "777");
+    assert.equal(h.calls[0].body.api_key, kind === "entered key" ? "synthetic-catalog-key" : undefined);
     assert.equal(h.store.forms.odmEmailTypeId, "3");
     assert.equal(h.odmTypesLoaded.value, true);
     assert.equal(h.odmSelectedTypeMissing.value, true);
@@ -119,7 +127,7 @@ for (const kind of ["modern", "legacy"]) {
   });
 
   test(`${kind} switching service clears stale types and refreshes for the chosen service`, async () => {
-    const h = harness(kind);
+    const h = await catalogHarness(kind);
     await h.lookupOdmServices();
     assert.equal(h.odmTypes.value.length, 1);
     h.store.forms.odmServiceId = "777";
@@ -133,7 +141,7 @@ for (const kind of ["modern", "legacy"]) {
   });
 
   test(`${kind} an older response cannot replace the selected service's catalog`, async () => {
-    const h = harness(kind);
+    const h = await catalogHarness(kind);
     let completeOld;
     h.respond(() => new Promise((resolve) => { completeOld = resolve; }));
     const oldRequest = h.lookupOdmServices();
@@ -150,7 +158,7 @@ for (const kind of ["modern", "legacy"]) {
   });
 
   test(`${kind} an empty sales catalog stays empty and backend errors remain visible`, async () => {
-    const h = harness(kind);
+    const h = await catalogHarness(kind);
     h.respond(async () => ({ ok: true, types: [], services: [] }));
     await h.lookupOdmServices();
     assert.equal(h.odmTypesLoaded.value, true);

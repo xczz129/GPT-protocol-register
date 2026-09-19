@@ -176,7 +176,7 @@ class SessionRefreshJobs:
                 "failed": 0,
                 "stopped": 0,
                 "current": "",
-                "concurrency": max(1, min(10, int(concurrency or 1))),
+                "concurrency": max(1, int(concurrency or 1)),
                 "created_at": _now(),
                 "started_at": "",
                 "finished_at": "",

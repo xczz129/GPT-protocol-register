@@ -2,9 +2,12 @@
 """跳过账号回收：把注册历史里 skipped 的存量账号收成可用账号。
 
 对 already_registered / password_reset_required 且邮箱仍可收码的跳过账号，
-按「重置密码设置2fa.har」的流程回收：
-  补密码授权(post_login_add_password) → 邮箱 OTP → validate →
-  password/add|reset → callback 读会话 → mfa/enroll → activate → 入库
+按 2026-09-17 手动打野抓包（D:\\Downloads\\最新.csv）的流程回收：
+  1. 邮箱验证码登录（signin 无特殊参数 → email-otp → callback）
+  2. 登录态重置密码（reauth=password + post_login_password_reset 事务
+     → 事务内 OTP → password/reset → callback）
+  3. 设置 2FA（mfa/enroll → activate_enrollment）→ 入库
+面板注册状态：正常=注册成功，回收=打野成功。
 
 用法:
   .venv/bin/python scripts/recover_skipped_accounts.py --dry-run
@@ -105,7 +108,12 @@ def load_candidates(db_path: Path, *, domain: str = "", reason: str = "") -> lis
 
 def _is_rate_limited(error: BaseException) -> bool:
     text = str(error)
-    return "429" in text or "too many requests" in text.lower()
+    return (
+        "429" in text
+        or "too many requests" in text.lower()
+        or "rate_limit_exceeded" in text
+        or "rate limit" in text.lower()
+    )
 
 
 def _is_connection_error(error: BaseException) -> bool:
@@ -119,17 +127,22 @@ def _is_connection_error(error: BaseException) -> bool:
     return any(marker in text for marker in markers)
 
 
-def _is_passwordless_route_error(error: BaseException) -> bool:
-    """普通登录事务未进入密码路线 → 账号大概率无密码，应改走补密码事务。"""
+def _is_login_route_retryable(error: BaseException) -> bool:
+    """登录路由/会话层临时错误：换事务重试通常可恢复（密码已重置时尤其值得）。"""
     text = str(error)
     return any(
         marker in text
         for marker in (
-            "password_add_unexpected_auth_step",
-            "unexpected_auth_step",
             "password_route_unavailable",
-            "credential_login_password_route_unavailable",
-            "pending_recovery_password_route_unavailable",
+            "chatgpt_session_incomplete",
+            "pending_recovery_unexpected_login_step",
+            "pending_recovery_auth_step_loop",
+            "invalid_state",
+            "pending_recovery_email_otp_timeout",
+            "验证码超时",
+            "验证码获取超时",
+            "unexpected_auth_step",
+            "未完成 OAuth callback",
         )
     )
 
@@ -219,9 +232,18 @@ def recover_one(
     mailbox = None
     last_known_password = ""
     try:
-        # 固定地址分配：按邮箱隔离 provider，allow_used 允许复用历史邮箱
-        mailbox = create_mailbox(email, register_proxy=proxy, allow_used=True)
-        if str(mailbox.get("address") or "").strip().lower() != email:
+        # split 子号(parent+split@)的验证码落主号收件箱：按主号分配邮箱，
+        # 用主号 address+api_key 查询(HME 别名共用收件箱)
+        from mail.parsing import base_mailbox_address
+
+        receive_address = base_mailbox_address(email)
+        mailbox = create_mailbox(
+            receive_address, register_proxy=proxy, allow_used=True
+        )
+        if (
+            str(mailbox.get("address") or "").strip().lower()
+            != receive_address
+        ):
             raise RuntimeError("mailbox_address_mismatch")
         provider = str(mailbox.get("provider") or "")
         base["provider"] = provider
@@ -231,40 +253,35 @@ def recover_one(
         max_attempts = 3
         for attempt in range(max_attempts):
             try:
-                candidate_password = _random_password()
-                try:
-                    # 尝试 A：HAR 普通登录事务，已有密码的账号在事务内完成
-                    # authorize(/log-in/password) → send-otp → validate → password/reset
-                    password = registrar._complete_post_registration_password(
-                        email,
-                        candidate_password,
-                        mailbox,
-                        index,
-                        skip_existing_password=False,
-                        existing_password_route=True,
+                if not last_known_password:
+                    # 上一轮已重置过密码(security_pending)的账号直接复用，
+                    # 不再消耗一轮验证码重置
+                    for saved in load_account_records_by_emails(
+                        {email}, ACCOUNTS_FILE
+                    ):
+                        if (
+                            str(saved.get("password") or "").strip()
+                            and str(saved.get("registration_state") or "")
+                            == "security_pending"
+                        ):
+                            last_known_password = str(saved["password"]).strip()
+                            log(
+                                f"REUSE {email} 沿用已重置密码，"
+                                f"跳过重置只补会话和 2FA"
+                            )
+                            break
+                # 手动抓包流程（2026-09-17）：先用邮箱验证码登录上去
+                tokens = dict(registrar.login(email, mailbox, index))
+                if not last_known_password:
+                    # 登录态重置密码：reauth=password 事务内再验一次码
+                    password = registrar._complete_loggedin_password_reset(
+                        email, _random_password(), mailbox, index
                     )
-                except Exception as route_error:
-                    if not _is_passwordless_route_error(route_error):
-                        raise
-                    log(
-                        f"ROUTE {email} 密码路线不可用，按无密码账号改走补密码事务"
+                    last_known_password = password
+                    # 密码重置 callback 后刷新会话令牌
+                    tokens = registrar._read_chatgpt_session(
+                        email, last_known_password, index
                     )
-                    # 尝试 B：无密码账号走 post_login_add_password 事务(password/add)
-                    password = registrar._complete_post_registration_password(
-                        email,
-                        candidate_password,
-                        mailbox,
-                        index,
-                        skip_existing_password=False,
-                    )
-                last_known_password = password
-                # HAR 收尾：密码已设置/重置，用新密码 password/verify 登录建立会话
-                # （重置路线的 /reset-password/success 不产生登录态，必须补 verify）
-                tokens = dict(
-                    registrar.login_pending_with_password(
-                        email, password, index, mailbox=mailbox
-                    )
-                )
                 security = registrar._enroll_totp(
                     tokens, index, replace_existing=True
                 )
@@ -273,7 +290,7 @@ def recover_one(
                 )
                 record = registrar._build_registration_record(
                     email,
-                    password,
+                    last_known_password,
                     tokens,
                     security,
                     source_type,
@@ -293,10 +310,33 @@ def recover_one(
                     }
                 record["email"] = email
                 record["group_id"] = group_id
+                record["recovered_from_skipped"] = True
                 upsert_account_record(record, ACCOUNTS_FILE, create=True)
+                # 面板可见的注册状态：正常注册=注册成功，回收=打野成功
+                try:
+                    from common.account_operation_log import record_operation_event
+
+                    record_operation_event(
+                        record,
+                        "registration",
+                        "success",
+                        message="打野成功",
+                        metadata={
+                            "recovered_from_skipped": True,
+                            "provider": provider,
+                        },
+                        secrets=(
+                            last_known_password,
+                            str(record.get("totp_secret") or ""),
+                            str(record.get("access_token") or ""),
+                            str(record.get("refresh_token") or ""),
+                        ),
+                    )
+                except Exception:
+                    pass
                 mark_mailbox_result(mailbox, success=True)
                 log(
-                    f"OK   {email} 密码已重置+2FA 已设置 "
+                    f"OK   {email} 打野成功（密码已重置+2FA 已设置）"
                     f"provider={provider} via={proxy_label}"
                 )
                 return {**base, "result": "success", "reason": ""}
@@ -315,13 +355,15 @@ def recover_one(
             except Exception as error:
                 safe = str(error)
                 retryable = (
-                    _is_rate_limited(error) or _is_connection_error(error)
+                    _is_rate_limited(error)
+                    or _is_connection_error(error)
+                    or _is_login_route_retryable(error)
                 ) and attempt < max_attempts - 1
                 if retryable:
                     if proxies:
                         proxy = proxies[(seq + attempt + 1) % len(proxies)]
-                        registrar.close()
-                        registrar = PlatformRegistrar(proxy)
+                    registrar.close()
+                    registrar = PlatformRegistrar(proxy)
                     wait = (
                         random.uniform(30, 60)
                         if _is_rate_limited(error)

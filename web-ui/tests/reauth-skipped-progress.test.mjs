@@ -56,47 +56,74 @@ for (const skipped of [1, 95]) {
   });
 }
 
-function legacyFunction(name) {
-  const source = sourceOf("../src/App.vue").match(/<script setup[^>]*>([\s\S]*?)<\/script>/)[1];
-  const parsed = ts.createSourceFile("App.js", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
-  const declaration = parsed.statements.find((node) => ts.isFunctionDeclaration(node) && node.name?.text === name);
-  assert.ok(declaration, `Missing legacy function: ${name}`);
-  return declaration.getText(parsed);
+function reauthStore() {
+  const responses = [];
+  const { outputText } = ts.transpileModule(sourceOf("../src/new/stores/batchops.ts"), {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
+  });
+  const imports = {
+    vue,
+    pinia: { defineStore: (_name, setup) => setup },
+    "../api/batchops": {
+      async fetchReauthProgress() {
+        assert.ok(responses.length, "Unexpected progress request");
+        return responses.shift();
+      },
+    },
+  };
+  const exports = {};
+  runInNewContext(outputText, {
+    exports,
+    require(name) {
+      assert.ok(Object.hasOwn(imports, name), `Unexpected import: ${name}`);
+      return imports[name];
+    },
+    setInterval() { assert.fail("Snapshot refresh must not start a timer"); },
+    clearInterval() {},
+  });
+  return { responses, store: exports.useBatchOpsStore() };
 }
 
-test("legacy progress normalizes skipped independently and resets it for an older job", () => {
-  const reauthProgress = {};
-  const exports = {};
-  runInNewContext(`${legacyFunction("applyReauthProgress")}\nexports.apply = applyReauthProgress;`, {
-    exports, reauthProgress, reauthJobId: "", persistReauthUiState() {},
-  });
-  exports.apply({ job_id: "mixed", status: "running", total: 95, done: 1, failed: 0, skipped: 1,
-    last_status: "skipped", items: [{ email: "banned@example.test", status: "skipped" }] });
+test("current progress store normalizes skipped independently and resets it for an older-format job", async () => {
+  const { responses, store } = reauthStore();
+  responses.push({ job: { job_id: "mixed", status: "running", total: 95, done: 1, failed: 0, skipped: "1",
+    last: "banned@example.test", last_status: "skipped", last_message: "已封号，跳过重新登录",
+    items: [{ email: "banned@example.test", status: "skipped" }] } });
+  await store.refreshReauthProgress();
+  const reauthProgress = store.reauth;
   assert.equal(reauthProgress.running, true);
   assert.equal(reauthProgress.skipped, 1);
   assert.equal(reauthProgress.failed, 0);
   assert.equal(reauthProgress.lastStatus, "skipped");
+  assert.equal(reauthProgress.lastMessage, "已封号，跳过重新登录");
 
-  exports.apply({ job_id: "older", status: "running", total: 2, done: 0, failed: 0 });
+  responses.push({ job: { job_id: "older", status: "running", total: 2, done: 0, failed: 0 } });
+  await store.refreshReauthProgress();
+  assert.equal(reauthProgress.job_id, "older");
+  assert.equal(reauthProgress.running, true);
   assert.equal(reauthProgress.skipped, 0);
   assert.equal(reauthProgress.failed, 0);
+  assert.equal(reauthProgress.last, "");
   assert.equal(reauthProgress.lastStatus, "");
+  assert.equal(reauthProgress.lastMessage, "");
   assert.equal(reauthProgress.items.length, 0);
+  assert.equal(responses.length, 0);
 });
 
-test("legacy recent result distinguishes skipped, cancelled, failed and success", () => {
-  const source = sourceOf("../src/components/AccountsView.vue").match(/<script setup[^>]*>([\s\S]*?)<\/script>/)[1];
-  const parsed = ts.createSourceFile("AccountsView.js", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
-  const declaration = parsed.statements.find((node) => ts.isVariableStatement(node)
-    && node.declarationList.declarations.some((item) => item.name.getText(parsed) === "reauthLastStatusLabel"));
-  assert.ok(declaration);
-  const props = vue.reactive({ reauthProgress: { lastStatus: "skipped" } });
-  const exports = {};
-  runInNewContext(`${declaration.getText(parsed)}\nexports.label = reauthLastStatusLabel;`, {
-    exports, props, computed: vue.computed,
+test("current batch dialog distinguishes skipped, cancelled, failed and success results", async () => {
+  const labels = { skipped: "已跳过", cancelled: "已取消", failed: "失败", success: "成功" };
+  const component = dialogComponent({
+    operation: "reauth", running: false, status: "completed", total: 4, done: 4,
+    success: 1, failed: 1, skipped: 1, cancelled: 1,
+    items: Object.keys(labels).map((status) => ({ email: `${status}@example.test`, status, message: `${status} result` })),
   });
-  for (const [status, label] of Object.entries({ skipped: "已跳过", cancelled: "已取消", failed: "失败", success: "成功" })) {
-    props.reauthProgress.lastStatus = status;
-    assert.equal(exports.label.value, label);
+  const html = await renderToString(vue.createSSRApp(component, { open: true, kind: "reauth" }));
+  for (const [status, label] of Object.entries(labels)) {
+    assert.match(html, new RegExp(`class="item-row ${status}"><b>${status}@example\\.test</b><span class="item-status ${status}">${label}</span>`));
   }
+  assert.match(html, /成功 1/);
+  assert.match(html, /失败 1/);
+  assert.match(html, /已跳过 1/);
+  assert.match(html, /取消 1/);
+  assert.match(html, /4 \/ 4 · 100%/);
 });

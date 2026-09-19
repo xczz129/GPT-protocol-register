@@ -69,6 +69,18 @@ test("22 credential lines including eight @ passwords produce the exact 22 clean
   h.dispose();
 });
 
+test("protocol relogin restores and submits uncapped positive concurrency for login and health", async () => {
+  const h = harness({ saved: { input: EMAILS.join("\n"), concurrency: 175 } });
+  await h.mount();
+  h.selected.value = [...EMAILS];
+  assert.equal(h.concurrency.value, 175);
+  await h.start();
+  await h.healthCheck();
+  assert.equal(h.calls.find(([action]) => action === "start")[2], 175);
+  assert.equal(h.calls.find(([action]) => action === "health")[3], 175);
+  h.dispose();
+});
+
 test("clipboard paste immediately discards credential columns and only stores email input", async () => {
   const h = harness();
   await h.pasteEmails();

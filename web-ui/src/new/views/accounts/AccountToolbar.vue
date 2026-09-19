@@ -27,6 +27,7 @@ const confirm = useConfirm();
 
 const groupPanelOpen = ref(false);
 const newGroupName = ref("");
+const creatingGroup = ref(false);
 
 async function refresh() {
   await Promise.all([accounts.load(), groups.load(true)]);
@@ -96,13 +97,16 @@ async function removeAllAccounts() {
 
 async function addGroup() {
   const name = newGroupName.value.trim();
-  if (!name) return;
+  if (!name || creatingGroup.value) return;
+  creatingGroup.value = true;
   try {
     await groups.create(name);
-    newGroupName.value = "";
+    if (newGroupName.value.trim() === name) newGroupName.value = "";
     ui.notify(`分组「${name}」已创建`, "success");
   } catch (error) {
     ui.notify(error instanceof Error ? error.message : "创建失败", "error");
+  } finally {
+    creatingGroup.value = false;
   }
 }
 
@@ -144,7 +148,7 @@ async function removeOne(id: string, name: string) {
         <option value="limited">限流</option>
         <option value="invalid">失效</option>
         <option value="error">异常/待续期</option>
-        <option value="unchecked">未测活</option>
+        <option value="unchecked">未测活 / 待复测</option>
         <option value="deactivated">已封号</option>
       </select>
 
@@ -250,8 +254,8 @@ async function removeOne(id: string, name: string) {
 
     <div v-if="groupPanelOpen" class="group-panel">
       <div class="group-add">
-        <input v-model="newGroupName" class="input" type="text" maxlength="64" placeholder="新分组名称" @keyup.enter="addGroup" />
-        <AppButton variant="primary" size="sm" @click="addGroup"><FolderPlus :size="14" /><span>创建</span></AppButton>
+        <input v-model="newGroupName" class="input" type="text" maxlength="64" placeholder="新分组名称" :disabled="creatingGroup" @keyup.enter="addGroup" />
+        <AppButton variant="primary" size="sm" :loading="creatingGroup" :disabled="creatingGroup || !newGroupName.trim()" @click="addGroup"><FolderPlus :size="14" /><span>创建</span></AppButton>
       </div>
       <div class="group-list">
         <div v-for="group in groups.items" :key="group.id" class="group-row">

@@ -11,7 +11,7 @@ from curl_cffi.requests.cookies import Cookies
 from pydantic import ValidationError
 
 from codex_oauth.oauth import ProtocolClient
-from codex_oauth.sms import SmsActivation, SmsBowerClient, FirefoxSmsClient, SmsError, SmsSettings
+from codex_oauth.sms import SmsActivation, SmsBowerClient, SmsError, SmsSettings
 from test_sms_workflow import route, fake_login, account, config
 
 
@@ -210,12 +210,11 @@ def test_smsbower_reuse_checks_the_existing_activation_only(body, active):
     provider._request.assert_called_once_with("getStatus", id="lease-fixture")
 
 
-def test_firefox_reuse_checks_waiting_status_without_getting_another_number():
-    provider = FirefoxSmsClient(SmsSettings(provider="firefox", firefox_api_token="fixture-token"))
-    provider._authorized_request = Mock(return_value="0|-3")
-    activation = SmsActivation("lease-fixture", "+15550000000", "usa", "fixture-token")
-    assert provider.is_active(activation) is True
-    provider._authorized_request.assert_called_once_with("getPhoneCode", pkey="lease-fixture")
+def test_removed_provider_cannot_reuse_credentials_for_smsbower():
+    settings = SmsSettings.from_mapping({"enabled": True, "provider": "firefox", "token": "old-token", "api_key": "old-key"})
+    assert settings.enabled is False and settings.api_key == ""
+    with pytest.raises(SmsError, match="仅支持 SMSBower"):
+        SmsBowerClient(settings)
 
 
 def _import_phone_fixture(monkeypatch, limit=0):

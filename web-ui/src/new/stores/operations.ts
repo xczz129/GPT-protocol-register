@@ -1,7 +1,6 @@
 /* --- 运维中心 store：聚合数据、自动维护、备份恢复、回收站、接码设置 --- */
 import { defineStore } from "pinia";
 import {
-  clearSmsDockingHistory,
   createBackup,
   fetchOperations,
   fetchSmsConfig,
@@ -102,7 +101,7 @@ export const useOperationsStore = defineStore("operations", {
     },
     async loadSmsConfig() {
       const next = await this._run("sms", fetchSmsConfig);
-      if (this.smsConfig && ["provider", "firefox_api_name", "api_key_masked", "firefox_api_token_masked"].some(
+      if (this.smsConfig && ["provider", "api_key_masked"].some(
         key => this.smsConfig?.[key as keyof SmsConfig] !== next[key as keyof SmsConfig],
       )) this.smsBalance = null;
       this.smsConfig = next;
@@ -137,12 +136,6 @@ export const useOperationsStore = defineStore("operations", {
           };
           throw error;
         }
-      });
-    },
-    clearDockingHistory() {
-      return this._run("sms-dock-clear", async () => {
-        await clearSmsDockingHistory();
-        await this.loadSmsConfig();
       });
     },
     async loadSmsStats(force = false) {

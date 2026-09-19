@@ -1,12 +1,13 @@
 <script setup lang="ts">
 /* --- 注册任务配置表单 --- */
-import { computed, reactive, ref, watch } from "vue";
+import { computed, onMounted, reactive, ref, watch } from "vue";
 import { Play } from "@lucide/vue";
 import AppButton from "../../components/ui/AppButton.vue";
 import { useTasksStore } from "../../stores/tasks";
 import { useGroupsStore } from "../../stores/groups";
 import { useUiStore } from "../../stores/ui";
 import { useStatusStore } from "../../stores/status";
+import { fetchConfig } from "../../api/config";
 import { normalizeRegistrationNumbers, smsbowerPolicy } from "../../../shared/mailRegistration";
 
 const tasks = useTasksStore();
@@ -24,9 +25,12 @@ const form = reactive({
   groupId: "",
   autoGroup: false,
   autoGroupSize: 35,
+  autoSmsAfterRegister: false,
 });
 
 const busy = ref(false);
+const settingsLoading = ref(true);
+const settingsError = ref("");
 const smsbower = computed(() => (status.panel.mail?.providers || []).find((provider) => provider.type === "smsbower_mail"));
 const registrationPolicy = computed(() => smsbowerPolicy(form.mailType, smsbower.value?.register_child));
 
@@ -36,8 +40,23 @@ function normalizeNumbers() {
 
 watch(() => [form.mailType, smsbower.value?.register_child], normalizeNumbers);
 
+async function loadSettings() {
+  settingsLoading.value = true;
+  settingsError.value = "";
+  try {
+    const { config } = await fetchConfig();
+    form.autoSmsAfterRegister = config.registration?.auto_sms_after_register === true;
+  } catch (error) {
+    settingsError.value = error instanceof Error ? error.message : "注册设置加载失败";
+  } finally {
+    settingsLoading.value = false;
+  }
+}
+
+onMounted(loadSettings);
+
 async function submit() {
-  if (busy.value) return;
+  if (busy.value || tasks.job.running || settingsLoading.value || settingsError.value) return;
   busy.value = true;
   try {
     if (form.mailType === "smsbower_mail") await status.load(true);
@@ -52,6 +71,7 @@ async function submit() {
       group_id: form.groupId || null,
       auto_group: form.autoGroup,
       auto_group_size: Math.max(1, Math.min(500, Math.floor(form.autoGroupSize) || 35)),
+      auto_sms_after_register: form.autoSmsAfterRegister,
     });
     ui.notify("注册任务已启动", "success");
   } catch (error) {
@@ -131,10 +151,19 @@ async function submit() {
         <input v-model.number="form.autoGroupSize" class="input inline-num" type="number" min="1" max="500" :disabled="!form.autoGroup" />
         <span>个账号</span>
       </label>
+
+      <div class="auto-sms-option">
+        <label class="check">
+          <input v-model="form.autoSmsAfterRegister" type="checkbox" role="switch" aria-describedby="auto-sms-hint" :disabled="busy || tasks.job.running || settingsLoading || !!settingsError" />
+          <span>注册完成后自动接码</span>
+        </label>
+        <p id="auto-sms-hint">每个账号注册并测活后，在当前任务中继续接码，接码结束后才完成任务。沿用已有短信接码配置和费用上限，阶段和日志直接显示在任务卡片中。启动注册时保存此选项。</p>
+      </div>
     </div>
 
     <div class="form-actions">
-      <AppButton variant="primary" :loading="busy" :disabled="tasks.job.running" @click="submit">
+      <p v-if="settingsError" class="settings-error" role="alert">注册设置加载失败：{{ settingsError }} <button type="button" @click="loadSettings">重试</button></p>
+      <AppButton variant="primary" :loading="busy || settingsLoading" :disabled="tasks.job.running || settingsLoading || !!settingsError" @click="submit">
         <Play :size="15" /><span>{{ tasks.job.running ? "任务运行中" : "启动注册任务" }}</span>
       </AppButton>
     </div>
@@ -216,6 +245,33 @@ async function submit() {
   width: 70px;
   padding: 4px 8px;
   font-size: 0.78rem;
+}
+
+.auto-sms-option {
+  grid-column: 1 / -1;
+  padding-top: 8px;
+  border-top: 1px solid var(--line-subtle);
+}
+
+.auto-sms-option p {
+  margin: 6px 0 0 22px;
+  font-size: 0.74rem;
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+.settings-error {
+  margin: 0 0 10px;
+  color: var(--error);
+  font-size: 0.75rem;
+}
+
+.settings-error button {
+  border: 0;
+  background: none;
+  padding: 3px 6px;
+  color: var(--accent);
+  cursor: pointer;
 }
 
 .form-actions {

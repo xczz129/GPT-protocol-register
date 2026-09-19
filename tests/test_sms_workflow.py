@@ -304,17 +304,12 @@ def test_per_run_price_cap_rejects_invalid_values(route, price):
         route._effective_sms_config({"sms_code": config()}, {"max_price": price})
 
 
-def test_firefox_preflight_does_not_promise_unverified_cap_and_exposes_only_country(route):
-    cfg = {"sms_code": {"enabled": True, "provider": "firefox", "firefox_api_token": "private-token",
-                        "firefox_docking_code": "eng-1096-private", "max_price": "0.25"}}
-    section = route._effective_sms_config(cfg)
-    result = route._safe_sms_settings(section)
-    assert result["price_cap_supported"] is False
-    assert result["max_price"] == ""
-    assert result["country_order"] == "eng"
-    assert "private" not in json.dumps(result)
-    with pytest.raises(route.HTTPException):
-        route._effective_sms_config(cfg, {"country_order": "usa"})
+def test_removed_provider_preflight_is_explicitly_rejected(route):
+    cfg = {"sms_code": {"enabled": True, "provider": "firefox", "firefox_api_token": "private-token"}}
+    with pytest.raises(route.HTTPException, match="已移除"):
+        route._effective_sms_config(cfg)
+    with pytest.raises(route.HTTPException, match="已移除"):
+        route._effective_sms_config(cfg, {"provider": "smsbower"})
 
 
 def test_run_snapshots_overrides_without_mutating_config_or_accounts(route, monkeypatch):
@@ -523,3 +518,88 @@ def test_sms_token_field_update_rejects_concurrent_token_replacement(route, monk
     with pytest.raises(RuntimeError, match="sms_credentials_changed"):
         route._persist_sms_tokens(previous, {"access_token": team_token(), "refresh_token": "stale-rt"})
     assert store.load_accounts(db)[0]["refresh_token"] == "parallel-rt"
+
+
+def test_other_auth_429_stops_manual_batch_before_more_logins_or_phone_purchases(route, monkeypatch):
+    stop = route._reserve_batch("codex", 3, "limited-batch")
+    calls = fake_login(route, monkeypatch)
+    records = [account(f"limited-{i}@example.invalid") for i in range(3)]
+    monkeypatch.setattr(route, "_load_sms_batch_records", lambda wanted: [rec for rec in records if rec["email"] in wanted])
+
+    def limited(_self):
+        raise RuntimeError('HTTP 429 /api/accounts/password/verify: {"code":"rate_limit_exceeded"}')
+
+    monkeypatch.setattr(route.ProtocolClient, "submit_email", limited)
+    route._run_batch(records, config(0), concurrency=1, batch_id="limited-batch", stop_event=stop)
+    assert stop.is_set()
+    assert calls.login == calls.closed == 1
+    assert calls.acquire == calls.send == 0
+    assert route._STATE["status"] == "failed" and route._STATE["rate_limited"]
+    assert route._STATE["failed"] == 1
+    assert route._STATE["counts"]["cancelled"] == 2
+    assert route._STATE["done"] == 3
+    assert route._STATE["results"][0]["outcome"] == "failed"
+    assert "429" in route._STATE["results"][0]["error"]
+
+
+@pytest.mark.parametrize("stage_name", ["send", "otp"])
+def test_phone_429_releases_activation_once_and_does_not_retry_even_when_unlimited(route, monkeypatch, stage_name):
+    stop = route._reserve_batch("codex", 1, "limited-phone")
+    error = "HTTP 429: rate_limit_exceeded; proxy transport was rejected"
+    options = {"send_failures": 1, "send_error": error} if stage_name == "send" else {"otp_failures": 1, "otp_error": error}
+    calls = fake_login(route, monkeypatch, **options)
+    attempts = []
+    with pytest.raises(route._SmsRateLimited, match="429"):
+        route._process_one(account(), config(0), stop_event=stop, batch_id="limited-phone", phone_attempts=attempts)
+    assert stop.is_set() and route._STATE["rate_limited"]
+    assert calls.acquire == calls.cancelled == calls.login == calls.closed == 1
+    assert len(attempts) == 1 and attempts[0]["result"] == "failed"
+    assert not calls.workspaces
+
+
+def test_structured_http_429_preserves_classification_instead_of_network_retry(route, monkeypatch):
+    class SparseRateLimit(RuntimeError):
+        status_code = 429
+
+    stop = route._reserve_batch("codex", 1, "sparse-limit")
+    calls = fake_login(route, monkeypatch)
+
+    def limited(_self):
+        raise SparseRateLimit("proxy gateway rejected request")
+
+    monkeypatch.setattr(route.ProtocolClient, "bootstrap", limited)
+    with pytest.raises(route._SmsRateLimited, match="HTTP 429"):
+        route._process_one(account(), config(0), stop_event=stop, batch_id="sparse-limit")
+    assert calls.login == calls.closed == 1 and calls.acquire == 0
+    assert "HTTP 429" in route._STATE["rate_limit_error"]
+
+
+def test_ordinary_account_errors_do_not_stop_other_sms_accounts(route, monkeypatch):
+    stop = route._reserve_batch("codex", 3, "ordinary-errors")
+    calls = fake_login(route, monkeypatch)
+    records = [account(f"ordinary-{i}@example.invalid") for i in range(3)]
+    monkeypatch.setattr(route, "_load_sms_batch_records", lambda wanted: [rec for rec in records if rec["email"] in wanted])
+
+    def failed(_self):
+        raise RuntimeError("account authorization denied")
+
+    monkeypatch.setattr(route.ProtocolClient, "submit_email", failed)
+    route._run_batch(records, config(), concurrency=1, batch_id="ordinary-errors", stop_event=stop)
+    assert not stop.is_set() and not route._STATE["rate_limited"]
+    assert calls.login == calls.closed == 3
+    assert route._STATE["failed"] == 3
+    assert route._STATE["counts"]["cancelled"] == 0
+
+
+def test_late_429_cannot_stop_a_different_batch_and_new_batch_resets_diagnostic(route):
+    stop = route._reserve_batch("codex", 1, "current-batch")
+    route._stop_sms_batch_for_rate_limit("old-batch", "HTTP 429 rate_limit_exceeded")
+    assert not stop.is_set() and not route._STATE["rate_limited"]
+    route._stop_sms_batch_for_rate_limit("current-batch", "HTTP 429 first error")
+    route._stop_sms_batch_for_rate_limit("current-batch", "HTTP 429 later error")
+    assert stop.is_set() and route._STATE["rate_limit_error"] == "HTTP 429 first error"
+    route._finish_batch("current-batch")
+    assert route._STATE["status"] == "failed"
+    new_stop = route._reserve_batch("codex", 1, "next-batch")
+    assert not new_stop.is_set() and not route._STATE["rate_limited"]
+    assert route._STATE["rate_limit_error"] == ""

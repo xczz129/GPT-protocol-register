@@ -240,6 +240,9 @@ export function healthChip(account: Account): { text: string; kind: "success" | 
     case "invalid": return { text: "失效", kind: "error" };
     case "reauth_required": return { text: "待续期", kind: "warning" };
     case "error": return { text: "异常", kind: "error" };
+    case "unknown":
+      return account.health_probe_error || account.status === "待复测"
+        ? { text: "待复测", kind: "warning" } : { text: "未测活", kind: "info" };
     default: return { text: "未测活", kind: "info" };
   }
 }

@@ -67,6 +67,7 @@ function formatTime(value: unknown): string {
 }
 
 async function saveMaintenance() {
+  if (!Number.isSafeInteger(form.workers) || form.workers < 1) { ui.notify("测活并发数必须为正整数", "error"); return; }
   try {
     await ops.saveMaintenance({
       enabled: form.enabled,
@@ -129,7 +130,7 @@ async function saveQuota() {
       </label>
       <label class="field">
         <span>测活并发</span>
-        <input v-model.number="form.workers" class="input" type="number" min="1" max="20" />
+        <input v-model.number="form.workers" class="input" type="number" min="1" step="1" />
       </label>
       <label class="field span-2">
         <span>Webhook</span>

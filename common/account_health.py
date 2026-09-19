@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import threading
 import time
 import uuid
@@ -575,7 +576,17 @@ def _response_json(response, path: str) -> dict[str, Any]:
         data = None
     if response.status_code == 401:
         _raise_if_deactivated(data, source=f"HTTP 401 {path}")
-        raise InvalidAccessTokenError(f"token invalidated ({path})")
+        # Preserve a bounded machine-readable reason, never the response body
+        # (which can contain credentials or other account information).
+        error_data = data.get("error") if isinstance(data, dict) else None
+        code = error_data.get("code") if isinstance(error_data, dict) else None
+        code = code or (data.get("code") if isinstance(data, dict) else None)
+        safe_code = (
+            str(code) if isinstance(code, str)
+            and re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_.-]{0,79}", code) else ""
+        )
+        detail = f"; error_code={safe_code}" if safe_code else ""
+        raise InvalidAccessTokenError(f"token invalidated ({path}){detail}")
     if response.status_code != 200:
         detail = (response.text or "")[:400]
         lowered = detail.lower()
@@ -725,6 +736,7 @@ _HEALTH_OWNED_FIELDS = frozenset({
     "account_id", "workspace_account_id", "user_id", "email", "plan_type",
     "last_token_refresh_at", "last_token_refresh_error", "last_invalid_at",
     "status", "health_status", "health_checked_at", "health_error",
+    "health_last_confirmed_status", "health_last_confirmed_at",
     "health_probe_error", "health_probe_proxy_mode", "health_probe_channel",
     "reauth_blocked_reason",
     "type", "quota", "image_quota_unknown", "limits_progress",
@@ -734,6 +746,7 @@ _HEALTH_EXPECTED_FIELDS = (
     "access_token", "refresh_token", "session_token", "user_id", "email",
     "account_id", "password", "totp_secret", "import_account_type",
     "selected_workspace_id", "workspace_selection_verified",
+    "selected_workspace_metadata", "selected_workspace_evidence_source",
 )
 
 
@@ -820,6 +833,17 @@ def check_account(
     channel: str = "v4",
 ) -> dict[str, Any]:
     current = dict(record)
+    # Legacy rows stored the most recent verdict in health_status. Preserve it
+    # separately before a failed probe replaces the current result with unknown.
+    # A legacy probe_error means the timestamp may already describe a failed
+    # probe, so it must not be relabeled as a confirmed check.
+    if (
+        str(record.get("health_status") or "").lower()
+        in {"alive", "limited", "invalid", "reauth_required"}
+        and not record.get("health_probe_error")
+    ):
+        current["health_last_confirmed_status"] = record["health_status"]
+        current["health_last_confirmed_at"] = record.get("health_checked_at") or ""
     probe_channel = normalize_health_probe_channel(channel)
     operation_log_path = Path(path or ACCOUNTS_FILE).with_name(
         "account_operation_logs.sqlite3"
@@ -846,7 +870,7 @@ def check_account(
         probe_proxy_mode = "account_proxy" if stored_proxy else "direct"
         max_attempts = 2
     probe_proxy = probe_proxies[0]
-    last_transport_error: BaseException | None = None
+    current["health_probe_proxy_mode"] = probe_proxy_mode
 
     def apply_refreshed(refreshed: dict[str, Any]) -> None:
         # The saved registration proxy is historical metadata. Network calls
@@ -904,8 +928,11 @@ def check_account(
             health_status="invalid",
             health_checked_at=_now(),
             health_error="account_deactivated: account has been deleted or deactivated",
+            health_probe_error="",
             updated_at=_now(),
         )
+        current["health_last_confirmed_status"] = current["health_status"]
+        current["health_last_confirmed_at"] = current["health_checked_at"]
         if persist:
             current = _persist_health_results([(record, current)], path)[0]
         record_operation_event(
@@ -931,7 +958,7 @@ def check_account(
                         if probe_channel == "nerver"
                         else fetch_remote_account_info(probe_record)
                     )
-                except InvalidAccessTokenError:
+                except InvalidAccessTokenError as initial_token_error:
                     session_error: InvalidAccessTokenError | None = None
                     if current.get("session_token"):
                         try:
@@ -946,9 +973,7 @@ def check_account(
                             session_error = exc
                     if session_error is not None or not current.get("session_token"):
                         if not current.get("refresh_token"):
-                            raise session_error or InvalidAccessTokenError(
-                                "missing renewable credential"
-                            )
+                            raise session_error or initial_token_error
                         refreshed = refresh_oauth_tokens(
                             {**current, "proxy": probe_proxy},
                             force=True,
@@ -966,12 +991,14 @@ def check_account(
                 _validate_health_metadata(record, current, remote)
                 remote["health_probe_proxy_mode"] = probe_proxy_mode
                 remote["health_probe_channel"] = probe_channel
-                remote.setdefault("health_probe_error", "")
                 current.update(remote)
+                current.update(
+                    health_error="", health_probe_error="",
+                    last_token_refresh_error="", reauth_blocked_reason="",
+                )
                 break
             except Exception as exc:
                 if _is_health_transport_error(exc):
-                    last_transport_error = exc
                     if attempt + 1 < max_attempts:
                         # Imported OAuth records usually have no historical
                         # registration proxy. Give the next probe a real
@@ -993,7 +1020,10 @@ def check_account(
                         time.sleep(0.25)
                         continue
                     raise
-                if attempt == 0 and _is_transient_health_probe_error(exc):
+                if (
+                    attempt == 0 and attempt + 1 < max_attempts
+                    and _is_transient_health_probe_error(exc)
+                ):
                     if not configured_proxies:
                         try:
                             from common.trial_proxy_pool import selected_trial_proxies
@@ -1020,6 +1050,7 @@ def check_account(
             health_status="invalid",
             health_checked_at=_now(),
             health_error=str(exc)[:400],
+            health_probe_error="",
             reauth_blocked_reason="account_deactivated",
         )
     except InvalidAccessTokenError as exc:
@@ -1035,14 +1066,13 @@ def check_account(
             health_status=state,
             health_checked_at=_now(),
             health_error=str(exc)[:400],
+            health_probe_error="",
         )
     except Exception as exc:
-        if last_transport_error is not None and _is_health_transport_error(exc):
-            previous = str(record.get("health_status") or "").strip().lower()
-            preserved = previous if previous in {"alive", "limited"} else "unknown"
+        if _is_health_transport_error(exc) or _is_transient_health_probe_error(exc):
             current.update(
-                status=(record.get("status") if preserved != "unknown" else "待复测"),
-                health_status=preserved,
+                status="待复测",
+                health_status="unknown",
                 health_checked_at=_now(),
                 health_error="",
                 health_probe_error=str(exc)[:400],
@@ -1055,10 +1085,14 @@ def check_account(
                 health_status="error",
                 health_checked_at=_now(),
                 health_error=str(exc)[:400],
+                health_probe_error="",
                 health_probe_channel=probe_channel,
             )
     current["updated_at"] = _now()
     final_health = str(current.get("health_status") or "error").strip().lower()
+    if final_health in {"alive", "limited", "invalid", "reauth_required"}:
+        current["health_last_confirmed_status"] = final_health
+        current["health_last_confirmed_at"] = current.get("health_checked_at") or _now()
     record_operation_event(
         current,
         "health_check",
@@ -1066,6 +1100,7 @@ def check_account(
         message=(
             "账号测活成功"
             if final_health in {"alive", "limited"}
+            else "账号测活未完成，待复测" if final_health == "unknown"
             else "账号测活失败"
         ),
         error=current.get("health_error") or current.get("health_probe_error"),
@@ -1117,6 +1152,7 @@ def check_accounts(
     proxy_candidates: Iterable[str] | None = None,
     skip_known_deactivated: bool = True,
     channel: str = "v4",
+    stop_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     probe_channel = normalize_health_probe_channel(channel)
     source_items = list(records if records is not None else load_accounts(path))
@@ -1143,7 +1179,34 @@ def check_accounts(
             return
         batch = list(pending)
         pending.clear()
-        for persisted in _persist_health_results(batch, path):
+        try:
+            persisted_rows = list(_persist_health_results(batch, path))
+        except Exception:
+            # 批量落盘失败(如键迁移目标被占用的 ValueError):回退逐行,
+            # 只把真正有问题的行降级为 unknown,不允许炸掉整批、丢弃
+            # 其余未落盘结果。
+            persisted_rows = []
+            for original, checked in batch:
+                try:
+                    persisted_rows.extend(_persist_health_results([(original, checked)], path))
+                except Exception as row_error:
+                    degraded = dict(checked or original)
+                    degraded.update(
+                        {
+                            "health_status": "unknown",
+                            "health_error": f"persist_failed: {str(row_error)[:180]}",
+                        }
+                    )
+                    persisted_rows.append(degraded)
+                    record_operation_event(
+                        degraded,
+                        "health_check",
+                        "failed",
+                        message="账号测活结果落盘失败",
+                        error=str(row_error)[:240],
+                        path=operation_log_path,
+                    )
+        for persisted in persisted_rows:
             results.append(persisted)
             if callable(item_callback):
                 try:
@@ -1167,7 +1230,10 @@ def check_accounts(
         except Exception:
             executor_workers = requested_workers
 
-    def run_one(item: dict[str, Any]) -> dict[str, Any]:
+    def stopping() -> bool:
+        return bool(callable(stop_check) and stop_check())
+
+    def run_one(item: dict[str, Any]) -> dict[str, Any] | None:
         check_kwargs = {
             "persist": False,
             "path": path,
@@ -1175,10 +1241,13 @@ def check_accounts(
         }
         if probe_channel == "nerver":
             check_kwargs["channel"] = probe_channel
+        def probe() -> dict[str, Any] | None:
+            return None if stopping() else check_account(item, **check_kwargs)
+
         if not callable(worker_limit):
-            return check_account(item, **check_kwargs)
+            return probe()
         return _HEALTH_WORKER_GATE.run(
-            lambda: check_account(item, **check_kwargs),
+            probe,
             requested=requested_workers,
             limit_provider=worker_limit,
         )
@@ -1191,6 +1260,8 @@ def check_accounts(
         in_flight: dict[Any, dict[str, Any]] = {}
 
         def submit_next() -> bool:
+            if stopping():
+                return False
             try:
                 item = next(item_iterator)
             except StopIteration:
@@ -1202,12 +1273,29 @@ def check_accounts(
             submit_next()
 
         while in_flight:
+            if stopping():
+                for future in in_flight:
+                    future.cancel()
             completed_futures, _ = wait(
-                tuple(in_flight), return_when=FIRST_COMPLETED
+                tuple(in_flight), timeout=0.25, return_when=FIRST_COMPLETED
             )
             for future in completed_futures:
                 original = in_flight.pop(future)
-                checked = future.result()
+                if future.cancelled():
+                    continue
+                try:
+                    checked = future.result()
+                except Exception as worker_error:
+                    # 单账号测活异常只降级该账号,不允许炸掉整批。
+                    checked = dict(original)
+                    checked.update(
+                        {
+                            "health_status": "unknown",
+                            "health_error": f"check_crashed: {str(worker_error)[:180]}",
+                        }
+                    )
+                if checked is None:
+                    continue
                 completed += 1
                 pending.append((original, checked))
                 # ``completion_callback`` is deliberately invoked before the
@@ -1234,7 +1322,7 @@ def check_accounts(
             error=skipped.get("health_error"),
             path=operation_log_path,
         )
-    counts = {"alive": 0, "limited": 0, "invalid": 0, "reauth_required": 0, "error": 0}
+    counts = {"alive": 0, "limited": 0, "invalid": 0, "reauth_required": 0, "error": 0, "unknown": 0}
     for item in results:
         state = str(item.get("health_status") or "error")
         counts[state if state in counts else "error"] += 1
@@ -1247,12 +1335,15 @@ def check_accounts(
         "requested": requested,
         "actual_total": actual_total,
         "checked": len(results),
+        "interrupted": stopping() and len(results) < actual_total,
+        "stopped": max(0, actual_total - len(results)) if stopping() else 0,
         "usable": usable,
         "unavailable": (
             len(skipped_items)
             + counts["invalid"]
             + counts["reauth_required"]
             + counts["error"]
+            + counts["unknown"]
         ),
         "skipped_known_deactivated": len(skipped_items),
         "deactivated": deactivated,

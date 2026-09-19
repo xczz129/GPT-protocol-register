@@ -90,6 +90,7 @@ function healthLabel(account?: (typeof accounts.rows)[number]) {
   if (!account) return "未匹配";
   if (account.is_deactivated) return "已封号";
   const status = String(account.health_status || "unknown").toLowerCase();
+  if (status === "unknown" && (account.health_probe_error || account.status === "待复测")) return "待复测";
   return ({ alive: "可用", ok: "可用", limited: "限流", reauth_required: "待续期", invalid: "失效", error: "错误", unknown: "未检测" } as Record<string, string>)[status] || status;
 }
 
@@ -131,7 +132,8 @@ function removeEmails(emails: string | string[]) {
 
 async function start() {
   if (!canStart.value) return;
-  const workers = Math.min(20, Math.max(1, Number(concurrency.value) || 3));
+  if (!Number.isSafeInteger(concurrency.value) || concurrency.value < 1) { ui.notify("并发数必须为正整数", "error"); return; }
+  const workers = concurrency.value;
   busy.value = true;
   try {
     const value = await batch.startProtocolLogin(selectedReadyEmails.value, workers);
@@ -166,7 +168,8 @@ async function healthCheck() {
   const keys = accounts.rows.filter((item) => wanted.has(String(item.email || "").trim().toLowerCase())).map((item) => item.delete_key).filter(Boolean);
   if (!keys.length || health.value.running || progress.value.running) return;
   try {
-    await accounts.startHealth(keys, false, Math.min(20, Math.max(1, Number(concurrency.value) || 3)));
+    if (!Number.isSafeInteger(concurrency.value) || concurrency.value < 1) throw new Error("并发数必须为正整数");
+    await accounts.startHealth(keys, false, concurrency.value);
     ui.notify(`已开始协议状态检测（${keys.length} 个账号）`, "success");
   } catch (error) {
     ui.notify(error instanceof Error ? error.message : "检测启动失败", "error");
@@ -193,7 +196,7 @@ onMounted(async () => {
     const saved = JSON.parse(localStorage.getItem(INPUT_STATE_KEY) || "null");
     if (saved && typeof saved === "object") {
       if (typeof saved.input === "string") input.value = saved.input;
-      if (Number.isFinite(Number(saved.concurrency))) concurrency.value = Math.min(20, Math.max(1, Number(saved.concurrency)));
+      if (Number.isSafeInteger(Number(saved.concurrency)) && Number(saved.concurrency) > 0) concurrency.value = Number(saved.concurrency);
       saveInputState(); // Sanitize v1 caches immediately, including old full rows.
     }
   } catch { /* 忽略损坏的本地状态 */ }
@@ -223,7 +226,7 @@ onMounted(async () => {
       <div class="controls">
         <label class="field">
           <span>并发数</span>
-          <input v-model.number="concurrency" class="input concurrency" type="number" min="1" max="20" inputmode="numeric" />
+          <input v-model.number="concurrency" class="input concurrency" type="number" min="1" step="1" inputmode="numeric" />
         </label>
         <div class="control-actions">
           <AppButton variant="accent" size="sm" @click="pasteEmails"><ClipboardPaste :size="14" /><span>粘贴</span></AppButton>
@@ -275,6 +278,7 @@ onMounted(async () => {
         <span class="ok-text">正常 {{ health.alive || 0 }}</span>
         <span>限流 {{ health.limited || 0 }}</span>
         <span>待续期 {{ health.reauthRequired || 0 }}</span>
+        <span>待复测 {{ health.unknown || 0 }}</span>
         <span class="error-text">失效 {{ health.invalid || 0 }}</span>
         <span class="error-text">错误 {{ health.error || 0 }}</span>
       </div>

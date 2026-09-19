@@ -5,6 +5,7 @@ import {
   codexImport, codexRun, codexStop, fetchCodexStatus, fetchReauthProgress,
   fetchRefreshAtProgress, fetchTrialProgress, passwordChangeStart, preflightCodex, reauthByEmailStart, reauthStart,
   reauthStop, refreshAtStart, refreshAtStop, securityRepairStart, totpChangeStart, trialStart, trialStop,
+  cancelledImportResult, parseImportCredentials, importCredentialError, validImportConcurrency, IMPORT_MAX_CONCURRENCY,
   type CodexRunOptions, type CodexStatus, type ProtocolLoginStartResult, type ReauthProgress,
   type RefreshAtProgress, type RelayAction, type RelayStrategy, type SmsOptions, type TrialChannel, type TrialProgress,
 } from "../api/batchops";
@@ -46,7 +47,7 @@ export const useBatchOpsStore = defineStore("batchops", () => {
   }
 
   function cancelledItem(item: { status?: string; error?: string }) {
-    return item.status === "cancelled" || (item.status === "failed" && /^(?:任务已(?:停止|取消)|用户(?:停止|取消)|cancel(?:led|ed)\b)/i.test(item.error || ""));
+    return cancelledImportResult(item);
   }
 
   const codexSummary = computed(() => {
@@ -56,10 +57,11 @@ export const useBatchOpsStore = defineStore("batchops", () => {
     const items = value.items || [];
     const reused = number(counts.skipped, results.filter((item) => item.skipped || item.status === "skipped").length);
     const synced = number(counts.synced, results.filter((item) => item.outcome === "synced" || item.status === "synced" || (item.action === "sync_only" && item.relay_status === "synced")).length);
-    const legacyCancelled = results.filter(cancelledItem).length;
+    const legacyCancelled = results.filter((item) => item.status === "failed" && cancelledItem(item)).length;
+    const resultCancelled = results.filter(cancelledItem).length;
     const newSuccess = number(counts.success, Math.max(0, number(value.success) - reused - synced));
     const failed = number(counts.failed, Math.max(0, number(value.failed) - legacyCancelled));
-    const cancelled = number(counts.cancelled, number(value.cancelled, legacyCancelled));
+    const cancelled = number(counts.cancelled, number(value.cancelled, resultCancelled));
     const active = number(counts.active, items.filter((item) => item.status === "active").length);
     const done = Math.max(number(counts.done, number(value.done)), newSuccess + synced + reused + failed + cancelled);
     const total = Math.max(number(counts.total, number(value.total)), done + active);
@@ -294,6 +296,8 @@ export const useBatchOpsStore = defineStore("batchops", () => {
   async function retryCodexFailed(onlyEmail?: string | string[]) {
     if (codex.value.mode === "import") throw new Error("此批次为账号导入，请使用导入重试");
     if (codex.value.running || codexStartBusy.value) throw new Error("请等待当前任务结束后重试");
+    const oldProvider = codex.value.options?.sms_options?.provider || lastCodexOptions.sms_options?.provider;
+    if (oldProvider && oldProvider !== "smsbower") throw new Error("旧接码渠道仅供历史查看，请重新配置 SMSBower");
     const emails = failedCodexEmails(onlyEmail);
     if (!emails.length) throw new Error("没有可重试的失败账号");
     const options: CodexRunOptions = {
@@ -324,15 +328,12 @@ export const useBatchOpsStore = defineStore("batchops", () => {
 
   /** 导入账号（协议登录 密码+TOTP） */
   async function startImport(payload: { text: string; accountType: string; workspace: string; concurrency: number }) {
-    const value = String(payload.text || "").trim();
-    if (!value) return;
-    const rows = new Map<string, string>();
-    for (const line of value.split(/\r?\n/)) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith("#")) continue;
-      const [email] = trimmed.split("----");
-      if (email && email.trim()) rows.set(email.trim().toLowerCase(), trimmed);
-    }
+    const value = String(payload.text || "");
+    const parsed = parseImportCredentials(value);
+    if (parsed.errors.length) throw new Error(importCredentialError(parsed.errors));
+    if (!parsed.rows.length) throw new Error("请填写需要导入的账号");
+    if (!validImportConcurrency(payload.concurrency)) throw new Error(`导入并发必须为 1–${IMPORT_MAX_CONCURRENCY} 的整数`);
+    const rows = new Map(parsed.rows.map((row) => [row.email, row.line]));
     await launchCodexBatch("import", rows.size,
       () => codexImport(value, payload.accountType, payload.workspace, payload.concurrency), () => {
         lastImportLines.value = rows;

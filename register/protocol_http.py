@@ -13,13 +13,14 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 from curl_cffi import requests
 from common.proxy_clearance import headers_with_clearance
-from proxy_util import is_proxy_transport_error, is_rate_limit_error, is_tls_transient_error, normalize_proxy_url
+from proxy_util import is_proxy_transport_error, is_rate_limit_error, is_registration_access_denied, is_tls_transient_error, normalize_proxy_url
 from register.protocol_sentinel import build_sentinel_token as _build_sentinel_token_tuple, build_sentinel_with_so_token
 from register.protocol_runtime import current_runtime_settings
 
 from register.protocol_context import (
     _PROXY_CONFIG,
     _effective_proxy_config,
+    _is_cloudflare_challenge,
     _STOP_CHECK,
     _make_trace_headers,
     _oauth_timeout,
@@ -237,6 +238,8 @@ def request_with_local_retry(session: requests.Session, method: str, url: str, r
         try:
             response = session.request(method_name, url, **request_kwargs)
             status = int(getattr(response, "status_code", 0) or 0)
+            if status in {403, 429} or _is_cloudflare_challenge(response):
+                return response, ""
             should_retry = status in retryable_statuses and attempt + 1 < attempts
             if not should_retry:
                 return response, ""
@@ -256,6 +259,11 @@ def request_with_local_retry(session: requests.Session, method: str, url: str, r
             last_error = str(error)
             if is_rate_limit_error(error):
                 return None, "rate_limit_exceeded: " + last_error
+            if is_registration_access_denied(error):
+                return None, (
+                    last_error if is_registration_access_denied(last_error)
+                    else "registration_access_denied: " + last_error
+                )
             # TLS 瞬断是链路级偶发,原 session 短退避重试几乎必恢复;直接换
             # 代理会丢 oai-did/csrf cookie 并引入新出口 IP,反而更可疑。
             if is_tls_transient_error(last_error) and attempt + 1 < attempts:

@@ -175,18 +175,10 @@ export interface SmsConfig {
   timeout_seconds: number;
   max_price: string;
   max_phone_attempts: number;
-  firefox_api_name: string;
-  firefox_docking_code: string;
-  firefox_did: string;
-  firefox_item_id: string;
-  firefox_country_order: string;
   has_api_key: boolean;
   api_key_masked: string;
-  has_firefox_token: boolean;
-  firefox_api_token_masked: string;
   provider_label: string;
   configured: boolean;
-  firefox_docking_code_history: string[];
 }
 
 export function fetchSmsConfig(): Promise<SmsConfig> {
@@ -208,10 +200,6 @@ export interface SmsBalanceResult {
 
 export function testSmsConfig(): Promise<SmsBalanceResult> {
   return api<SmsBalanceResult>("/api/sms-config/test", { method: "POST", body: jsonBody({}) });
-}
-
-export function clearSmsDockingHistory() {
-  return api("/api/sms-config/docking-history", { method: "DELETE" });
 }
 
 export interface SmsStatsRow {
@@ -252,11 +240,12 @@ export interface SmsCountryItem {
   calling?: string;
   count?: number;
   price?: string | number;
+  min_price?: string | number | null;
   tiers?: SmsCountryTier[];
 }
 
-export function fetchSmsCountries(provider: string): Promise<{ ok: boolean; items: SmsCountryItem[] }> {
+export function fetchSmsCountries(): Promise<{ ok: boolean; items: SmsCountryItem[] }> {
   return api<{ ok: boolean; items: SmsCountryItem[] }>(
-    `/api/sms-countries?provider=${encodeURIComponent(provider)}`,
+    "/api/sms-countries?provider=smsbower",
   );
 }

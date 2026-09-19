@@ -24,6 +24,8 @@ from common.account_operation_log import record_operation_event
 from mail import count_pool_capacity, release_stale_in_use
 from proxy_util import (
     is_auth_identity_error,
+    is_cloudflare_block_error,
+    is_registration_access_denied,
     compute_proxy_retry_limit,
     is_proxy_transport_error,
     is_rate_limit_error,
@@ -43,7 +45,12 @@ from register.smsbower_batch import run_dynamic_mail_groups, _await_owned
 from register.pending_recovery import can_recover_registration, is_registration_guard_error, merge_registration_progress, recover_registration
 from register.registration_outcome import RegisteredEmailDetected
 from register.flow import register_one
-from register.protocol import repair_security_one
+from register.protocol import (
+    repair_security_one,
+    _new_cf_block_state,
+    _note_cf_block,
+    _cf_cooldown_remaining,
+)
 from register.protocol_context import _redact_operation_error
 from register.protocol_runtime import ProtocolRuntimeSettings
 from register.util import REGISTER_TIMEOUT
@@ -247,6 +254,7 @@ async def run_register(
     group_id: str = "",
     group_plan: list[str] | None = None,
     proxy_config_loader=None,
+    account_ready=None,
 ) -> list[dict[str, Any]]:
     """Run GPT registration batch. Returns successful account records.
 
@@ -284,6 +292,7 @@ async def run_register(
             group_id=group_id,
             group_plan=group_plan,
             proxy_config_loader=proxy_config_loader,
+            **({"account_ready": account_ready} if callable(account_ready) else {}),
         )
     hybrid_mode = engine in {"hybrid", "auto_hybrid"}
     post_security = engine == "browser" and _truthy(
@@ -420,6 +429,7 @@ async def run_register(
 
     results: list[dict[str, Any] | None] = [None] * n
     global_rate_limited = threading.Event()
+    cf_block_state = _new_cf_block_state()
     # Pin one mailbox to each task for the lifetime of the batch. A transient
     # failure releases the persistent mailbox state, so allocating afresh on
     # every task would repeatedly select the first address when concurrency=1.
@@ -504,11 +514,14 @@ async def run_register(
 
     async def _wait_if_paused(index: int, stop_override=None) -> None:
         logged = False
-        while _paused():
+        while _paused() or _cf_cooldown_remaining(cf_block_state) > 0:
             if (callable(stop_override) and stop_override()) or _stop() or (cancel_event is not None and cancel_event.is_set()):
                 raise JobCancelled("stop requested")
             if not logged:
-                emit_task(index, "paused", step="任务派发已暂停")
+                emit_task(index, "paused", step=(
+                    "Cloudflare 连续拦截，等待批次冷却后派发"
+                    if _cf_cooldown_remaining(cf_block_state) > 0 else "任务派发已暂停"
+                ))
                 logged = True
             await asyncio.sleep(0.25)
         if logged:
@@ -537,7 +550,7 @@ async def run_register(
                     task_email = str(mailbox_override.get("address") or "")
                 try:
                     await _wait_if_paused(i, task_stopped)
-                except JobCancelled:
+                except (JobCancelled, asyncio.CancelledError):
                     emit_task(i, "cancelled", step="暂停期间收到停止请求")
                     return
                 if start_barrier is not None:
@@ -592,7 +605,7 @@ async def run_register(
                 for attempt in range(proxy_retry_limit + 1):
                     try:
                         await _wait_if_paused(i, task_stopped)
-                    except JobCancelled:
+                    except (JobCancelled, asyncio.CancelledError):
                         emit_task(i, "cancelled", step="暂停期间收到停止请求")
                         break
                     if task_stopped():
@@ -642,7 +655,7 @@ async def run_register(
                         transport_error = is_proxy_transport_error(detail)
                         if callable(task_event):
                             forwarded = dict(fields)
-                            if status == "failed" and not (is_auth_identity_error(detail) or is_registration_guard_error(detail)) and not is_rate_limit_error(detail) and not task_stopped() and can_recover_registration(pending_account, active_mailbox):
+                            if status == "failed" and not (is_auth_identity_error(detail) or is_registration_guard_error(detail) or is_registration_access_denied(detail)) and not is_rate_limit_error(detail) and not task_stopped() and can_recover_registration(pending_account, active_mailbox):
                                 status = "running"
                                 forwarded["step"] = "注册凭据已保存，正在准备密码登录补全"
                             if transport_error:
@@ -726,7 +739,7 @@ async def run_register(
                                 # Browser cleanup/timeout may raise after the password
                                 # has been saved. Continue the same owned identity.
                                 owned_pending = bool((active_mailbox or {}).get("_registration_identity_created") and pending_account.get("password"))
-                                if is_auth_identity_error(registration_error) or is_registration_guard_error(registration_error) or skipped or task_stopped() or not (owned_pending or can_recover_registration(pending_account, active_mailbox)):
+                                if is_auth_identity_error(registration_error) or is_registration_guard_error(registration_error) or is_rate_limit_error(registration_error) or is_registration_access_denied(registration_error) or skipped or task_stopped() or not (owned_pending or can_recover_registration(pending_account, active_mailbox)):
                                     raise
                                 attempt_error_detail = str(registration_error)
                                 attempt_error = attempt_error_detail.lower()
@@ -741,7 +754,7 @@ async def run_register(
                             security_completion_failed = True
                             emit_task(i, "failed", email=pending_account.get("email"), error=original_error,
                                 step="邮箱验证尚未完成，已保留密码和原始错误，停止自动登录补全")
-                        if not record and not recovery_only and not task_stopped() and not (is_auth_identity_error(attempt_error) or is_registration_guard_error(attempt_error)) and can_recover_registration(pending_account, active_mailbox):
+                        if not record and not recovery_only and not task_stopped() and not (is_auth_identity_error(attempt_error) or is_registration_guard_error(attempt_error) or is_rate_limit_error(attempt_error) or is_registration_access_denied(attempt_error)) and can_recover_registration(pending_account, active_mailbox):
                             defer = bool(active_mailbox is not None and active_mailbox.get("provider") == "smsbower_mail" and active_mailbox.get("register_child", True) and active_mailbox.get("_smsbower_pair_role", "primary") == "primary" and (active_mailbox.get("_registration_code_received") or active_mailbox.get("_otp_accepted_by_server")))
                             if defer:
                                 active_mailbox["_registration_recovery_pending"] = True
@@ -899,6 +912,13 @@ async def run_register(
                             step=f"任务成功 · {em}" if em else "任务成功",
                         )
                         break
+                    if is_cloudflare_block_error(attempt_error):
+                        cf_cooldown = _note_cf_block(cf_block_state)
+                        if cf_cooldown > 0:
+                            print(
+                                f"  [调度] Cloudflare 连续拦截，"
+                                f"后续任务冷却 {cf_cooldown:.0f}s 后派发；当前被拒绝账号已停止"
+                            )
                     if security_completion_failed:
                         break
                     if skipped:
@@ -914,6 +934,8 @@ async def run_register(
                     if task_stopped():
                         break
                     if is_auth_identity_error(attempt_error) or is_registration_guard_error(attempt_error):
+                        break
+                    if is_registration_access_denied(attempt_error):
                         break
                     alias_pinned = fixed_alias_batch or paired_alias
                     if alias_pinned and not alias_proxy_retryable(attempt_error):
@@ -966,6 +988,8 @@ async def run_register(
                         except JobCancelled:
                             break
                 results[i - 1] = record
+                if record and callable(account_ready):
+                    await account_ready(i, record, stop_check=task_stopped)
                 if not record and mailbox_override is not None and mailbox_override.get("_registration_recovery_pending") and not mailbox_override.get("_registration_recovery_only"):
                     return
                 if not record and not skipped and not task_stopped():
@@ -1047,7 +1071,8 @@ async def run_register(
 
             await run_dynamic_mail_groups(sorted(dynamic_indices), concurrency=conc, mail_config=mail_config, provider_type=provider_type,
                                           run_account=run_allocated, result_at=lambda index: results[index - 1], emit=emit_dynamic,
-                                          stop_check=lambda: global_rate_limited.is_set() or bool(_stop()) or bool(cancel_event is not None and cancel_event.is_set()), pause_check=_paused)
+                                          stop_check=lambda: global_rate_limited.is_set() or bool(_stop()) or bool(cancel_event is not None and cancel_event.is_set()),
+                                          pause_check=lambda: _paused() or _cf_cooldown_remaining(cf_block_state) > 0)
 
     ok = [r for r in results if r]
     if _stop() or (cancel_event is not None and cancel_event.is_set()):

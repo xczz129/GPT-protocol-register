@@ -25,8 +25,8 @@ let openGeneration = 0;
 const scopeText = computed(() => props.all ? `全部未封号账号（当前约 ${accounts.activeCount} 个）` : `${props.keys.length} 个选中账号`);
 
 function clampWorkers(value: unknown): number {
-  const parsed = Math.floor(Number(value));
-  return Math.max(1, Math.min(20, Number.isFinite(parsed) ? parsed : 10));
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 10;
 }
 
 watch(() => props.open, (open) => {
@@ -51,6 +51,10 @@ watch(() => props.open, (open) => {
 
 async function submit() {
   if (submitting.value || loadingSettings.value || accounts.health.running || accounts.healthSubmitting || (!props.all && !props.keys.length)) return;
+  if (!Number.isSafeInteger(concurrency.value) || concurrency.value < 1) {
+    ui.notify("并发数必须为正整数", "error");
+    return;
+  }
   submitting.value = true;
   const workers = clampWorkers(concurrency.value);
   try {
@@ -73,8 +77,8 @@ async function submit() {
 
     <div class="field-row">
       <label class="field-label" for="health-workers">并发数</label>
-      <input id="health-workers" v-model.number="concurrency" class="field-input" type="number" min="1" max="20" step="1" :disabled="loadingSettings || submitting" />
-      <span class="field-hint">1–20</span>
+      <input id="health-workers" v-model.number="concurrency" class="field-input" type="number" min="1" step="1" :disabled="loadingSettings || submitting" />
+      <span class="field-hint">正整数</span>
     </div>
     <p v-if="loadingSettings" class="settings-note">正在读取并发默认值…</p>
 

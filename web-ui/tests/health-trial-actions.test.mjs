@@ -121,6 +121,32 @@ for (const all of [false, true]) {
   });
 }
 
+for (const kind of ["health", "reauth", "refreshAt", "trial"]) {
+  test(`${kind} preserves concurrency defaults and submissions above former fixed limits`, async () => {
+    const h = harness(kind, { settings: { health_workers: 150, reauth_workers: 150, refresh_at_workers: 150, trial_workers: 150 } });
+    h.setOpen(true);
+    await flushPromises();
+    assert.equal(h.dialog.concurrency.value, 150);
+    h.dialog.concurrency.value = 275;
+    await h.dialog.submit();
+    const launch = h.launches[0];
+    assert.ok(launch);
+    assert.equal(kind === "reauth" ? launch.args[2].concurrency : launch.args[kind === "trial" ? 3 : 2], 275);
+  });
+  test(`${kind} rejects nonpositive and fractional concurrency without launching`, async () => {
+    const h = harness(kind);
+    h.setOpen(true);
+    await flushPromises();
+    for (const invalid of [0, -1, 1.5, NaN, Infinity]) {
+      h.dialog.concurrency.value = invalid;
+      await h.dialog.submit();
+    }
+    assert.equal(h.launches.length, 0);
+    assert.equal(h.notices.length, 5);
+    assert.ok(h.notices.every(([message]) => /正整数/.test(message)));
+  });
+}
+
 for (const channel of ["v4", "nerver"]) {
   for (const all of [false, true]) {
     test(`trial ${channel} ${all ? "all" : "selection"} preserves the user's channel, scope, force and concurrency`, async () => {

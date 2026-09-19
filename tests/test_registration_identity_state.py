@@ -316,7 +316,7 @@ def test_missing_identity_cannot_restart_password_authorization_or_consume_otp(
         )
 
     assert caught.value is original_error
-    registrar._start_password_add_authorize.assert_called_once_with(mailbox["address"], 1)
+    registrar._start_password_add_authorize.assert_called_once_with(mailbox["address"], 1, plain_login=False)
     sleep.assert_not_called()
     wait_for_code.assert_not_called()
     for method in (

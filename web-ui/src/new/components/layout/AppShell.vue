@@ -8,6 +8,7 @@ import { useUiStore } from "../../stores/ui";
 import { useStatusStore } from "../../stores/status";
 import { useAccountsStore } from "../../stores/accounts";
 import { useBatchOpsStore } from "../../stores/batchops";
+import { useTasksStore } from "../../stores/tasks";
 import SmsTaskBar from "../../views/accounts/SmsTaskBar.vue";
 import SmsStartDialog from "../../views/accounts/SmsStartDialog.vue";
 import SmsHistoryDialog from "../../views/accounts/SmsHistoryDialog.vue";
@@ -19,6 +20,7 @@ const status = useStatusStore();
 const route = useRoute();
 const accounts = useAccountsStore();
 const batch = useBatchOpsStore();
+const tasks = useTasksStore();
 const importHistoryOpen = ref(false);
 
 function openImportHistory() {
@@ -30,6 +32,7 @@ provide("open-import-history", openImportHistory);
 onMounted(() => {
   batch.setOnCodexFinished(() => accounts.load());
   void batch.restoreCodex();
+  void tasks.load();
 });
 
 status.load();

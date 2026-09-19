@@ -37,7 +37,6 @@ DEFAULT_ACTION_KEY_NAME = "quota-action-key"
 DEFAULT_TIMEOUT = 30.0
 DEFAULT_CONCURRENCY = 6
 DEFAULT_IMPORT_CONCURRENCY = 2
-MAX_IMPORT_CONCURRENCY = 32
 DEFAULT_CACHE_SECONDS = 30
 
 _USER_AGENT = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
@@ -619,13 +618,7 @@ def load_config(path: str | Path | None = None) -> QuotaConfig:
     except (TypeError, ValueError):
         concurrency = DEFAULT_CONCURRENCY
     try:
-        import_concurrency = max(
-            1,
-            min(
-                MAX_IMPORT_CONCURRENCY,
-                int(data.get("import_concurrency", os.getenv("OAUTH_IMPORT_CONCURRENCY", DEFAULT_IMPORT_CONCURRENCY))),
-            ),
-        )
+        import_concurrency = max(1, int(data.get("import_concurrency", os.getenv("OAUTH_IMPORT_CONCURRENCY", DEFAULT_IMPORT_CONCURRENCY))))
     except (TypeError, ValueError):
         import_concurrency = DEFAULT_IMPORT_CONCURRENCY
     skip_phone_required = _boolean(
@@ -671,9 +664,11 @@ def save_import_settings(
         if isinstance(concurrency, bool):
             raise QuotaError("导入并发数必须是整数")
         try:
-            normalized = max(1, min(MAX_IMPORT_CONCURRENCY, int(str(concurrency).strip())))
+            normalized = int(str(concurrency).strip())
+            if normalized < 1:
+                raise ValueError("positive integer required")
         except (TypeError, ValueError) as exc:
-            raise QuotaError(f"导入并发数必须是 1-{MAX_IMPORT_CONCURRENCY} 的整数") from exc
+            raise QuotaError("导入并发数必须是正整数") from exc
     path = config.config_path or default_config_path()
     data: dict[str, Any] = {}
     if path.exists():

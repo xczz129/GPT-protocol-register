@@ -34,7 +34,7 @@ const submitting = ref(false);
 const settingsLoading = ref(false);
 let settingsGeneration = 0;
 
-const workerLimit = computed(() => props.kind === "refreshAt" ? 10 : 20);
+const workerLimit = computed(() => ["reauth", "refreshAt", "trial"].includes(props.kind) ? undefined : 20);
 
 const config = computed(() => {
   const n = props.all ? "全部" : props.keys.length;
@@ -92,11 +92,12 @@ watch(() => props.open, (value) => {
     confirmPassword.value = "";
     force.value = false;
     trialChannel.value = "v4";
-    if (props.kind === "trial") {
+    if (["reauth", "refreshAt", "trial"].includes(props.kind)) {
       settingsLoading.value = true;
       void fetchUiSettings().then((settings) => {
         if (generation !== settingsGeneration) return;
-        concurrency.value = Math.max(1, Math.min(20, Math.floor(Number(settings.trial_workers) || 20)));
+        const savedWorkers = Number(props.kind === "trial" ? settings.trial_workers : props.kind === "refreshAt" ? settings.refresh_at_workers : settings.reauth_workers);
+        if (Number.isSafeInteger(savedWorkers) && savedWorkers > 0) concurrency.value = savedWorkers;
         trialChannel.value = settings.trial_channel === "nerver" ? "nerver" : "v4";
       }).catch(() => {
         // The editable local defaults remain available if settings cannot be loaded.
@@ -116,8 +117,12 @@ const passwordInvalid = computed(() => {
 
 async function submit() {
   if (submitting.value || settingsLoading.value || passwordInvalid.value) return;
+  if (!Number.isSafeInteger(concurrency.value) || concurrency.value < 1) {
+    ui.notify("并发数必须为正整数", "error");
+    return;
+  }
   submitting.value = true;
-  const workers = Math.max(1, Math.min(workerLimit.value, Math.floor(Number(concurrency.value) || 1)));
+  const workers = workerLimit.value ? Math.min(workerLimit.value, concurrency.value) : concurrency.value;
   try {
     if (props.kind === "refreshAt") {
       await batch.startRefreshAt(props.keys, Boolean(props.all), workers);

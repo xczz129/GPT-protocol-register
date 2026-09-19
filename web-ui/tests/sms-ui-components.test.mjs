@@ -30,6 +30,7 @@ function component(name, names, overrides = {}) {
     "../../stores/ui": { useUiStore: () => ({ notify: (...args) => calls.push(["notify", ...args]) }) },
     "../../composables/useCopy": { useCopy: () => ({ copiedKey: vue.ref(""), copyText: async (...args) => { calls.push(["copy", ...args]); return true; } }) },
     "../../api/batchops": overrides.api || {},
+    "../../api/settings": { fetchUiSettings: async () => ({ codex_sms_workers: 3, ...overrides.settings }) },
   };
   const { outputText } = ts.transpileModule(`${source}\nexport { ${names.join(", ")} };`, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } });
   runInNewContext(outputText, { exports, require: (id) => { assert.ok(id in imports, `Unexpected import ${id}`); return imports[id]; }, defineEmits: () => (...args) => calls.push(["emit", ...args]), Date, Blob, URL, setTimeout, clearTimeout, setInterval, clearInterval });
@@ -78,6 +79,41 @@ test("countdown never becomes negative or labels a finished account as waiting",
   assert.equal(h.countdown({ status: "active", wait_deadline: 165 }), "等码剩余 1:05");
   assert.equal(h.countdown({ status: "active", wait_deadline: 99 }), "等码时间已到，正在更新状态");
   assert.equal(h.countdown({ status: "success", wait_deadline: 165 }), "");
+  h.dispose();
+});
+
+test("authorization rate-limit cooldown is distinct from SMS waiting in live account progress", () => {
+  const h = component("CodexLiveDialog", ["label", "countdown", "now"]);
+  h.now.value = 100000;
+  const waiting = { status: "active", stage: "rate_limit_wait", message: "授权请求限流，同批授权和取号暂缓", wait_deadline: 190 };
+  assert.equal(h.label(waiting), "授权限流等待");
+  assert.equal(h.countdown(waiting), "授权冷却剩余 1:30");
+  assert.equal(h.countdown({ ...waiting, wait_deadline: 221 }), "授权冷却剩余 2:01");
+  h.now.value = 191000;
+  assert.equal(h.countdown(waiting), "授权冷却时间已到，正在更新状态");
+  for (const status of ["success", "failed", "cancelled"]) assert.equal(h.countdown({ ...waiting, status }), "");
+  for (const wait_deadline of [undefined, null, 0, -1, NaN, Infinity]) assert.equal(h.countdown({ ...waiting, wait_deadline }), "");
+  assert.equal(h.label({ ...waiting, stage: "waiting_sms" }), "等待短信");
+  assert.equal(h.countdown({ ...waiting, stage: "waiting_sms", wait_deadline: 256 }), "等码剩余 1:05");
+  h.dispose();
+});
+
+test("shared batch cooldown does not attribute another account's authorization limit to this account", () => {
+  const h = component("CodexLiveDialog", ["label", "countdown", "now"]);
+  h.now.value = 100000;
+  const waiting = { status: "active", stage: "batch_rate_limit_wait", message: "已提交号码，因同批其他账号限流暂缓查询短信", wait_deadline: 190 };
+  assert.equal(h.label(waiting), "批次限流等待");
+  assert.equal(h.countdown(waiting), "批次冷却剩余 1:30");
+  assert.equal(h.countdown({ ...waiting, wait_deadline: 221 }), "批次冷却剩余 2:01");
+  h.now.value = 191000;
+  assert.equal(h.countdown(waiting), "批次冷却时间已到，正在更新状态");
+  for (const status of ["success", "failed", "cancelled"]) assert.equal(h.countdown({ ...waiting, status }), "");
+  for (const wait_deadline of [undefined, null, 0, -1, NaN, Infinity]) assert.equal(h.countdown({ ...waiting, wait_deadline }), "");
+  h.now.value = 100000;
+  assert.equal(h.label({ ...waiting, stage: "rate_limit_wait" }), "授权限流等待");
+  assert.equal(h.countdown({ ...waiting, stage: "rate_limit_wait" }), "授权冷却剩余 1:30");
+  assert.equal(h.label({ ...waiting, stage: "waiting_sms" }), "等待短信");
+  assert.equal(h.countdown({ ...waiting, stage: "waiting_sms" }), "等码剩余 1:30");
   h.dispose();
 });
 
@@ -215,7 +251,7 @@ test("explicit reauthorization is not disabled merely because RT already exists"
   h.dispose();
 });
 
-test("a late preflight response cannot overwrite a newer provider selection", async () => {
+test("a late preflight response cannot overwrite a newer preview", async () => {
   let resolveFirst;
   let calls = 0;
   const h = component("SmsStartDialog", ["check", "preview", "form"], { api: { codexPreflight: () => ++calls === 1 ? new Promise((resolve) => { resolveFirst = resolve; }) : Promise.resolve(preflightResult({ eligible: 0, skipped: 1 })) } });
@@ -226,6 +262,55 @@ test("a late preflight response cannot overwrite a newer provider selection", as
   assert.equal(h.preview.value.eligible, 0);
   assert.equal(h.preview.value.skipped, 1);
   h.dispose();
+});
+
+test("SMS start loads the saved uncapped default and preserves a larger per-run override", async () => {
+  const launches = [];
+  const h = component("SmsStartDialog", ["form", "check", "launch", "invalid"], {
+    settings: { codex_sms_workers: 175 }, api: { codexPreflight: async () => preflightResult() },
+    task: { runCodex: async (...args) => launches.push(args) },
+  });
+  await h.watches[0].handler(true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.form.concurrency, 175);
+  h.form.concurrency = 260;
+  assert.equal(h.invalid.value, "");
+  await h.launch();
+  assert.equal(launches[0][1], 260);
+  assert.equal(launches[0][3].provider, "smsbower");
+  for (const value of [0, -1, 2.5, Infinity]) { h.form.concurrency = value; assert.match(h.invalid.value, /正整数/); }
+  h.dispose();
+});
+
+test("retired SMS configuration blocks authorization but does not block sync-only", async () => {
+  const launches = [];
+  const h = component("SmsStartDialog", ["form", "check", "launch", "error", "launchDisabled"], {
+    api: { codexPreflight: async () => preflightResult({ settings: { ...preflightResult().settings, provider: "firefox" } }) },
+    task: { runCodex: async (...args) => launches.push(args) },
+  });
+  await h.check(true);
+  assert.match(h.error.value, /停用/);
+  await h.launch();
+  assert.equal(launches.length, 0);
+  h.form.strategy = "sync_only";
+  await h.check(true);
+  assert.equal(h.launchDisabled.value, false);
+  await h.launch();
+  assert.equal(launches.length, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(launches[0][3])), {});
+  h.dispose();
+});
+
+test("retired provider history and live snapshots remain readable without retry actions", () => {
+  const h = component("SmsHistoryDialog", ["entries", "latestFailures", "optionLabel"]);
+  const entry = { email: "old@example.test", outcome: "failed", options: { sms_options: { provider: "firefox" } } };
+  h.entries.value = [entry];
+  assert.equal(h.latestFailures.value.length, 0);
+  assert.match(h.optionLabel(entry), /火狐狸/);
+  h.dispose();
+  const live = component("CodexLiveDialog", ["retryAvailable"], { task: { codex: { running: false, mode: "codex", results: [{ email: "old@example.test", status: "failed" }], options: entry.options } } });
+  assert.equal(live.retryAvailable.value, false);
+  live.dispose();
 });
 
 test("history retry excludes a historical failure which later succeeded or was cancelled", () => {

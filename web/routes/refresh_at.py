@@ -27,7 +27,7 @@ def _state() -> Any:
 class AccountRefreshAtRequest(BaseModel):
     keys: list[str] = Field(default_factory=list, max_length=2000)
     all_accounts: bool = False
-    concurrency: int = Field(default=10, ge=1, le=10)
+    concurrency: int = Field(default=10, ge=1)
 
 
 @router.post("/api/accounts/refresh-at")

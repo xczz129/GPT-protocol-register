@@ -20,6 +20,25 @@ export interface TaskCard {
   batch_started_at: string;
   skip_reason?: string;
   error?: string;
+  phase?: string;
+  registration_status?: string;
+  sms_status?: "pending" | "running" | "success" | "failed" | "cancelled" | "interrupted";
+  stage?: string;
+  message?: string;
+  attempt?: number;
+  max_phone_attempts?: number;
+  wait_deadline?: number | null;
+}
+
+export interface RegistrationSmsFollowup {
+  status: "disabled" | "pending" | "running" | "completed" | "failed" | "cancelled" | "interrupted";
+  total: number;
+  message?: string;
+  batch_id?: string;
+  source_batch_id?: string;
+  completed?: number;
+  pending?: number;
+  failed?: number;
 }
 
 export interface JobSnapshot {
@@ -27,11 +46,13 @@ export interface JobSnapshot {
   paused: boolean;
   success_count: number;
   fail_count: number;
+  retryable_fail_count?: number;
   skipped_count: number;
   total: number;
   last_error: string;
   started_at: string;
   params?: Record<string, unknown>;
+  auto_sms?: RegistrationSmsFollowup;
 }
 
 export interface TasksResponse {
@@ -49,6 +70,7 @@ export interface StartJobPayload {
   group_id?: string | null;
   auto_group: boolean;
   auto_group_size: number;
+  auto_sms_after_register: boolean;
 }
 
 export function fetchTasks(limit = 500): Promise<TasksResponse> {

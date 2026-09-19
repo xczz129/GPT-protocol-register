@@ -98,7 +98,7 @@ function credentialLabel(value?: string) {
 }
 
 function healthLabel(value?: string) {
-  return ({ alive: "可用", ok: "可用", limited: "限流", reauth_required: "待续期", invalid: "失效", error: "错误", unknown: "未检测" } as Record<string, string>)[String(value || "unknown").toLowerCase()] || String(value || "未检测");
+  return ({ alive: "可用", ok: "可用", limited: "限流", reauth_required: "待续期", invalid: "失效", error: "错误", unknown: "待检测 / 复测" } as Record<string, string>)[String(value || "unknown").toLowerCase()] || String(value || "未检测");
 }
 
 function planLabel(value?: string) {

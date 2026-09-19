@@ -48,7 +48,7 @@ class TaskDeleteRequest(BaseModel):
 class MaintenanceUpdate(BaseModel):
     enabled: bool = False
     interval_hours: int = Field(12, ge=1, le=168)
-    workers: int = Field(10, ge=1, le=20)
+    workers: int = Field(10, ge=1)
     auto_delete_invalid: bool = False
     webhook_url: str = ""
     notify_on_complete: bool = False
@@ -662,12 +662,12 @@ async def mail_registration_stats(provider: str = "smsbower_mail"):
 
 
 class UiSettingsUpdate(BaseModel):
-    health_workers: int = Field(default=10, ge=1, le=20)
-    reauth_workers: int = Field(default=3, ge=1, le=20)
-    trial_workers: int = Field(default=20, ge=1, le=20)
-    refresh_at_workers: int = Field(default=10, ge=1, le=10)
-    # 接码批量任务默认并发(保存的默认值,保存上限 64;单次任务并发不受此限制)
-    codex_sms_workers: int = Field(default=2, ge=1, le=64)
+    health_workers: int = Field(default=10, ge=1)
+    reauth_workers: int = Field(default=3, ge=1)
+    trial_workers: int = Field(default=20, ge=1)
+    refresh_at_workers: int = Field(default=10, ge=1)
+    # 接码批量任务默认并发，与单次任务一样只要求正整数。
+    codex_sms_workers: int = Field(default=2, ge=1)
     reauth_mode: str = Field(default="protocol")
     trial_channel: str = Field(default="v4")
 
@@ -686,12 +686,12 @@ async def ui_settings_get():
 
         return {
             "ok": True,
-            "health_workers": max(1, min(_int(raw.get("health_workers"), 10), 20)),
-            "reauth_workers": max(1, min(_int(raw.get("reauth_workers"), 3), 20)),
-            "trial_workers": max(1, min(_int(raw.get("trial_workers"), 20), 20)),
+            "health_workers": max(1, _int(raw.get("health_workers"), 10)),
+            "reauth_workers": max(1, _int(raw.get("reauth_workers"), 3)),
+            "trial_workers": max(1, _int(raw.get("trial_workers"), 20)),
             "trial_channel": "nerver" if str(raw.get("trial_channel") or "").strip().lower() == "nerver" else "v4",
-            "refresh_at_workers": max(1, min(_int(raw.get("refresh_at_workers"), 10), 10)),
-            "codex_sms_workers": max(1, min(_int(raw.get("codex_sms_workers"), 2), 64)),
+            "refresh_at_workers": max(1, _int(raw.get("refresh_at_workers"), 10)),
+            "codex_sms_workers": max(1, _int(raw.get("codex_sms_workers"), 2)),
             "reauth_mode": "browser" if str(raw.get("reauth_mode") or "").strip().lower() == "browser" else "protocol",
         }
 
@@ -705,12 +705,12 @@ async def ui_settings_update(body: UiSettingsUpdate):
             current = cfg.setdefault("ui_settings", {})
             current.update(
                 {
-                    "health_workers": max(1, min(int(body.health_workers or 10), 20)),
-                    "reauth_workers": max(1, min(int(body.reauth_workers or 3), 20)),
-                    "trial_workers": max(1, min(int(body.trial_workers or 20), 20)),
+                    "health_workers": body.health_workers,
+                    "reauth_workers": body.reauth_workers,
+                    "trial_workers": body.trial_workers,
                     "trial_channel": "nerver" if str(body.trial_channel or "").strip().lower() == "nerver" else "v4",
-                    "refresh_at_workers": max(1, min(int(body.refresh_at_workers or 10), 10)),
-                    "codex_sms_workers": max(1, min(int(body.codex_sms_workers or 2), 64)),
+                    "refresh_at_workers": body.refresh_at_workers,
+                    "codex_sms_workers": body.codex_sms_workers,
                     "reauth_mode": "browser" if str(body.reauth_mode or "").strip().lower() == "browser" else "protocol",
                 }
             )

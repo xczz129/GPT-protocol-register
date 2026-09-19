@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import random
+import re
 import secrets
 import time
 import uuid
@@ -20,12 +21,12 @@ class _LightweightClearanceOk:
     cookies: dict = {}
 from common.session_export import build_account_record, parse_jwt_payload
 from common.totp import totp_code
-from common.team_workspace import _personal_workspace, select_personal_workspace, select_team_workspace, validate_team_session, workspace_entries
+from common.team_workspace import _personal_workspace, selected_workspace_metadata, select_personal_workspace, select_team_workspace, validate_personal_session, validate_team_session, workspace_entries
 from common.mail_registration_metrics import begin_attempt
 from register.sessions import JobCancelled
 from mail import mark_mailbox_code_boundary, mark_mailbox_result, mark_smsbower_otp_accepted, release_mailbox
-from mail.parsing import CANONICAL_PROVIDER_TYPES, normalize_provider_type
-from proxy_util import is_auth_identity_error, is_rate_limit_error, is_tls_transient_error, proxy_brief
+from mail.parsing import CANONICAL_PROVIDER_TYPES, base_mailbox_address, normalize_provider_type
+from proxy_util import is_auth_identity_error, is_rate_limit_error, is_registration_access_denied, is_tls_transient_error, proxy_brief
 from register.protocol_fingerprint import REGISTER_BROWSER_PROFILES, _header_fingerprint
 from register.protocol_pkce import generate_pkce as _generate_pkce
 from register.protocol_sentinel import build_sentinel_with_so_token
@@ -162,6 +163,59 @@ def _workspace_recovery_log_url(value: str, base: str = "") -> str:
 def _is_workspace_recovery_page(url: str) -> bool:
     path = urlsplit(url).path.lower()
     return not path.startswith("/api/") and ("workspace" in path or path.endswith("/consent"))
+
+
+def _csrf_failure_message(response: Any, error: str = "", *, prefix: str = "chatgpt_csrf") -> str:
+    """Summarize a failed CSRF response without copying its body or URL query.
+
+    Error bodies can echo OAuth codes, cookies, credentials and proxy passwords.
+    Use fixed body categories and known API error labels, never free-form text.
+    """
+    _payload, metadata = read_auth_response(response)
+    try:
+        path = urlsplit(str(getattr(response, "url", "") or "")).path
+    except ValueError:
+        path = ""
+    metadata["path"] = path if path in {
+        "/api/auth/csrf", "/api/auth/error", "/", "/log-in", "/login", "/auth/login",
+    } else ("unexpected_path" if path else "/api/auth/csrf")
+    try:
+        headers = {str(key).lower(): str(value).strip() for key, value in response.headers.items()}
+    except (AttributeError, TypeError, ValueError):
+        headers = {}
+    ray = headers.get("cf-ray", "")
+    if re.fullmatch(r"[0-9a-fA-F]{8,32}(?:-[A-Za-z]{3})?", ray):
+        metadata["cf_ray"] = ray
+    request_id = headers.get("x-request-id", "") or headers.get("request-id", "") or headers.get("openai-request-id", "")
+    if re.fullmatch(r"(?:req[_-])?[0-9a-fA-F-]{16,64}", request_id):
+        metadata["request_id"] = request_id
+    body = str(getattr(response, "text", "") or "")
+    metadata["body_chars"] = len(body)
+    body_lower = body[:65536].lower()
+    if _is_cloudflare_challenge(response):
+        summary = "cloudflare_challenge"
+    elif metadata["response_kind"].startswith("json"):
+        summary = metadata["response_kind"]
+    elif not body.strip():
+        summary = "empty"
+    elif "<html" in body_lower or "<!doctype html" in body_lower:
+        summary = "html_access_denied" if any(value in body_lower for value in ("access denied", "forbidden")) else "html"
+    else:
+        summary = "non_json_body_omitted"
+    metadata["body_summary"] = summary
+    if error:
+        if is_rate_limit_error(error):
+            metadata["error_category"] = "rate_limit_exceeded"
+        elif is_registration_access_denied(error):
+            metadata["error_category"] = "registration_access_denied"
+        detail = str(error).lower()
+        metadata["transport_error"] = (
+            "protocol_account_timeout" if "protocol_account_timeout" in detail
+            else "timeout" if "timeout" in detail or "timed out" in detail or "curl: (28)" in detail
+            else "tls_error" if "ssl" in detail or "tls" in detail
+            else "network_error"
+        )
+    return f"{prefix}_http_{metadata['http_status']}: " + json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
 
 
 class _TlsRotateSessionProxy:
@@ -360,7 +414,9 @@ class PlatformRegistrar:
 
         第1轮：短抖动后同会话导航重试（挑战 Cookie 已吸收，直接重访）
         第2轮：更长退避 + 先预热域名根路径刷新 __cf_bm，再重访目标
-        第3轮：同会话换 TLS 指纹族（JA4 变化，UA 不变）重访
+        第3轮：同家族持久轮换 TLS 指纹（JA4 变化，UA/Client Hints 同步
+              重写）后重访。轮换后的指纹对后续请求保持生效，避免探针
+              通过而重试仍用已拉黑旧指纹的"假恢复"。
         任一轮探针通过即返回 True；全部失败返回 False 交给 FlareSolverr。
         """
         try:
@@ -369,13 +425,20 @@ class PlatformRegistrar:
         except Exception:
             origin = platform_base
         plans = (
-            {"delay": (1.2, 3.0), "warm": False, "impersonate": None},
-            {"delay": (3.0, 6.0), "warm": True, "impersonate": None},
-            {"delay": (6.0, 10.0), "warm": True, "impersonate": "chrome131"},
+            {"delay": (1.2, 3.0), "warm": False},
+            {"delay": (3.0, 6.0), "warm": True},
+            {"delay": (6.0, 10.0), "warm": True},
         )
         for attempt, plan in enumerate(plans, 1):
             if _STOP_CHECK.get()():
                 return False
+            probe_kwargs: dict[str, Any] = {}
+            if attempt == 3:
+                # 第三轮先持久轮换指纹再探针：探针与调用方后续重试共用
+                # 新指纹（_rotate_tls_fingerprint 已同步 session impersonate
+                # 与 UA/CH）。家族内无候选时退回临时 chrome131 探测。
+                if not self._rotate_tls_fingerprint():
+                    probe_kwargs["impersonate"] = "chrome131"
             lo, hi = plan["delay"]
             time.sleep(lo + random.random() * (hi - lo))
             try:
@@ -397,9 +460,6 @@ class PlatformRegistrar:
                     except Exception:
                         pass
                 probe_headers = self._navigate_headers(f"{platform_base}/", target_url)
-                probe_kwargs: dict[str, Any] = {}
-                if plan["impersonate"]:
-                    probe_kwargs["impersonate"] = plan["impersonate"]
                 probe, _ = request_with_local_retry(
                     self.session,
                     "get",
@@ -425,13 +485,26 @@ class PlatformRegistrar:
             )
         return False
 
-    def _refresh_cloudflare_clearance(self, target_url: str, index: int):
+    def _refresh_cloudflare_clearance(self, target_url: str, index: int, *, force_solver: bool = False):
+        """刷新目标域的 Cloudflare clearance。
+
+        默认先走轻量算法层（同会话抖动/预热/轮换指纹，不启动浏览器）；
+        轻量失败才落到 FlareSolverr。``force_solver=True`` 跳过轻量层直接
+        FlareSolverr：轻量层的探针通过可能只是临时抖动，重试仍被拦截时
+        需要真正的 cf_clearance cookie 才有意义。
+        """
         self.clearance_failure_reason = ""
         # 轻量算法层优先：同会话抖动重试，不启动浏览器
-        if self._cf_lightweight_recovery(target_url, index):
+        if not force_solver and self._cf_lightweight_recovery(target_url, index):
             step(index, "CF 轻量算法恢复成功，重试当前请求", "yellow")
             return _LightweightClearanceOk()
-        step(index, "检测到 Cloudflare 拦截，正在通过 FlareSolverr 清障", "yellow")
+        step(
+            index,
+            "轻量恢复后仍被拦截，强制通过 FlareSolverr 清障"
+            if force_solver
+            else "检测到 Cloudflare 拦截，正在通过 FlareSolverr 清障",
+            "yellow",
+        )
         proxy_config = _effective_proxy_config(_PROXY_CONFIG.get())
         bundle = refresh_clearance(
             proxy_config,
@@ -558,8 +631,12 @@ class PlatformRegistrar:
         csrf_url = chatgpt_base + "/api/auth/csrf"
 
         def fetch_csrf() -> tuple[str, Any, str]:
+            # CF 轻量恢复可能已持久轮换 TLS 指纹;按当前指纹重建 UA/CH,
+            # 避免重试仍携带已拉黑旧指纹的请求头。
             csrf_headers = _headers_with_clearance(
-                {**common, "referer": chatgpt_base + "/"},
+                _header_fingerprint(
+                    {**common, "referer": chatgpt_base + "/"}, self.fingerprint
+                ),
                 csrf_url,
                 self.proxy,
                 self.clearance_user_agent,
@@ -580,23 +657,55 @@ class PlatformRegistrar:
         # fails or lands on a challenge.  This removes one high-latency request
         # from the common protocol path.
         csrf_token, csrf_response, csrf_error = fetch_csrf()
-        if _is_cloudflare_challenge(csrf_response):
-            bundle = self._refresh_cloudflare_clearance(csrf_url, index)
-            if bundle is None:
-                raise RuntimeError(
-                    _cloudflare_block_message(
-                        csrf_response,
-                        reason=self.clearance_failure_reason,
-                    )
-                )
+
+        def csrf_cloudflare_blocked() -> bool:
+            # Only a 403/429 whose body is a real Cloudflare challenge page
+            # can be healed by refreshing clearance.
+            return bool(
+                getattr(csrf_response, "status_code", None) in {403, 429}
+                and _is_cloudflare_challenge(csrf_response)
+            )
+
+        def csrf_refused() -> bool:
+            # A definite upstream refusal (non-challenge 403/429/503,
+            # access_denied, rate limit) keeps its diagnostics and fails
+            # without homepage warmup or clearance refresh.
+            return bool(
+                getattr(csrf_response, "status_code", None) in {403, 429, 503}
+                or is_registration_access_denied(csrf_error)
+                or is_rate_limit_error(csrf_error)
+            )
+
+        # Cloudflare 直接在 CSRF fast-path 出挑战页时，先刷新 clearance（轻量
+        # 算法恢复 + FlareSolverr）再原会话重试：多数出口 IP 只需一枚新的
+        # clearance cookie 即可通过，避免任务 0.7s 即终态失败。
+        for _csrf_retry_round in range(2):
+            if not csrf_cloudflare_blocked():
+                break
+            step(
+                index,
+                "CSRF 被 Cloudflare 拦截"
+                f"({getattr(csrf_response, 'status_code', '?')})，"
+                f"刷新 clearance 后重试 ({_csrf_retry_round + 1}/2)",
+                "yellow",
+            )
+            if self._refresh_cloudflare_clearance(chatgpt_base + "/", index) is None:
+                break
             csrf_token, csrf_response, csrf_error = fetch_csrf()
+        if csrf_cloudflare_blocked() or csrf_refused():
+            # A definite upstream refusal must keep its original diagnostics;
+            # homepage warmup cannot turn it into a missing-CSRF-cookie error.
+            raise RuntimeError(_csrf_failure_message(csrf_response, csrf_error))
         if (
             csrf_response is None
             or csrf_response.status_code != 200
             or not csrf_token
         ):
             step(index, "CSRF fast-path 未命中，回退 ChatGPT 首页预热", "yellow")
-            home_headers = {**common, "accept": "text/html,application/xhtml+xml"}
+            home_headers = _header_fingerprint(
+                {**common, "accept": "text/html,application/xhtml+xml"},
+                self.fingerprint,
+            )
             home_headers = _headers_with_clearance(
                 home_headers,
                 chatgpt_base + "/",
@@ -656,8 +765,7 @@ class PlatformRegistrar:
                 or not csrf_token
             ):
                 raise RuntimeError(
-                    csrf_error
-                    or f"chatgpt_csrf_http_{getattr(csrf_response, 'status_code', 'unknown')}"
+                    _csrf_failure_message(csrf_response, csrf_error)
                 )
 
         signin_params = {
@@ -699,12 +807,15 @@ class PlatformRegistrar:
         query = urlencode(signin_params)
         signin_url = f"{chatgpt_base}/api/auth/signin/openai?{query}"
         signin_headers = _headers_with_clearance(
-            {
-                **common,
-                "content-type": "application/x-www-form-urlencoded",
-                "origin": chatgpt_base,
-                "referer": chatgpt_base + "/",
-            },
+            _header_fingerprint(
+                {
+                    **common,
+                    "content-type": "application/x-www-form-urlencoded",
+                    "origin": chatgpt_base,
+                    "referer": chatgpt_base + "/",
+                },
+                self.fingerprint,
+            ),
             signin_url,
             self.proxy,
             self.clearance_user_agent,
@@ -739,7 +850,10 @@ class PlatformRegistrar:
             )
 
         authorize_headers = _headers_with_clearance(
-            {**common, "accept": "text/html,application/xhtml+xml", "referer": chatgpt_base + "/"},
+            _header_fingerprint(
+                {**common, "accept": "text/html,application/xhtml+xml", "referer": chatgpt_base + "/"},
+                self.fingerprint,
+            ),
             authorize_url,
             self.proxy,
             self.clearance_user_agent,
@@ -755,11 +869,18 @@ class PlatformRegistrar:
         # The authorize URL is served by auth.openai.com and can be challenged
         # independently from the ChatGPT CSRF/home requests above.  In the HAR
         # flow this appears as a 403 Cloudflare page followed by a successful
-        # redirect after clearance is refreshed.  Treat it like the other
-        # authenticated navigation steps instead of surfacing a transient
-        # challenge as a permanent login failure.
-        if _is_cloudflare_challenge(authorize_response):
-            bundle = self._refresh_cloudflare_clearance(authorize_url, index)
+        # redirect after clearance is refreshed.  The lightweight recovery can
+        # report success after a lucky probe while the session still carries
+        # no usable clearance, so escalate: round 1 lightweight recovery, then
+        # round 2 a forced FlareSolverr clearance before surfacing the failure.
+        for _authorize_cf_round in range(2):
+            if not _is_cloudflare_challenge(authorize_response):
+                break
+            bundle = self._refresh_cloudflare_clearance(
+                authorize_url,
+                index,
+                force_solver=_authorize_cf_round > 0,
+            )
             if bundle is None:
                 raise RuntimeError(
                     _cloudflare_block_message(
@@ -768,7 +889,10 @@ class PlatformRegistrar:
                     )
                 )
             authorize_headers = _headers_with_clearance(
-                {**common, "accept": "text/html,application/xhtml+xml", "referer": chatgpt_base + "/"},
+                _header_fingerprint(
+                    {**common, "accept": "text/html,application/xhtml+xml", "referer": chatgpt_base + "/"},
+                    self.fingerprint,
+                ),
                 authorize_url,
                 self.proxy,
                 self.clearance_user_agent,
@@ -782,13 +906,13 @@ class PlatformRegistrar:
                 allow_redirects=True,
                 verify=_tls_verify(),
             )
-            if _is_cloudflare_challenge(authorize_response):
-                raise RuntimeError(
-                    _cloudflare_block_message(
-                        authorize_response,
-                        "ChatGPT authorize clearance 重试仍被拦截",
-                    )
+        if _is_cloudflare_challenge(authorize_response):
+            raise RuntimeError(
+                _cloudflare_block_message(
+                    authorize_response,
+                    "ChatGPT authorize clearance 重试仍被拦截",
                 )
+            )
         final_url = str(getattr(authorize_response, "url", "") or "")
         auth_error = _auth_error_details_from_url(final_url)
         if registration_password_flow and (
@@ -1112,11 +1236,12 @@ class PlatformRegistrar:
 
     def _select_workspace(
         self, index: int, workspace_name: str, referer: str,
-        *, require_team_workspace: bool = False, auth_payloads: tuple[Any, ...] = (),
+        *, require_team_workspace: bool = False, require_personal_workspace: bool = False,
+        auth_payloads: tuple[Any, ...] = (),
     ) -> str:
         """Select the requested workspace before consuming its callback."""
         workspaces = self._auth_session_workspaces(*auth_payloads)
-        if not workspaces and require_team_workspace:
+        if not workspaces and (require_team_workspace or require_personal_workspace):
             refreshed = self._dump_client_auth_session(referer, index, recover_workspaces=True)
             workspaces = self._auth_session_workspaces(refreshed, *auth_payloads)
             referer = getattr(self, "_workspace_recovery_referer", "") or referer
@@ -1185,6 +1310,7 @@ class PlatformRegistrar:
             )
         self._selected_workspace_id = workspace_id
         self._selected_workspace_name = label
+        self._selected_workspace_metadata = selected_workspace_metadata(selected)
         # 抓包确认: workspace/select 的 continue_url 直接就是 chatgpt.com 的
         # OAuth callback URL，返回给调用方统一跟随（与个人账号 MFA 后流程一致）
         return continue_url
@@ -1197,13 +1323,17 @@ class PlatformRegistrar:
         index: int,
         workspace_name: str = "",
         require_team_workspace: bool = False,
+        require_personal_workspace: bool = False,
     ) -> dict[str, Any]:
         """Complete the HAR-observed password plus TOTP login transaction."""
+        if require_team_workspace and require_personal_workspace:
+            raise RuntimeError("workspace_mode_conflict: 不能同时要求个人与 Team 工作区")
         email = str(email or "").strip()
         password = str(password or "").strip()
         totp_secret = str(totp_secret or "").strip()
         self._selected_workspace_id = ""
         self._selected_workspace_name = ""
+        self._selected_workspace_metadata = {}
         self._workspace_recovery_referer = ""
         if not email:
             raise RuntimeError("协议凭据登录缺少邮箱")
@@ -1308,15 +1438,18 @@ class PlatformRegistrar:
             )
             if not _is_chatgpt_callback_url(callback_url):
                 raise RuntimeError("team_workspace_missing_callback: 团队选择未完成，未继续个人登录")
-        elif not _is_chatgpt_callback_url(callback_url):
+        elif not _is_chatgpt_callback_url(callback_url) or (require_personal_workspace and workspace_page):
             # Team 账号 MFA 后会进入工作区选择页：选择目标工作区后拿新 callback
             # 抓包确认: select 请求的 Referer 必须是 workspace 页面本身
             if "workspace" in f"{callback_page or ''} {callback_url or ''}".lower():
                 workspace_referer = (
-                    _absolute_auth_url(callback_url) or mfa_referer
+                    (_absolute_auth_url(callback_url) if not _is_chatgpt_callback_url(callback_url) else "")
+                    or mfa_referer
                 )
                 callback_url = self._select_workspace(
-                    index, workspace_name, workspace_referer
+                    index, workspace_name, workspace_referer,
+                    require_personal_workspace=require_personal_workspace,
+                    auth_payloads=(verified, session_dump),
                 )
             if not _is_chatgpt_callback_url(callback_url):
                 raise RuntimeError(
@@ -1337,13 +1470,22 @@ class PlatformRegistrar:
                 f"final={_safe_url_for_log(final_url)}"
             )
         tokens = self._read_chatgpt_session(email, password, index)
-        if require_team_workspace:
-            identity = validate_team_session(tokens, selected_workspace_id=self._selected_workspace_id)
-            tokens["selected_workspace_id"] = self._selected_workspace_id
-            tokens["selected_workspace_name"] = self._selected_workspace_name
-            tokens["workspace_selection_verified"] = True
+        if require_team_workspace or require_personal_workspace:
+            validate_workspace = validate_team_session if require_team_workspace else validate_personal_session
+            identity = validate_workspace(
+                tokens, selected_workspace_id=self._selected_workspace_id,
+                selected_workspace_metadata=self._selected_workspace_metadata,
+            )
+            tokens["workspace_selection_mode"] = "team" if require_team_workspace else "personal"
+            if self._selected_workspace_id:
+                tokens["selected_workspace_id"] = self._selected_workspace_id
+                tokens["selected_workspace_name"] = self._selected_workspace_name
+                tokens["selected_workspace_metadata"] = self._selected_workspace_metadata
+                tokens["selected_workspace_evidence_source"] = "auth_workspace_selection"
+                tokens["workspace_selection_verified"] = True
             tokens["user_id"] = identity["user_id"]
-            step(index, f"Team 工作区验证通过 · 套餐={identity['plan_type']}")
+            mode_label = "Team" if require_team_workspace else "个人"
+            step(index, f"{mode_label}工作区验证通过 · 套餐={identity['plan_type'] or '未标注'}")
         step(index, "ChatGPT 会话读取完成，AT/Refresh 会话校验通过")
         tokens["mfa_factor_id"] = factor_id
         tokens["mfa_factor_type"] = "totp"
@@ -1399,7 +1541,10 @@ class PlatformRegistrar:
         if isinstance(mailbox, dict) and mailbox.get("_registration_outcome") == "already_registered":
             raise RuntimeError("pending_recovery_registered_candidate_rejected")
         if mailbox is not None and str(mailbox.get("address") or "").strip().lower() != email.lower():
-            raise RuntimeError("pending_recovery_mailbox_identity_mismatch")
+            # split 子号与其主号共用同一收件箱(HME 别名)：
+            # 主号邮箱可为 split 地址收码，仅 base 地址不一致才算身份不匹配
+            if base_mailbox_address(str(mailbox.get("address") or "")) != base_mailbox_address(email):
+                raise RuntimeError("pending_recovery_mailbox_identity_mismatch")
         _add_task_event_secrets(password, secret)
         initial = self._complete_chatgpt_session(email, password, index, start_only=True)
         ensure_running()
@@ -2425,6 +2570,41 @@ class PlatformRegistrar:
         step(index, "passwordless token 换取完成")
         return tokens
 
+    def _wait_nextauth_login_otp(self, mailbox: dict, index: int) -> str | None:
+        """NextAuth 登录流等码：两轮共 180s，每 45s 一段无码时重发。
+
+        节奏与注册/补密码流程一致。重发走 email-otp/resend（email-verification
+        页面对应的端点），刷新 challenge 同时重置 validate 的尝试计数。
+        """
+        rounds = 2
+        segments_per_round = 2
+        segment_timeout = 45.0
+        total_segments = rounds * segments_per_round
+        for segment_no in range(1, total_segments + 1):
+            round_no = (segment_no - 1) // segments_per_round + 1
+            if (segment_no - 1) % segments_per_round == 0:
+                step(
+                    index,
+                    f"开始等待登录验证码（{round_no}/{rounds} 轮，"
+                    f"每轮 {int(segment_timeout * segments_per_round)}s，45s 一次重发）",
+                )
+            code = wait_for_code(
+                mailbox,
+                register_proxy=self.proxy,
+                wait_timeout=segment_timeout,
+            )
+            if code:
+                return code
+            if segment_no < total_segments:
+                step(
+                    index,
+                    f"第 {segment_no} 段（{int(segment_no * segment_timeout)}s）未收到验证码，重发登录验证码",
+                    "yellow",
+                )
+                if self._resend_email_otp(index):
+                    mark_mailbox_code_boundary(mailbox, grace_seconds=0)
+        return None
+
     def login(self, email: str, mailbox: dict, index: int) -> dict[str, Any]:
         """Log in an existing account through the HAR-observed NextAuth flow."""
         step(index, "开始协议登录")
@@ -2435,11 +2615,33 @@ class PlatformRegistrar:
             start_only=True,
         )
         mark_mailbox_code_boundary(mailbox)
-        code = wait_for_code(mailbox, register_proxy=self.proxy)
-        if not code:
-            raise RuntimeError("协议登录验证码获取超时")
 
-        validated = self._validate_otp(code, index)
+        validated = None
+        max_otp_attempts = 2
+        for otp_attempt in range(max_otp_attempts):
+            code = self._wait_nextauth_login_otp(mailbox, index)
+            if not code:
+                raise RuntimeError("等待登录验证码超时（两轮共180秒）")
+            step(index, "收到登录验证码")
+            try:
+                validated = self._validate_otp(code, index)
+                break
+            except RuntimeError as error:
+                if (
+                    _is_wrong_email_otp_error(error)
+                    and otp_attempt + 1 < max_otp_attempts
+                ):
+                    # 错码会消耗 challenge 的 check 次数；刷新 challenge 后等新码再试一次。
+                    step(
+                        index,
+                        "登录验证码被服务端判定错误，刷新验证码后继续等待新码",
+                        "yellow",
+                    )
+                    self._resend_email_otp(index)
+                    mark_mailbox_code_boundary(mailbox, grace_seconds=0)
+                    continue
+                raise
+
         continue_url, _page_type = _auth_step_details(validated)
         if not continue_url:
             raise RuntimeError("协议登录 OTP 响应缺少 continue_url")
@@ -2587,7 +2789,12 @@ class PlatformRegistrar:
         return result
 
     def _start_password_add_authorize(
-        self, email: str, index: int, *, plain_login: bool = False
+        self,
+        email: str,
+        index: int,
+        *,
+        plain_login: bool = False,
+        signin_params: dict[str, str] | None = None,
     ) -> str:
         """Start the post-registration password-add authentication transaction."""
         fp = _browser_fingerprint(self.fingerprint)
@@ -2639,8 +2846,7 @@ class PlatformRegistrar:
             or not csrf_token
         ):
             raise RuntimeError(
-                csrf_error
-                or f"password_add_chatgpt_csrf_http_{getattr(csrf_response, 'status_code', 'unknown')}"
+                _csrf_failure_message(csrf_response, csrf_error, prefix="password_add_chatgpt_csrf")
             )
 
         def signin(params: dict[str, str]) -> Any:
@@ -2688,6 +2894,14 @@ class PlatformRegistrar:
                     )
                 return self._navigate_auth_step(authorize_url, home_url, index)
 
+        if signin_params is not None:
+            self._diagnostic(
+                index,
+                "启动登录态密码重置授权 "
+                "reauth=password post_login_password_reset=true",
+            )
+            response = signin(signin_params)
+            return str(getattr(response, "url", "") or "")
         if plain_login:
             # HAR(重置密码设置2fa) 的普通登录事务：prompt=login+
             # screen_hint=login_or_signup+connection=password+login_hint 直接落在
@@ -3112,6 +3326,95 @@ class PlatformRegistrar:
             f"{auth_base}/reset-password/new-password",
             index,
         )
+        return password
+
+    def _complete_loggedin_password_reset(
+        self,
+        email: str,
+        password: str,
+        mailbox: dict[str, Any],
+        index: int,
+    ) -> str:
+        """登录态下重置密码（2026-09-17 手动打野抓包流程）。
+
+        前提：registrar.login() 已完成邮箱 OTP 登录，会话可用。
+        signin 原样复刻抓包参数：login_hint + reauth=password +
+        post_login_password_reset=true + max_age=0 + ext-oai-did；
+        事务内走一次邮箱 OTP 验证后提交 password/reset，跟随 callback。
+        """
+        if not str(password or "").strip():
+            raise RuntimeError(
+                "password_reset_failed: generated password is empty"
+            )
+        start_url = self._start_password_add_authorize(
+            email,
+            index,
+            signin_params={
+                "login_hint": email,
+                "reauth": "password",
+                "post_login_password_reset": "true",
+                "max_age": "0",
+                "ext-oai-did": self.device_id,
+            },
+        )
+        mark_mailbox_code_boundary(
+            mailbox, grace_seconds=0, reset_seen_codes=True
+        )
+        validated: dict[str, Any] | None = None
+        max_otp_attempts = 3
+        for otp_attempt in range(max_otp_attempts):
+            step(
+                index,
+                f"开始等待密码重置验证码 ({otp_attempt + 1}/{max_otp_attempts})",
+            )
+            code = wait_for_code(mailbox, register_proxy=self.proxy)
+            if not code:
+                raise RuntimeError(
+                    _otp_wait_timeout_message(mailbox, "密码重置")
+                )
+            try:
+                validated = self._validate_otp(
+                    code,
+                    index,
+                    allow_sentinel_retry=True,
+                )
+                mark_smsbower_otp_accepted(mailbox)
+                break
+            except RuntimeError as error:
+                if (
+                    _is_wrong_email_otp_error(error)
+                    and otp_attempt + 1 < max_otp_attempts
+                ):
+                    step(
+                        index,
+                        "密码重置验证码被服务端判定错误，已排除本次候选并继续等待新码",
+                        "yellow",
+                    )
+                    continue
+                raise
+        if not isinstance(validated, dict):
+            raise RuntimeError("password_reset_otp_validate_empty_response")
+        continue_url, page_type = _auth_step_details(validated)
+        self._diagnostic(
+            index,
+            "密码重置 OTP 后认证分支 "
+            f"page_type={page_type or '?'} "
+            f"continue={_safe_url_for_log(continue_url)}",
+        )
+        if _url_path(continue_url) != "/reset-password/new-password":
+            raise RuntimeError(
+                "password_reset_unexpected_auth_step: "
+                f"{_safe_url_for_log(continue_url)}"
+            )
+        password_result = self._add_password(password, index, reset_existing=True)
+        next_url, _next_page_type = _auth_step_details(password_result)
+        if next_url:
+            self._navigate_auth_step(
+                next_url,
+                f"{auth_base}/reset-password/new-password",
+                index,
+            )
+        step(index, "密码重置完成，会话已随 callback 更新")
         return password
 
     def _send_otp(self, index: int) -> None:

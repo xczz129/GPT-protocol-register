@@ -54,6 +54,7 @@ async function resume() {
       <span>跳过已封号 {{ health.skippedKnownDeactivated || 0 }}</span>
       <span class="ok">可用 {{ health.usable ?? health.alive ?? 0 }}</span>
       <span class="warn">待续期 {{ health.reauthRequired || 0 }}</span>
+      <span class="warn">待复测 {{ health.unknown || 0 }}</span>
       <span class="err">失效 {{ health.invalid || 0 }}</span>
       <span class="err">错误 {{ health.error || 0 }}</span>
     </div>

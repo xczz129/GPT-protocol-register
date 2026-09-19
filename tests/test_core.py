@@ -10381,7 +10381,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
         self.assertEqual(refresh.call_count, 2)
         sleep.assert_called_once_with(0.25)
 
-    def test_account_health_transport_error_preserves_last_known_status(self):
+    def test_account_health_transport_error_separates_last_known_status(self):
         from common.account_health import check_account
 
         source = {
@@ -10401,8 +10401,9 @@ class ProtocolAndHealthTests(unittest.TestCase):
         ):
             checked = check_account(source, persist=False)
 
-        self.assertEqual(checked["health_status"], "alive")
-        self.assertEqual(checked["status"], "正常")
+        self.assertEqual(checked["health_status"], "unknown")
+        self.assertEqual(checked["health_last_confirmed_status"], "alive")
+        self.assertEqual(checked["status"], "待复测")
         self.assertEqual(checked["health_error"], "")
         self.assertIn("curl: (35)", checked["health_probe_error"])
 

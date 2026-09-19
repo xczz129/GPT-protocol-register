@@ -28,7 +28,6 @@ from .oauth import (
     totp_from_secret,
 )
 from .sms import (
-    FirefoxSmsClient,
     SmsActivation,
     SmsBowerClient,
     SmsError,
@@ -55,13 +54,12 @@ def _flag(value: Any, default: bool = False) -> bool:
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
 
-# Import workers are deliberately bounded even when an operator enters a
-# large value in the dashboard.  The executor is kept at this upper bound and
-# a condition-protected slot gate applies the live setting, which lets the
-# setting change immediately without replacing an executor that may still
-# contain queued jobs.
+# The configured positive worker count controls concurrency. The slot gate
+# applies decreases without interrupting sessions that are already running.
 DEFAULT_IMPORT_CONCURRENCY = 2
-MAX_IMPORT_CONCURRENCY = 32
+# 登录会话重建(stale sign-in session)的次数上限:无上限时,持续失效的
+# 账号会在队列中永久循环。超过后按失败收敛。
+_SESSION_RESTART_LIMIT = 5
 MAX_ACCOUNT_EXPORTS = 500
 MAX_ACCOUNT_EXPORT_BYTES = 4 * 1024 * 1024
 MAX_PERSISTED_JOBS = 300
@@ -73,10 +71,10 @@ JOB_HISTORY_VERSION = 1
 
 def _sms_client_for(settings: SmsSettings, timeout: float) -> Any | None:
     """Build the selected SMS provider client while keeping old patches/API stable."""
+    if settings.provider != "smsbower":
+        raise SmsError("此接码渠道已移除，仅支持 SMSBower")
     if not settings.enabled or not settings.credentials_configured:
         return None
-    if settings.provider == "firefox":
-        return FirefoxSmsClient(settings, timeout=timeout)
     return SmsBowerClient(settings, timeout=timeout)
 
 
@@ -754,7 +752,7 @@ class ImportJobManager:
         # closed and made retryable below.
         self._load_jobs()
         self._executor = ThreadPoolExecutor(
-            max_workers=MAX_IMPORT_CONCURRENCY,
+            max_workers=self.concurrency,
             thread_name_prefix="oauth-import",
         )
 
@@ -876,13 +874,23 @@ class ImportJobManager:
             number = int(str(value).strip())
         except (TypeError, ValueError) as exc:
             raise ValueError("并发数必须是整数") from exc
-        return max(1, min(MAX_IMPORT_CONCURRENCY, number))
+        if number < 1:
+            raise ValueError("并发数必须是正整数")
+        return number
 
     def set_concurrency(self, value: Any) -> int:
         """Set the live import concurrency and wake waiting workers."""
         number = self.normalize_concurrency(value)
         with self._condition:
             self.concurrency = number
+            # Keep pending work in the same executor. CPython's worker limit
+            # is changed under its own shutdown lock; idle workers are lazy,
+            # so a large setting does not pre-create a large thread pool.
+            with self._executor._shutdown_lock:
+                self._executor._max_workers = number
+                queued = sum(job.status == "queued" for job in self._jobs.values())
+                for _ in range(max(0, min(number, queued + self._active_workers) - len(self._executor._threads))):
+                    self._executor._adjust_thread_count()
             self._condition.notify_all()
             self._persist_jobs_locked()
         return number
@@ -1514,8 +1522,10 @@ class ImportJobManager:
             return
         try:
             sms_client.cancel(activation)
-        except Exception:
-            pass
+        except Exception as error:
+            # 取消未被供应商确认。activation 未置 finished,下次清理会重试;
+            # 此处记告警,避免号码在供应商侧静默占用计费。
+            print(f"[sms] number release unconfirmed: {str(error)[:200]}", flush=True)
 
     def _phone_step(self, job: ImportJob, client: ProtocolClient) -> None:
         try:
@@ -1856,6 +1866,23 @@ class ImportJobManager:
         def request_session_restart(error: Exception) -> None:
             nonlocal retry_requested, retry_delay
             job.session_retries += 1
+            if job.session_retries > _SESSION_RESTART_LIMIT:
+                # 连续重建会话仍失效:停止无限重排,按失败收敛,避免 job
+                # 在队列中永久循环占用并发槽位。
+                job.status = "failed"
+                job.step = "failed"
+                job.progress = 100
+                job.error = redact_log(str(error))
+                job.waiting_for = ""
+                job.finished_at = int(time.time())
+                job.add_log(
+                    f"登录会话连续失效 {job.session_retries - 1} 次，停止重建会话",
+                    "error",
+                )
+                self.store.update(job.account_id, status="failed", last_error=job.error)
+                with self._lock:
+                    self._persist_jobs_locked()
+                return
             job.status = "queued"
             job.step = "queued"
             job.progress = 0

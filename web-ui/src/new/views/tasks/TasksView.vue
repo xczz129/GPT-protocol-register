@@ -1,6 +1,7 @@
 <script setup lang="ts">
 /* --- 任务调度页：任务配置 + 运行控制 + 任务卡列表 --- */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { RouterLink } from "vue-router";
 import {
   Check, ChevronDown, ChevronUp, ClipboardList, Copy, Pause, Play,
   RotateCcw, Square, Trash2,
@@ -14,16 +15,18 @@ import { useTasksStore } from "../../stores/tasks";
 import { useGroupsStore } from "../../stores/groups";
 import { useStatusStore } from "../../stores/status";
 import { useUiStore } from "../../stores/ui";
+import { useBatchOpsStore } from "../../stores/batchops";
 import { useConfirm } from "../../composables/useConfirm";
 import { useCopy } from "../../composables/useCopy";
 import type { TaskCard } from "../../api/tasks";
 import type { MailProviderStatus } from "../../api/types";
-import { isVisibleTask, taskEmailLabel, taskFailureDetail } from "../../../shared/taskPresentation";
+import { isVisibleTask, taskEmailLabel, taskFailureDetail, taskSmsLabel, taskSmsNeedsAttention, taskSmsProgress } from "../../../shared/taskPresentation";
 
 const tasks = useTasksStore();
 const groups = useGroupsStore();
 const status = useStatusStore();
 const ui = useUiStore();
+const batch = useBatchOpsStore();
 const confirm = useConfirm();
 const { copiedKey, copyText } = useCopy();
 
@@ -51,6 +54,13 @@ const jobDone = computed(
 const jobPercent = computed(() =>
   tasks.job.total ? Math.round((jobDone.value * 100) / tasks.job.total) : 0,
 );
+const retryableFailCount = computed(() => Math.max(0, Number(tasks.job.retryable_fail_count ?? tasks.job.fail_count) || 0));
+const autoSmsState = computed(() => {
+  const sms = tasks.job.auto_sms;
+  if (!sms || sms.status === "disabled") return null;
+  const labels = { pending: "等待接码", running: "正在接码", completed: "接码已完成", failed: "接码失败", cancelled: "接码已取消", interrupted: "接码已中断" };
+  return { ...sms, label: labels[sms.status] || sms.status, error: ["failed", "interrupted"].includes(sms.status) };
+});
 const smsbowerMail = computed<MailProviderStatus>(() =>
   (status.panel.mail?.providers || []).find((item) => item.type === "smsbower_mail") || { type: "smsbower_mail" },
 );
@@ -88,7 +98,8 @@ function statusInfo(task: TaskCard): { text: string; kind: "success" | "warning"
     cancelled: { text: "已取消", kind: "default" },
     skipped: { text: "已跳过", kind: "default" },
   };
-  const info = labels[task.status] || { text: task.status, kind: "default" as const };
+  const base = labels[task.status] || { text: task.status, kind: "default" as const };
+  const info = { ...base, text: taskSmsLabel(task) || base.text };
   if (["success", "failed", "cancelled", "skipped"].includes(task.status)) {
     return { ...info, text: `${info.text} (${elapsed(task)})` };
   }
@@ -124,8 +135,9 @@ function resume() {
 }
 
 function retryFailed() {
-  run(async () => {
-    if (!(await confirm("重试所有失败任务？", { title: "重试失败", confirmText: "重试" }))) return;
+  if (tasks.job.running || retryableFailCount.value <= 0) return;
+  return run(async () => {
+    if (!(await confirm(`重试 ${retryableFailCount.value} 个注册失败的任务？已注册成功的账号请到账号页处理接码。`, { title: "重试注册失败", confirmText: "重试" }))) return;
     await tasks.retryFailed();
   }, "");
 }
@@ -191,8 +203,8 @@ onBeforeUnmount(() => {
           <AppButton v-if="tasks.job.running" variant="danger" size="sm" :disabled="busyAction" @click="stop">
             <Square :size="14" /><span>停止</span>
           </AppButton>
-          <AppButton v-if="!tasks.job.running && tasks.job.fail_count" variant="ghost" size="sm" :disabled="busyAction" @click="retryFailed">
-            <RotateCcw :size="14" /><span>重试失败</span>
+          <AppButton v-if="!tasks.job.running && retryableFailCount > 0" variant="ghost" size="sm" :disabled="busyAction" @click="retryFailed">
+            <RotateCcw :size="14" /><span>重试注册失败（{{ retryableFailCount }}）</span>
           </AppButton>
         </div>
       </div>
@@ -202,6 +214,10 @@ onBeforeUnmount(() => {
       </div>
 
       <p v-if="tasks.job.last_error" class="job-error">最近错误：{{ tasks.job.last_error }}</p>
+      <div v-if="autoSmsState" class="auto-sms-status" :class="{ 'has-error': autoSmsState.error }" role="status">
+        <span><b>注册后自动接码 · {{ autoSmsState.label }}</b><span v-if="autoSmsState.total"> · 已处理 {{ autoSmsState.completed || 0 }}/{{ autoSmsState.total }}<template v-if="autoSmsState.failed"> · 失败 {{ autoSmsState.failed }}</template></span><small v-if="autoSmsState.message">{{ autoSmsState.message }}</small></span>
+        <AppButton v-if="autoSmsState.batch_id" variant="ghost" size="sm" @click="batch.openCodexDialog()">查看接码进度</AppButton>
+      </div>
     </section>
 
     <!-- 任务卡列表 -->
@@ -242,11 +258,15 @@ onBeforeUnmount(() => {
                   </button>
                 </div>
                 <div class="card-meta">
+                  <span v-if="task.registration_status === 'success'" class="card-registration">注册成功</span>
                   <span v-if="task.provider">{{ task.provider }}</span>
                   <span v-if="task.proxy" class="meta-proxy" :title="task.proxy">代理 {{ task.proxy }}</span>
                   <span>耗时 {{ elapsed(task) }}</span>
                 </div>
+                <p v-if="taskSmsLabel(task) && task.message" class="card-stage">{{ task.message }}</p>
+                <p v-if="taskSmsProgress(task, clock / 1000)" class="card-stage">{{ taskSmsProgress(task, clock / 1000) }}</p>
                 <p v-if="taskFailureDetail(task)" class="card-error">{{ taskFailureDetail(task) }}</p>
+                <p v-if="taskSmsNeedsAttention(task)" class="card-stage">账号已保留。<RouterLink to="/accounts" class="card-sms-link">到账号页为此账号接码 →</RouterLink></p>
               </div>
               <div class="card-right">
                 <AppTag :kind="statusInfo(task).kind">{{ statusInfo(task).text }}</AppTag>
@@ -254,7 +274,8 @@ onBeforeUnmount(() => {
                   v-if="(task.steps || []).length"
                   class="mini-action expand"
                   type="button"
-                  :title="expanded.has(String(task.card_id || task.index)) ? '收起步骤' : '展开步骤'"
+                  :title="expanded.has(String(task.card_id || task.index)) ? '收起步骤与日志' : '展开步骤与日志'"
+                  :aria-expanded="expanded.has(String(task.card_id || task.index))"
                   @click="toggleExpand(String(task.card_id || task.index))"
                 >
                   <ChevronUp v-if="expanded.has(String(task.card_id || task.index))" :size="14" />
@@ -393,6 +414,22 @@ onBeforeUnmount(() => {
   overflow-wrap: anywhere;
 }
 
+.auto-sms-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line-subtle);
+  color: var(--text-secondary);
+  font-size: 0.76rem;
+}
+
+.auto-sms-status b { font-weight: 500; color: var(--text-primary); }
+.auto-sms-status small { display: block; margin-top: 4px; line-height: 1.5; overflow-wrap: anywhere; }
+.auto-sms-status.has-error small { color: var(--error); }
+
 /* --- 任务卡 --- */
 .cards-panel {
   padding: 16px 18px;
@@ -486,6 +523,12 @@ onBeforeUnmount(() => {
   color: var(--error);
   overflow-wrap: anywhere;
 }
+
+.card-registration { color: var(--success); }
+.card-stage { margin: 5px 0 0; font-size: 0.74rem; line-height: 1.5; color: var(--text-secondary); overflow-wrap: anywhere; }
+.card-sms-link { color: var(--accent); text-decoration: none; }
+.card-sms-link:hover { text-decoration: underline; }
+.card-sms-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 
 .meta-proxy {
   max-width: 200px;

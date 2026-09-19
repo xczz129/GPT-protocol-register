@@ -40,6 +40,11 @@ async function loadSettings() {
 }
 
 async function saveSettings() {
+  if (workersSaving.value) return;
+  if ([workersForm.health_workers, workersForm.reauth_workers, workersForm.trial_workers, workersForm.refresh_at_workers, workersForm.codex_sms_workers].some((value) => !Number.isSafeInteger(value) || value < 1)) {
+    ui.notify("并发数必须为正整数", "error");
+    return;
+  }
   workersSaving.value = true;
   try {
     await updateUiSettings({ ...workersForm });
@@ -108,24 +113,24 @@ onMounted(() => {
     <template v-else>
       <div class="form-grid">
         <label class="field">
-          <span>测活并发（上限 20）</span>
-          <input v-model.number="workersForm.health_workers" class="input" type="number" min="1" max="20" />
+          <span>测活并发</span>
+          <input v-model.number="workersForm.health_workers" class="input" type="number" min="1" step="1" />
         </label>
         <label class="field">
-          <span>重登并发（上限 20）</span>
-          <input v-model.number="workersForm.reauth_workers" class="input" type="number" min="1" max="20" />
+          <span>重登并发</span>
+          <input v-model.number="workersForm.reauth_workers" class="input" type="number" min="1" step="1" />
         </label>
         <label class="field">
-          <span>试用检测并发（上限 20）</span>
-          <input v-model.number="workersForm.trial_workers" class="input" type="number" min="1" max="20" />
+          <span>试用检测并发</span>
+          <input v-model.number="workersForm.trial_workers" class="input" type="number" min="1" step="1" />
         </label>
         <label class="field">
-          <span>刷新 AT 并发（上限 10）</span>
-          <input v-model.number="workersForm.refresh_at_workers" class="input" type="number" min="1" max="10" />
+          <span>刷新 AT 并发</span>
+          <input v-model.number="workersForm.refresh_at_workers" class="input" type="number" min="1" step="1" />
         </label>
         <label class="field">
-          <span>接码默认并发（上限 64）</span>
-          <input v-model.number="workersForm.codex_sms_workers" class="input" type="number" min="1" max="64" />
+          <span>接码默认并发</span>
+          <input v-model.number="workersForm.codex_sms_workers" class="input" type="number" min="1" step="1" />
         </label>
         <label class="field">
           <span>重登方式</span>

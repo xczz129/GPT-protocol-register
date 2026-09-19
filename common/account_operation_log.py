@@ -25,11 +25,12 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from config import ROOT
 from common.account_store import account_delete_key
+from common.diagnostic_codes import public_error_code
 
 
 OPERATION_LOG_DB_FILE = ROOT / "data" / "account_operation_logs.sqlite3"
 DEFAULT_DB_PATH = OPERATION_LOG_DB_FILE
-TRACE_DIR = ROOT / "data" / "registration_logs"
+TRACE_DIR = Path(os.environ.get("REGISTRATION_TRACE_DIR") or ROOT / "data" / "registration_logs")
 _LOCK = threading.RLock()
 # The production audit database is written from registration/maintenance
 # worker threads. Keep one configured connection per thread so each event does
@@ -107,6 +108,7 @@ _SENSITIVE_QUERY_KEYS = _SENSITIVE_KEYS | {
     "mfa_code",
     "verification_code",
     "key",
+    "state",
 }
 _COMPACT_SENSITIVE_KEYS = frozenset(item.replace("_", "") for item in _SENSITIVE_KEYS)
 _COMPACT_SENSITIVE_QUERY_KEYS = frozenset(
@@ -187,19 +189,21 @@ def _redact_text(value: Any, secrets: Iterable[Any] = ()) -> str:
     text = re.sub(
         rf"(?i)([\"'])({sensitive_name})\1\s*:\s*([\"'])(.*?)(\3)",
         lambda match: f"{match.group(1)}{match.group(2)}{match.group(1)}:"
-        f"{match.group(3)}***{match.group(5)}",
+        f"{match.group(3)}{match.group(4) if public_error_code(match.group(2), match.group(4)) else '***'}{match.group(5)}",
         text,
     )
     text = re.sub(
         rf"(?i)(?<![A-Za-z0-9])({sensitive_name})(?![A-Za-z0-9])"
         r"(\s*[:=]\s*)([\"'])(.*?)(\3)",
-        lambda match: f"{match.group(1)}{match.group(2)}{match.group(3)}***{match.group(5)}",
+        lambda match: f"{match.group(1)}{match.group(2)}{match.group(3)}"
+        f"{match.group(4) if public_error_code(match.group(1), match.group(4)) else '***'}{match.group(5)}",
         text,
     )
     text = re.sub(
         rf"(?i)(?<![A-Za-z0-9])({sensitive_name})(?![A-Za-z0-9])"
         r"(\s*[:=]\s*)([^\s,;}\]]+)",
-        lambda match: f"{match.group(1)}{match.group(2)}***",
+        lambda match: f"{match.group(1)}{match.group(2)}"
+        f"{match.group(3) if public_error_code(match.group(1), match.group(3)) else '***'}",
         text,
     )
     text = re.sub(
@@ -238,6 +242,8 @@ def _redact_text(value: Any, secrets: Iterable[Any] = ()) -> str:
 def _redact_value(value: Any, *, key: str = "", secrets: Iterable[Any] = ()) -> Any:
     normalized = re.sub(r"[^a-z0-9]+", "_", _text(key).lower()).strip("_")
     compact = normalized.replace("_", "")
+    if public_error_code(normalized, value):
+        return value
     # Provider payloads use both snake_case and camelCase (for example
     # ``newPassword``). Treat the compact form as sensitive too; short
     # counters such as ``promotion_count`` remain unaffected.
@@ -331,7 +337,14 @@ def _acquire(path: Path) -> tuple[sqlite3.Connection, bool]:
     cached_path = getattr(_CONNECTION_CACHE, "path", None)
     cached = getattr(_CONNECTION_CACHE, "connection", None)
     if cached is not None and cached_path == str(path.resolve()):
-        return cached, False
+        # 备份恢复会用 os.replace 换掉日志库文件;已缓存的连接仍指向
+        # 旧 inode,写入会静默丢失。按 inode 校验,文件被换后自动重连。
+        try:
+            if os.stat(path).st_ino == getattr(_CONNECTION_CACHE, "ino", None):
+                return cached, False
+        except OSError:
+            pass
+        _close_cached_connection()
     if cached is not None:
         try:
             cached.close()
@@ -340,6 +353,10 @@ def _acquire(path: Path) -> tuple[sqlite3.Connection, bool]:
     connection = _connect(path)
     _CONNECTION_CACHE.path = str(path.resolve())
     _CONNECTION_CACHE.connection = connection
+    try:
+        _CONNECTION_CACHE.ino = os.stat(path).st_ino
+    except OSError:
+        _CONNECTION_CACHE.ino = None
     return connection, False
 
 

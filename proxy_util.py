@@ -240,9 +240,76 @@ def is_cloudflare_block_error(error: BaseException | str | None) -> bool:
         for marker in (
             "被 cloudflare 拦截",
             "cf_blocked",
-            "chatgpt_home_http_403",
+            "clearance 重试仍被拦截",
+            "error_category=edge_blocked",
         )
-    )
+    ) or bool(re.search(
+        r"(?:[\"']?body_summary[\"']?\s*[:=]\s*[\"']?cloudflare_challenge"
+        r"|[\"']?error_category[\"']?\s*[:=]\s*[\"']?edge_blocked)(?![a-z0-9_])",
+        message,
+    ))
+
+
+_FORBIDDEN_HTTP_STATUS = re.compile(
+    r"(?<![a-z0-9])(?:"
+    r"http(?:/\d+(?:\.\d+)?)?(?:[\s_-]+(?:error|status)(?:[\s_-]+code)?)?"
+    r"|(?:response[\s_-]+)?status(?:[\s_-]+code)?"
+    r"|response"
+    r")[\s'\":=_([{<\-]*403(?![a-z0-9])"
+    r"|(?<![a-z0-9])403[\s_:=-]+(?:client[\s_-]+error:?[\s_-]+)?"
+    r"forbidden(?![a-z])",
+    re.IGNORECASE,
+)
+_PROXY_TUNNEL_REFUSAL = re.compile(
+    r"connect tunnel failed|tunnel connection failed|proxy tunnel (?:failed|refused|rejected)",
+    re.IGNORECASE,
+)
+
+
+def is_http_forbidden_error(error: BaseException | str | None) -> bool:
+    """An explicit HTTP refusal is not a broken transport or a proxy failure."""
+    seen: set[int] = set()
+    current = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current)
+        proxy_tunnel = bool(_PROXY_TUNNEL_REFUSAL.search(message))
+        if not proxy_tunnel and _FORBIDDEN_HTTP_STATUS.search(message):
+            return True
+        if not isinstance(current, BaseException):
+            break
+        for source in (current, getattr(current, "response", None)):
+            if source is None:
+                continue
+            for attribute in ("status_code", "status"):
+                status = getattr(source, attribute, None)
+                if not proxy_tunnel and isinstance(status, (int, str)) and str(status).strip() == "403":
+                    return True
+        current = current.__cause__ or (
+            current.__context__ if not current.__suppress_context__ else None
+        )
+    return False
+
+
+def is_registration_access_denied(error: BaseException | str | None) -> bool:
+    """Stop upstream refusals without confusing a CONNECT proxy refusal with one."""
+    if is_http_forbidden_error(error):
+        return True
+    seen: set[int] = set()
+    current = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if is_cloudflare_block_error(current) or re.search(
+            r"(?<![a-z0-9_])registration_access_denied(?![a-z0-9_])",
+            str(current).lower(),
+        ):
+            return True
+        if not isinstance(current, BaseException):
+            break
+        current = current.__cause__ or (
+            current.__context__ if not current.__suppress_context__ else None
+        )
+    return False
 
 
 def is_tls_transient_error(error: BaseException | str | None) -> bool:
@@ -273,7 +340,10 @@ def is_tls_transient_error(error: BaseException | str | None) -> bool:
 
 def is_proxy_transport_error(error: BaseException | str | None) -> bool:
     """Identify failures where retrying through another proxy is useful."""
-    if is_rate_limit_error(error) or is_auth_identity_error(error):
+    if (
+        is_rate_limit_error(error) or is_auth_identity_error(error)
+        or is_registration_access_denied(error)
+    ):
         return False
     message = str(error or "").lower()
     if not message:
@@ -293,12 +363,6 @@ def is_proxy_transport_error(error: BaseException | str | None) -> bool:
         "proxy connect",
         "proxyerror",
         "response 407",
-        "chatgpt_home_http_403",
-        "cf_blocked",
-        # Cloudflare 403/503 challenge pages mean the exit IP is currently
-        # flagged; rotating to another proxy (and quarantining this one) is
-        # the correct recovery, exactly like a broken tunnel.
-        "被 cloudflare 拦截",
         # curl-cffi/OpenSSL and proxy bridges use several equivalent labels
         # for a transient TLS tunnel failure.  These errors do not say
         # anything about the account credential, so a different route should

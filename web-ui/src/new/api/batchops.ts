@@ -1,6 +1,61 @@
 /* --- 批量操作 API：接码(codex)/导入/重新登录/安全修复/改密/改2FA/刷新AT/试用检测 --- */
 import { api, jsonBody } from "./client";
 
+export const IMPORT_MAX_CONCURRENCY = 10;
+
+/** Shared by the paste preview, retry cache and API boundary. Never drop bad rows. */
+export function parseImportCredentials(text: string) {
+  const rows: { email: string; line: string; lineNumber: number }[] = [];
+  const errors: string[] = [];
+  const seen = new Set<string>();
+  let total = 0;
+  String(text || "").split(/\r\n|\n|\r/).forEach((raw, index) => {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) return;
+    total++;
+    const parts = line.split("----").map((part) => part.trim());
+    const label = `第 ${index + 1} 行`;
+    if (parts.length !== 3 || parts.some((part) => !part)) {
+      errors.push(`${label}格式错误：需要邮箱、密码、2FA 密钥三列`);
+      return;
+    }
+    const [email, password, rawSecret] = parts;
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      errors.push(`${label}邮箱格式错误`);
+      return;
+    }
+    const secret = rawSecret.replace(/\s/g, "").toUpperCase();
+    const unpadded = secret.replace(/=+$/, "");
+    // Match Python b32decode after the backend adds missing padding.
+    const padding = secret.length - unpadded.length + ((8 - secret.length % 8) % 8);
+    if (!/^[A-Z2-7]+={0,6}$/.test(secret) || ![0, 1, 3, 4, 6].includes(padding)) {
+      errors.push(`${label}2FA 密钥不是有效 Base32`);
+      return;
+    }
+    const key = email.toLowerCase();
+    if (seen.has(key)) {
+      errors.push(`${label}邮箱重复`);
+      return;
+    }
+    seen.add(key);
+    rows.push({ email: key, line: [email, password, secret].join("----"), lineNumber: index + 1 });
+  });
+  return { rows, errors, total };
+}
+
+export function importCredentialError(errors: string[]) {
+  return errors.slice(0, 10).join("；") + (errors.length > 10 ? "；还有其他错误行" : "");
+}
+
+export function validImportConcurrency(value: number) {
+  return Number.isInteger(value) && value >= 1 && value <= IMPORT_MAX_CONCURRENCY;
+}
+
+export function cancelledImportResult(item: { status?: string; error?: string }) {
+  return item.status === "cancelled" || (item.status === "failed"
+    && /^(?:任务已(?:停止|取消)|用户(?:停止|取消)|cancel(?:led|ed)\b|stop requested\b)/i.test(item.error || ""));
+}
+
 /* --- 类型 --- */
 export interface CodexLogLine {
   t: string;
@@ -291,6 +346,8 @@ export interface ImportHistoryEntry {
 
 /* --- 接码 / 导入（共用 codex 批次状态） --- */
 export function codexRun(emails: string[], concurrency: number, force = false, smsOptions?: SmsOptions, strategy?: RelayStrategy, accountActions?: Record<string, RelayAction>) {
+  if (!Number.isSafeInteger(concurrency) || concurrency < 1) throw new Error("并发数必须为正整数");
+  if (smsOptions?.provider && smsOptions.provider !== "smsbower") throw new Error("旧接码渠道仅供历史查看，请重新配置 SMSBower");
   return api<CodexStartResult>("/api/codex-oauth/run", {
     method: "POST",
     body: jsonBody({ emails, concurrency, force, ...(smsOptions ? { sms_options: smsOptions } : {}), ...(strategy ? { strategy } : {}), ...(accountActions ? { account_actions: accountActions } : {}) }),
@@ -298,15 +355,21 @@ export function codexRun(emails: string[], concurrency: number, force = false, s
 }
 
 export function preflightCodex(payload: { emails: string[]; concurrency?: number; force?: boolean; sms_options?: SmsOptions; strategy?: RelayStrategy; account_actions?: Record<string, RelayAction> }) {
+  if (payload.concurrency !== undefined && (!Number.isSafeInteger(payload.concurrency) || payload.concurrency < 1)) throw new Error("并发数必须为正整数");
+  if (payload.sms_options?.provider && payload.sms_options.provider !== "smsbower") throw new Error("旧接码渠道仅供历史查看，请重新配置 SMSBower");
   return api<CodexPreflight>("/api/codex-oauth/preflight", { method: "POST", body: jsonBody(payload) });
 }
 
 export const codexPreflight = preflightCodex;
 
 export function codexImport(text: string, accountType: string, workspace: string, concurrency: number) {
+  const parsed = parseImportCredentials(text);
+  if (parsed.errors.length) throw new Error(importCredentialError(parsed.errors));
+  if (!parsed.rows.length) throw new Error("请填写需要导入的账号");
+  if (!validImportConcurrency(concurrency)) throw new Error(`导入并发必须为 1–${IMPORT_MAX_CONCURRENCY} 的整数`);
   return api<CodexStartResult>("/api/codex-oauth/import", {
     method: "POST",
-    body: jsonBody({ text, account_type: accountType, workspace, concurrency }),
+    body: jsonBody({ text: parsed.rows.map((row) => row.line).join("\n"), account_type: accountType, workspace, concurrency }),
   });
 }
 

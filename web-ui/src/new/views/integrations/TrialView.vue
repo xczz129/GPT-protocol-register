@@ -72,6 +72,7 @@ async function checkSingle() {
 }
 
 async function startBatch() {
+  if (!Number.isSafeInteger(form.value.workers) || form.value.workers < 1) { ui.notify("并发数必须为正整数", "error"); return; }
   const count = await trial.startBatch();
   if (!count) {
     ui.notify("请先粘贴至少一个有效的 Access Token", "error");
@@ -217,7 +218,7 @@ onMounted(() => {
           </label>
           <div class="batch-side">
             <div class="batch-count"><span>已识别</span><b>{{ parsedCount }}</b><span>个 Token</span></div>
-            <label class="workers-field"><span>并发</span><input v-model.number="form.workers" class="input" type="number" min="1" max="20" :disabled="batch.running" /></label>
+            <label class="workers-field"><span>并发</span><input v-model.number="form.workers" class="input" type="number" min="1" step="1" :disabled="batch.running" /></label>
             <div class="batch-actions">
               <AppButton variant="primary" :disabled="batch.running || !parsedCount" @click="startBatch">
                 <Play :size="14" /><span>{{ batch.running ? "检测中…" : "开始批量检测" }}</span>

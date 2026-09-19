@@ -117,7 +117,7 @@ class TrialEligibilityJobs:
                 "failed": 0,
                 "stopped": 0,
                 "current": "",
-                "concurrency": max(1, min(20, int(concurrency or 1))),
+                "concurrency": max(1, int(concurrency or 1)),
                 "attempts": max(1, min(20, int(attempts or 1))),
                 "channel": "nerver" if str(channel or "").strip().lower() == "nerver" else "v4",
                 "created_at": _now(),

@@ -73,11 +73,12 @@ const hasSelection = computed(() => selectedRetryTargets.value.length > 0);
 // Use the visible result rows as the source of truth. Some server snapshots
 // omit aggregate failed counts while still returning failed/error items.
 const hasFailed = computed(() => failedEmails.value.length > 0 || summary.value.failed > 0);
-const retryAvailable = computed(() => !status.value.running && hasFailed.value && (!isImport.value || batch.canRetryImport(hasSelection.value ? selectedRetryTargets.value : undefined)));
+const retiredProvider = computed(() => !!status.value.options?.sms_options?.provider && status.value.options.sms_options.provider !== "smsbower");
+const retryAvailable = computed(() => !retiredProvider.value && !status.value.running && hasFailed.value && (!isImport.value || batch.canRetryImport(hasSelection.value ? selectedRetryTargets.value : undefined)));
 const tokenResults = computed(() => (status.value.results || []).filter((item) => ["success", "synced", "skipped"].includes(resultState(item)) && item.refresh_token));
 const filteredLogs = computed(() => (status.value.logs || []).filter((line) => logFilter.value === "all" || (logFilter.value === "issues" ? ["warning", "error"].includes(line.level) : line.level === logFilter.value)));
 const lastUpdated = computed(() => batch.codexLastUpdated ? new Date(batch.codexLastUpdated).toLocaleTimeString() : "尚未同步");
-const stageLabels: Record<string, string> = { pending: "等待执行", login: "登录", password: "验证密码", mfa: "二次认证", acquiring: "获取号码", phone: "提交号码", waiting_sms: "等待短信", verifying_sms: "验证短信", workspace: "选择工作区", token: "保存 RT", mfa_retry: "等待认证窗口", relay_sync: "同步中转", syncing: "同步中转", relay_check: "检查中转" };
+const stageLabels: Record<string, string> = { pending: "等待执行", login: "登录", password: "验证密码", mfa: "二次认证", acquiring: "获取号码", phone: "提交号码", waiting_sms: "等待短信", verifying_sms: "验证短信", workspace: "选择工作区", token: "保存 RT", mfa_retry: "等待认证窗口", relay_sync: "同步中转", syncing: "同步中转", relay_check: "检查中转", rate_limit_wait: "授权限流等待", batch_rate_limit_wait: "批次限流等待" };
 const statusLabels: Record<string, string> = { pending: "未执行", active: "处理中", success: "授权并同步", synced: "已补同步", skipped: "中转已有", failed: "失败", cancelled: "已取消" };
 function label(item: DisplayItem) {
   if (item.status === "active") return stageLabels[item.stage || ""] || item.message || "处理中";
@@ -87,9 +88,10 @@ function label(item: DisplayItem) {
   return statusLabels[item.status] || item.status;
 }
 function countdown(item: DisplayItem) {
-  if (!item.wait_deadline || item.status !== "active") return "";
+  if (typeof item.wait_deadline !== "number" || !Number.isFinite(item.wait_deadline) || item.wait_deadline <= 0 || item.status !== "active") return "";
   const remaining = Math.max(0, Math.ceil(item.wait_deadline - now.value / 1000));
-  return remaining ? `等码剩余 ${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, "0")}` : "等码时间已到，正在更新状态";
+  const waiting = item.stage === "batch_rate_limit_wait" ? "批次冷却" : item.stage === "rate_limit_wait" ? "授权冷却" : "等码";
+  return remaining ? `${waiting}剩余 ${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, "0")}` : `${waiting}时间已到，正在更新状态`;
 }
 watch(() => batch.codexDialogOpen, (open) => {
   if (clock) clearInterval(clock);
@@ -139,6 +141,7 @@ function exportSuccess() {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 async function retry(email?: string) {
+  if (retiredProvider.value) return;
   try { if (isImport.value) await batch.retryImportFailed(email); else await batch.retryCodexFailed(email); }
   catch (cause) { ui.notify(cause instanceof Error ? cause.message : "重试失败", "error"); }
 }
@@ -148,6 +151,7 @@ function toggleRetry(email: string) {
     : [...retrySelection.value, email];
 }
 async function retrySelected() {
+  if (retiredProvider.value) return;
   try {
     const targets = retryTargets.value;
     if (isImport.value) await batch.retryImportFailed(hasSelection.value ? targets : undefined);
@@ -185,7 +189,7 @@ function close() { batch.codexDialogOpen = false; }
       <p v-if="!filteredItems.length" class="empty-state">{{ items.length ? '没有匹配条件的账号' : status.running ? '正在准备账号，请稍候…' : '本批次暂无账号结果' }}</p>
       <article v-for="item in filteredItems.slice(0, visibleLimit)" :key="item.email" :class="['result-row', `result-${item.status}`]">
         <div class="result-main"><div class="result-title"><b>{{ item.email }}</b><span class="result-status">{{ label(item) }}</span></div><small v-if="item.error" class="error-text">{{ item.error }}</small><small v-else-if="item.status === 'skipped'">{{ item.relay_status === 'ready' ? '中转已有匹配凭据，未在线验证' : '旧记录仅确认持有 RT，未核对中转' }}</small><small v-else-if="item.status === 'synced'">已补齐中转 JSON，未重新授权或取号</small><small v-else-if="item.status === 'pending'">{{ status.running ? '等待空闲处理位' : '尚未执行，可重新选择后启动' }}</small><small v-else-if="item.status === 'cancelled'">本次处理已取消</small><small v-else-if="item.status === 'success'">{{ item.token_kind === 'at' ? 'AT' : 'RT' }} 已保存</small><small v-else>{{ item.message || '正在处理' }}</small><small v-if="item.relay_file" class="relay-file">中转文件：{{ item.relay_file }}</small><small v-if="item.authorization_status === 'success' && item.relay_status === 'failed'" class="relay-warning">新凭据已保存在账号库，重试只补同步，不再重复授权。</small><div v-if="!isImport && (item.attempt || item.wait_deadline)" class="stage-meta"><span v-if="item.attempt">取号 {{ item.attempt }} / {{ item.max_phone_attempts === 0 ? '不限' : (item.max_phone_attempts ?? '—') }} 次</span><span v-if="countdown(item)" class="countdown">{{ countdown(item) }}</span></div></div>
-        <div class="actions"><label v-if="item.status === 'failed' && !status.running" class="retry-check"><input type="checkbox" :checked="retrySelection.includes(item.email)" :aria-label="`选择重试 ${item.email}`" @change="toggleRetry(item.email)" />选择</label><AppButton v-if="item.logs?.length" size="sm" :aria-expanded="!!expandedLogs[item.email]" @click="toggleLogs(item)"><ScrollText :size="13" />{{ expandedLogs[item.email] ? '收起' : item.status === 'active' ? '实时日志' : '日志' }}</AppButton><AppButton v-if="item.status === 'failed' && !status.running && (!isImport || batch.canRetryImport(item.email))" size="sm" :disabled="batch.codexStartBusy" :aria-label="`重试 ${item.email}`" @click="retry(item.email)"><RefreshCw :size="13" />{{ item.retry_action === 'sync_only' ? '补同步中转' : '重试' }}</AppButton><AppButton v-if="item.refresh_token && ['success', 'synced', 'skipped'].includes(item.status)" size="sm" :aria-label="`复制 ${item.email} 的 Token`" @click="copyToken(item)"><Check v-if="copiedKey === `codex-${item.email}`" :size="13" /><Clipboard v-else :size="13" />{{ item.token_kind === 'at' ? '复制 AT' : '复制 RT' }}</AppButton></div>
+        <div class="actions"><label v-if="item.status === 'failed' && !status.running && !retiredProvider" class="retry-check"><input type="checkbox" :checked="retrySelection.includes(item.email)" :aria-label="`选择重试 ${item.email}`" @change="toggleRetry(item.email)" />选择</label><AppButton v-if="item.logs?.length" size="sm" :aria-expanded="!!expandedLogs[item.email]" @click="toggleLogs(item)"><ScrollText :size="13" />{{ expandedLogs[item.email] ? '收起' : item.status === 'active' ? '实时日志' : '日志' }}</AppButton><AppButton v-if="item.status === 'failed' && !status.running && !retiredProvider && (!isImport || batch.canRetryImport(item.email))" size="sm" :disabled="batch.codexStartBusy" :aria-label="`重试 ${item.email}`" @click="retry(item.email)"><RefreshCw :size="13" />{{ item.retry_action === 'sync_only' ? '补同步中转' : '重试' }}</AppButton><AppButton v-if="item.refresh_token && ['success', 'synced', 'skipped'].includes(item.status)" size="sm" :aria-label="`复制 ${item.email} 的 Token`" @click="copyToken(item)"><Check v-if="copiedKey === `codex-${item.email}`" :size="13" /><Clipboard v-else :size="13" />{{ item.token_kind === 'at' ? '复制 AT' : '复制 RT' }}</AppButton></div>
         <div v-if="expandedLogs[item.email]" class="account-logs"><p v-for="(line, index) in item.logs || []" :key="index" :class="logClass(line.level)"><span class="log-time">{{ line.t }}</span>{{ line.m }}</p></div>
       </article>
       <AppButton v-if="filteredItems.length > visibleLimit" size="sm" @click="visibleLimit += 40">再显示 {{ Math.min(40, filteredItems.length - visibleLimit) }} 个账号</AppButton>

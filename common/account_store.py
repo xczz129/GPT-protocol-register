@@ -51,6 +51,33 @@ _ACCOUNT_HEALTH_SUMMARY_CACHE_MAX_ENTRIES = 16
 _ACCOUNT_ROWS_CACHE_LOCK = RLock()
 _ACCOUNT_ROWS_CACHE: dict[tuple[str, int], list[dict[str, Any]]] = {}
 _ACCOUNT_ROWS_CACHE_MAX_ENTRIES = 1
+
+
+def invalidate_store_caches(path: str | Path = "") -> None:
+    """Drop in-memory account caches (decoded rows + health summary).
+
+    Needed after an out-of-band store replacement such as a backup restore:
+    the restored SQLite file can carry the same revision as the pre-restore
+    snapshot, which would keep serving the stale decoded rows.
+    """
+    store_key = ""
+    if str(path or "").strip():
+        try:
+            store_key = str(Path(path).resolve())
+        except Exception:
+            store_key = ""
+    with _ACCOUNT_ROWS_CACHE_LOCK:
+        for key in [
+            k for k in list(_ACCOUNT_ROWS_CACHE)
+            if not store_key or k[0] == store_key
+        ]:
+            _ACCOUNT_ROWS_CACHE.pop(key, None)
+    with _ACCOUNT_HEALTH_SUMMARY_CACHE_LOCK:
+        for key in [
+            k for k in list(_ACCOUNT_HEALTH_SUMMARY_CACHE)
+            if not store_key or k[0] == store_key
+        ]:
+            _ACCOUNT_HEALTH_SUMMARY_CACHE.pop(key, None)
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 _FIELD_ORDER = (
     "email",
@@ -1910,6 +1937,9 @@ def account_public_view(record: dict[str, Any]) -> dict[str, Any]:
         "reauth_available": reauth_available,
         "health_checked_at": record.get("health_checked_at"),
         "health_error": record.get("health_error") if health_status in {"error", "invalid", "reauth_required"} else "",
+        "health_probe_error": record.get("health_probe_error") if health_status == "unknown" else "",
+        "health_last_confirmed_status": record.get("health_last_confirmed_status") or "",
+        "health_last_confirmed_at": record.get("health_last_confirmed_at") or "",
         "trial_eligibility_status": trial_status or ("pending" if has_access_token else "no_at"),
         "trial_eligibility_label": trial_label or ("待检测" if has_access_token else "无 AT"),
         "trial_eligibility_checked_at": record.get("trial_eligibility_checked_at") or "",

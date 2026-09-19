@@ -21,7 +21,7 @@ from typing import Any, Mapping
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from .quota import QuotaClient, QuotaError, QuotaService, load_config, save_import_settings, save_quota_settings
-from .import_jobs import AccountStore, ImportErrorBase, ImportJobManager, MAX_IMPORT_CONCURRENCY
+from .import_jobs import AccountStore, ImportErrorBase, ImportJobManager
 from .sms import SmsError, SmsSettings, check_sms_balance, load_sms_settings, save_sms_settings
 from .token_files import (
     TokenFileError,
@@ -295,12 +295,6 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 sms = load_sms_settings(self._imports().sms_settings_path).public_mapping()
             except SmsError:
                 sms = {"enabled": False, "configured": False, "state_label": "接码配置读取失败"}
-            # The settings dialog has a separate endpoint for editing masked
-            # provider fields.  The lightweight status panel should never
-            # echo account names, docking codes, or other credential-shaped
-            # values into a general diagnostics response.
-            for secret_field in ("firefox_api_name", "firefox_docking_code", "firefox_did"):
-                sms.pop(secret_field, None)
             return self._send(HTTPStatus.OK, _json_bytes({
                 **service_status,
                 "import": self._imports().runtime_status(),
@@ -322,7 +316,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 "import_mirror_dir": str(self._imports().mirror_dir) if self._imports().mirror_dir else "",
                 "import_store": str(self._imports().store.path),
                 "import_concurrency": self._imports().concurrency,
-                "import_concurrency_limit": MAX_IMPORT_CONCURRENCY,
+                "import_concurrency_limit": None,
                 "skip_phone_required": self._imports().skip_phone_required,
             }))
         if path == "/api/settings/quota":
@@ -729,23 +723,15 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             body = self._read_json_body() or {}
             try:
                 settings = SmsSettings.from_mapping(body)
-                # Permit masked/omitted secrets only when an existing value is
-                # already on disk; the browser never receives either provider's
-                # password/token.  Keeping this merge server-side also makes
-                # switching providers in the UI safe when the other provider
-                # is configured but not currently selected.
+                if settings.provider != "smsbower":
+                    raise SmsError("此接码渠道已移除，仅支持 SMSBower")
+                # Preserve only an existing SMSBower key when omitted.
                 existing = load_sms_settings(self._imports().sms_settings_path)
                 settings = replace(
                     settings,
                     api_key=settings.api_key or existing.api_key,
-                    firefox_api_name=settings.firefox_api_name or existing.firefox_api_name,
-                    firefox_api_password=settings.firefox_api_password or existing.firefox_api_password,
-                    firefox_api_token=settings.firefox_api_token or existing.firefox_api_token,
-                    firefox_docking_code=settings.firefox_docking_code or existing.firefox_docking_code,
                 )
                 if settings.enabled and not settings.credentials_configured:
-                    if settings.provider == "firefox":
-                        raise ImportErrorBase("启用火狐狸前请填写对接码和 API token（或 ApiName、PassWord）")
                     raise ImportErrorBase("启用 SMSBower 前请填写 API key")
                 save_sms_settings(self._imports().sms_settings_path, settings)
             except (SmsError, ImportErrorBase) as exc:
