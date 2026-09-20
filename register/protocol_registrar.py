@@ -24,7 +24,13 @@ from common.totp import totp_code
 from common.team_workspace import _personal_workspace, selected_workspace_metadata, select_personal_workspace, select_team_workspace, validate_personal_session, validate_team_session, workspace_entries
 from common.mail_registration_metrics import begin_attempt
 from register.sessions import JobCancelled
-from mail import mark_mailbox_code_boundary, mark_mailbox_result, mark_smsbower_otp_accepted, release_mailbox
+from mail import (
+    OTP_RESEND_BOUNDARY_GRACE_SECONDS,
+    mark_mailbox_code_boundary,
+    mark_mailbox_result,
+    mark_smsbower_otp_accepted,
+    release_mailbox,
+)
 from mail.parsing import CANONICAL_PROVIDER_TYPES, base_mailbox_address, normalize_provider_type
 from proxy_util import is_auth_identity_error, is_rate_limit_error, is_registration_access_denied, is_tls_transient_error, proxy_brief
 from register.protocol_fingerprint import REGISTER_BROWSER_PROFILES, _header_fingerprint
@@ -2474,7 +2480,9 @@ class PlatformRegistrar:
                 # 重发确认成功才推进收码边界：失败时保留在途旧码继续等，
                 # 否则既作废未读旧码又等不到新码，白白超时失败。
                 if resent:
-                    mark_mailbox_code_boundary(mailbox, grace_seconds=0)
+                    mark_mailbox_code_boundary(
+                        mailbox, grace_seconds=OTP_RESEND_BOUNDARY_GRACE_SECONDS
+                    )
         return None
 
     def _wait_login_otp_rounds(self, mailbox: dict, index: int) -> str | None:
@@ -2521,7 +2529,9 @@ class PlatformRegistrar:
                     # The auth transaction already advanced; keep polling —
                     # a resend racing the auto-send shows up as 409.
                     step(index, "验证码已自动发送，无需重复请求", "yellow")
-                mark_mailbox_code_boundary(mailbox, grace_seconds=0)
+                mark_mailbox_code_boundary(
+                    mailbox, grace_seconds=OTP_RESEND_BOUNDARY_GRACE_SECONDS
+                )
         return None
 
     def _passwordless_login(self, email: str, mailbox: dict, index: int) -> dict:
@@ -2595,7 +2605,9 @@ class PlatformRegistrar:
                     "yellow",
                 )
                 if self._resend_email_otp(index):
-                    mark_mailbox_code_boundary(mailbox, grace_seconds=0)
+                    mark_mailbox_code_boundary(
+                        mailbox, grace_seconds=OTP_RESEND_BOUNDARY_GRACE_SECONDS
+                    )
         return None
 
     def login(self, email: str, mailbox: dict, index: int) -> dict[str, Any]:
@@ -2631,7 +2643,9 @@ class PlatformRegistrar:
                         "yellow",
                     )
                     if self._resend_email_otp(index):
-                        mark_mailbox_code_boundary(mailbox, grace_seconds=0)
+                        mark_mailbox_code_boundary(
+                            mailbox, grace_seconds=OTP_RESEND_BOUNDARY_GRACE_SECONDS
+                        )
                     continue
                 raise
 
@@ -3164,7 +3178,9 @@ class PlatformRegistrar:
                             "yellow",
                         )
                         self._resend_email_otp(index)
-                        mark_mailbox_code_boundary(mailbox, grace_seconds=0)
+                        mark_mailbox_code_boundary(
+                            mailbox, grace_seconds=OTP_RESEND_BOUNDARY_GRACE_SECONDS
+                        )
                         continue
                     raise
             if not isinstance(validated, dict):
@@ -3390,7 +3406,9 @@ class PlatformRegistrar:
                         "yellow",
                     )
                     self._resend_email_otp(index)
-                    mark_mailbox_code_boundary(mailbox, grace_seconds=0)
+                    mark_mailbox_code_boundary(
+                        mailbox, grace_seconds=OTP_RESEND_BOUNDARY_GRACE_SECONDS
+                    )
                     continue
                 raise
         if not isinstance(validated, dict):
@@ -3960,7 +3978,9 @@ class PlatformRegistrar:
                         # max_check_attempts。显式 resend 刷新 challenge（重置
                         # 计数），并把 code boundary 推进到 resend 时刻作废旧邮件。
                         self._resend_email_otp(index)
-                        mark_mailbox_code_boundary(mailbox, grace_seconds=0)
+                        mark_mailbox_code_boundary(
+                            mailbox, grace_seconds=OTP_RESEND_BOUNDARY_GRACE_SECONDS
+                        )
                         step(
                             index,
                             "注册验证码被服务端判定错误，已重发验证码并重置校验计数，等待新码",
@@ -3972,7 +3992,9 @@ class PlatformRegistrar:
                         raise
                     step(index, "NextAuth 登录状态已失效，清理会话并重新发送验证码", "yellow")
                     self._reset_auth_cookies()
-                    mark_mailbox_code_boundary(mailbox, grace_seconds=0)
+                    mark_mailbox_code_boundary(
+                        mailbox, grace_seconds=OTP_RESEND_BOUNDARY_GRACE_SECONDS
+                    )
                     self._complete_chatgpt_session(
                         email,
                         "",

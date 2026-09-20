@@ -241,7 +241,14 @@ IN_USE_STALE_SECONDS = 30 * 60
 UNAVAILABLE_STATES = {"used", "token_invalid", "failed"}
 RATE_LIMIT_COOLDOWN_SECONDS = 30 * 60
 BJ_TZ = timezone(timedelta(hours=8))
-OTP_CODE_GRACE_SECONDS = 5.0
+# 事务起点边界 grace：登录流程先触发自动发码、后标记边界，自动发码邮件
+# 常在边界标记前十几秒就已落箱；5s 覆盖不了，会把自己事务的有效码当旧码
+# 排除，之后 180s 只能等到无效的重发码。
+OTP_CODE_GRACE_SECONDS = 60.0
+# 重发后推进边界的回看窗：网关对 Junk 邮箱的采集有 20-120s 延迟，邮件入库
+# 时 received_at 可能已早于重发时刻。保留约两个 45s 段的回看，避免"采集到
+# 即过期"；旧码若真已失效，wrong_email_otp 重试路径会兜底。
+OTP_RESEND_BOUNDARY_GRACE_SECONDS = 75.0
 
 # External APIs: prefer direct (no system proxy)
 _NO_PROXY = {"http": None, "https": None}
@@ -850,6 +857,20 @@ def _icloud_payload_messages(data: dict[str, Any]) -> list[dict[str, Any]]:
             if item_id:
                 seen_ids.add(item_id)
             messages.append(item)
+    # /code/wait 把命中的邮件详情放在 lookup.last_code_mail / lookup.last_mail，
+    # 一并纳入解析，让顶层 code 能绑定到带 from/to/received_at 的真实邮件。
+    lookup = data.get("lookup")
+    if isinstance(lookup, dict):
+        for key in ("last_code_mail", "last_mail"):
+            item = lookup.get(key)
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("id") or item.get("message_id") or "")
+            if item_id and item_id in seen_ids:
+                continue
+            if item_id:
+                seen_ids.add(item_id)
+            messages.append(item)
     if not messages and any(
         key in data for key in ("subject", "text", "preview", "body", "html")
     ):
@@ -880,6 +901,8 @@ def _icloud_payload_code_candidates(
     # /code/wait authenticates by the parent key and may return another
     # recipient's latest code. Bind the top-level code to its message before
     # applying recipient and timestamp checks; never trust the echoed email.
+    # 注意（2026-09-20 实测）：tm1.openai.com 影子发码域镜像投递与正常域相同的
+    # 有效码（实测 tm1 投递的 103897 提交 validate 通过），不要按发件人域过滤。
     if _icloud_message_matches_mailbox(first_message, mailbox):
         nested_code = str(first_message.get("code") or first_message.get("otp") or "").strip()
         if not nested_code or nested_code == str(data.get("code") or ""):
@@ -1908,9 +1931,10 @@ class ICloudApiProvider:
                     marker in subject_lower
                     for marker in ("new sign-in", "new login", "security alert")
                 )
-                # tm1.openai.com 是 OpenAI 当前坏掉的影子发码域,投递的码全部
-                # 无效(参考项目实测固定返回 493682,validate 必拒)。在候选
-                # 阶段硬过滤,避免当有效码提交、白白消耗 check 次数。
+                # 历史事件：tm1.openai.com 影子发码域曾复投固定无效码 493682
+                # (validate 必拒)，在此特判避免当有效码提交、白白消耗 check 次数。
+                # 注意(2026-09-20 实测)：tm1 已改为镜像投递与正常域相同的有效码
+                # (实测 103897 提交通过)，不可按发件人域过滤 tm1 邮件。
                 if code == "493682":
                     if code not in exclude:
                         seen_codes.append(code)
