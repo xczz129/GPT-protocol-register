@@ -514,6 +514,13 @@ def record_operation_event(
 ) -> dict[str, Any] | None:
     """Best-effort append used by workers so logging never breaks an account op."""
     try:
+        # 展示层中文化：操作日志的 error 字段统一翻译成中文说明（保留原始码），
+        # 面板/账号列表看到的失败原因即中文。日志与数据库的完整原始错误不受影响。
+        raw_error = kwargs.get("error")
+        if raw_error:
+            from proxy_util import error_zh
+
+            kwargs["error"] = error_zh(raw_error)
         return append_operation_event(account, operation, status, **kwargs)
     except Exception:
         return None

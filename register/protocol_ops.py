@@ -9,7 +9,7 @@ from typing import Any, Callable
 from common.session_export import parse_jwt_payload
 from register.sessions import JobCancelled
 from mail import mark_mailbox_code_boundary, mark_mailbox_result, release_mailbox
-from proxy_util import is_auth_identity_error, is_proxy_transport_error, is_rate_limit_error, proxy_brief
+from proxy_util import error_zh, is_auth_identity_error, is_proxy_transport_error, is_rate_limit_error, proxy_brief
 from register.protocol_runtime import (
     ProtocolRuntimeSettings,
     activate_runtime,
@@ -536,11 +536,16 @@ def repair_security_one(
         # missing, replace that factor before attempting a password reset.
         # The reset endpoint itself requires MFA when a factor exists, so
         # doing the password step first would strand the account with neither
-        # a usable local secret nor a confirmed password.  An existing AT is
-        # sufficient for the ChatGPT settings API and avoids asking for the
-        # missing TOTP during this bootstrap phase.
+        # a usable local secret nor a confirmed password.  This bootstrap only
+        # matters when a password step follows; when the password is already
+        # set the final enrollment path rebuilds a fresh session instead.
+        # OpenAI has tightened the settings API: disabling a factor now
+        # requires a freshly authenticated session, so a stored AT may be
+        # rejected with 401 "must re-authenticate" — tolerate it and let the
+        # email-OTP rebuild in the final path retry the replacement.
         if (
             needs_totp
+            and needs_password
             and remote_mfa_enabled
             and not is_browser_registration
         ):
@@ -556,17 +561,31 @@ def repair_security_one(
             protocol_tokens.update(early_tokens)
             ensure_running()
             step(index, "本地缺少 TOTP，先替换远端旧因子再继续密码流程")
-            replacement = registrar._enroll_totp(
-                early_tokens,
-                index,
-                replace_existing=True,
-            )
-            save_partial(replacement)
-            needs_totp = False
-            early_totp_replaced = True
-            existing_totp = str(
-                fields.get("totp_secret") or replacement.get("totp_secret") or ""
-            ).strip()
+            try:
+                replacement = registrar._enroll_totp(
+                    early_tokens,
+                    index,
+                    replace_existing=True,
+                )
+            except RuntimeError as replacement_error:
+                error_text = str(replacement_error)
+                if (
+                    "mfa_disable_http_401" not in error_text
+                    and "re-authenticate" not in error_text
+                ):
+                    raise
+                step(
+                    index,
+                    "存量 AT 停用旧因子被拒(需新鲜认证)，改由邮箱 OTP 会话重试替换",
+                    "yellow",
+                )
+            else:
+                save_partial(replacement)
+                needs_totp = False
+                early_totp_replaced = True
+                existing_totp = str(
+                    fields.get("totp_secret") or replacement.get("totp_secret") or ""
+                ).strip()
 
         if needs_password:
             password_flow_baseline = {
@@ -675,33 +694,51 @@ def repair_security_one(
             password_for_session = str(
                 fields.get("password") or existing_password
             ).strip()
-            # When only the local TOTP secret is missing, an existing AT is
-            # sufficient for the ChatGPT settings API.  Avoid starting a new
-            # password+TOTP login (which would require the very secret being
-            # repaired) and use that token directly.
+            # When only the local TOTP secret is missing, an existing AT may
+            # still serve read-only probes.  Factor replacement, however, now
+            # requires a freshly authenticated session (OpenAI re-auth check),
+            # so remote_mfa_enabled excludes the stored token from direct use
+            # and the rebuild below produces an interactive login instead.
             can_use_stored_access_token = bool(
                 str(tokens.get("access_token") or "").strip()
                 and not is_browser_registration
+                and not remote_mfa_enabled
             )
             needs_session_refresh = not has_session_credentials(tokens)
             if password_for_session and (
                 not can_use_stored_access_token or needs_session_refresh
             ):
-                try:
-                    session_tokens = registrar._read_chatgpt_session(
-                        email,
-                        password_for_session,
-                        index,
-                    )
-                except RuntimeError as session_error:
-                    if is_browser_registration:
+                session_tokens: dict[str, Any] = {}
+                session_read_error: RuntimeError | None = None
+                # Skip the session-cookie refresh when replacing an active
+                # factor: a refreshed AT still fails the interactive-auth
+                # requirement; go straight to the email-OTP rebuild.
+                if not (needs_totp and remote_mfa_enabled):
+                    try:
+                        session_tokens = registrar._read_chatgpt_session(
+                            email,
+                            password_for_session,
+                            index,
+                        )
+                    except RuntimeError as error:
+                        session_read_error = error
+                if not str(session_tokens.get("access_token") or "").strip():
+                    if is_browser_registration and session_read_error is not None:
                         raise RuntimeError(
                             "browser_protocol_session_lost_after_password: "
-                            f"{str(session_error)[:240]}"
-                        ) from session_error
+                            f"{str(session_read_error)[:240]}"
+                        ) from session_read_error
+                    if remote_mfa_enabled:
+                        # 已开启 2FA 的账号 OpenAI 不发邮箱验证码：邮箱登录
+                        # 通道不存在，等码只会超时。本地密钥错误/缺失 + 远端
+                        # 2FA 生效 = 协议侧无法自动恢复，快速失败给出明确原因。
+                        raise RuntimeError(
+                            "mfa_email_otp_login_unavailable: 账号已开启2FA且本地密钥与远端不符，"
+                            "邮箱验证码登录通道不存在（OpenAI 对2FA账号不发信），无法自动恢复"
+                        )
                     step(
                         index,
-                        "现有 ChatGPT 会话已失效，使用邮箱 OTP 重建协议会话",
+                        "使用邮箱 OTP 重建协议会话（MFA 因子操作需新鲜认证）",
                         "yellow",
                     )
                     if mailbox is None:
@@ -965,6 +1002,45 @@ def _validate_protocol_login_result(result: dict[str, Any]) -> None:
         raise RuntimeError(message) from error
 
 
+def _credential_failure_hint(error_text: str) -> str:
+    """按错误类型给出凭据失败的下一步处置建议（不含任何敏感值）。"""
+    text = str(error_text or "")
+    # 特定错误码优先于通用步骤码：mfa_verify_http_403 既可能是错码
+    # 也可能是封号，必须先判 account_deactivated 再落到 incorrect_code。
+    if "account_deactivated" in text:
+        return "账号已被服务端停用(account_deactivated)。建议：删除该账号"
+    if "email_address_changed" in text:
+        return "账号邮箱已被变更(email_address_changed)。建议：删除该账号或重新确认归属"
+    if "mfa_email_otp_login_unavailable" in text:
+        return (
+            "账号已开启2FA：OpenAI 对2FA账号不提供邮箱验证码登录（无发信）。"
+            "本地2FA密钥与远端不符时该账号无法自动恢复。建议：人工核对密钥或删除该账号"
+        )
+    if "等待登录验证码超时" in text or "otp_wait_timeout" in text.lower():
+        return (
+            "邮箱验证码未到达：账号若已开启2FA则 OpenAI 不会发信（邮箱登录通道不存在）；"
+            "未开2FA则检查邮箱通道投递/凭据"
+        )
+    if "password_verify_http_401" in text or "invalid_username_or_password" in text:
+        return (
+            "密码被服务端拒绝(invalid_username_or_password)：存储密码与账号实际密码不符。"
+            "建议：走邮箱 OTP 密码重置，或删除该账号"
+        )
+    if "mfa_verify_http_403" in text or "incorrect_code" in text:
+        return (
+            "TOTP 验证码被拒(incorrect_code)：2FA 密钥与账号不符（时钟已 NTP 同步，基本排除时间漂移）。"
+            "建议：走安全字段补全重挂 2FA"
+        )
+    if "credential_login_password_route_unavailable" in text:
+        return (
+            "服务端未提供密码登录入口(导向邮箱验证)。"
+            "建议：该账号改走邮箱验证码登录/重置"
+        )
+    if "429" in text or "rate_limit" in text.lower() or "限流" in text:
+        return "触发服务端限流。建议：降低并发或稍后重试"
+    return ""
+
+
 
 
 def login_with_password_totp_one(
@@ -1133,12 +1209,20 @@ def login_with_password_totp_one(
                 "yellow",
             )
         else:
-            log(f"任务{index} 密码 + TOTP 协议登录失败，本次耗时{cost:.1f}s，原因: {safe_error}", "red")
+            zh_error = error_zh(safe_error)
+            log(
+                f"任务{index} 密码 + TOTP 协议登录失败 · 账号={email} · "
+                f"本次耗时{cost:.1f}s · 原因: {zh_error}",
+                "red",
+            )
+            hint = _credential_failure_hint(safe_error)
+            if hint:
+                log(f"任务{index} [凭据诊断] {hint}", "red")
         if callable(task_event):
             task_event(
                 index,
                 "failed",
-                error=safe_error[:300],
+                error=error_zh(safe_error)[:300],
                 step="当前连接失败，本次登录未完成" if transport_error else safe_error[:160],
             )
         return None
@@ -1589,7 +1673,13 @@ def login_one(
                 "yellow",
             )
         else:
-            log(f"任务{index} 协议登录失败，本次耗时{cost:.1f}s，原因: {error}", "red")
+            log(
+                f"任务{index} 协议登录失败 · 账号={email} · 本次耗时{cost:.1f}s · 原因: {error_zh(error)}",
+                "red",
+            )
+            hint = _credential_failure_hint(str(error))
+            if hint:
+                log(f"任务{index} [凭据诊断] {hint}", "red")
         if callable(task_event):
             task_event(
                 index,

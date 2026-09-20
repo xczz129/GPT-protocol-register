@@ -83,13 +83,22 @@ def test_unrelated_inbox_is_rejected_before_network(method):
 @pytest.mark.parametrize("payload", [
     {"code": "111222"},
     {"code": "111222", "email": CHILD_A},
-    {"code": "111222", "mail": {"alias_email": PARENT}},
-    {"code": "111222", "mail": {"to": PARENT}},
     {"code": "111222", "mail": {"to": CHILD_B}},
     {"code": "111222", "mail": {"to": f"{CHILD_A}, {CHILD_B}"}},
 ])
-def test_split_never_trusts_parent_or_ambiguous_code(payload):
+def test_split_rejects_account_echo_other_child_and_ambiguous_code(payload):
     assert mail._icloud_payload_code_candidates(payload, {"address": CHILD_A}) == []
+
+
+@pytest.mark.parametrize("payload", [
+    {"code": "111222", "mail": {"alias_email": PARENT}},
+    {"code": "111222", "mail": {"to": PARENT}},
+    {"code": "111222", "mail": {"to": f"Hide My Email <{PARENT}>"}},
+])
+def test_split_reads_parent_inbox_mail(payload):
+    """Hide My Email 转发会把收件人归一化为主邮箱: 子槽按主邮箱收信匹配。"""
+    candidates = mail._icloud_payload_code_candidates(payload, {"address": CHILD_A})
+    assert [candidate[0] for candidate in candidates] == ["111222"]
 
 
 @pytest.mark.parametrize("recipient", [CHILD_A, f"Child <{CHILD_A.upper()}>",
@@ -134,37 +143,54 @@ def test_malformed_or_unbounded_recipient_lists_do_not_establish_ownership(recip
 
 def test_body_or_echoed_email_never_supplies_missing_recipient_evidence():
     payload = {"email": CHILD_A, "code": "222333", "mail": {
-        "alias_email": PARENT, "subject": "Verification code", "code": "222333",
+        "alias_email": "unrelated@icloud.test", "subject": "Verification code", "code": "222333",
         "body_text": f"Hello {CHILD_A}, code 222333", "preview": repr([CHILD_A]),
     }}
     assert mail._icloud_payload_code_candidates(payload, {"address": CHILD_A}) == []
 
 
-def test_concurrent_parent_and_children_each_receive_only_their_code():
-    codes = {PARENT: "111222", CHILD_A: "222333", CHILD_B: "333444"}
-    messages = [_message(address, code) for address, code in codes.items()]
+def test_split_reads_parent_latest_and_explicit_child_mail_still_isolated():
+    """新策略: 主邮箱代收的码子槽可用; 显式收件人仍只归该子槽。"""
+    parent_code = "111222"
+    messages = [
+        _message(PARENT, parent_code),
+        _message(CHILD_B, "333444"),
+    ]
 
-    def receive(address):
+    def child_reads_parent_inbox_code():
         provider = _provider()
-        # The provider's fast endpoint returns its shared latest parent code.
-        # Split tasks must read the parent cache and select their own recipient.
         def request(url, **kwargs):
             assert kwargs["params"]["email"] == PARENT
             assert kwargs["params"]["key"] == KEY
             if url.endswith("/code/wait"):
-                return _response({"ok": True, "code": "111222", "mail": messages[0]})
+                return _response({"ok": True, "code": parent_code, "mail": messages[0]})
             return _response({"ok": True, "messages": messages})
         provider.session.get.side_effect = request
-        mailbox = {"address": address, "api_key": KEY,
+        mailbox = {"address": CHILD_A, "api_key": KEY,
                    "_code_not_before": datetime.now(timezone.utc) - timedelta(seconds=1)}
         result = provider.wait_for_code(mailbox)
-        return address, result, mailbox["_seen_otp_codes"]
+        return result, mailbox["_seen_otp_codes"]
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        results = list(executor.map(receive, codes))
-    for address, result, seen in results:
-        assert result == codes[address]
-        assert seen == [codes[address]]
+    def child_b_gets_own_explicit_code():
+        provider = _provider()
+        def request(url, **kwargs):
+            if url.endswith("/code/wait"):
+                return _response({"ok": True, "messages": []})
+            return _response({"ok": True, "messages": messages})
+        provider.session.get.side_effect = request
+        mailbox = {"address": CHILD_B, "api_key": KEY,
+                   "_code_not_before": datetime.now(timezone.utc) - timedelta(seconds=1), "_seen_otp_codes": ["111222"]}
+        result = provider.wait_for_code(mailbox)
+        return result, mailbox["_seen_otp_codes"]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        (parent_read, parent_seen), (child_b_read, child_b_seen) = list(
+            executor.map(lambda fn: fn(), [child_reads_parent_inbox_code, child_b_gets_own_explicit_code])
+        )
+    assert parent_read == parent_code
+    assert parent_seen == [parent_code]
+    assert child_b_read == "333444"
+    assert child_b_seen == ["111222", "333444"]
 
 
 def test_filtered_cache_still_rejects_seen_and_old_codes():

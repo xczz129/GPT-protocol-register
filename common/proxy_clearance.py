@@ -234,7 +234,27 @@ def refresh_clearance(
     if not settings["enabled"] or settings["mode"] != "flaresolverr" or not settings["url"]:
         _set_error("FlareSolverr 清障未启用或地址为空")
         return None
+    # 先查缓存：批量任务撞同一出口的 CF 拦截时，后来者直接复用已解出的
+    # clearance，避免把 FlareSolverr 打爆。
+    cached = cached_clearance(proxy_config, target_url, request_proxy)
+    if cached is not None:
+        return cached
     _ensure_flaresolverr(settings)
+    # 全局串行化求解：FlareSolverr(v3) 单浏览器实例并发求解会互相超时，
+    # 批量高并发下表现为"clearance 刷新失败"。排队 + 双检缓存后，同键
+    # 请求等前排解完直接命中缓存，异键请求顺序求解。
+    with _REFRESH_LOCK:
+        cached = cached_clearance(proxy_config, target_url, request_proxy)
+        if cached is not None:
+            return cached
+        return _solve_clearance_locked(settings, target_url)
+
+
+_REFRESH_LOCK = threading.Lock()
+
+
+def _solve_clearance_locked(settings: dict[str, Any], target_url: str) -> ClearanceBundle | None:
+    """Actual FlareSolverr round-trip; caller must hold _REFRESH_LOCK."""
     payload: dict[str, Any] = {
         "cmd": "request.get",
         "url": target_url,

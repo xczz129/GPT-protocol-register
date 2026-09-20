@@ -5737,7 +5737,7 @@ class ProtocolAndHealthTests(unittest.TestCase):
         self.assertEqual(saved["status"], "已封号")
         self.assertEqual(saved["health_status"], "invalid")
         self.assertEqual(saved["reauth_blocked_reason"], "account_deactivated")
-        self.assertIn("account_deactivated", saved["health_error"])
+        self.assertIn("封号", saved["health_error"])
 
     def test_protocol_reauthentication_failure_replaces_stale_alive_state(self):
         import web_app
@@ -5809,8 +5809,10 @@ class ProtocolAndHealthTests(unittest.TestCase):
             )
 
         self.assertEqual(saved["health_status"], "error")
-        self.assertEqual(saved["health_error"], detail)
-        self.assertEqual(saved["last_reauth_error"], detail)
+        # 展示层中文化：传输错误存储为中文说明+原始码
+        self.assertIn("SSL/TLS连接失败", saved["health_error"])
+        self.assertIn("curl: (35)", saved["health_error"])
+        self.assertIn("SSL/TLS连接失败", saved["last_reauth_error"])
 
     def test_successful_reauthentication_clears_previous_failure_fields(self):
         import web_app
@@ -7607,8 +7609,8 @@ class ProtocolAndHealthTests(unittest.TestCase):
         self.assertEqual(result["session_token"], "complete-session-token")
         self.assertEqual(partials[0], refreshed_tokens)
 
-    def test_protocol_security_repair_refreshes_session_after_remote_mfa_replacement(self):
-        """The early remote-factor replacement also persists Account ID/session."""
+    def test_protocol_security_repair_fails_fast_when_mfa_blocks_email_otp_login(self):
+        """2FA 生效 + 本地密钥缺失：邮箱登录通道不存在，快速失败不空等。"""
         from register.protocol import repair_security_one
 
         registrar = MagicMock()
@@ -7616,56 +7618,29 @@ class ProtocolAndHealthTests(unittest.TestCase):
             SimpleNamespace(status_code=200, json=lambda: {"mfa_enabled": True}),
             "",
         )
-        registrar._enroll_totp.return_value = {
-            "mfa_enabled": True,
-            "mfa_factor_id": "replacement-factor",
-            "totp_secret": "JBSWY3DPEHPK3PXP",
-        }
-        refreshed_tokens = {
-            "access_token": "complete-access-token",
-            "session_token": "complete-session-token",
-            "account_id": "complete-account-id",
-        }
-        registrar._read_chatgpt_session.return_value = refreshed_tokens
-        partials = []
         with (
             patch("register.protocol_ops.PlatformRegistrar", return_value=registrar),
             patch("register.protocol_ops.step"),
             patch("register.protocol_ops.mark_mailbox_result"),
         ):
-            result = repair_security_one(
-                1,
-                account={
-                    "email": "remote-mfa-replacement@example.com",
-                    "password": "Aa1!existing-password",
-                    "password_set": True,
-                    "access_token": "old-access-token",
-                    "session_token": "",
-                    "account_id": "",
-                    "totp_secret": "",
-                    "mfa_enabled": True,
-                },
-                mail_config={"providers": []},
-                partial_sink=partials.append,
-            )
-
-        registrar._enroll_totp.assert_called_once_with(
-            {
-                "access_token": "old-access-token",
-                "session_token": "",
-                "account_id": "",
-            },
-            1,
-            replace_existing=True,
-        )
-        registrar._read_chatgpt_session.assert_called_once_with(
-            "remote-mfa-replacement@example.com",
-            "Aa1!existing-password",
-            1,
-        )
-        self.assertEqual(result["account_id"], "complete-account-id")
-        self.assertEqual(result["session_token"], "complete-session-token")
-        self.assertIn(refreshed_tokens, partials)
+            with self.assertRaises(RuntimeError) as raised:
+                repair_security_one(
+                    1,
+                    account={
+                        "email": "mfa-email-blocked@example.com",
+                        "password": "Aa1!existing-password",
+                        "password_set": True,
+                        "access_token": "old-access-token",
+                        "session_token": "",
+                        "account_id": "",
+                        "totp_secret": "",
+                        "mfa_enabled": True,
+                    },
+                    mail_config={"providers": []},
+                )
+        self.assertIn("mfa_email_otp_login_unavailable", str(raised.exception))
+        registrar.login.assert_not_called()
+        registrar._enroll_totp.assert_not_called()
 
     def test_protocol_security_repair_drops_stale_session_after_early_mfa_and_at_rotation(self):
         """An early factor replacement must not pair a rotated AT with old IDs."""

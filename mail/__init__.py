@@ -928,12 +928,20 @@ def _icloud_payload_code_candidates(
 def _icloud_message_matches_mailbox(
     message: dict[str, Any], mailbox: dict[str, Any] | None,
 ) -> bool:
-    """Require recipient evidence when reading a split slot via its parent."""
+    """Match messages to a mailbox; split slots read via the parent inbox.
+
+    实测（icloud.xbovo.online /api/v1/messages）：Hide My Email 转发会把
+    收件人归一化为主邮箱地址（to: "Hide My Email <parent@…>"，alias_email
+    为主邮箱），发往 +split 子槽的邮件在 API 返回里完全不含子槽地址。
+    因此子槽必须按主邮箱收信地址匹配（用户确认的投递行为）；显式显示
+    其他子槽地址的邮件仍拒绝，尽可能保留隔离。
+    """
     if not mailbox:
         return True
     target = str(mailbox.get("address") or "").strip().lower()
     if not target:
         return True
+    base = base_mailbox_address(target)
     values: list[str] = []
     has_recipient_field = False
     for key in ("to", "to_addrs", "recipients", "recipient"):
@@ -950,7 +958,6 @@ def _icloud_message_matches_mailbox(
         if "@" in address
     }
     if recipients:
-        base = base_mailbox_address(target)
         child_recipients = {
             recipient for recipient in recipients
             if recipient != base and base_mailbox_address(recipient) == base
@@ -959,15 +966,17 @@ def _icloud_message_matches_mailbox(
             # Forwarded mail may mention both parent and child. The specific
             # child is the owner; multiple children would be ambiguous.
             return child_recipients == {target}
-        return target in recipients
+        # 子槽的收信由主邮箱代收（To: 显示主地址）：主地址收件同样归本槽。
+        return target in recipients or base in recipients
     if has_recipient_field:
         return False
-    # alias_email is the API's stored owner. A parent owner is insufficient
-    # evidence for a child slot; the response's top-level email is only the
-    # authenticated account and must never be treated as a recipient.
+    # alias_email is the API's stored owner (the parent inbox). Split slots
+    # read through the parent inbox, so the parent owner matches children;
+    # the response's top-level email is only the authenticated account and
+    # must never be treated as a recipient.
     owner = str(message.get("alias_email") or "").strip().lower()
     if owner:
-        return owner == target
+        return owner == target or owner == base
     return target == base_mailbox_address(target)
 
 

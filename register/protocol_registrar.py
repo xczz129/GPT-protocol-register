@@ -88,7 +88,10 @@ from register.protocol_context import (
 
 from register.protocol_fingerprint import (
     _browser_fingerprint,
+    _chrome_sec_ch_ua,
+    _chrome_sec_ch_ua_full_version_list,
     _client_hint_headers,
+    _extract_chrome_version_from_user_agent,
     _header_fingerprint,
     _make_browser_fingerprint,
     _proxy_country_code,
@@ -274,6 +277,20 @@ class _TlsRotateSessionProxy:
         return self._call("post", *args, **kwargs)
 
 
+def _totp_window_guarded(generator: Callable[[], str]) -> str:
+    """窗口尾段守卫：剩余 <10s 时等到下一窗口再取码。
+
+    30 秒窗口只剩几秒时生成的验证码，可能在网络往返/服务端校验途中过期，
+    被误判为 incorrect_code（假阴性）。代价是偶发多等几秒，换取提交时
+    码至少有 10 秒余量。调用方用 lambda 传入原取码函数，保持各调用点
+    的符号（totp_code / _totp_code）与测试 mock 一致。
+    """
+    remaining = 30 - (int(time.time()) % 30)
+    if remaining < 10:
+        time.sleep(remaining + 0.2)
+    return generator()
+
+
 class PlatformRegistrar:
     def __init__(self, proxy: str = "") -> None:
         self.proxy = str(proxy or "").strip()
@@ -446,7 +463,8 @@ class PlatformRegistrar:
                 if not self._rotate_tls_fingerprint():
                     probe_kwargs["impersonate"] = "chrome131"
             lo, hi = plan["delay"]
-            time.sleep(lo + random.random() * (hi - lo))
+            backoff = lo + random.random() * (hi - lo)
+            time.sleep(backoff)
             try:
                 if plan["warm"]:
                     try:
@@ -482,14 +500,97 @@ class PlatformRegistrar:
             if probe is not None and not _is_cloudflare_challenge(probe):
                 self._diagnostic(
                     index,
-                    f"CF 轻量算法恢复成功（第{attempt}轮 status={probe_status}）",
+                    f"CF 轻量算法恢复成功（第{attempt}轮 status={probe_status}, 退避{backoff:.1f}s, "
+                    f"预热={'on' if plan['warm'] else 'off'}, 指纹轮换={'on' if attempt == 3 else 'off'}）",
                 )
                 return True
             self._diagnostic(
                 index,
-                f"CF 轻量恢复第{attempt}轮仍被拦截（status={probe_status}）",
+                f"CF 轻量恢复第{attempt}轮仍被拦截（status={probe_status}, 退避{backoff:.1f}s, "
+                f"预热={'on' if plan['warm'] else 'off'}, 指纹轮换={'on' if attempt == 3 else 'off'}）",
             )
         return False
+
+    def _align_identity_to_solver(self, bundle, index: int) -> bool:
+        """把协议会话身份对齐到 FlareSolverr 解质询的 Chromium。
+
+        cf_clearance 由 Cloudflare 绑定到求解会话的 (出口 IP, UA, TLS 指纹)。
+        FlareSolverr 用 Chromium 解质询，若重放仍用账号原生的 Firefox 指纹，
+        cookie 会被 CF 判为身份不符直接 403（"clearance 刷新成功但重试仍被
+        拦截"的根因）。这里把 impersonate 切到与求解 Chromium 大版本最接近
+        的 Chrome 家族档位，UA 逐字节保留求解器原串，Client Hints / 平台
+        字段按该版本重写，使 IP/UA/TLS 三要素与 clearance 签发会话一致。
+
+        求解器 UA 非 Chrome（或解析失败）时返回 False，保持账号原指纹。
+        """
+        solver_ua = str(getattr(bundle, "user_agent", "") or "").strip()
+        major, full_version = _extract_chrome_version_from_user_agent(solver_ua)
+        if not major:
+            self._diagnostic(index, f"CF clearance 求解器 UA 非 Chrome，保持原指纹: {solver_ua[:60]}")
+            return False
+        fp = _browser_fingerprint(self.fingerprint)
+        if (
+            str(fp.get("browser_family")) == "chrome"
+            and str(fp.get("user_agent")) == solver_ua
+        ):
+            self._diagnostic(index, f"CF clearance 身份已对齐(Chrome/{major})，无需切换")
+            return True
+        # 在 Chrome 家族档位里选与求解 Chromium 大版本差值最小的 impersonate
+        best: dict[str, str] | None = None
+        best_gap = -1
+        for profile in REGISTER_BROWSER_PROFILES:
+            if str(profile.get("browser_family")) != "chrome":
+                continue
+            try:
+                gap = abs(int(str(profile.get("major") or "0")) - int(major))
+            except ValueError:
+                continue
+            if best is None or gap < best_gap:
+                best, best_gap = profile, gap
+        if best is None:
+            return False
+        new_fp = dict(self.fingerprint)
+        new_fp.update(
+            {
+                "impersonate": str(best.get("impersonate") or ""),
+                "browser_family": "chrome",
+                "major": major,
+                "full_version": full_version,
+                # UA 逐字节保留求解器原串：clearance 校验对 UA 做字符串级匹配
+                "user_agent": solver_ua,
+                "sec_ch_ua": _chrome_sec_ch_ua(major),
+                "sec_ch_ua_full_version_list": _chrome_sec_ch_ua_full_version_list(major, full_version),
+                "navigator_vendor": "Google Inc.",
+            }
+        )
+        # FlareSolverr 容器是 Linux Chromium（UA 含 "X11; Linux x86_64"），
+        # 平台字段必须与 UA 一致，否则 "Linux UA + Windows CH" 是强机器人信号
+        if "X11; Linux" in solver_ua or "Linux x86_64" in solver_ua:
+            new_fp.update({"platform": "Linux x86_64", "platform_version": "6.8.0"})
+        self.fingerprint = new_fp
+        # 家族切换后重置轮换候选，让后续 TLS 轮换在 Chrome 家族内重建
+        self._tls_rotation_state = None
+        self._sync_session_identity()
+        platform_label = (
+            "Linux"
+            if "X11; Linux" in solver_ua or "Linux x86_64" in solver_ua
+            else "Windows/Mac"
+        )
+        self._diagnostic(
+            index,
+            f"CF clearance 身份对齐: 求解器=Chrome/{full_version}({platform_label}) · "
+            f"TLS {fp.get('impersonate')}({fp.get('browser_family')}) → {best.get('impersonate')}(chrome)",
+        )
+        self._diagnostic(
+            index,
+            f"CF clearance UA 切换: {str(fp.get('user_agent') or '')[:72]} → Chrome/{major} 求解器原串(逐字节保留)",
+        )
+        self._diagnostic(
+            index,
+            f"CF clearance CH/平台同步: sec-ch-ua=v{major} · 平台={new_fp.get('platform')} {new_fp.get('platform_version')} · "
+            f"待注入 clearance cookies {len(bundle.cookies)} 枚",
+        )
+        return True
 
     def _refresh_cloudflare_clearance(self, target_url: str, index: int, *, force_solver: bool = False):
         """刷新目标域的 Cloudflare clearance。
@@ -512,6 +613,13 @@ class PlatformRegistrar:
             "yellow",
         )
         proxy_config = _effective_proxy_config(_PROXY_CONFIG.get())
+        solver_started = time.monotonic()
+        self._diagnostic(
+            index,
+            f"FlareSolverr 清障请求: 目标={target_url} · "
+            f"代理={proxy_brief(self.proxy) if self.proxy else '直连'} · "
+            f"强制求解={'是' if force_solver else '否'}",
+        )
         bundle = refresh_clearance(
             proxy_config,
             target_url,
@@ -520,11 +628,24 @@ class PlatformRegistrar:
         if bundle is None:
             detail = clearance_error()
             self.clearance_failure_reason = detail or "FlareSolverr 未返回可用 clearance，请检查服务、代理和出口 IP"
-            step(index, self.clearance_failure_reason, "yellow")
+            step(
+                index,
+                f"FlareSolverr 清障失败(耗时{time.monotonic() - solver_started:.1f}s): {self.clearance_failure_reason}",
+                "yellow",
+            )
             return None
-        # Keep the protocol identity stable.  FlareSolverr may report its own
-        # browser UA (often Chromium); it is only used for clearance cookies,
-        # never as the account's Firefox fingerprint.
+        self._diagnostic(
+            index,
+            f"FlareSolverr 清障完成: 耗时{time.monotonic() - solver_started:.1f}s · "
+            f"cookies=[{', '.join(sorted(bundle.cookies))}] · "
+            f"TTL={max(0, int(bundle.expires_at - time.time()))}s · 域={bundle.target_host}",
+        )
+        # cf_clearance 绑定求解会话的 (IP, UA, TLS)。重放前把会话身份对齐
+        # 到 FlareSolverr 的 Chromium（Chrome 家族 impersonate + 求解器原版
+        # UA + 同步 Client Hints），否则 Firefox 身份重放 Chrome 签发的
+        # clearance 会被 CF 判为身份不符直接 403。对齐失败（非 Chrome 求解
+        # 器）时回退账号原指纹。
+        self._align_identity_to_solver(bundle, index)
         self.clearance_user_agent = _browser_fingerprint(self.fingerprint)["user_agent"]
         self._sync_session_identity()
         for name, value in bundle.cookies.items():
@@ -695,9 +816,19 @@ class PlatformRegistrar:
                 f"刷新 clearance 后重试 ({_csrf_retry_round + 1}/2)",
                 "yellow",
             )
-            if self._refresh_cloudflare_clearance(chatgpt_base + "/", index) is None:
+            # 第 2 轮强制 FlareSolverr：第 1 轮轻量探测已全部失败，
+            # 重复 3 轮退避探针只是浪费时间，真正的 cf_clearance 才有意义
+            if self._refresh_cloudflare_clearance(
+                chatgpt_base + "/", index, force_solver=_csrf_retry_round > 0
+            ) is None:
                 break
             csrf_token, csrf_response, csrf_error = fetch_csrf()
+            if not csrf_cloudflare_blocked():
+                self._diagnostic(
+                    index,
+                    f"CSRF 清障重试通过（status={getattr(csrf_response, 'status_code', '?')}, "
+                    f"第{_csrf_retry_round + 1}轮）",
+                )
         if csrf_cloudflare_blocked() or csrf_refused():
             # A definite upstream refusal must keep its original diagnostics;
             # homepage warmup cannot turn it into a missing-CSRF-cookie error.
@@ -1414,8 +1545,14 @@ class PlatformRegistrar:
             "mfa_issue_challenge",
         )
         step(index, "协议凭据登录[4/6] TOTP challenge 已签发 · factor_type=totp")
-        code = totp_code(totp_secret)
-        step(index, "协议凭据登录[5/6] TOTP 验证码已生成，提交 MFA 校验（验证码不写入日志）")
+        code = _totp_window_guarded(lambda: totp_code(totp_secret))
+        totp_now = time.time()
+        step(
+            index,
+            f"协议凭据登录[5/6] TOTP 验证码已生成"
+            f"（时间窗={int(totp_now // 30)}, 窗口剩余{30 - int(totp_now) % 30}s），"
+            "提交 MFA 校验（验证码不写入日志）",
+        )
         verify_url = f"{auth_base}/api/accounts/mfa/verify"
         verified = self._post_auth_json(
             verify_url,
@@ -1601,7 +1738,7 @@ class PlatformRegistrar:
                 ensure_running()
                 state = self._post_auth_json(
                     f"{auth_base}/api/accounts/mfa/verify", url or f"{auth_base}/mfa-challenge",
-                    {"id": factor_id, "type": "totp", "code": totp_code(secret)}, index, "mfa_verify",
+                    {"id": factor_id, "type": "totp", "code": _totp_window_guarded(lambda: totp_code(secret))}, index, "mfa_verify",
                 )
                 verified_factor = factor_id
                 continue
@@ -1694,7 +1831,7 @@ class PlatformRegistrar:
             "mfa_issue_challenge",
             flow_invocation=True,
         )
-        code = _totp_code(totp_secret)
+        code = _totp_window_guarded(lambda: _totp_code(totp_secret))
         verified = self._post_auth_json(
             f"{auth_base}/api/accounts/mfa/verify",
             mfa_referer,
@@ -2112,7 +2249,7 @@ class PlatformRegistrar:
         activate_data: dict[str, Any] = {}
         previous_code = ""
         for activate_attempt in range(2):
-            code = _totp_code(secret)
+            code = _totp_window_guarded(lambda: _totp_code(secret))
             if activate_attempt and code == previous_code:
                 for _ in range(32):
                     # After disabling the old factor this becomes a critical

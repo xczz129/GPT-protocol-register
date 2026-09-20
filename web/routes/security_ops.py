@@ -11,6 +11,7 @@ import time
 from typing import Any
 
 from common.team_workspace import requires_team_workspace, validate_session_replacement
+from proxy_util import error_zh
 
 
 def _state() -> Any:
@@ -86,10 +87,35 @@ def _persist_reauthenticated_account(
         refreshed["user_id"] = identity["user_id"]
     if identity["plan_type"]:
         refreshed["plan_type"] = identity["plan_type"]
-    checked = check_account(refreshed, persist=False, path=_state().ACCOUNTS_FILE)
-    if _state().normalized_health_status(checked) not in {"alive", "limited"}:
-        detail = str(checked.get("health_error") or "重新登录后的凭证测活失败")
-        raise RuntimeError(detail[:400])
+    checked = None
+    last_health_detail = ""
+    transient_markers = (
+        "curl", "timeout", "timed out", "connection",
+        "ssl", "tls", "handshake", "proxy", "临时", "超时",
+    )
+    for check_attempt in range(3):
+        candidate = None
+        try:
+            candidate = check_account(refreshed, persist=False, path=_state().ACCOUNTS_FILE)
+        except Exception as health_error:
+            last_health_detail = str(health_error)
+        if candidate is not None:
+            if _state().normalized_health_status(candidate) in {"alive", "limited"}:
+                checked = candidate
+                break
+            last_health_detail = str(candidate.get("health_error") or "重新登录后的凭证测活失败")
+        if not any(marker in last_health_detail.lower() for marker in transient_markers):
+            raise RuntimeError(last_health_detail[:400])
+        if check_attempt < 2:
+            time.sleep(2.0 + 2.0 * check_attempt)
+    if checked is None:
+        # 登录已成功且新凭证在手：测活通道的瞬态故障不应丢弃新凭证。
+        # 按 unknown/待复测落库，交给后续测活批次确认。
+        checked = {
+            **refreshed,
+            "health_status": "unknown",
+            "health_error": f"重新登录成功，测活通道瞬态失败待复测: {last_health_detail[:200]}",
+        }
     validate_session_replacement(account, checked, require_identity=require_team)
     return upsert_account_record(checked, _state().ACCOUNTS_FILE, create=False)
 
@@ -101,8 +127,10 @@ def _persist_reauthentication_failure(
     mode: str = "",
     step: str = "",
 ) -> dict[str, Any]:
-    detail = str(error or "重新登录失败").strip()[:400]
-    lowered = detail.lower()
+    detail_raw = str(error or "重新登录失败").strip()[:400]
+    # 展示层中文化：分类判断用原始串，账号记录里存储的失败原因用中文
+    detail = error_zh(detail_raw)
+    lowered = detail_raw.lower()
     previous_health = _state().normalized_health_status(account)
     now = _state()._now_iso()
     deactivated = (
@@ -110,12 +138,12 @@ def _persist_reauthentication_failure(
         or str(account.get("reauth_blocked_reason") or "").strip().lower()
         == "account_deactivated"
     )
-    transport_error = _state().is_proxy_transport_error(detail)
+    transport_error = _state().is_proxy_transport_error(detail_raw)
 
     if deactivated:
         health_status = "invalid"
         status = "已封号"
-        health_error = "account_deactivated: account has been deleted or deactivated"
+        health_error = "账号已被停用（封号）"
         blocked_reason = "account_deactivated"
     elif transport_error:
         health_status = "error"
@@ -201,6 +229,22 @@ def _account_email_relogin_ready(account: dict[str, Any]) -> bool:
     except Exception:
         return False
     return normalize_provider_type(mapped) in CANONICAL_PROVIDER_TYPES
+
+
+def _email_otp_provider_ready(provider_type: str) -> bool:
+    """Whether the resolved mail provider can receive an OTP email right now."""
+    from mail import CANONICAL_PROVIDER_TYPES, normalize_provider_type
+
+    return normalize_provider_type(str(provider_type or "")) in CANONICAL_PROVIDER_TYPES
+
+
+def _record_mfa_enabled(account: dict[str, Any]) -> bool:
+    """本地记录标记该账号已开启 2FA。
+
+    OpenAI 对已开启 2FA 的账号不提供邮箱验证码登录（无发信），
+    邮箱 OTP 路径对其必然超时，应在调度层快速失败。
+    """
+    return str(account.get("mfa_enabled") or "").strip().lower() in ("1", "true", "yes")
 
 
 def _reauthenticate_account_sync(
@@ -334,6 +378,10 @@ def _reauthenticate_account_sync(
             "otp_not_delivered",
             "no_code",
             "cf_blocked",
+            "clearance",
+            "cloudflare",
+            "csrf_http_403",
+            "just a moment",
             "代理出口 ip 检测失败",
             "host unreachable",
             "connection reset",
@@ -402,9 +450,59 @@ def _reauthenticate_account_sync(
                             "require_team_workspace": True,
                         } if requires_team_workspace(account) else {}),
                     )
+                    if (
+                        not (tokens and str(tokens.get("access_token") or "").strip())
+                        and "credential_login_password_route_unavailable" in reauth_error
+                        and not requires_team_workspace(account)
+                        and not _record_mfa_enabled(account)
+                        and _email_otp_provider_ready(provider_type)
+                    ):
+                        # 服务端把该账号导向邮箱验证（不给密码入口）：
+                        # 账密登录无法进行，自动降级为邮箱验证码登录。
+                        _state().JOB.append_log(
+                            f"[重新登录] 密码入口不可用(服务端导向邮箱验证) · {email} · 改走邮箱验证码登录"
+                        )
+                        reauth_error = ""
+                        current_step = ""
+                        tokens = protocol_email_login_one(
+                            1,
+                            email=email,
+                            mail_config=mail_cfg,
+                            provider_type=provider_type,
+                            proxy=proxy,
+                            stop_check=stop,
+                            task_event=capture_reauth_result,
+                            error_sink=lambda detail: capture_reauth_result(
+                                1, "failed", error=detail
+                            ),
+                            proxy_config=proxy_cfg,
+                        )
+                    elif (
+                        not (tokens and str(tokens.get("access_token") or "").strip())
+                        and "credential_login_password_route_unavailable" in reauth_error
+                        and _record_mfa_enabled(account)
+                    ):
+                        # 已开启 2FA 的账号 OpenAI 不提供邮箱验证码登录：
+                        # 密码入口不可用 + 2FA 生效 = 协议登录无路可走，
+                        # 不再空等 180s 邮箱超时。
+                        reauth_error = (
+                            "mfa_email_otp_login_unavailable: 账号已开启2FA且密码入口不可用，"
+                            "OpenAI 对2FA账号不提供邮箱验证码登录，无法协议登录"
+                        )
+                        _state().JOB.append_log(
+                            f"[重新登录] 密码入口不可用且已开启2FA(无邮箱验证码通道) · {email} · 无法协议登录"
+                        )
                 else:
                     # Passwordless account with a receivable mailbox:
                     # refresh the web session with an emailed OTP.
+                    if _record_mfa_enabled(account):
+                        # 已开启 2FA 的账号 OpenAI 不发邮箱验证码：
+                        # 快速失败，不空等 180s 超时。
+                        raise RuntimeError(
+                            "mfa_email_otp_login_unavailable: 账号已开启2FA，"
+                            "OpenAI 对2FA账号不提供邮箱验证码登录；"
+                            "本地2FA密钥与远端不符时无法自动恢复"
+                        )
                     tokens = protocol_email_login_one(
                         1,
                         email=email,
@@ -446,9 +544,18 @@ def _reauthenticate_account_sync(
             if "account_deactivated" in lowered_error:
                 break
             transport_error = is_proxy_transport_error(reauth_error)
-            if transport_error and proxy:
+            # CF 拦截本质是出口 IP 被盯上（错误信息本身建议更换 IP/代理），
+            # 与代理传输失败同权重：标记当前线并切换下一条重试。
+            cf_blocked_error = any(
+                marker in lowered_error
+                for marker in (
+                    "clearance", "cloudflare", "cf_blocked",
+                    "csrf_http_403", "just a moment",
+                )
+            )
+            if (transport_error or cf_blocked_error) and proxy:
                 failed_proxies.add(proxy)
-            if transport_error:
+            if transport_error or cf_blocked_error:
                 if attempt >= proxy_retry_limit or len(failed_proxies) >= len(set(proxy_candidates)):
                     break
                 next_proxy = next(
@@ -459,30 +566,33 @@ def _reauthenticate_account_sync(
                     "",
                 )
                 _state().JOB.append_log(
-                    f"[重新登录] 代理连接失败 · {email} · "
+                    f"[重新登录] {'CF 拦截' if cf_blocked_error else '代理连接失败'} · {email} · "
                     f"已切换代理重试 {attempt + 2}/{proxy_retry_limit + 1} · "
                     f"{proxy_brief(next_proxy) if next_proxy else 'direct'}"
                 )
                 if reauth_mode != "protocol":
                     update_mailbox_states([email], action="release")
-                time.sleep(0.5)
+                time.sleep(2.0 if cf_blocked_error else 0.5)
                 continue
             retryable = any(marker in lowered_error for marker in retryable_markers)
-            if attempt >= reauth_retries or not retryable:
+            # 限流单独处理：3 秒短退避大概率再撞一次限流，等 30s 让窗口恢复
+            rate_limited = "rate_limit" in lowered_error or "限流" in reauth_error
+            if attempt >= reauth_retries or not (retryable or rate_limited):
                 break
+            wait_seconds = 30.0 if rate_limited else 3.0
             _state().JOB.append_log(
-                f"[重新登录] 临时页面错误，3 秒后重试 "
+                f"[重新登录] {'认证服务限流，30 秒后重试' if rate_limited else '临时页面错误，3 秒后重试'} "
                 f"{attempt + 2}/{proxy_retry_limit + 1} · {reauth_error or 'unknown'}"
             )
             if reauth_mode != "protocol":
                 update_mailbox_states([email], action="release")
-            time.sleep(3)
+            time.sleep(wait_seconds)
         if not tokens or not str(tokens.get("access_token") or "").strip():
             if "account_deactivated" in reauth_error.lower():
                 raise RuntimeError("account_deactivated: 已封号")
             detail = reauth_error or "未取得新的访问凭证"
             mode_label = "协议" if reauth_mode == "protocol" else "混合"
-            raise RuntimeError(f"{mode_label}模式重新登录失败: {detail[:240]}")
+            raise RuntimeError(f"{mode_label}模式重新登录失败: {error_zh(detail)}")
         saved = _state()._persist_reauthenticated_account({**account, "proxy": proxy}, tokens)
         _state().JOB.append_log(f"[重新登录] 成功 · {email} · {reauth_mode}")
         _state().record_operation_event(

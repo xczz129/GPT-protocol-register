@@ -1207,10 +1207,20 @@ def _client_hint_headers(fp: dict[str, str]) -> dict[str, str]:
     """Return Chromium client hints only when the selected profile uses them."""
     if not fp.get("sec_ch_ua"):
         return {}
+    # 平台头必须与 UA 一致：FlareSolverr 清障对齐后的 Chromium 运行在
+    # Linux 容器里（UA 含 "X11; Linux x86_64"），"Linux UA + Windows CH"
+    # 是强机器人信号。默认档位 UA 均为 Windows，行为不变。
+    ua = str(fp.get("user_agent") or "")
+    if "X11; Linux" in ua or "Linux x86_64" in ua:
+        platform = '"Linux"'
+    elif "Macintosh" in ua or "Mac OS X" in ua:
+        platform = '"macOS"'
+    else:
+        platform = '"Windows"'
     return {
         "sec-ch-ua": fp["sec_ch_ua"],
         "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
+        "sec-ch-ua-platform": platform,
     }
 
 

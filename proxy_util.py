@@ -9,6 +9,67 @@ from typing import Any
 from urllib.parse import quote, unquote
 
 
+# ---------------------------------------------------------------------------
+# 错误信息中文化：面板/操作日志展示层统一把英文错误码翻译成中文。
+# 规则按特异性从上到下匹配，首个命中生效；未命中原样返回。
+# ---------------------------------------------------------------------------
+_ERROR_ZH_RULES: tuple[tuple[str, str], ...] = (
+    ("mfa_verify_http_403: account_deactivated", "账号已被停用（封号）"),
+    ("account_deactivated", "账号已被停用（封号）"),
+    ("invalid_username_or_password", "密码错误：存储密码与账号实际密码不符"),
+    ("password_verify_http_401", "密码验证被拒：密码与账号不符"),
+    ("mfa_verify_http_403", "TOTP验证码被拒：2FA密钥与账号不符"),
+    ("incorrect_code", "验证码错误"),
+    ("mfa_email_otp_login_unavailable", "已开启2FA：无邮箱验证码登录通道，无法自动恢复"),
+    ("email_address_changed", "账号邮箱已被变更"),
+    ("credential_login_password_route_unavailable", "服务端未提供密码登录入口（导向邮箱验证）"),
+    ("mfa_verify_missing_callback", "TOTP校验后未取得登录回调"),
+    ("chatgpt_csrf_http_403", "Cloudflare拦截：CSRF请求被质询"),
+    ("clearance 重试仍被拦截", "Cloudflare拦截：清障后仍被拦截，需更换IP/代理"),
+    ("cloudflare_challenge", "Cloudflare质询拦截"),
+    ("team_workspace_unavailable", "团队工作区不可用：认证会话未提供工作区列表"),
+    ("team_workspace_id_mismatch", "工作区ID不匹配：已保留原团队会话"),
+    ("team_workspace_unverified", "团队工作区选择未完成"),
+    ("重新登录后的凭证测活失败", "登录成功但凭证测活失败"),
+    ("等待登录验证码超时", "邮箱验证码未到达（180秒超时）"),
+    ("otp_not_delivered", "邮箱验证码未送达"),
+    ("rate_limit", "触发服务端限流"),
+    ("限流", "触发服务端限流"),
+    ("no_email_input", "页面未找到邮箱输入框"),
+    ("goto_failed", "页面加载失败"),
+    ("stuck_on_verification", "卡在验证页"),
+    ("stuck_on_login", "卡在登录页"),
+    ("invalid_state", "认证状态已失效"),
+    ("curl: (7)", "代理连接失败"),
+    ("curl: (28)", "连接超时"),
+    ("curl: (35)", "SSL/TLS连接失败"),
+    ("curl: (56)", "连接被重置"),
+    ("timed out", "请求超时"),
+    ("timeout", "请求超时"),
+)
+
+
+def error_zh(error_text: object) -> str:
+    """把常见英文错误码翻译成中文说明（附原始码便于排查）。
+
+    面板与操作日志的展示层调用；日志/数据库中的完整原始错误不受影响。
+    幂等：错误信息会经过 task_event → 调度器 → 持久化多层传递，已含
+    中文翻译的文本直接原样返回，避免嵌套包装。
+    """
+    text = str(error_text or "").strip()
+    if not text:
+        return text
+    # 已含任一中文译文的文本视为已翻译，不再二次包装
+    for _needle, zh in _ERROR_ZH_RULES:
+        if zh in text:
+            return text
+    lowered = text.lower()
+    for needle, zh in _ERROR_ZH_RULES:
+        if needle in text or needle.lower() in lowered:
+            return f"{zh}（{text[:72]}）" if len(text) > 72 else f"{zh}（{text}）"
+    return text
+
+
 def _encode_proxy_credential(value: object) -> str:
     """Percent-encode proxy credentials for the URL userinfo component.
 
