@@ -88,10 +88,11 @@ function moveTo(groupId: string) {
   if (!groupId) return;
   run(async () => {
     const name = groups.nameOf(groupId);
-    await groups.move(groupId, accounts.selectedKeys);
+    const keys = [...accounts.selectedKeys];
+    await groups.move(groupId, keys);
     ui.notify(`已移动 ${count.value} 个账号到「${name}」`, "success");
     accounts.clearSelection();
-    await accounts.load();
+    accounts.applyGroup(groupId, name, keys);
   });
 }
 

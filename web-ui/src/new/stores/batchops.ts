@@ -334,6 +334,7 @@ export const useBatchOpsStore = defineStore("batchops", () => {
     if (!parsed.rows.length) throw new Error("请填写需要导入的账号");
     if (!validImportConcurrency(payload.concurrency)) throw new Error(`导入并发必须为 1–${IMPORT_MAX_CONCURRENCY} 的整数`);
     const rows = new Map(parsed.rows.map((row) => [row.email, row.line]));
+    lastBatchKeys = []; // 导入产生新账号（keys 未知），完成后由回调退回全量加载
     await launchCodexBatch("import", rows.size,
       () => codexImport(value, payload.accountType, payload.workspace, payload.concurrency), () => {
         lastImportLines.value = rows;
@@ -432,7 +433,7 @@ export const useBatchOpsStore = defineStore("batchops", () => {
     }
   }
 
-  function startReauthPolling(onFinished?: () => void) {
+  function startReauthPolling(onFinished?: (keys?: string[]) => void) {
     stopReauthPolling();
     const generation = reauthGeneration;
     reauthConnection.value = "connected";
@@ -441,7 +442,7 @@ export const useBatchOpsStore = defineStore("batchops", () => {
       await refreshReauthProgress(generation);
       if (!reauth.running) {
         stopReauthPolling();
-        onFinished?.();
+        onFinished?.([...lastBatchKeys]);
       }
     }, 1500);
   }
@@ -452,6 +453,7 @@ export const useBatchOpsStore = defineStore("batchops", () => {
     options: { concurrency: number; passwordMode?: string; newPassword?: string; confirmPassword?: string },
   ) {
     if (!keys.length) return;
+    lastBatchKeys = [...keys];
     if (operation === "reauth") await reauthStart(keys, "protocol", options.concurrency);
     else if (operation === "security_repair") await securityRepairStart(keys, options.concurrency);
     else if (operation === "password_change") {
@@ -465,6 +467,7 @@ export const useBatchOpsStore = defineStore("batchops", () => {
 
   /** 协议登录（按邮箱）：预检+启动合一，返回预检摘要；有 job_id 时接管进度轮询 */
   async function startProtocolLogin(emails: string[], concurrency: number): Promise<ProtocolLoginStartResult> {
+    lastBatchKeys = []; // 按邮箱启动，无 keys，完成后由回调退回全量加载
     const value = await reauthByEmailStart(emails, concurrency);
     applyReauth(value);
     if (value.job_id) startReauthPolling(onFinishedRefresh);
@@ -547,7 +550,7 @@ export const useBatchOpsStore = defineStore("batchops", () => {
       refreshAtError.value = "";
       if (!refreshAt.running) {
         stopRefreshAtPolling();
-        onFinishedRefresh();
+        onFinishedRefresh([...lastBatchKeys]);
       }
     } catch (error) {
       refreshAtFailures += 1;
@@ -572,6 +575,7 @@ export const useBatchOpsStore = defineStore("batchops", () => {
 
   async function startRefreshAt(keys: string[], allAccounts: boolean, concurrency: number) {
     stopRefreshAtPolling();
+    lastBatchKeys = allAccounts ? [] : [...keys];
     refreshAtDialogOpen.value = true;
     refreshAtConnection.value = "connected";
     refreshAtError.value = "";
@@ -645,7 +649,7 @@ export const useBatchOpsStore = defineStore("batchops", () => {
       trialError.value = "";
       if (!trial.running) {
         stopTrialPolling();
-        onFinishedRefresh();
+        onFinishedRefresh([...lastBatchKeys]);
       }
     } catch (error) {
       trialFailures += 1;
@@ -673,6 +677,7 @@ export const useBatchOpsStore = defineStore("batchops", () => {
     channel: TrialChannel = "v4",
   ) {
     stopTrialPolling();
+    lastBatchKeys = allAccounts ? [] : [...keys];
     trialDialogOpen.value = true;
     trialConnection.value = "connected";
     trialError.value = "";
@@ -715,9 +720,11 @@ export const useBatchOpsStore = defineStore("batchops", () => {
     await Promise.allSettled([restoreReauth(), restoreRefreshAt(), restoreTrial()]);
   }
 
-  /* --- 批次完成后的账号列表刷新回调（由 accounts 视图注入） --- */
-  let onFinishedRefresh: () => void = () => {};
-  function setOnFinished(callback: () => void) {
+  /* --- 批次完成后的账号列表刷新回调（由 accounts 视图注入） ---
+     回调收到本次批次涉及的账号 keys；为空（全部模式/未知）时由调用方退回全量加载。 */
+  let onFinishedRefresh: (keys?: string[]) => void = () => {};
+  let lastBatchKeys: string[] = [];
+  function setOnFinished(callback: (keys?: string[]) => void) {
     onFinishedRefresh = callback;
   }
 

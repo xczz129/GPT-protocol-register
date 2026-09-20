@@ -1,1 +1,0 @@
-import{r as e}from"./_plugin-vue_export-helper-CIo_gUBR.js";function t(){return e(`/api/status`)}export{t};

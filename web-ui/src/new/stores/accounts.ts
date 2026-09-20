@@ -4,7 +4,7 @@
 import { computed, shallowRef, ref } from "vue";
 import { defineStore } from "pinia";
 import {
-  deleteAccounts, deleteInvalidAccounts, fetchAccountsPage, fetchHealthProgress,
+  deleteAccounts, deleteInvalidAccounts, fetchAccountsByKeys, fetchAccountsPage, fetchHealthProgress,
   resumeHealthCheck, startHealthCheck, type Account, type HealthProgress,
 } from "../api/accounts";
 
@@ -206,7 +206,23 @@ export const useAccountsStore = defineStore("accounts", () => {
       clearHealthTimer();
       if (wasRunning && !healthLoadQueued) {
         healthLoadQueued = true;
-        void load().finally(() => { healthLoadQueued = false; });
+        void (async () => {
+          try {
+            // 终态快照带完整账号视图 updates（批次 ≤200 时收集），本地合并代替全量重载
+            const final = await fetchHealthProgress(true);
+            const updates = final?.updates || {};
+            if (Object.keys(updates).length) {
+              const byKey = new Map<string, Account>(Object.entries(updates));
+              rows.value = rows.value.map((a) => byKey.get(a.delete_key) || a);
+            } else {
+              await load();
+            }
+          } catch {
+            await load();
+          } finally {
+            healthLoadQueued = false;
+          }
+        })();
       }
     }
   }
@@ -298,19 +314,85 @@ export const useAccountsStore = defineStore("accounts", () => {
     await launchHealth(() => resumeHealthCheck(workers, channel), requested, workers);
   }
 
-  /* --- 删除后同步 --- */
+  /* --- 删除后同步：本地移除对应行，不再全量重载列表 --- */
   async function remove(keys: string[], deleteAll = false) {
     const result = await deleteAccounts(keys, deleteAll);
     clearSelection();
-    await load();
+    if (deleteAll) {
+      rows.value = [];
+      total.value = 0;
+    } else {
+      const removed = new Set(keys);
+      rows.value = rows.value.filter((a) => !removed.has(a.delete_key));
+      total.value = result.count;
+    }
     return result;
   }
 
   async function removeInvalid(keys: string[], deleteAll = false) {
     const result = await deleteInvalidAccounts(keys, deleteAll);
     clearSelection();
-    await load();
+    // 与后端同口径：仅"失效(health_status=invalid)且未封号"的账号被移入回收站
+    const removed = new Set(keys);
+    rows.value = rows.value.filter(
+      (a) =>
+        !(
+          String(a.health_status || "").toLowerCase() === "invalid" &&
+          !a.is_deactivated &&
+          (deleteAll || removed.has(a.delete_key))
+        ),
+    );
+    total.value = result.count;
     return result;
+  }
+
+  /** 批次/操作结束后按 keys 增量拉取受影响账号并本地合并；涉及面过大或失败时退回全量加载 */
+  async function refreshKeys(keys: string[]) {
+    const wanted = [...new Set(keys.map((k) => String(k || "").trim()).filter(Boolean))];
+    if (!wanted.length || !rows.value.length) {
+      await load();
+      return;
+    }
+    // 涉及账号过多时，增量请求与全量重载成本相当，直接走全量
+    if (wanted.length >= Math.max(500, Math.floor(rows.value.length / 2))) {
+      await load();
+      return;
+    }
+    try {
+      const data = await fetchAccountsByKeys(wanted);
+      if (!data.items.length) {
+        await load();
+        return;
+      }
+      const byKey = new Map(data.items.map((a) => [a.delete_key, a]));
+      const existing = new Set(rows.value.map((a) => a.delete_key));
+      const merged = rows.value.map((a) => byKey.get(a.delete_key) || a);
+      // keys 中不在现有列表的（如批次期间新增）追加到末尾
+      for (const item of data.items) {
+        if (!existing.has(item.delete_key)) merged.push(item);
+      }
+      rows.value = merged;
+      total.value = data.count;
+    } catch {
+      await load();
+    }
+  }
+
+  /** 分组移动成功后本地更新 group_id/group_name（服务端已确认） */
+  function applyGroup(groupId: string, groupName: string, keys: string[]) {
+    const moved = new Set(keys);
+    if (!moved.size || !groupId) return;
+    rows.value = rows.value.map((a) =>
+      moved.has(a.delete_key) ? { ...a, group_id: groupId, group_name: groupName } : a,
+    );
+  }
+
+  /** 删除分组后本地把组内账号归入目标分组（默认组） */
+  function regroupAccounts(fromGroupId: string, toGroupId: string, toGroupName: string) {
+    if (!fromGroupId) return;
+    rows.value = rows.value.map((a) =>
+      a.group_id === fromGroupId ? { ...a, group_id: toGroupId, group_name: toGroupName } : a,
+    );
   }
 
   return {
@@ -320,6 +402,6 @@ export const useAccountsStore = defineStore("accounts", () => {
     activeCount, atRiskKeys, protocolReauthKeys, invalidKeys,
     selectedKeys, selectedSet, toggle, toggleAll, clearSelection,
     health, healthError, healthSubmitting, refreshHealth, startHealth, resumeHealth,
-    remove, removeInvalid,
+    remove, removeInvalid, refreshKeys, applyGroup, regroupAccounts,
   };
 });

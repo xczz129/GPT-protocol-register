@@ -1,1 +1,0 @@
-import{o as e,r as t}from"./_plugin-vue_export-helper-cQypK6Pq.js";function n(){return t(`/api/ui-settings`)}function r(n){return t(`/api/ui-settings`,{method:`PUT`,body:e(n)})}export{r as n,n as t};

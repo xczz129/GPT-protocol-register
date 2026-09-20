@@ -1,1 +1,0 @@
-import{o as e,r as t}from"./_plugin-vue_export-helper-cQypK6Pq.js";function n(){return t(`/api/config`)}function r(n){return t(`/api/config`,{method:`PUT`,body:e({config:n})})}function i(){return t(`/api/browsers/status`)}export{n,r,i as t};

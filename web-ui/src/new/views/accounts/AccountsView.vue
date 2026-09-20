@@ -176,7 +176,11 @@ watch(
 );
 
 onMounted(async () => {
-  batch.setOnFinished(() => accounts.load());
+  /* 批次结束：有涉及 keys 时增量合并受影响账号，否则（全部模式/导入/未知）退回全量加载 */
+  batch.setOnFinished((keys) => {
+    if (keys?.length) void accounts.refreshKeys(keys);
+    else void accounts.load();
+  });
   await Promise.all([groups.load(), accounts.load(), accounts.refreshHealth()]);
   /* 页面刷新后接管所有后台批次，避免刷新 AT/试用检测继续运行但进度窗口丢失。 */
   await batch.restoreBackgroundBatches();

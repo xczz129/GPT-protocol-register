@@ -126,7 +126,8 @@ async function removeOne(id: string, name: string) {
   try {
     await groups.remove(id);
     if (accounts.groupFilter === id) accounts.groupFilter = "all";
-    await accounts.load();
+    const fallback = groups.defaultGroup;
+    accounts.regroupAccounts(id, fallback?.id || "", fallback?.name || "默认分组");
     ui.notify("分组已删除", "success");
   } catch (error) {
     ui.notify(error instanceof Error ? error.message : "删除失败", "error");

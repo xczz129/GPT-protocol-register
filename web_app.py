@@ -2969,6 +2969,46 @@ async def accounts(limit: int = 200, offset: int = 0):
     return await asyncio.to_thread(_do)
 
 
+@app.post("/api/accounts/by-keys")
+async def accounts_by_keys(body: BulkDeleteRequest):
+    """按 keys 返回账号公开视图：前端批次结束后增量合并，代替全量分页重载。"""
+    wanted = [str(key or "").strip() for key in (body.keys or [])]
+    wanted = [key for key in dict.fromkeys(wanted) if key]
+    if not wanted:
+        return JSONResponse(
+            {
+                "ok": True,
+                "items": [],
+                "count": await asyncio.to_thread(count_accounts, ACCOUNTS_FILE),
+            },
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
+
+    def _do():
+        records_by_key = _records_by_keys_with_fallback(set(wanted))
+        groups = _groups_with_counts()
+        names = {item["id"]: item["name"] for item in groups}
+        default_id = groups[0]["id"] if groups else ""
+        slim = []
+        for key in wanted:
+            record = records_by_key.get(key)
+            if record is None:
+                continue
+            item = dict(account_public_view(record))
+            group_id = str(item.get("group_id") or "").strip()
+            if group_id not in names:
+                group_id = default_id
+            item["group_id"] = group_id
+            item["group_name"] = names.get(group_id, "")
+            slim.append(item)
+        return {"ok": True, "items": slim, "count": count_accounts(ACCOUNTS_FILE)}
+
+    payload = await asyncio.to_thread(_do)
+    return JSONResponse(
+        payload, headers={"Cache-Control": "no-store", "Pragma": "no-cache"}
+    )
+
+
 from web.routes.trial_health import router as trial_health_router  # noqa: E402
 
 app.include_router(trial_health_router)

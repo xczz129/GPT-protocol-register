@@ -78,11 +78,20 @@ export interface HealthProgress {
   finishedAt?: string;
   workers: number;
   requestedWorkers: number;
-  updates: Record<string, { health_status?: string; status?: string }>;
+  /* 后端在批次 ≤200 时收集的完整账号公开视图（与列表项同构），可直接本地合并 */
+  updates: Record<string, Account>;
 }
 
 export function fetchAccountsPage(limit: number, offset: number): Promise<AccountsPage> {
   return api<AccountsPage>(`/api/accounts?limit=${limit}&offset=${offset}`);
+}
+
+/** 按 keys 增量拉取账号（批次/操作结束后局部合并，代替全量分页重载） */
+export function fetchAccountsByKeys(keys: string[]) {
+  return api<{ ok: boolean; items: Account[]; count: number }>("/api/accounts/by-keys", {
+    method: "POST",
+    body: jsonBody({ keys }),
+  });
 }
 
 /* --- 测活 --- */
