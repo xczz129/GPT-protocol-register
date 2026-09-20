@@ -111,7 +111,9 @@ def _settings(
         else configured_proxy or runtime_proxy
     )
     return {
-        "enabled": bool(cfg.get("enabled")) and bool(clearance.get("enabled")),
+        # 清障链独立于代理开关：proxy.enabled=false（直连）时同样可能撞 CF
+        # 质询，clearance.enabled 单独控制 FlareSolverr 是否参与。
+        "enabled": bool(clearance.get("enabled")),
         "mode": str(clearance.get("mode") or "none").strip().lower(),
         "url": str(clearance.get("flaresolverr_url") or "").strip().rstrip("/"),
         "proxy": clearance_proxy,
